@@ -19,7 +19,7 @@ def download(url, path, info):
 
 root = Path("html")
 if not root.exists():
-    raise RuntimeError("Must be run from with the root directory")
+    raise RuntimeError("Must be run from within the root directory")
 
 opener = build_opener()
 opener.addheaders = [("User-agent", "Mozilla/5.0")]
