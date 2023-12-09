@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from urllib.request import build_opener, install_opener, Request, urlopen, urlretrieve
+import urllib.request as request
 
 def download(url, path, info):
     def spin():
@@ -14,8 +14,14 @@ def download(url, path, info):
         print(next(spinner) + "\b", end="", flush=True)
 
     print(f"{info:.<40s} ", end="")
-    urlretrieve(url, path, reporthook)
+    request.urlretrieve(url, path, reporthook)
     print("OK")
+
+    return json.load(open(path))
+
+index_name = "index.json"
+db_name = "db.json"
+mtime_name = "mtime"
 
 with open("update.conf") as file:
     active = [line.rstrip() for line in file]
@@ -24,12 +30,11 @@ root = Path("html")
 if not root.exists():
     raise RuntimeError("Must be run from within the root directory")
 
-opener = build_opener()
+opener = request.build_opener()
 opener.addheaders = [("User-agent", "Mozilla/5.0")]
-install_opener(opener)
+request.install_opener(opener)
 
-req = Request("https://devdocs.io/docs.json", headers={"User-agent": "Mozilla/5.0"})
-index = json.load(urlopen(req))
+index = download("https://devdocs.io/docs.json", root / index_name, "Doc index")
 
 for doc in index:
     doc_mtime = str(doc["mtime"])
@@ -38,13 +43,16 @@ for doc in index:
 
     if not doc_slug in active: continue
 
-    mtime_path = doc_path / "mtime"
+    mtime_path = doc_path / mtime_name
     mtime = mtime_path.read_text() if mtime_path.exists() else ""
 
     if doc_mtime != mtime:
         doc_path.mkdir(parents=True, exist_ok=True)
 
-        for doc_name in [ "index.json", "db.json" ]:
-            download(f"https://documents.devdocs.io/{doc_slug}/{doc_name}", doc_path / doc_name, f"{doc_slug} ({doc_name})")
+        url = "https://documents.devdocs.io/" + doc_slug + "/"
+        doc_index = download(url + index_name, doc_path / index_name, doc_slug + "/index")
+        doc_db = download(url + db_name, doc_path / db_name, doc_slug + "/db")
 
         mtime_path.write_text(doc_mtime)
+
+print("DONE")
