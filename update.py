@@ -17,6 +17,9 @@ def download(url, path, info):
     urlretrieve(url, path, reporthook)
     print("OK")
 
+with open("update.conf") as file:
+    active = [line.rstrip() for line in file]
+
 root = Path("html")
 if not root.exists():
     raise RuntimeError("Must be run from within the root directory")
@@ -32,6 +35,8 @@ for doc in index:
     doc_mtime = str(doc["mtime"])
     doc_slug = doc["slug"]
     doc_path = root / doc["type"] / doc_slug
+
+    if not doc_slug in active: continue
 
     mtime_path = doc_path / "mtime"
     mtime = mtime_path.read_text() if mtime_path.exists() else ""
