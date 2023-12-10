@@ -50,7 +50,8 @@ if not root.exists():
     raise RuntimeError("Must be run from within the root directory")
 
 with open("download.conf") as fp:
-    wanted = [ ln.rstrip() for ln in fp ]
+    dl_doc = [ ln.rstrip() for ln in fp ]
+    dl_all = len(dl_doc) == 1 and dl_doc[0] == "*"
 
 opener = request.build_opener()
 opener.addheaders = [("User-agent", "Mozilla/5.0")]
@@ -63,21 +64,20 @@ for doc in docs:
     name = doc["slug"]
     path = root / doc["type"] / name
 
-    if not name in wanted: continue
+    if dl_all or name in dl_doc:
+        mtime_path = path / "mtime"
+        old_mtime = mtime_path.read_text() if mtime_path.exists() else ""
 
-    mtime_path = path / "mtime"
-    old_mtime = mtime_path.read_text() if mtime_path.exists() else ""
+        if mtime != old_mtime:
+            index = download(doc_templ_url.format(name, "index.json"), name + " index")
+            db = download(doc_templ_url.format(name, "db.json"), name + " db")
 
-    if mtime != old_mtime:
-        index = download(doc_templ_url.format(name, "index.json"), name + " index")
-        db = download(doc_templ_url.format(name, "db.json"), name + " db")
+            path.mkdir(parents=True, exist_ok=True)
+            purge(path)
 
-        path.mkdir(parents=True, exist_ok=True)
-        purge(path)
+            save_db(path, db)
+            save_index(path / "index.json", index)
 
-        save_db(path, db)
-        save_index(path / "index.json", index)
-
-        mtime_path.write_text(mtime)
+            mtime_path.write_text(mtime)
 
 print("DONE")
