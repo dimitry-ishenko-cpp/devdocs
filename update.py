@@ -41,7 +41,7 @@ def save_db(path, db):
         file_path.write_text(content)
 
 def save_index(path, index):
-    index = [{ "name": e["name"], "path": e["path"] } for e in index["entries"]]
+    index = { e["name"]: (e["path"] + ".html") for e in index["entries"] }
     with path.open("w") as fp: json.dump(index, fp)
 
 ####################
