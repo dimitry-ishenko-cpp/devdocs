@@ -49,7 +49,7 @@ root = Path("html")
 if not root.exists():
     raise RuntimeError("Must be run from within the root directory")
 
-with open("update.conf") as fp:
+with open("download.conf") as fp:
     wanted = [ ln.rstrip() for ln in fp ]
 
 opener = request.build_opener()
