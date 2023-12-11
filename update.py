@@ -54,7 +54,7 @@ doc_templ_url = "https://documents.devdocs.io/{}/{}"
 
 root_path = Path.cwd()
 html_path = root_path / "html"
-dl_path   = root_path / "download.conf"
+dl_path   = root_path / "update.conf"
 
 with open(dl_path) as fp:
     dl_doc = [ ln.rstrip() for ln in fp ]
