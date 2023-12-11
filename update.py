@@ -7,9 +7,6 @@ import shutil
 from tempfile import TemporaryDirectory as tempdir
 import urllib.request as request
 
-docs_url = "https://devdocs.io/docs.json"
-doc_templ_url = "https://documents.devdocs.io/{}/{}"
-
 def download(url, banner):
     def spin():
         while True:
@@ -21,6 +18,7 @@ def download(url, banner):
 
     with tempdir() as dirname:
         path = Path(dirname) / "file.json"
+
         print(f"{banner:.<40s} ", end="")
         request.urlretrieve(url, path, reporthook)
         with open(path) as fp: content = json.load(fp)
@@ -42,14 +40,17 @@ def save_db(path, db):
 
 def save_index(path, index):
     index = { e["name"]: (e["path"] + ".html") for e in index["entries"] }
-    with path.open("w") as fp: json.dump(index, fp)
+    with open(path, "w") as fp: json.dump(index, fp)
 
 ####################
-root = Path("html")
-if not root.exists():
-    raise RuntimeError("Must be run from within the root directory")
+docs_url = "https://devdocs.io/docs.json"
+doc_templ_url = "https://documents.devdocs.io/{}/{}"
 
-with open("download.conf") as fp:
+root_path = Path.cwd()
+html_path = root_path / "html"
+dl_path   = root_path / "download.conf"
+
+with open(dl_path) as fp:
     dl_doc = [ ln.rstrip() for ln in fp ]
     dl_all = len(dl_doc) == 1 and dl_doc[0] == "*"
 
@@ -58,21 +59,20 @@ opener.addheaders = [("User-agent", "Mozilla/5.0")]
 request.install_opener(opener)
 
 docs = download(docs_url, "Document index")
-
 for doc in docs:
-    mtime = str(doc["mtime"])
     name = doc["slug"]
-    path = root / doc["type"] / name
+    path = html_path / name
 
     if dl_all or name in dl_doc:
         mtime_path = path / "mtime"
         old_mtime = mtime_path.read_text() if mtime_path.exists() else ""
 
+        mtime = str(doc["mtime"])
         if mtime != old_mtime:
             index = download(doc_templ_url.format(name, "index.json"), name + " index")
             db = download(doc_templ_url.format(name, "db.json"), name + " db")
 
-            path.mkdir(parents=True, exist_ok=True)
+            path.mkdir(exist_ok=True)
             purge(path)
 
             save_db(path, db)
