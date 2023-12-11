@@ -37,12 +37,15 @@ def save_db(path, db):
         item_path = path / (item + ".html")
         item_path.parent.mkdir(parents=True, exist_ok=True)
 
-        content = re.sub('((href=")(?!http)[^"#]+)', '\\1.html', content)
+        content = re.sub('((href=")(?!http)[^"#]+)', "\\1.html", content)
         item_path.write_text(content)
 
-def save_index(path, index):
+def save_index(path, old_index):
+    index = { }
+    for e in old_index["entries"]:
+        index[e["name"]] = re.sub("^([^#]+)", "\\1.html", e["path"])
+
     index_path = path / "index.json"
-    index = { e["name"]: (e["path"] + ".html") for e in index["entries"] }
     with open(index_path, "w") as fp: json.dump(index, fp)
 
 ####################
