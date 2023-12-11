@@ -27,20 +27,23 @@ def download(url, banner):
     return content
 
 def purge(path):
-    for child in path.iterdir():
-        shutil.rmtree(child) if child.is_dir() else child.unlink()
+    if path.exists():
+        for child in path.iterdir():
+            shutil.rmtree(child) if child.is_dir() else child.unlink()
+    else: path.mkdir()
 
 def save_db(path, db):
-    for file, content in db.items():
-        file_path = path / (file + ".html")
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+    for item, content in db.items():
+        item_path = path / (item + ".html")
+        item_path.parent.mkdir(parents=True, exist_ok=True)
 
         content = re.sub('((href=")(?!http)[^"#]+)', '\\1.html', content)
-        file_path.write_text(content)
+        item_path.write_text(content)
 
 def save_index(path, index):
+    index_path = path / "index.json"
     index = { e["name"]: (e["path"] + ".html") for e in index["entries"] }
-    with open(path, "w") as fp: json.dump(index, fp)
+    with open(index_path, "w") as fp: json.dump(index, fp)
 
 ####################
 docs_url = "https://devdocs.io/docs.json"
@@ -69,14 +72,12 @@ for doc in docs:
 
         mtime = str(doc["mtime"])
         if mtime != old_mtime:
-            index = download(doc_templ_url.format(name, "index.json"), name + " index")
-            db = download(doc_templ_url.format(name, "db.json"), name + " db")
+            index = download(doc_templ_url.format(name, "index.json"), name + "-index")
+            db = download(doc_templ_url.format(name, "db.json"), name + "-db")
 
-            path.mkdir(exist_ok=True)
             purge(path)
-
             save_db(path, db)
-            save_index(path / "index.json", index)
+            save_index(path, index)
 
             mtime_path.write_text(mtime)
 
