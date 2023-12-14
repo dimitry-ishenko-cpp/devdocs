@@ -16,9 +16,10 @@ else()
     set(DEVDOCS_INSTALL_BINDIR $ENV{HOME}/.local/bin)
 endif()
 
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/html)
+install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/html DESTINATION ${DEVDOCS_INSTALL_DATADIR})
+
 configure_file(devgrep.in devgrep)
 configure_file(devmanage.in devmanage)
 configure_file(devopen.in devopen)
-
-install(DIRECTORY html DESTINATION ${DEVDOCS_INSTALL_DATADIR})
 install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/devgrep ${CMAKE_CURRENT_BINARY_DIR}/devmanage ${CMAKE_CURRENT_BINARY_DIR}/devopen DESTINATION ${DEVDOCS_INSTALL_BINDIR})
