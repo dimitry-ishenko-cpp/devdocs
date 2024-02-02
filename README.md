@@ -10,7 +10,7 @@ and _[w3m](https://w3m.sourceforge.net/)_ text-based browser?
 Stable version (requires [CMake](https://cmake.org/) >= 3.16):
 
 ```shell
-$ p=devdocs-offline v=0.2.2
+$ p=devdocs v=0.3
 $ wget -O ${p}-${v}.tar.gz https://github.com/dimitry-ishenko-cpp/${p}/archive/refs/tags/v${v}.tar.gz
 $ tar xzf ${p}-${v}.tar.gz
 $ mkdir ${p}-${v}/build
@@ -25,14 +25,6 @@ To install system-wide, change the above commands to:
 $ cmake -DSYSTEM_INSTALL=ON ..
 $ make
 $ sudo make install
-```
-
-## Tips and tricks
-
-Enable preview window in fzf:
-
-```shell
-export FZF_DEFAULT_OPTS="--preview='devopen {}' --preview-window=,66%"
 ```
 
 ## Authors
