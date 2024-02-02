@@ -19,6 +19,11 @@ endif()
 configure_file(bin/devgrep.in devgrep)
 configure_file(bin/devmanage.in devmanage)
 configure_file(bin/devopen.in devopen)
-install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/devgrep ${CMAKE_CURRENT_BINARY_DIR}/devmanage ${CMAKE_CURRENT_BINARY_DIR}/devopen DESTINATION ${DEVDOCS_INSTALL_BINDIR})
+install(PROGRAMS
+    ${CMAKE_CURRENT_BINARY_DIR}/devgrep
+    ${CMAKE_CURRENT_BINARY_DIR}/devmanage
+    ${CMAKE_CURRENT_BINARY_DIR}/devopen 
+    DESTINATION ${DEVDOCS_INSTALL_BINDIR}
+)
 
 install(DIRECTORY html DESTINATION ${DEVDOCS_INSTALL_DATADIR})
