@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16) # focal
-project(devdocs VERSION 0.2.2 LANGUAGES C)
+project(devdocs VERSION 0.3 LANGUAGES C)
 
 option(SYSTEM_INSTALL "" OFF)
 
