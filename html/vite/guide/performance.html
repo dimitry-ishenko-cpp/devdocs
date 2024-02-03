@@ -1,0 +1,97 @@
+<h1 id="performance" tabindex="-1">Performance </h1>
+<p>While Vite is fast by default, performance issues can creep in as the project's requirements grow. This guide aims to help you identify and fix common performance issues, such as:</p>
+<ul>
+<li>Slow server starts</li>
+<li>Slow page loads</li>
+<li>Slow builds</li>
+</ul>
+<h2 id="audit-configured-vite-plugins" tabindex="-1">Audit Configured Vite Plugins </h2>
+<p>Vite's internal and official plugins are optimized to do the least amount of work possible while providing compatibility with the broader ecosystem. For example, code transformations use regex in dev, but do a complete parse in build to ensure correctness.</p>
+<p>However, the performance of community plugins is out of Vite's control, which may affect the developer experience. Here are a few things you can look out for when using additional Vite plugins:</p>
+<ol>
+<li><p>Large dependencies that are only used in certain cases should be dynamically imported to reduce the Node.js startup time. Example refactors: <a href="https://github.com/vitejs/vite-plugin-react/pull/212" target="_blank" rel="noreferrer">vite-plugin-react#212</a> and <a href="https://github.com/vite-pwa/vite-plugin-pwa/pull/244" target="_blank" rel="noreferrer">vite-plugin-pwa#224</a>.</p></li>
+<li><p>The <code>buildStart</code>, <code>config</code>, and <code>configResolved</code> hooks should not run long and extensive operations. These hooks are awaited during dev server startup, which delays when you can access the site in the browser.</p></li>
+<li>
+<p>The <code>resolveId</code>, <code>load</code>, and <code>transform</code> hooks may cause some files to load slower than others. While sometimes unavoidable, it's still worth checking for possible areas to optimize. For example, checking if the <code>code</code> contains a specific keyword, or the <code>id</code> matches a specific extension, before doing the full transformation.</p>
+<p>The longer it takes to transform a file, the more significant the request waterfall will be when loading the site in the browser.</p>
+<p>You can inspect the duration it takes to transform a file using <code>DEBUG="vite:plugin-transform" vite</code> or <a href="https://github.com/antfu/vite-plugin-inspect" target="_blank" rel="noreferrer">vite-plugin-inspect</a>. Note that as asynchronous operations tend to provide inaccurate timings, you should treat the numbers as a rough estimate, but it should still reveal the more expensive operations.</p>
+</li>
+</ol>
+<div class="tip custom-block">
+<strong class="custom-block-title">Profiling</strong><p>You can run <code>vite --profile</code>, visit the site, and press <code>p + enter</code> in your terminal to record a <code>.cpuprofile</code>. A tool like <a href="https://www.speedscope.app" target="_blank" rel="noreferrer">speedscope</a> can then be used to inspect the profile and identify the bottlenecks. You can also <a href="https://chat.vitejs.dev" target="_blank" rel="noreferrer">share the profiles</a> with the Vite team to help us identify performance issues.</p>
+</div>
+<h2 id="reduce-resolve-operations" tabindex="-1">Reduce Resolve Operations </h2>
+<p>Resolving import paths can be an expensive operation when hitting its worst case often. For example, Vite supports "guessing" import paths with the <a href="../config/shared-options.html#resolve-extensions"><code>resolve.extensions</code></a> option, which defaults to <code>['.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx', '.json']</code>.</p>
+<p>When you try to import <code>./Component.jsx</code> with <code>import './Component'</code>, Vite will run these steps to resolve it:</p>
+<ol>
+<li>Check if <code>./Component</code> exists, no.</li>
+<li>Check if <code>./Component.mjs</code> exists, no.</li>
+<li>Check if <code>./Component.js</code> exists, no.</li>
+<li>Check if <code>./Component.mts</code> exists, no.</li>
+<li>Check if <code>./Component.ts</code> exists, no.</li>
+<li>Check if <code>./Component.jsx</code> exists, yes!</li>
+</ol>
+<p>As shown, a total of 6 filesystem checks is required to resolve an import path. The more implicit imports you have, the more time it adds up to resolve the paths.</p>
+<p>Hence, it's usually better to be explicit with your import paths, e.g. <code>import './Component.jsx'</code>. You can also narrow down the list for <code>resolve.extensions</code> to reduce the general filesystem checks, but you have to make sure it works for files in <code>node_modules</code> too.</p>
+<p>If you're a plugin author, make sure to only call <a href="https://rollupjs.org/plugin-development/#this-resolve" target="_blank" rel="noreferrer"><code>this.resolve</code></a> when needed to reduce the number of checks above.</p>
+<div class="tip custom-block">
+<strong class="custom-block-title">TypeScript</strong><p>If you are using TypeScript, enable <code>"moduleResolution": "bundler"</code> and <code>"allowImportingTsExtensions": true</code> in your <code>tsconfig.json</code>'s <code>compilerOptions</code> to use <code>.ts</code> and <code>.tsx</code> extensions directly in your code.</p>
+</div>
+<h2 id="avoid-barrel-files" tabindex="-1">Avoid Barrel Files </h2>
+<p>Barrel files are files that re-export the APIs of other files in the same directory. For example:</p>
+<div class="language-js vp-adaptive-theme">
+<span class="lang">js</span><pre class="shiki shiki-themes github-light github-dark vp-code" data-language="javascript">// src/utils/index.js
+export * from './color.js'
+export * from './dom.js'
+export * from './slash.js'</pre>
+</div>
+<p>When you only import an individual API, e.g. <code>import { slash } from './utils'</code>, all the files in that barrel file need to be fetched and transformed as they may contain the <code>slash</code> API and may also contain side-effects that run on initialization. This means you're loading more files than required on the initial page load, resulting in a slower page load.</p>
+<p>If possible, you should avoid barrel files and import the individual APIs directly, e.g. <code>import { slash } from './utils/slash.js'</code>. You can read <a href="https://github.com/vitejs/vite/issues/8237" target="_blank" rel="noreferrer">issue #8237</a> for more information.</p>
+<h2 id="warm-up-frequently-used-files" tabindex="-1">Warm Up Frequently Used Files </h2>
+<p>The Vite dev server only transforms files as requested by the browser, which allows it to start up quickly and only apply transformations for used files. It can also pre-transform files if it anticipates certain files will be requested shortly. However, request waterfalls may still happen if some files take longer to transform than others. For example:</p>
+<p>Given an import graph where the left file imports the right file:</p>
+<div class="language- vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" data-language="javascript">main.js -&gt; BigComponent.vue -&gt; big-utils.js -&gt; large-data.json</pre>
+</div>
+<p>The import relationship can only be known after the file is transformed. If <code>BigComponent.vue</code> takes some time to transform, <code>big-utils.js</code> has to wait for its turn, and so on. This causes an internal waterfall even with pre-transformation built-in.</p>
+<p>Vite allows you to warm up files that you know are frequently used, e.g. <code>big-utils.js</code>, using the <a href="../config/server-options.html#server-warmup"><code>server.warmup</code></a> option. This way <code>big-utils.js</code> will be ready and cached to be served immediately when requested.</p>
+<p>You can find files that are frequently used by running <code>DEBUG="vite:transform" vite</code> and inspect the logs:</p>
+<div class="language-bash vp-adaptive-theme">
+<span class="lang">bash</span><pre class="shiki shiki-themes github-light github-dark vp-code" data-language="javascript">vite:transform 28.72ms /@vite/client +1ms
+vite:transform 62.95ms /src/components/BigComponent.vue +1ms
+vite:transform 102.54ms /src/utils/big-utils.js +1ms</pre>
+</div>
+<div class="language-js vp-adaptive-theme">
+<span class="lang">js</span><pre class="shiki shiki-themes github-light github-dark vp-code" data-language="javascript">export default defineConfig({
+  server: {
+    warmup: {
+      clientFiles: [
+        './src/components/BigComponent.vue',
+        './src/utils/big-utils.js',
+      ],
+    },
+  },
+})</pre>
+</div>
+<p>Note that you should only warm up files that are frequently used to not overload the Vite dev server on startup. Check the <a href="../config/server-options.html#server-warmup"><code>server.warmup</code></a> option for more information.</p>
+<p>Using <a href="../config/server-options.html#server-open"><code>--open</code> or <code>server.open</code></a> also provides a performance boost, as Vite will automatically warm up the entry point of your app or the provided URL to open.</p>
+<h2 id="use-lesser-or-native-tooling" tabindex="-1">Use Lesser or Native Tooling </h2>
+<p>Keeping Vite fast with a growing codebase is about reducing the amount of work for the source files (JS/TS/CSS).</p>
+<p>Examples of doing less work:</p>
+<ul>
+<li>Use CSS instead of Sass/Less/Stylus when possible (nesting can be handled by PostCSS)</li>
+<li>Don't transform SVGs into UI framework components (React, Vue, etc). Import them as strings or URLs instead.</li>
+<li>When using <code>@vitejs/plugin-react</code>, avoid configuring the Babel options, so it skips the transformation during build (only esbuild will be used).</li>
+</ul>
+<p>Examples of using native tooling:</p>
+<p>Using native tooling often brings larger installation size and as so is not the default when starting a new Vite project. But it may be worth the cost for larger applications.</p>
+<ul>
+<li>Try out the experimental support for <a href="https://github.com/vitejs/vite/discussions/13835" target="_blank" rel="noreferrer">LightningCSS</a>
+</li>
+<li>Use <a href="https://github.com/vitejs/vite-plugin-react-swc" target="_blank" rel="noreferrer"><code>@vitejs/plugin-react-swc</code></a> in place of <code>@vitejs/plugin-react</code>.</li>
+</ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2019–present, Yuxi (Evan) You and Vite contributors<br>Licensed under the MIT License.<br>
+    <a href="https://vitejs.dev/guide/performance" class="_attribution-link">https://vitejs.dev/guide/performance</a>
+  </p>
+</div>
