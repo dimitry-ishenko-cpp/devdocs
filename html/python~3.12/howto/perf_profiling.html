@@ -1,0 +1,111 @@
+ <span id="perf-profiling"></span><h1>Python support for the Linux perf profiler</h1> <dl class="field-list simple"> <dt class="field-odd">author</dt> <dd class="field-odd">
+<p>Pablo Galindo</p> </dd> </dl> <p><a class="reference external" href="https://perf.wiki.kernel.org">The Linux perf profiler</a> is a very powerful tool that allows you to profile and obtain information about the performance of your application. <code>perf</code> also has a very vibrant ecosystem of tools that aid with the analysis of the data that it produces.</p> <p>The main problem with using the <code>perf</code> profiler with Python applications is that <code>perf</code> only gets information about native symbols, that is, the names of functions and procedures written in C. This means that the names and file names of Python functions in your code will not appear in the output of <code>perf</code>.</p> <p>Since Python 3.12, the interpreter can run in a special mode that allows Python functions to appear in the output of the <code>perf</code> profiler. When this mode is enabled, the interpreter will interpose a small piece of code compiled on the fly before the execution of every Python function and it will teach <code>perf</code> the relationship between this piece of code and the associated Python function using <a class="reference internal" href="../c-api/perfmaps.html"><span class="doc">perf map files</span></a>.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Support for the <code>perf</code> profiler is currently only available for Linux on select architectures. Check the output of the <code>configure</code> build step or check the output of <code>python -m sysconfig | grep HAVE_PERF_TRAMPOLINE</code> to see if your system is supported.</p> </div> <p>For example, consider the following script:</p> <pre data-language="python">def foo(n):
+    result = 0
+    for _ in range(n):
+        result += 1
+    return result
+
+def bar(n):
+    foo(n)
+
+def baz(n):
+    bar(n)
+
+if __name__ == "__main__":
+    baz(1000000)
+</pre> <p>We can run <code>perf</code> to sample CPU stack traces at 9999 hertz:</p> <pre data-language="shell">$ perf record -F 9999 -g -o perf.data python my_script.py
+</pre> <p>Then we can use <code>perf report</code> to analyze the data:</p> <pre data-language="shell">$ perf report --stdio -n -g
+
+# Children      Self       Samples  Command     Shared Object       Symbol
+# ........  ........  ............  ..........  ..................  ..........................................
+#
+    91.08%     0.00%             0  python.exe  python.exe          [.] _start
+            |
+            ---_start
+            |
+                --90.71%--__libc_start_main
+                        Py_BytesMain
+                        |
+                        |--56.88%--pymain_run_python.constprop.0
+                        |          |
+                        |          |--56.13%--_PyRun_AnyFileObject
+                        |          |          _PyRun_SimpleFileObject
+                        |          |          |
+                        |          |          |--55.02%--run_mod
+                        |          |          |          |
+                        |          |          |           --54.65%--PyEval_EvalCode
+                        |          |          |                     _PyEval_EvalFrameDefault
+                        |          |          |                     PyObject_Vectorcall
+                        |          |          |                     _PyEval_Vector
+                        |          |          |                     _PyEval_EvalFrameDefault
+                        |          |          |                     PyObject_Vectorcall
+                        |          |          |                     _PyEval_Vector
+                        |          |          |                     _PyEval_EvalFrameDefault
+                        |          |          |                     PyObject_Vectorcall
+                        |          |          |                     _PyEval_Vector
+                        |          |          |                     |
+                        |          |          |                     |--51.67%--_PyEval_EvalFrameDefault
+                        |          |          |                     |          |
+                        |          |          |                     |          |--11.52%--_PyLong_Add
+                        |          |          |                     |          |          |
+                        |          |          |                     |          |          |--2.97%--_PyObject_Malloc
+...
+</pre> <p>As you can see, the Python functions are not shown in the output, only <code>_PyEval_EvalFrameDefault</code> (the function that evaluates the Python bytecode) shows up. Unfortunately that’s not very useful because all Python functions use the same C function to evaluate bytecode so we cannot know which Python function corresponds to which bytecode-evaluating function.</p> <p>Instead, if we run the same experiment with <code>perf</code> support enabled we get:</p> <pre data-language="shell">$ perf report --stdio -n -g
+
+# Children      Self       Samples  Command     Shared Object       Symbol
+# ........  ........  ............  ..........  ..................  .....................................................................
+#
+    90.58%     0.36%             1  python.exe  python.exe          [.] _start
+            |
+            ---_start
+            |
+                --89.86%--__libc_start_main
+                        Py_BytesMain
+                        |
+                        |--55.43%--pymain_run_python.constprop.0
+                        |          |
+                        |          |--54.71%--_PyRun_AnyFileObject
+                        |          |          _PyRun_SimpleFileObject
+                        |          |          |
+                        |          |          |--53.62%--run_mod
+                        |          |          |          |
+                        |          |          |           --53.26%--PyEval_EvalCode
+                        |          |          |                     py::&lt;module&gt;:/src/script.py
+                        |          |          |                     _PyEval_EvalFrameDefault
+                        |          |          |                     PyObject_Vectorcall
+                        |          |          |                     _PyEval_Vector
+                        |          |          |                     py::baz:/src/script.py
+                        |          |          |                     _PyEval_EvalFrameDefault
+                        |          |          |                     PyObject_Vectorcall
+                        |          |          |                     _PyEval_Vector
+                        |          |          |                     py::bar:/src/script.py
+                        |          |          |                     _PyEval_EvalFrameDefault
+                        |          |          |                     PyObject_Vectorcall
+                        |          |          |                     _PyEval_Vector
+                        |          |          |                     py::foo:/src/script.py
+                        |          |          |                     |
+                        |          |          |                     |--51.81%--_PyEval_EvalFrameDefault
+                        |          |          |                     |          |
+                        |          |          |                     |          |--13.77%--_PyLong_Add
+                        |          |          |                     |          |          |
+                        |          |          |                     |          |          |--3.26%--_PyObject_Malloc
+</pre> <section id="how-to-enable-perf-profiling-support"> <h2>How to enable <code>perf</code> profiling support</h2> <p><code>perf</code> profiling support can be enabled either from the start using the environment variable <span class="target" id="index-0"></span><a class="reference internal" href="../using/cmdline.html#envvar-PYTHONPERFSUPPORT"><code>PYTHONPERFSUPPORT</code></a> or the <a class="reference internal" href="../using/cmdline.html#cmdoption-X"><code>-X perf</code></a> option, or dynamically using <a class="reference internal" href="../library/sys.html#sys.activate_stack_trampoline" title="sys.activate_stack_trampoline"><code>sys.activate_stack_trampoline()</code></a> and <a class="reference internal" href="../library/sys.html#sys.deactivate_stack_trampoline" title="sys.deactivate_stack_trampoline"><code>sys.deactivate_stack_trampoline()</code></a>.</p> <p>The <code>sys</code> functions take precedence over the <code>-X</code> option, the <code>-X</code> option takes precedence over the environment variable.</p> <p>Example, using the environment variable:</p> <pre data-language="shell">$ PYTHONPERFSUPPORT=1 python script.py
+$ perf report -g -i perf.data
+</pre> <p>Example, using the <code>-X</code> option:</p> <pre data-language="shell">$ python -X perf script.py
+$ perf report -g -i perf.data
+</pre> <p>Example, using the <a class="reference internal" href="../library/sys.html#module-sys" title="sys: Access system-specific parameters and functions."><code>sys</code></a> APIs in file <code>example.py</code>:</p> <pre data-language="python">import sys
+
+sys.activate_stack_trampoline("perf")
+do_profiled_stuff()
+sys.deactivate_stack_trampoline()
+
+non_profiled_stuff()
+</pre> <p>…then:</p> <pre data-language="shell">$ python ./example.py
+$ perf report -g -i perf.data
+</pre> </section> <section id="how-to-obtain-the-best-results"> <h2>How to obtain the best results</h2> <p>For best results, Python should be compiled with <code>CFLAGS="-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer"</code> as this allows profilers to unwind using only the frame pointer and not on DWARF debug information. This is because as the code that is interposed to allow <code>perf</code> support is dynamically generated it doesn’t have any DWARF debugging information available.</p> <p>You can check if your system has been compiled with this flag by running:</p> <pre data-language="shell">$ python -m sysconfig | grep 'no-omit-frame-pointer'
+</pre> <p>If you don’t see any output it means that your interpreter has not been compiled with frame pointers and therefore it may not be able to show Python functions in the output of <code>perf</code>.</p> </section> <div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2023 Python Software Foundation<br>Licensed under the PSF License.<br>
+    <a href="https://docs.python.org/3.12/howto/perf_profiling.html" class="_attribution-link">https://docs.python.org/3.12/howto/perf_profiling.html</a>
+  </p>
+</div>
