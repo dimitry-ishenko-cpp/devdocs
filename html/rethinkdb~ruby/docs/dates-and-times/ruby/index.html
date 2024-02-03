@@ -1,0 +1,111 @@
+<h1 class="title">Dates and times in RethinkDB</h1>  <div class="alg-content">
+<p>RethinkDB has native support for millisecond-precision times with time zones. Some highlights:</p> <ul> <li>
+<strong>Times are integrated with the official drivers</strong>, which will automatically convert to and from your language’s native time type.</li> <li>
+<strong>Queries are timezone-aware</strong>, so you can ask questions like “Did this event happen on a Monday in the time zone where it was recorded?”</li> <li>
+<strong>Times work as indexes</strong>, so you can efficiently retrieve events based on when they occurred.</li> <li>
+<strong>Time operations are pure ReQL</strong>, which means that even complicated date-time queries can be distributed efficiently across the cluster.</li> </ul> <div class="toc">  <ul id="markdown-toc"> <li><a href="#a-quick-example" id="markdown-toc-a-quick-example">A quick example</a></li> <li><a href="#technical-details" id="markdown-toc-technical-details">Technical details</a></li> <li><a href="#inserting-times" id="markdown-toc-inserting-times">Inserting times</a></li> <li><a href="#retrieving-times" id="markdown-toc-retrieving-times">Retrieving times</a></li> <li><a href="#working-with-times" id="markdown-toc-working-with-times">Working with times</a></li> <li><a href="#putting-it-all-together" id="markdown-toc-putting-it-all-together">Putting it all together</a></li> </ul> </div> <p><img alt="Dates and Times Illustration" class="api_command_illustration" src="https://d33wubrfki0l68.cloudfront.net/023fb56a57ff0452a636d3a87f0f083be62007ce/47e01/assets/images/docs/api_illustrations/dates-and-times.png"></p> <h2 id="a-quick-example">A quick example</h2> <p>First, let’s create a table and insert some events. We’ll insert the first event using a native time object, and the second with the <code class="language-plaintext highlighter-rouge">epoch_time</code> constructor:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">r.table_create('events').run(conn)
+
+r.table('events').insert(
+    [{'id' =&gt; 0, 'timestamp' =&gt; Time.now},
+     {'id' =&gt; 1, 'timestamp' =&gt; r.epoch_time(1376436769.923)}]
+  ).run(conn)
+</pre></div></div> <p>Now, let’s get those back:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.table('events').run(conn).to_a
+[{"timestamp"=&gt;2013-08-13 16:32:48 -0700, "id"=&gt;0},
+ {"timestamp"=&gt;2013-08-13 23:32:49 +0000, "id"=&gt;1}]
+</pre></div></div> <p>You’ll notice that both times we inserted are returned as native Ruby <code class="language-plaintext highlighter-rouge">Time</code> objects. They’re in different time zones because <code class="language-plaintext highlighter-rouge">Time.now</code> creates a time object in the local time zone, but <code class="language-plaintext highlighter-rouge">r.epoch_time</code> creates a UTC time (it doesn’t know or care what time zone the client is in). If we had instead inserted <code class="language-plaintext highlighter-rouge">Time.now.utc</code>, they’d both be in UTC when we retrieved them.</p> <p>We can now filter based on these times:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.table('events').filter{|row| row['timestamp'].hours() &gt; 20}.run(conn)
+[{"timestamp"=&gt;2013-08-13 23:32:49 +0000, "id"=&gt;1}]
+&gt; r.table('events').filter{|row|
+    row['timestamp'].in_timezone('-02:00').hours() &gt; 20
+  }.run(conn)
+[{"timestamp"=&gt;2013-08-13 16:32:48 -0700, "id"=&gt;0},
+ {"timestamp"=&gt;2013-08-13 23:32:49 +0000, "id"=&gt;1}]
+</pre></div></div> <p>Or create a secondary index on them:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.table('events').index_create('timestamp').run(conn)
+{"created"=&gt;1}
+&gt; r.table('events').between(r.epoch_time(1376436769.913),
+                            r.epoch_time(1376436769.933),
+                            :index =&gt; 'timestamp').run(conn)
+[{"timestamp"=&gt;2013-08-13 23:32:49 +0000, "id"=&gt;1}]
+</pre></div></div> <h2 id="technical-details">Technical details</h2> <p>Times are stored on the server as seconds since epoch (UTC) with millisecond precision plus a time zone. Currently the only available time zones are minute-precision time offsets from UTC, but we may add support for DST-aware time zones in the future. Time zones are strings as specified by ISO 8601.</p> <p>Times are considered equal when their epoch (UTC) time values are equal, <strong>regardless of what time zone they’re in</strong>. This is true for both comparisons and indexed operations. Times are compared in floating point with millisecond precision.</p> <p>Most date operations are only defined on years in the range <code class="language-plaintext highlighter-rouge">[1400, 10000]</code> (but note that times in the year <code class="language-plaintext highlighter-rouge">10000</code> cannot be printed as ISO 8601 dates).</p> <p>Leap-seconds aren’t well-supported right now: <code class="language-plaintext highlighter-rouge">2012-06-30T23:59:60</code> and <code class="language-plaintext highlighter-rouge">2012-07-01T00:00:00</code> parse to the same time.</p> <h2 id="inserting-times">Inserting times</h2> <p>You can insert times by simply passing a native Ruby <code class="language-plaintext highlighter-rouge">Time</code> object. If the local time object contains a time zone, the inserted time will have that time zone; if it doesn’t, the inserted time will be in UTC. (Check this if you’re using a third-party driver.)</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.table('events').insert({'id' =&gt; 2, 'timestamp' =&gt; Time.now}).run(conn)
+{"unchanged"=&gt;0, "skipped"=&gt;0, "replaced"=&gt;0, "inserted"=&gt;1, "errors"=&gt;0, "deleted"=&gt;0}
+</pre></div></div> <p>You can also use <code class="language-plaintext highlighter-rouge">r.now</code> (which the server interprets as the time the query was received in UTC), or construct a time using <code class="language-plaintext highlighter-rouge">r.time</code>, <code class="language-plaintext highlighter-rouge">r.epoch_time</code>, or <code class="language-plaintext highlighter-rouge">r.iso8601</code>.</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.now().to_iso8601().run(conn)
+"2013-08-09T18:53:15.012+00:00"
+&gt; r.time(2013, r.august, 9, 18, 53, 15.012, '-07:00').to_iso8601().run(conn)
+"2013-08-09T18:53:15.012-07:00"
+&gt; r.epoch_time(1376074395.012).to_iso8601().run(conn)
+"2013-08-09T18:53:15.012+00:00"
+&gt; r.iso8601("2013-08-09T18:53:15.012-07:00").to_iso8601().run(conn)
+"2013-08-09T18:53:15.012-07:00"
+</pre></div></div> <p>Times may be used as the primary key for a table. Two times are considered equal if they have the same number of milliseconds since epoch (UTC), regardless of time zone.</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.table('t').insert({'id' =&gt; r.iso8601("2013-08-09T11:58:00.1111-07:00")}).run(conn)
+{"unchanged"=&gt;0, "skipped"=&gt;0, "replaced"=&gt;0, "inserted"=&gt;1, "errors"=&gt;0, "deleted"=&gt;0}
+&gt; r.table('t').insert({'id' =&gt; r.iso8601("2013-08-09T10:58:00.1112-08:00")}).run(conn)
+{"unchanged"=&gt;0, "skipped"=&gt;0, "replaced"=&gt;0, "inserted"=&gt;0,
+ "first_error"=&gt;"Duplicate primary key `id`: ...", "errors"=&gt;1, "deleted"=&gt;0}
+</pre></div></div> <p>You may also insert a time by inserting a literal pseudotype object. This is useful if, for instance, you exported a row using <code class="language-plaintext highlighter-rouge">:time_format =&gt; 'raw'</code> (see <strong>Retrieving Times</strong> below).</p> <blockquote class="infobox ">
+<p><strong>Note:</strong> Avoid using keys matching the regular expression <code class="language-plaintext highlighter-rouge">^\$reql_.+\$$</code> in your objects. RethinkDB considers those to be reserved keywords.</p> </blockquote> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.expr({'$reql_type$' =&gt; 'TIME',
+          'epoch_time' =&gt; 1376075362.662,
+          'timezone' =&gt; '+00:00'}).to_iso8601().run(conn)
+"2013-08-09T19:09:22.662+00:00"
+</pre></div></div> <h2 id="retrieving-times">Retrieving times</h2> <p>By default, times are converted into native time objects when they are retrieved from the server. This may be overridden by passing the optarg <code class="language-plaintext highlighter-rouge">time_format</code> to <code class="language-plaintext highlighter-rouge">run</code>. The only options right now are <code class="language-plaintext highlighter-rouge">native</code>, the default, and <code class="language-plaintext highlighter-rouge">raw</code>.</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.now().run(conn)
+2013-08-09 19:09:11 UTC
+&gt; r.now().in_timezone('-07:00').run(conn)
+2013-08-09 12:14:56 -0700
+&gt; r.now().run(conn, :time_format =&gt; 'raw')
+{'timezone'=&gt;'+00:00', "epoch_time"=&gt;1376075362.662, "$reql_type$"=&gt;"TIME"}
+&gt; r.now().in_timezone('-07:00').run(conn, :time_format =&gt; 'raw')
+{"timezone"=&gt;"-07:00", "epoch_time"=&gt;1376075702.485, "$reql_type$"=&gt;"TIME"}
+</pre></div></div> <p>You can also transform a time object on the server using either <code class="language-plaintext highlighter-rouge">to_epoch_time</code> or <code class="language-plaintext highlighter-rouge">to_iso8601</code>.</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.now().to_epoch_time().run(conn)
+1376075986.574
+&gt; r.now().to_iso8601().run(conn)
+"2013-08-09T19:19:46.574+00:00"
+</pre></div></div> <h2 id="working-with-times">Working with times</h2> <p>There are only three useful things you can do with a time: modify it, compare it to another time, or retrieve a portion of it.</p> <h3 id="modifying-times">Modifying times</h3> <p>You can put a time into a new time zone:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.expr(Time.now).to_iso8601().run(conn)
+"2013-08-09T12:48:59.103-07:00"
+&gt; r.expr(Time.now).in_timezone('-06:00').to_iso8601().run(conn)
+"2013-08-09T13:49:15.503-06:00"
+</pre></div></div> <p>You can also add or subtract a duration (in seconds):</p> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; (r.time(2015, 1, 1, 'Z') + 86400).run(conn)
+2015-01-02 00:00:00 +0000
+</pre></div></div> <p>If you subtract two times, you get a duration:</p> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; (r.time(2015, 1, 2, 'Z') - r.time(2015, 1, 1, 'Z')).run(conn)
+86400
+</pre></div></div> <h3 id="comparing-times">Comparing times</h3> <p>All of the normal comparison operators are defined on times:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; (r.epoch_time(1376081287.982) &lt; Time.now).run(conn)
+true
+</pre></div></div> <p>Times are only compared with millisecond precision:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.epoch_time(1376081287.9821).eq(r.epoch_time(1376081287.9822)).run(conn)
+true
+</pre></div></div> <p>There’s also the <a href="../../../api/ruby/during/index.html">during</a> command, which can check whether a time is in a particular range of times.</p> <h3 id="retrieving-portions-of-times">Retrieving portions of times</h3> <p>If you have a time, you can retrieve a particular portion (like the month, or the hours) relative to the current time zone. (See the full list at the <a href="https://rethinkdb.com/api">API reference</a>.)</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.expr(Time.now).run(conn)
+2013-08-09 13:53:00 -0700
+&gt; r.expr(Time.now).month().run(conn)
+8
+&gt; r.expr(Time.now).hours().run(conn)
+13
+&gt; r.expr(Time.now).in_timezone('-06:00').hours().run(conn)
+14
+</pre></div></div> <p>We use the ISO 8601 definition of a week, which starts with Monday, represented as <code class="language-plaintext highlighter-rouge">1</code>.</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.expr(Time.now).day_of_week().run(conn)
+5 # Friday
+</pre></div></div> <p>We define <code class="language-plaintext highlighter-rouge">r.monday...r.sunday</code> and <code class="language-plaintext highlighter-rouge">r.january...r.december</code> for convenience:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.expr(Time.now).day_of_week().eq(r.friday).run(conn)
+true
+</pre></div></div> <p>We also let you slice the time into the date and the current time of day (a time and a duration, respectively):</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">&gt; r.now().to_epoch_time().run(conn)
+1376351312.744
+&gt; r.now().date().to_epoch_time().run(conn)
+1376265600
+&gt; r.now().time_of_day().run(conn)
+85712.744
+</pre></div></div> <h2 id="putting-it-all-together">Putting it all together</h2> <p>By combining these operations, you can write surprisingly useful queries in pure ReQL. For example, let’s say you have a table of sales your company has made, and you want to figure out how much of the gross comes from people who were working overtime:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">r.table('sales').filter {|sale|
+  # Weekends are overtime.
+  sale['time'].day_of_week().eq(r.saturday) |
+  sale['time'].day_of_week().eq(r.sunday) |
+  # Weekdays outside 9-5 are overtime.
+  (sale['time'].hours() &lt; 9) |
+  (sale['time'].hours() &gt;= 17)
+}.sum('dollars').run(conn)
+</pre></div></div> <p>If your timestamps are stored with time zones, this query will work even if you have sales from different offices in different countries (assuming they all work 9-5 local time).</p> <p>Since this query is pure ReQL, the entire query will be distributed efficiently over the cluster without any computation being done on the client.</p> <p>Further, because it’s ReQL, the query’s individual pieces are easily composable. If you decide you want those numbers on a per-month basis, you can just throw a <code class="language-plaintext highlighter-rouge">group</code> in there:</p> <div class="language-ruby highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">r.table('sales').filter {|sale|
+  # Weekends are overtime.
+  sale['time'].day_of_week().eq(r.saturday) |
+  sale['time'].day_of_week().eq(r.sunday) |
+  # Weekdays outside 9-5 are overtime.
+  (sale['time'].hours() &lt; 9) |
+  (sale['time'].hours() &gt;= 17)
+}.group{|sale| sale['time'].month()}.sum('dollars').run(conn)
+</pre></div></div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; RethinkDB contributors<br>Licensed under the Creative Commons Attribution-ShareAlike 3.0 Unported License.<br>
+    <a href="https://rethinkdb.com/docs/dates-and-times/ruby/" class="_attribution-link">https://rethinkdb.com/docs/dates-and-times/ruby/</a>
+  </p>
+</div>
