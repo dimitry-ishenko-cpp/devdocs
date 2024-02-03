@@ -1,0 +1,106 @@
+<h2 id="c-embedder-api">C++ embedder API
+</h2> <p>Node.js provides a number of C++ APIs that can be used to execute JavaScript in a Node.js environment from other C++ software.</p> <p>The documentation for these APIs can be found in <a href="https://github.com/nodejs/node/blob/HEAD/src/node.h">src/node.h</a> in the Node.js source tree. In addition to the APIs exposed by Node.js, some required concepts are provided by the V8 embedder API.</p> <p>Because using Node.js as an embedded library is different from writing code that is executed by Node.js, breaking changes do not follow typical Node.js <a href="deprecations.html">deprecation policy</a> and may occur on each semver-major release without prior warning.</p> <section><h3 id="example-embedding-application">Example embedding application
+</h3> <p>The following sections will provide an overview over how to use these APIs to create an application from scratch that will perform the equivalent of <code>node -e &lt;code&gt;</code>, i.e. that will take a piece of JavaScript and run it in a Node.js-specific environment.</p> <p>The full code can be found <a href="https://github.com/nodejs/node/blob/HEAD/test/embedding/embedtest.cc">in the Node.js source tree</a>.</p> <h4 id="setting-up-per-process-state">Setting up per-process state
+</h4> <p>Node.js requires some per-process state management in order to run:</p> <ul> <li>Arguments parsing for Node.js <a href="cli.html">CLI options</a>,</li> <li>V8 per-process requirements, such as a <code>v8::Platform</code> instance.</li> </ul> <p>The following example shows how these can be set up. Some class names are from the <code>node</code> and <code>v8</code> C++ namespaces, respectively.</p> <pre data-language="js">int main(int argc, char** argv) {
+  argv = uv_setup_args(argc, argv);
+  std::vector&lt;std::string&gt; args(argv, argv + argc);
+  // Parse Node.js CLI options, and print any errors that have occurred while
+  // trying to parse them.
+  std::unique_ptr&lt;node::InitializationResult&gt; result =
+      node::InitializeOncePerProcess(args, {
+        node::ProcessInitializationFlags::kNoInitializeV8,
+        node::ProcessInitializationFlags::kNoInitializeNodeV8Platform
+      });
+
+  for (const std::string&amp; error : result-&gt;errors())
+    fprintf(stderr, "%s: %s\n", args[0].c_str(), error.c_str());
+  if (result-&gt;early_return() != 0) {
+    return result-&gt;exit_code();
+  }
+
+  // Create a v8::Platform instance. `MultiIsolatePlatform::Create()` is a way
+  // to create a v8::Platform instance that Node.js can use when creating
+  // Worker threads. When no `MultiIsolatePlatform` instance is present,
+  // Worker threads are disabled.
+  std::unique_ptr&lt;MultiIsolatePlatform&gt; platform =
+      MultiIsolatePlatform::Create(4);
+  V8::InitializePlatform(platform.get());
+  V8::Initialize();
+
+  // See below for the contents of this function.
+  int ret = RunNodeInstance(
+      platform.get(), result-&gt;args(), result-&gt;exec_args());
+
+  V8::Dispose();
+  V8::DisposePlatform();
+
+  node::TearDownOncePerProcess();
+  return ret;
+} copy</pre> <h4 id="per-instance-state">Per-instance state
+</h4> <div class="api_metadata"> <details class="changelog"><summary>History</summary> <table> <tbody>
+<tr>
+<th>Version</th>
+<th>Changes</th>
+</tr> <tr>
+<td>v15.0.0</td> <td><p>The <code>CommonEnvironmentSetup</code> and <code>SpinEventLoop</code> utilities were added.</p></td>
+</tr> </tbody>
+</table> </details> </div> <p>Node.js has a concept of a “Node.js instance”, that is commonly being referred to as <code>node::Environment</code>. Each <code>node::Environment</code> is associated with:</p> <ul> <li>Exactly one <code>v8::Isolate</code>, i.e. one JS Engine instance,</li> <li>Exactly one <code>uv_loop_t</code>, i.e. one event loop, and</li> <li>A number of <code>v8::Context</code>s, but exactly one main <code>v8::Context</code>.</li> <li>One <code>node::IsolateData</code> instance that contains information that could be shared by multiple <code>node::Environment</code>s that use the same <code>v8::Isolate</code>. Currently, no testing if performed for this scenario.</li> </ul> <p>In order to set up a <code>v8::Isolate</code>, an <code>v8::ArrayBuffer::Allocator</code> needs to be provided. One possible choice is the default Node.js allocator, which can be created through <code>node::ArrayBufferAllocator::Create()</code>. Using the Node.js allocator allows minor performance optimizations when addons use the Node.js C++ <code>Buffer</code> API, and is required in order to track <code>ArrayBuffer</code> memory in <a href="process.html#processmemoryusage"><code>process.memoryUsage()</code></a>.</p> <p>Additionally, each <code>v8::Isolate</code> that is used for a Node.js instance needs to be registered and unregistered with the <code>MultiIsolatePlatform</code> instance, if one is being used, in order for the platform to know which event loop to use for tasks scheduled by the <code>v8::Isolate</code>.</p> <p>The <code>node::NewIsolate()</code> helper function creates a <code>v8::Isolate</code>, sets it up with some Node.js-specific hooks (e.g. the Node.js error handler), and registers it with the platform automatically.</p> <pre data-language="js">int RunNodeInstance(MultiIsolatePlatform* platform,
+                    const std::vector&lt;std::string&gt;&amp; args,
+                    const std::vector&lt;std::string&gt;&amp; exec_args) {
+  int exit_code = 0;
+
+  // Setup up a libuv event loop, v8::Isolate, and Node.js Environment.
+  std::vector&lt;std::string&gt; errors;
+  std::unique_ptr&lt;CommonEnvironmentSetup&gt; setup =
+      CommonEnvironmentSetup::Create(platform, &amp;errors, args, exec_args);
+  if (!setup) {
+    for (const std::string&amp; err : errors)
+      fprintf(stderr, "%s: %s\n", args[0].c_str(), err.c_str());
+    return 1;
+  }
+
+  Isolate* isolate = setup-&gt;isolate();
+  Environment* env = setup-&gt;env();
+
+  {
+    Locker locker(isolate);
+    Isolate::Scope isolate_scope(isolate);
+    HandleScope handle_scope(isolate);
+    // The v8::Context needs to be entered when node::CreateEnvironment() and
+    // node::LoadEnvironment() are being called.
+    Context::Scope context_scope(setup-&gt;context());
+
+    // Set up the Node.js instance for execution, and run code inside of it.
+    // There is also a variant that takes a callback and provides it with
+    // the `require` and `process` objects, so that it can manually compile
+    // and run scripts as needed.
+    // The `require` function inside this script does *not* access the file
+    // system, and can only load built-in Node.js modules.
+    // `module.createRequire()` is being used to create one that is able to
+    // load files from the disk, and uses the standard CommonJS file loader
+    // instead of the internal-only `require` function.
+    MaybeLocal&lt;Value&gt; loadenv_ret = node::LoadEnvironment(
+        env,
+        "const publicRequire ="
+        "  require('node:module').createRequire(process.cwd() + '/');"
+        "globalThis.require = publicRequire;"
+        "require('node:vm').runInThisContext(process.argv[1]);");
+
+    if (loadenv_ret.IsEmpty())  // There has been a JS exception.
+      return 1;
+
+    exit_code = node::SpinEventLoop(env).FromMaybe(1);
+
+    // node::Stop() can be used to explicitly stop the event loop and keep
+    // further JavaScript from running. It can be called from any thread,
+    // and will act like worker.terminate() if called from another thread.
+    node::Stop(env);
+  }
+
+  return exit_code;
+} copy</pre></section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Joyent, Inc. and other Node contributors<br>Licensed under the MIT License.<br>Node.js is a trademark of Joyent, Inc. and is used with its permission.<br>We are not endorsed by or affiliated with Joyent.<br>
+    <a href="https://nodejs.org/api/embedding.html" class="_attribution-link">https://nodejs.org/api/embedding.html</a>
+  </p>
+</div>

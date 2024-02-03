@@ -1,0 +1,852 @@
+<h2 id="c-addons">C++ addons
+</h2> <p><em>Addons</em> are dynamically-linked shared objects written in C++. The <a href="modules.html#requireid"><code>require()</code></a> function can load addons as ordinary Node.js modules. Addons provide an interface between JavaScript and C/C++ libraries.</p> <p>There are three options for implementing addons: Node-API, nan, or direct use of internal V8, libuv, and Node.js libraries. Unless there is a need for direct access to functionality which is not exposed by Node-API, use Node-API. Refer to <a href="n-api.html">C/C++ addons with Node-API</a> for more information on Node-API.</p> <p>When not using Node-API, implementing addons is complicated, involving knowledge of several components and APIs:</p> <ul> <li> <p><a href="https://v8.dev/">V8</a>: the C++ library Node.js uses to provide the JavaScript implementation. V8 provides the mechanisms for creating objects, calling functions, etc. V8's API is documented mostly in the <code>v8.h</code> header file (<code>deps/v8/include/v8.h</code> in the Node.js source tree), which is also available <a href="https://v8docs.nodesource.com/">online</a>.</p> </li> <li> <p><a href="https://github.com/libuv/libuv">libuv</a>: The C library that implements the Node.js event loop, its worker threads and all of the asynchronous behaviors of the platform. It also serves as a cross-platform abstraction library, giving easy, POSIX-like access across all major operating systems to many common system tasks, such as interacting with the file system, sockets, timers, and system events. libuv also provides a threading abstraction similar to POSIX threads for more sophisticated asynchronous addons that need to move beyond the standard event loop. Addon authors should avoid blocking the event loop with I/O or other time-intensive tasks by offloading work via libuv to non-blocking system operations, worker threads, or a custom use of libuv threads.</p> </li> <li> <p>Internal Node.js libraries. Node.js itself exports C++ APIs that addons can use, the most important of which is the <code>node::ObjectWrap</code> class.</p> </li> <li> <p>Node.js includes other statically linked libraries including OpenSSL. These other libraries are located in the <code>deps/</code> directory in the Node.js source tree. Only the libuv, OpenSSL, V8, and zlib symbols are purposefully re-exported by Node.js and may be used to various extents by addons. See <a href="#linking-to-libraries-included-with-nodejs">Linking to libraries included with Node.js</a> for additional information.</p> </li> </ul> <p>All of the following examples are available for <a href="https://github.com/nodejs/node-addon-examples">download</a> and may be used as the starting-point for an addon.</p> <section><h3 id="hello-world">Hello world
+</h3> <p>This "Hello world" example is a simple addon, written in C++, that is the equivalent of the following JavaScript code:</p> <pre data-language="js">module.exports.hello = () =&gt; 'world'; copy</pre> <p>First, create the file <code>hello.cc</code>:</p> <pre data-language="js">// hello.cc
+#include &lt;node.h&gt;
+
+namespace demo {
+
+using v8::FunctionCallbackInfo;
+using v8::Isolate;
+using v8::Local;
+using v8::Object;
+using v8::String;
+using v8::Value;
+
+void Method(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+  args.GetReturnValue().Set(String::NewFromUtf8(
+      isolate, "world").ToLocalChecked());
+}
+
+void Initialize(Local&lt;Object&gt; exports) {
+  NODE_SET_METHOD(exports, "hello", Method);
+}
+
+NODE_MODULE(NODE_GYP_MODULE_NAME, Initialize)
+
+}  // namespace demo copy</pre> <p>All Node.js addons must export an initialization function following the pattern:</p> <pre data-language="js">void Initialize(Local&lt;Object&gt; exports);
+NODE_MODULE(NODE_GYP_MODULE_NAME, Initialize) copy</pre> <p>There is no semi-colon after <code>NODE_MODULE</code> as it's not a function (see <code>node.h</code>).</p> <p>The <code>module_name</code> must match the filename of the final binary (excluding the <code>.node</code> suffix).</p> <p>In the <code>hello.cc</code> example, then, the initialization function is <code>Initialize</code> and the addon module name is <code>addon</code>.</p> <p>When building addons with <code>node-gyp</code>, using the macro <code>NODE_GYP_MODULE_NAME</code> as the first parameter of <code>NODE_MODULE()</code> will ensure that the name of the final binary will be passed to <code>NODE_MODULE()</code>.</p> <p>Addons defined with <code>NODE_MODULE()</code> can not be loaded in multiple contexts or multiple threads at the same time.</p> <h4 id="context-aware-addons">Context-aware addons
+</h4> <p>There are environments in which Node.js addons may need to be loaded multiple times in multiple contexts. For example, the <a href="https://electronjs.org/">Electron</a> runtime runs multiple instances of Node.js in a single process. Each instance will have its own <code>require()</code> cache, and thus each instance will need a native addon to behave correctly when loaded via <code>require()</code>. This means that the addon must support multiple initializations.</p> <p>A context-aware addon can be constructed by using the macro <code>NODE_MODULE_INITIALIZER</code>, which expands to the name of a function which Node.js will expect to find when it loads an addon. An addon can thus be initialized as in the following example:</p> <pre data-language="js">using namespace v8;
+
+extern "C" NODE_MODULE_EXPORT void
+NODE_MODULE_INITIALIZER(Local&lt;Object&gt; exports,
+                        Local&lt;Value&gt; module,
+                        Local&lt;Context&gt; context) {
+  /* Perform addon initialization steps here. */
+} copy</pre> <p>Another option is to use the macro <code>NODE_MODULE_INIT()</code>, which will also construct a context-aware addon. Unlike <code>NODE_MODULE()</code>, which is used to construct an addon around a given addon initializer function, <code>NODE_MODULE_INIT()</code> serves as the declaration of such an initializer to be followed by a function body.</p> <p>The following three variables may be used inside the function body following an invocation of <code>NODE_MODULE_INIT()</code>:</p> <ul> <li>
+<code>Local&lt;Object&gt; exports</code>,</li> <li>
+<code>Local&lt;Value&gt; module</code>, and</li> <li><code>Local&lt;Context&gt; context</code></li> </ul> <p>The choice to build a context-aware addon carries with it the responsibility of carefully managing global static data. Since the addon may be loaded multiple times, potentially even from different threads, any global static data stored in the addon must be properly protected, and must not contain any persistent references to JavaScript objects. The reason for this is that JavaScript objects are only valid in one context, and will likely cause a crash when accessed from the wrong context or from a different thread than the one on which they were created.</p> <p>The context-aware addon can be structured to avoid global static data by performing the following steps:</p> <ul> <li>Define a class which will hold per-addon-instance data and which has a static member of the form <pre data-language="js">static void DeleteInstance(void* data) {
+  // Cast `data` to an instance of the class and delete it.
+} copy</pre> </li> <li>Heap-allocate an instance of this class in the addon initializer. This can be accomplished using the <code>new</code> keyword.</li> <li>Call <code>node::AddEnvironmentCleanupHook()</code>, passing it the above-created instance and a pointer to <code>DeleteInstance()</code>. This will ensure the instance is deleted when the environment is torn down.</li> <li>Store the instance of the class in a <code>v8::External</code>, and</li> <li>Pass the <code>v8::External</code> to all methods exposed to JavaScript by passing it to <code>v8::FunctionTemplate::New()</code> or <code>v8::Function::New()</code> which creates the native-backed JavaScript functions. The third parameter of <code>v8::FunctionTemplate::New()</code> or <code>v8::Function::New()</code> accepts the <code>v8::External</code> and makes it available in the native callback using the <code>v8::FunctionCallbackInfo::Data()</code> method.</li> </ul> <p>This will ensure that the per-addon-instance data reaches each binding that can be called from JavaScript. The per-addon-instance data must also be passed into any asynchronous callbacks the addon may create.</p> <p>The following example illustrates the implementation of a context-aware addon:</p> <pre data-language="js">#include &lt;node.h&gt;
+
+using namespace v8;
+
+class AddonData {
+ public:
+  explicit AddonData(Isolate* isolate):
+      call_count(0) {
+    // Ensure this per-addon-instance data is deleted at environment cleanup.
+    node::AddEnvironmentCleanupHook(isolate, DeleteInstance, this);
+  }
+
+  // Per-addon data.
+  int call_count;
+
+  static void DeleteInstance(void* data) {
+    delete static_cast&lt;AddonData*&gt;(data);
+  }
+};
+
+static void Method(const v8::FunctionCallbackInfo&lt;v8::Value&gt;&amp; info) {
+  // Retrieve the per-addon-instance data.
+  AddonData* data =
+      reinterpret_cast&lt;AddonData*&gt;(info.Data().As&lt;External&gt;()-&gt;Value());
+  data-&gt;call_count++;
+  info.GetReturnValue().Set((double)data-&gt;call_count);
+}
+
+// Initialize this addon to be context-aware.
+NODE_MODULE_INIT(/* exports, module, context */) {
+  Isolate* isolate = context-&gt;GetIsolate();
+
+  // Create a new instance of `AddonData` for this instance of the addon and
+  // tie its life cycle to that of the Node.js environment.
+  AddonData* data = new AddonData(isolate);
+
+  // Wrap the data in a `v8::External` so we can pass it to the method we
+  // expose.
+  Local&lt;External&gt; external = External::New(isolate, data);
+
+  // Expose the method `Method` to JavaScript, and make sure it receives the
+  // per-addon-instance data we created above by passing `external` as the
+  // third parameter to the `FunctionTemplate` constructor.
+  exports-&gt;Set(context,
+               String::NewFromUtf8(isolate, "method").ToLocalChecked(),
+               FunctionTemplate::New(isolate, Method, external)
+                  -&gt;GetFunction(context).ToLocalChecked()).FromJust();
+} copy</pre> <h5 id="worker-support">Worker support
+</h5> <div class="api_metadata"> <details class="changelog"><summary>History</summary> <table> <tbody>
+<tr>
+<th>Version</th>
+<th>Changes</th>
+</tr> <tr>
+<td>v14.8.0, v12.19.0</td> <td><p>Cleanup hooks may now be asynchronous.</p></td>
+</tr> </tbody>
+</table> </details> </div> <p>In order to be loaded from multiple Node.js environments, such as a main thread and a Worker thread, an add-on needs to either:</p> <ul> <li>Be an Node-API addon, or</li> <li>Be declared as context-aware using <code>NODE_MODULE_INIT()</code> as described above</li> </ul> <p>In order to support <a href="worker_threads.html#class-worker"><code>Worker</code></a> threads, addons need to clean up any resources they may have allocated when such a thread exists. This can be achieved through the usage of the <code>AddEnvironmentCleanupHook()</code> function:</p> <pre data-language="js">void AddEnvironmentCleanupHook(v8::Isolate* isolate,
+                               void (*fun)(void* arg),
+                               void* arg); copy</pre> <p>This function adds a hook that will run before a given Node.js instance shuts down. If necessary, such hooks can be removed before they are run using <code>RemoveEnvironmentCleanupHook()</code>, which has the same signature. Callbacks are run in last-in first-out order.</p> <p>If necessary, there is an additional pair of <code>AddEnvironmentCleanupHook()</code> and <code>RemoveEnvironmentCleanupHook()</code> overloads, where the cleanup hook takes a callback function. This can be used for shutting down asynchronous resources, such as any libuv handles registered by the addon.</p> <p>The following <code>addon.cc</code> uses <code>AddEnvironmentCleanupHook</code>:</p> <pre data-language="js">// addon.cc
+#include &lt;node.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdlib.h&gt;
+
+using node::AddEnvironmentCleanupHook;
+using v8::HandleScope;
+using v8::Isolate;
+using v8::Local;
+using v8::Object;
+
+// Note: In a real-world application, do not rely on static/global data.
+static char cookie[] = "yum yum";
+static int cleanup_cb1_called = 0;
+static int cleanup_cb2_called = 0;
+
+static void cleanup_cb1(void* arg) {
+  Isolate* isolate = static_cast&lt;Isolate*&gt;(arg);
+  HandleScope scope(isolate);
+  Local&lt;Object&gt; obj = Object::New(isolate);
+  assert(!obj.IsEmpty());  // assert VM is still alive
+  assert(obj-&gt;IsObject());
+  cleanup_cb1_called++;
+}
+
+static void cleanup_cb2(void* arg) {
+  assert(arg == static_cast&lt;void*&gt;(cookie));
+  cleanup_cb2_called++;
+}
+
+static void sanity_check(void*) {
+  assert(cleanup_cb1_called == 1);
+  assert(cleanup_cb2_called == 1);
+}
+
+// Initialize this addon to be context-aware.
+NODE_MODULE_INIT(/* exports, module, context */) {
+  Isolate* isolate = context-&gt;GetIsolate();
+
+  AddEnvironmentCleanupHook(isolate, sanity_check, nullptr);
+  AddEnvironmentCleanupHook(isolate, cleanup_cb2, cookie);
+  AddEnvironmentCleanupHook(isolate, cleanup_cb1, isolate);
+} copy</pre> <p>Test in JavaScript by running:</p> <pre data-language="js">// test.js
+require('./build/Release/addon'); copy</pre> <h4 id="building">Building
+</h4> <p>Once the source code has been written, it must be compiled into the binary <code>addon.node</code> file. To do so, create a file called <code>binding.gyp</code> in the top-level of the project describing the build configuration of the module using a JSON-like format. This file is used by <a href="https://github.com/nodejs/node-gyp">node-gyp</a>, a tool written specifically to compile Node.js addons.</p> <pre data-language="js">{
+  "targets": [
+    {
+      "target_name": "addon",
+      "sources": [ "hello.cc" ]
+    }
+  ]
+} copy</pre> <p>A version of the <code>node-gyp</code> utility is bundled and distributed with Node.js as part of <code>npm</code>. This version is not made directly available for developers to use and is intended only to support the ability to use the <code>npm install</code> command to compile and install addons. Developers who wish to use <code>node-gyp</code> directly can install it using the command <code>npm install -g node-gyp</code>. See the <code>node-gyp</code> <a href="https://github.com/nodejs/node-gyp#installation">installation instructions</a> for more information, including platform-specific requirements.</p> <p>Once the <code>binding.gyp</code> file has been created, use <code>node-gyp configure</code> to generate the appropriate project build files for the current platform. This will generate either a <code>Makefile</code> (on Unix platforms) or a <code>vcxproj</code> file (on Windows) in the <code>build/</code> directory.</p> <p>Next, invoke the <code>node-gyp build</code> command to generate the compiled <code>addon.node</code> file. This will be put into the <code>build/Release/</code> directory.</p> <p>When using <code>npm install</code> to install a Node.js addon, npm uses its own bundled version of <code>node-gyp</code> to perform this same set of actions, generating a compiled version of the addon for the user's platform on demand.</p> <p>Once built, the binary addon can be used from within Node.js by pointing <a href="modules.html#requireid"><code>require()</code></a> to the built <code>addon.node</code> module:</p> <pre data-language="js">// hello.js
+const addon = require('./build/Release/addon');
+
+console.log(addon.hello());
+// Prints: 'world' copy</pre> <p>Because the exact path to the compiled addon binary can vary depending on how it is compiled (i.e. sometimes it may be in <code>./build/Debug/</code>), addons can use the <a href="https://github.com/TooTallNate/node-bindings">bindings</a> package to load the compiled module.</p> <p>While the <code>bindings</code> package implementation is more sophisticated in how it locates addon modules, it is essentially using a <code>try…catch</code> pattern similar to:</p> <pre data-language="js">try {
+  return require('./build/Release/addon.node');
+} catch (err) {
+  return require('./build/Debug/addon.node');
+} copy</pre> <h4 id="linking-to-libraries-included-with-nodejs">Linking to libraries included with Node.js
+</h4> <p>Node.js uses statically linked libraries such as V8, libuv, and OpenSSL. All addons are required to link to V8 and may link to any of the other dependencies as well. Typically, this is as simple as including the appropriate <code>#include &lt;...&gt;</code> statements (e.g. <code>#include &lt;v8.h&gt;</code>) and <code>node-gyp</code> will locate the appropriate headers automatically. However, there are a few caveats to be aware of:</p> <ul> <li> <p>When <code>node-gyp</code> runs, it will detect the specific release version of Node.js and download either the full source tarball or just the headers. If the full source is downloaded, addons will have complete access to the full set of Node.js dependencies. However, if only the Node.js headers are downloaded, then only the symbols exported by Node.js will be available.</p> </li> <li> <p><code>node-gyp</code> can be run using the <code>--nodedir</code> flag pointing at a local Node.js source image. Using this option, the addon will have access to the full set of dependencies.</p> </li> </ul> <h4 id="loading-addons-using-require">Loading addons using <code>require()</code>
+</h4> <p>The filename extension of the compiled addon binary is <code>.node</code> (as opposed to <code>.dll</code> or <code>.so</code>). The <a href="modules.html#requireid"><code>require()</code></a> function is written to look for files with the <code>.node</code> file extension and initialize those as dynamically-linked libraries.</p> <p>When calling <a href="modules.html#requireid"><code>require()</code></a>, the <code>.node</code> extension can usually be omitted and Node.js will still find and initialize the addon. One caveat, however, is that Node.js will first attempt to locate and load modules or JavaScript files that happen to share the same base name. For instance, if there is a file <code>addon.js</code> in the same directory as the binary <code>addon.node</code>, then <a href="modules.html#requireid"><code>require('addon')</code></a> will give precedence to the <code>addon.js</code> file and load it instead.</p> </section><section><h3 id="native-abstractions-for-nodejs">Native abstractions for Node.js
+</h3> <p>Each of the examples illustrated in this document directly use the Node.js and V8 APIs for implementing addons. The V8 API can, and has, changed dramatically from one V8 release to the next (and one major Node.js release to the next). With each change, addons may need to be updated and recompiled in order to continue functioning. The Node.js release schedule is designed to minimize the frequency and impact of such changes but there is little that Node.js can do to ensure stability of the V8 APIs.</p> <p>The <a href="https://github.com/nodejs/nan">Native Abstractions for Node.js</a> (or <code>nan</code>) provide a set of tools that addon developers are recommended to use to keep compatibility between past and future releases of V8 and Node.js. See the <code>nan</code> <a href="https://github.com/nodejs/nan/tree/HEAD/examples/">examples</a> for an illustration of how it can be used.</p> </section><section><h3 id="node-api">Node-API
+</h3> 
+<div class="api_stability api_stability_2">
+<a href="https://nodejs.org/api/documentation.html#stability-index">Stability: 2</a> - Stable</div>
+ <p>Node-API is an API for building native addons. It is independent from the underlying JavaScript runtime (e.g. V8) and is maintained as part of Node.js itself. This API will be Application Binary Interface (ABI) stable across versions of Node.js. It is intended to insulate addons from changes in the underlying JavaScript engine and allow modules compiled for one version to run on later versions of Node.js without recompilation. Addons are built/packaged with the same approach/tools outlined in this document (node-gyp, etc.). The only difference is the set of APIs that are used by the native code. Instead of using the V8 or <a href="https://github.com/nodejs/nan">Native Abstractions for Node.js</a> APIs, the functions available in the Node-API are used.</p> <p>Creating and maintaining an addon that benefits from the ABI stability provided by Node-API carries with it certain <a href="n-api.html#implications-of-abi-stability">implementation considerations</a>.</p> <p>To use Node-API in the above "Hello world" example, replace the content of <code>hello.cc</code> with the following. All other instructions remain the same.</p> <pre data-language="js">// hello.cc using Node-API
+#include &lt;node_api.h&gt;
+
+namespace demo {
+
+napi_value Method(napi_env env, napi_callback_info args) {
+  napi_value greeting;
+  napi_status status;
+
+  status = napi_create_string_utf8(env, "world", NAPI_AUTO_LENGTH, &amp;greeting);
+  if (status != napi_ok) return nullptr;
+  return greeting;
+}
+
+napi_value init(napi_env env, napi_value exports) {
+  napi_status status;
+  napi_value fn;
+
+  status = napi_create_function(env, nullptr, 0, Method, nullptr, &amp;fn);
+  if (status != napi_ok) return nullptr;
+
+  status = napi_set_named_property(env, exports, "hello", fn);
+  if (status != napi_ok) return nullptr;
+  return exports;
+}
+
+NAPI_MODULE(NODE_GYP_MODULE_NAME, init)
+
+}  // namespace demo copy</pre> <p>The functions available and how to use them are documented in <a href="n-api.html">C/C++ addons with Node-API</a>.</p> </section><section><h3 id="addon-examples">Addon examples
+</h3> <p>Following are some example addons intended to help developers get started. The examples use the V8 APIs. Refer to the online <a href="https://v8docs.nodesource.com/">V8 reference</a> for help with the various V8 calls, and V8's <a href="https://v8.dev/docs/embed">Embedder's Guide</a> for an explanation of several concepts used such as handles, scopes, function templates, etc.</p> <p>Each of these examples using the following <code>binding.gyp</code> file:</p> <pre data-language="js">{
+  "targets": [
+    {
+      "target_name": "addon",
+      "sources": [ "addon.cc" ]
+    }
+  ]
+} copy</pre> <p>In cases where there is more than one <code>.cc</code> file, simply add the additional filename to the <code>sources</code> array:</p> <pre data-language="js">"sources": ["addon.cc", "myexample.cc"] copy</pre> <p>Once the <code>binding.gyp</code> file is ready, the example addons can be configured and built using <code>node-gyp</code>:</p> <pre data-language="js">node-gyp configure build copy</pre> <h4 id="function-arguments">Function arguments
+</h4> <p>Addons will typically expose objects and functions that can be accessed from JavaScript running within Node.js. When functions are invoked from JavaScript, the input arguments and return value must be mapped to and from the C/C++ code.</p> <p>The following example illustrates how to read function arguments passed from JavaScript and how to return a result:</p> <pre data-language="js">// addon.cc
+#include &lt;node.h&gt;
+
+namespace demo {
+
+using v8::Exception;
+using v8::FunctionCallbackInfo;
+using v8::Isolate;
+using v8::Local;
+using v8::Number;
+using v8::Object;
+using v8::String;
+using v8::Value;
+
+// This is the implementation of the "add" method
+// Input arguments are passed using the
+// const FunctionCallbackInfo&lt;Value&gt;&amp; args struct
+void Add(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+
+  // Check the number of arguments passed.
+  if (args.Length() &lt; 2) {
+    // Throw an Error that is passed back to JavaScript
+    isolate-&gt;ThrowException(Exception::TypeError(
+        String::NewFromUtf8(isolate,
+                            "Wrong number of arguments").ToLocalChecked()));
+    return;
+  }
+
+  // Check the argument types
+  if (!args[0]-&gt;IsNumber() || !args[1]-&gt;IsNumber()) {
+    isolate-&gt;ThrowException(Exception::TypeError(
+        String::NewFromUtf8(isolate,
+                            "Wrong arguments").ToLocalChecked()));
+    return;
+  }
+
+  // Perform the operation
+  double value =
+      args[0].As&lt;Number&gt;()-&gt;Value() + args[1].As&lt;Number&gt;()-&gt;Value();
+  Local&lt;Number&gt; num = Number::New(isolate, value);
+
+  // Set the return value (using the passed in
+  // FunctionCallbackInfo&lt;Value&gt;&amp;)
+  args.GetReturnValue().Set(num);
+}
+
+void Init(Local&lt;Object&gt; exports) {
+  NODE_SET_METHOD(exports, "add", Add);
+}
+
+NODE_MODULE(NODE_GYP_MODULE_NAME, Init)
+
+}  // namespace demo copy</pre> <p>Once compiled, the example addon can be required and used from within Node.js:</p> <pre data-language="js">// test.js
+const addon = require('./build/Release/addon');
+
+console.log('This should be eight:', addon.add(3, 5)); copy</pre> <h4 id="callbacks">Callbacks
+</h4> <p>It is common practice within addons to pass JavaScript functions to a C++ function and execute them from there. The following example illustrates how to invoke such callbacks:</p> <pre data-language="js">// addon.cc
+#include &lt;node.h&gt;
+
+namespace demo {
+
+using v8::Context;
+using v8::Function;
+using v8::FunctionCallbackInfo;
+using v8::Isolate;
+using v8::Local;
+using v8::Null;
+using v8::Object;
+using v8::String;
+using v8::Value;
+
+void RunCallback(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+  Local&lt;Function&gt; cb = Local&lt;Function&gt;::Cast(args[0]);
+  const unsigned argc = 1;
+  Local&lt;Value&gt; argv[argc] = {
+      String::NewFromUtf8(isolate,
+                          "hello world").ToLocalChecked() };
+  cb-&gt;Call(context, Null(isolate), argc, argv).ToLocalChecked();
+}
+
+void Init(Local&lt;Object&gt; exports, Local&lt;Object&gt; module) {
+  NODE_SET_METHOD(module, "exports", RunCallback);
+}
+
+NODE_MODULE(NODE_GYP_MODULE_NAME, Init)
+
+}  // namespace demo copy</pre> <p>This example uses a two-argument form of <code>Init()</code> that receives the full <code>module</code> object as the second argument. This allows the addon to completely overwrite <code>exports</code> with a single function instead of adding the function as a property of <code>exports</code>.</p> <p>To test it, run the following JavaScript:</p> <pre data-language="js">// test.js
+const addon = require('./build/Release/addon');
+
+addon((msg) =&gt; {
+  console.log(msg);
+// Prints: 'hello world'
+}); copy</pre> <p>In this example, the callback function is invoked synchronously.</p> <h4 id="object-factory">Object factory
+</h4> <p>Addons can create and return new objects from within a C++ function as illustrated in the following example. An object is created and returned with a property <code>msg</code> that echoes the string passed to <code>createObject()</code>:</p> <pre data-language="js">// addon.cc
+#include &lt;node.h&gt;
+
+namespace demo {
+
+using v8::Context;
+using v8::FunctionCallbackInfo;
+using v8::Isolate;
+using v8::Local;
+using v8::Object;
+using v8::String;
+using v8::Value;
+
+void CreateObject(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+
+  Local&lt;Object&gt; obj = Object::New(isolate);
+  obj-&gt;Set(context,
+           String::NewFromUtf8(isolate,
+                               "msg").ToLocalChecked(),
+                               args[0]-&gt;ToString(context).ToLocalChecked())
+           .FromJust();
+
+  args.GetReturnValue().Set(obj);
+}
+
+void Init(Local&lt;Object&gt; exports, Local&lt;Object&gt; module) {
+  NODE_SET_METHOD(module, "exports", CreateObject);
+}
+
+NODE_MODULE(NODE_GYP_MODULE_NAME, Init)
+
+}  // namespace demo copy</pre> <p>To test it in JavaScript:</p> <pre data-language="js">// test.js
+const addon = require('./build/Release/addon');
+
+const obj1 = addon('hello');
+const obj2 = addon('world');
+console.log(obj1.msg, obj2.msg);
+// Prints: 'hello world' copy</pre> <h4 id="function-factory">Function factory
+</h4> <p>Another common scenario is creating JavaScript functions that wrap C++ functions and returning those back to JavaScript:</p> <pre data-language="js">// addon.cc
+#include &lt;node.h&gt;
+
+namespace demo {
+
+using v8::Context;
+using v8::Function;
+using v8::FunctionCallbackInfo;
+using v8::FunctionTemplate;
+using v8::Isolate;
+using v8::Local;
+using v8::Object;
+using v8::String;
+using v8::Value;
+
+void MyFunction(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+  args.GetReturnValue().Set(String::NewFromUtf8(
+      isolate, "hello world").ToLocalChecked());
+}
+
+void CreateFunction(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+  Local&lt;FunctionTemplate&gt; tpl = FunctionTemplate::New(isolate, MyFunction);
+  Local&lt;Function&gt; fn = tpl-&gt;GetFunction(context).ToLocalChecked();
+
+  // omit this to make it anonymous
+  fn-&gt;SetName(String::NewFromUtf8(
+      isolate, "theFunction").ToLocalChecked());
+
+  args.GetReturnValue().Set(fn);
+}
+
+void Init(Local&lt;Object&gt; exports, Local&lt;Object&gt; module) {
+  NODE_SET_METHOD(module, "exports", CreateFunction);
+}
+
+NODE_MODULE(NODE_GYP_MODULE_NAME, Init)
+
+}  // namespace demo copy</pre> <p>To test:</p> <pre data-language="js">// test.js
+const addon = require('./build/Release/addon');
+
+const fn = addon();
+console.log(fn());
+// Prints: 'hello world' copy</pre> <h4 id="wrapping-c-objects">Wrapping C++ objects
+</h4> <p>It is also possible to wrap C++ objects/classes in a way that allows new instances to be created using the JavaScript <code>new</code> operator:</p> <pre data-language="js">// addon.cc
+#include &lt;node.h&gt;
+#include "myobject.h"
+
+namespace demo {
+
+using v8::Local;
+using v8::Object;
+
+void InitAll(Local&lt;Object&gt; exports) {
+  MyObject::Init(exports);
+}
+
+NODE_MODULE(NODE_GYP_MODULE_NAME, InitAll)
+
+}  // namespace demo copy</pre> <p>Then, in <code>myobject.h</code>, the wrapper class inherits from <code>node::ObjectWrap</code>:</p> <pre data-language="js">// myobject.h
+#ifndef MYOBJECT_H
+#define MYOBJECT_H
+
+#include &lt;node.h&gt;
+#include &lt;node_object_wrap.h&gt;
+
+namespace demo {
+
+class MyObject : public node::ObjectWrap {
+ public:
+  static void Init(v8::Local&lt;v8::Object&gt; exports);
+
+ private:
+  explicit MyObject(double value = 0);
+  ~MyObject();
+
+  static void New(const v8::FunctionCallbackInfo&lt;v8::Value&gt;&amp; args);
+  static void PlusOne(const v8::FunctionCallbackInfo&lt;v8::Value&gt;&amp; args);
+
+  double value_;
+};
+
+}  // namespace demo
+
+#endif copy</pre> <p>In <code>myobject.cc</code>, implement the various methods that are to be exposed. Below, the method <code>plusOne()</code> is exposed by adding it to the constructor's prototype:</p> <pre data-language="js">// myobject.cc
+#include "myobject.h"
+
+namespace demo {
+
+using v8::Context;
+using v8::Function;
+using v8::FunctionCallbackInfo;
+using v8::FunctionTemplate;
+using v8::Isolate;
+using v8::Local;
+using v8::Number;
+using v8::Object;
+using v8::ObjectTemplate;
+using v8::String;
+using v8::Value;
+
+MyObject::MyObject(double value) : value_(value) {
+}
+
+MyObject::~MyObject() {
+}
+
+void MyObject::Init(Local&lt;Object&gt; exports) {
+  Isolate* isolate = exports-&gt;GetIsolate();
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+
+  Local&lt;ObjectTemplate&gt; addon_data_tpl = ObjectTemplate::New(isolate);
+  addon_data_tpl-&gt;SetInternalFieldCount(1);  // 1 field for the MyObject::New()
+  Local&lt;Object&gt; addon_data =
+      addon_data_tpl-&gt;NewInstance(context).ToLocalChecked();
+
+  // Prepare constructor template
+  Local&lt;FunctionTemplate&gt; tpl = FunctionTemplate::New(isolate, New, addon_data);
+  tpl-&gt;SetClassName(String::NewFromUtf8(isolate, "MyObject").ToLocalChecked());
+  tpl-&gt;InstanceTemplate()-&gt;SetInternalFieldCount(1);
+
+  // Prototype
+  NODE_SET_PROTOTYPE_METHOD(tpl, "plusOne", PlusOne);
+
+  Local&lt;Function&gt; constructor = tpl-&gt;GetFunction(context).ToLocalChecked();
+  addon_data-&gt;SetInternalField(0, constructor);
+  exports-&gt;Set(context, String::NewFromUtf8(
+      isolate, "MyObject").ToLocalChecked(),
+      constructor).FromJust();
+}
+
+void MyObject::New(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+
+  if (args.IsConstructCall()) {
+    // Invoked as constructor: `new MyObject(...)`
+    double value = args[0]-&gt;IsUndefined() ?
+        0 : args[0]-&gt;NumberValue(context).FromMaybe(0);
+    MyObject* obj = new MyObject(value);
+    obj-&gt;Wrap(args.This());
+    args.GetReturnValue().Set(args.This());
+  } else {
+    // Invoked as plain function `MyObject(...)`, turn into construct call.
+    const int argc = 1;
+    Local&lt;Value&gt; argv[argc] = { args[0] };
+    Local&lt;Function&gt; cons =
+        args.Data().As&lt;Object&gt;()-&gt;GetInternalField(0)
+            .As&lt;Value&gt;().As&lt;Function&gt;();
+    Local&lt;Object&gt; result =
+        cons-&gt;NewInstance(context, argc, argv).ToLocalChecked();
+    args.GetReturnValue().Set(result);
+  }
+}
+
+void MyObject::PlusOne(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+
+  MyObject* obj = ObjectWrap::Unwrap&lt;MyObject&gt;(args.Holder());
+  obj-&gt;value_ += 1;
+
+  args.GetReturnValue().Set(Number::New(isolate, obj-&gt;value_));
+}
+
+}  // namespace demo copy</pre> <p>To build this example, the <code>myobject.cc</code> file must be added to the <code>binding.gyp</code>:</p> <pre data-language="js">{
+  "targets": [
+    {
+      "target_name": "addon",
+      "sources": [
+        "addon.cc",
+        "myobject.cc"
+      ]
+    }
+  ]
+} copy</pre> <p>Test it with:</p> <pre data-language="js">// test.js
+const addon = require('./build/Release/addon');
+
+const obj = new addon.MyObject(10);
+console.log(obj.plusOne());
+// Prints: 11
+console.log(obj.plusOne());
+// Prints: 12
+console.log(obj.plusOne());
+// Prints: 13 copy</pre> <p>The destructor for a wrapper object will run when the object is garbage-collected. For destructor testing, there are command-line flags that can be used to make it possible to force garbage collection. These flags are provided by the underlying V8 JavaScript engine. They are subject to change or removal at any time. They are not documented by Node.js or V8, and they should never be used outside of testing.</p> <p>During shutdown of the process or worker threads destructors are not called by the JS engine. Therefore it's the responsibility of the user to track these objects and ensure proper destruction to avoid resource leaks.</p> <h4 id="factory-of-wrapped-objects">Factory of wrapped objects
+</h4> <p>Alternatively, it is possible to use a factory pattern to avoid explicitly creating object instances using the JavaScript <code>new</code> operator:</p> <pre data-language="js">const obj = addon.createObject();
+// instead of:
+// const obj = new addon.Object(); copy</pre> <p>First, the <code>createObject()</code> method is implemented in <code>addon.cc</code>:</p> <pre data-language="js">// addon.cc
+#include &lt;node.h&gt;
+#include "myobject.h"
+
+namespace demo {
+
+using v8::FunctionCallbackInfo;
+using v8::Isolate;
+using v8::Local;
+using v8::Object;
+using v8::String;
+using v8::Value;
+
+void CreateObject(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  MyObject::NewInstance(args);
+}
+
+void InitAll(Local&lt;Object&gt; exports, Local&lt;Object&gt; module) {
+  MyObject::Init(exports-&gt;GetIsolate());
+
+  NODE_SET_METHOD(module, "exports", CreateObject);
+}
+
+NODE_MODULE(NODE_GYP_MODULE_NAME, InitAll)
+
+}  // namespace demo copy</pre> <p>In <code>myobject.h</code>, the static method <code>NewInstance()</code> is added to handle instantiating the object. This method takes the place of using <code>new</code> in JavaScript:</p> <pre data-language="js">// myobject.h
+#ifndef MYOBJECT_H
+#define MYOBJECT_H
+
+#include &lt;node.h&gt;
+#include &lt;node_object_wrap.h&gt;
+
+namespace demo {
+
+class MyObject : public node::ObjectWrap {
+ public:
+  static void Init(v8::Isolate* isolate);
+  static void NewInstance(const v8::FunctionCallbackInfo&lt;v8::Value&gt;&amp; args);
+
+ private:
+  explicit MyObject(double value = 0);
+  ~MyObject();
+
+  static void New(const v8::FunctionCallbackInfo&lt;v8::Value&gt;&amp; args);
+  static void PlusOne(const v8::FunctionCallbackInfo&lt;v8::Value&gt;&amp; args);
+  static v8::Global&lt;v8::Function&gt; constructor;
+  double value_;
+};
+
+}  // namespace demo
+
+#endif copy</pre> <p>The implementation in <code>myobject.cc</code> is similar to the previous example:</p> <pre data-language="js">// myobject.cc
+#include &lt;node.h&gt;
+#include "myobject.h"
+
+namespace demo {
+
+using node::AddEnvironmentCleanupHook;
+using v8::Context;
+using v8::Function;
+using v8::FunctionCallbackInfo;
+using v8::FunctionTemplate;
+using v8::Global;
+using v8::Isolate;
+using v8::Local;
+using v8::Number;
+using v8::Object;
+using v8::String;
+using v8::Value;
+
+// Warning! This is not thread-safe, this addon cannot be used for worker
+// threads.
+Global&lt;Function&gt; MyObject::constructor;
+
+MyObject::MyObject(double value) : value_(value) {
+}
+
+MyObject::~MyObject() {
+}
+
+void MyObject::Init(Isolate* isolate) {
+  // Prepare constructor template
+  Local&lt;FunctionTemplate&gt; tpl = FunctionTemplate::New(isolate, New);
+  tpl-&gt;SetClassName(String::NewFromUtf8(isolate, "MyObject").ToLocalChecked());
+  tpl-&gt;InstanceTemplate()-&gt;SetInternalFieldCount(1);
+
+  // Prototype
+  NODE_SET_PROTOTYPE_METHOD(tpl, "plusOne", PlusOne);
+
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+  constructor.Reset(isolate, tpl-&gt;GetFunction(context).ToLocalChecked());
+
+  AddEnvironmentCleanupHook(isolate, [](void*) {
+    constructor.Reset();
+  }, nullptr);
+}
+
+void MyObject::New(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+
+  if (args.IsConstructCall()) {
+    // Invoked as constructor: `new MyObject(...)`
+    double value = args[0]-&gt;IsUndefined() ?
+        0 : args[0]-&gt;NumberValue(context).FromMaybe(0);
+    MyObject* obj = new MyObject(value);
+    obj-&gt;Wrap(args.This());
+    args.GetReturnValue().Set(args.This());
+  } else {
+    // Invoked as plain function `MyObject(...)`, turn into construct call.
+    const int argc = 1;
+    Local&lt;Value&gt; argv[argc] = { args[0] };
+    Local&lt;Function&gt; cons = Local&lt;Function&gt;::New(isolate, constructor);
+    Local&lt;Object&gt; instance =
+        cons-&gt;NewInstance(context, argc, argv).ToLocalChecked();
+    args.GetReturnValue().Set(instance);
+  }
+}
+
+void MyObject::NewInstance(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+
+  const unsigned argc = 1;
+  Local&lt;Value&gt; argv[argc] = { args[0] };
+  Local&lt;Function&gt; cons = Local&lt;Function&gt;::New(isolate, constructor);
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+  Local&lt;Object&gt; instance =
+      cons-&gt;NewInstance(context, argc, argv).ToLocalChecked();
+
+  args.GetReturnValue().Set(instance);
+}
+
+void MyObject::PlusOne(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+
+  MyObject* obj = ObjectWrap::Unwrap&lt;MyObject&gt;(args.Holder());
+  obj-&gt;value_ += 1;
+
+  args.GetReturnValue().Set(Number::New(isolate, obj-&gt;value_));
+}
+
+}  // namespace demo copy</pre> <p>Once again, to build this example, the <code>myobject.cc</code> file must be added to the <code>binding.gyp</code>:</p> <pre data-language="js">{
+  "targets": [
+    {
+      "target_name": "addon",
+      "sources": [
+        "addon.cc",
+        "myobject.cc"
+      ]
+    }
+  ]
+} copy</pre> <p>Test it with:</p> <pre data-language="js">// test.js
+const createObject = require('./build/Release/addon');
+
+const obj = createObject(10);
+console.log(obj.plusOne());
+// Prints: 11
+console.log(obj.plusOne());
+// Prints: 12
+console.log(obj.plusOne());
+// Prints: 13
+
+const obj2 = createObject(20);
+console.log(obj2.plusOne());
+// Prints: 21
+console.log(obj2.plusOne());
+// Prints: 22
+console.log(obj2.plusOne());
+// Prints: 23 copy</pre> <h4 id="passing-wrapped-objects-around">Passing wrapped objects around
+</h4> <p>In addition to wrapping and returning C++ objects, it is possible to pass wrapped objects around by unwrapping them with the Node.js helper function <code>node::ObjectWrap::Unwrap</code>. The following examples shows a function <code>add()</code> that can take two <code>MyObject</code> objects as input arguments:</p> <pre data-language="js">// addon.cc
+#include &lt;node.h&gt;
+#include &lt;node_object_wrap.h&gt;
+#include "myobject.h"
+
+namespace demo {
+
+using v8::Context;
+using v8::FunctionCallbackInfo;
+using v8::Isolate;
+using v8::Local;
+using v8::Number;
+using v8::Object;
+using v8::String;
+using v8::Value;
+
+void CreateObject(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  MyObject::NewInstance(args);
+}
+
+void Add(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+
+  MyObject* obj1 = node::ObjectWrap::Unwrap&lt;MyObject&gt;(
+      args[0]-&gt;ToObject(context).ToLocalChecked());
+  MyObject* obj2 = node::ObjectWrap::Unwrap&lt;MyObject&gt;(
+      args[1]-&gt;ToObject(context).ToLocalChecked());
+
+  double sum = obj1-&gt;value() + obj2-&gt;value();
+  args.GetReturnValue().Set(Number::New(isolate, sum));
+}
+
+void InitAll(Local&lt;Object&gt; exports) {
+  MyObject::Init(exports-&gt;GetIsolate());
+
+  NODE_SET_METHOD(exports, "createObject", CreateObject);
+  NODE_SET_METHOD(exports, "add", Add);
+}
+
+NODE_MODULE(NODE_GYP_MODULE_NAME, InitAll)
+
+}  // namespace demo copy</pre> <p>In <code>myobject.h</code>, a new public method is added to allow access to private values after unwrapping the object.</p> <pre data-language="js">// myobject.h
+#ifndef MYOBJECT_H
+#define MYOBJECT_H
+
+#include &lt;node.h&gt;
+#include &lt;node_object_wrap.h&gt;
+
+namespace demo {
+
+class MyObject : public node::ObjectWrap {
+ public:
+  static void Init(v8::Isolate* isolate);
+  static void NewInstance(const v8::FunctionCallbackInfo&lt;v8::Value&gt;&amp; args);
+  inline double value() const { return value_; }
+
+ private:
+  explicit MyObject(double value = 0);
+  ~MyObject();
+
+  static void New(const v8::FunctionCallbackInfo&lt;v8::Value&gt;&amp; args);
+  static v8::Global&lt;v8::Function&gt; constructor;
+  double value_;
+};
+
+}  // namespace demo
+
+#endif copy</pre> <p>The implementation of <code>myobject.cc</code> is similar to before:</p> <pre data-language="js">// myobject.cc
+#include &lt;node.h&gt;
+#include "myobject.h"
+
+namespace demo {
+
+using node::AddEnvironmentCleanupHook;
+using v8::Context;
+using v8::Function;
+using v8::FunctionCallbackInfo;
+using v8::FunctionTemplate;
+using v8::Global;
+using v8::Isolate;
+using v8::Local;
+using v8::Object;
+using v8::String;
+using v8::Value;
+
+// Warning! This is not thread-safe, this addon cannot be used for worker
+// threads.
+Global&lt;Function&gt; MyObject::constructor;
+
+MyObject::MyObject(double value) : value_(value) {
+}
+
+MyObject::~MyObject() {
+}
+
+void MyObject::Init(Isolate* isolate) {
+  // Prepare constructor template
+  Local&lt;FunctionTemplate&gt; tpl = FunctionTemplate::New(isolate, New);
+  tpl-&gt;SetClassName(String::NewFromUtf8(isolate, "MyObject").ToLocalChecked());
+  tpl-&gt;InstanceTemplate()-&gt;SetInternalFieldCount(1);
+
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+  constructor.Reset(isolate, tpl-&gt;GetFunction(context).ToLocalChecked());
+
+  AddEnvironmentCleanupHook(isolate, [](void*) {
+    constructor.Reset();
+  }, nullptr);
+}
+
+void MyObject::New(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+
+  if (args.IsConstructCall()) {
+    // Invoked as constructor: `new MyObject(...)`
+    double value = args[0]-&gt;IsUndefined() ?
+        0 : args[0]-&gt;NumberValue(context).FromMaybe(0);
+    MyObject* obj = new MyObject(value);
+    obj-&gt;Wrap(args.This());
+    args.GetReturnValue().Set(args.This());
+  } else {
+    // Invoked as plain function `MyObject(...)`, turn into construct call.
+    const int argc = 1;
+    Local&lt;Value&gt; argv[argc] = { args[0] };
+    Local&lt;Function&gt; cons = Local&lt;Function&gt;::New(isolate, constructor);
+    Local&lt;Object&gt; instance =
+        cons-&gt;NewInstance(context, argc, argv).ToLocalChecked();
+    args.GetReturnValue().Set(instance);
+  }
+}
+
+void MyObject::NewInstance(const FunctionCallbackInfo&lt;Value&gt;&amp; args) {
+  Isolate* isolate = args.GetIsolate();
+
+  const unsigned argc = 1;
+  Local&lt;Value&gt; argv[argc] = { args[0] };
+  Local&lt;Function&gt; cons = Local&lt;Function&gt;::New(isolate, constructor);
+  Local&lt;Context&gt; context = isolate-&gt;GetCurrentContext();
+  Local&lt;Object&gt; instance =
+      cons-&gt;NewInstance(context, argc, argv).ToLocalChecked();
+
+  args.GetReturnValue().Set(instance);
+}
+
+}  // namespace demo copy</pre> <p>Test it with:</p> <pre data-language="js">// test.js
+const addon = require('./build/Release/addon');
+
+const obj1 = addon.createObject(10);
+const obj2 = addon.createObject(20);
+const result = addon.add(obj1, obj2);
+
+console.log(result);
+// Prints: 30 copy</pre></section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Joyent, Inc. and other Node contributors<br>Licensed under the MIT License.<br>Node.js is a trademark of Joyent, Inc. and is used with its permission.<br>We are not endorsed by or affiliated with Joyent.<br>
+    <a href="https://nodejs.org/api/addons.html" class="_attribution-link">https://nodejs.org/api/addons.html</a>
+  </p>
+</div>
