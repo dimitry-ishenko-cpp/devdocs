@@ -1,0 +1,85 @@
+<h1>   <span>Data mapping and validation</span> </h1> <p>We will take a look at the role schemas play when validating and casting data through changesets. As we will see, sometimes the best solution is not to completely avoid schemas, but break a large schema into smaller ones. Maybe one for reading data, another for writing. Maybe one for your database, another for your forms.</p>
+<h2 id="schemas-are-mappers" class="section-heading">  Schemas are mappers </h2> <p>The <a href="ecto.schema.html"><code class="inline">Ecto.Schema</code></a> moduledoc says:</p>
+<blockquote><p>An Ecto schema is used to map <em>any</em> data source into an Elixir struct.</p></blockquote>
+<p>We put emphasis on <em>any</em> because it is a common misconception to think Ecto schemas map only to your database tables.</p>
+<p>For instance, when you write a web application using Phoenix and you use Ecto to receive external changes and apply such changes to your database, we have this mapping:</p>
+<pre data-language="elixir">Database &lt;-&gt; Ecto schema &lt;-&gt; Forms / API</pre>
+<p>Although there is a single Ecto schema mapping to both your database and your API, in many situations it is better to break this mapping in two. Let's see some practical examples.</p>
+<p>Imagine you are working with a client that wants the "Sign Up" form to contain the fields "First name", "Last name" along side "E-mail" and other information. You know there are a couple problems with this approach.</p>
+<p>First of all, not everyone has a first and last name. Although your client is decided on presenting both fields, they are a UI concern, and you don't want the UI to dictate the shape of your data. Furthermore, you know it would be useful to break the "Sign Up" information across two tables, the "accounts" and "profiles" tables.</p>
+<p>Given the requirements above, how would we implement the Sign Up feature in the backend?</p>
+<p>One approach would be to have two schemas, Account and Profile, with virtual fields such as <code class="inline">first_name</code> and <code class="inline">last_name</code>, and <a href="https://dashbit.co/blog/working-with-ecto-associations-and-embeds">use associations along side nested forms</a> to tie the schemas to your UI. One of such schemas would be:</p>
+<pre data-language="elixir">defmodule Profile do
+  use Ecto.Schema
+
+  schema "profiles" do
+    field :name
+    field :first_name, :string, virtual: true
+    field :last_name, :string, virtual: true
+    ...
+  end
+end</pre>
+<p>It is not hard to see how we are polluting our Profile schema with UI requirements by adding fields such <code class="inline">first_name</code> and <code class="inline">last_name</code>. If the Profile schema is used for both reading and writing data, it may end-up in an awkward place where it is not useful for any, as it contains fields that map just to one or the other operation.</p>
+<p>One alternative solution is to break the "Database &lt;-&gt; Ecto schema &lt;-&gt; Forms / API" mapping in two parts. The first will cast and validate the external data with its own structure which you then transform and write to the database. For such, let's define a schema named <code class="inline">Registration</code> that will take care of casting and validating the form data exclusively, mapping directly to the UI fields:</p>
+<pre data-language="elixir">defmodule Registration do
+  use Ecto.Schema
+
+  embedded_schema do
+    field :first_name
+    field :last_name
+    field :email
+  end
+end</pre>
+<p>We used <code class="inline">embedded_schema</code> because it is not our intent to persist it anywhere. With the schema in hand, we can use Ecto changesets and validations to process the data:</p>
+<pre data-language="elixir">fields = [:first_name, :last_name, :email]
+
+changeset =
+  %Registration{}
+  |&gt; Ecto.Changeset.cast(params["sign_up"], fields)
+  |&gt; validate_required(...)
+  |&gt; validate_length(...)</pre>
+<p>Now that the registration changes are mapped and validated, we can check if the resulting changeset is valid and act accordingly:</p>
+<pre data-language="elixir">if changeset.valid? do
+  # Get the modified registration struct from changeset
+  registration = Ecto.Changeset.apply_changes(changeset)
+  account = Registration.to_account(registration)
+  profile = Registration.to_profile(registration)
+
+  MyApp.Repo.transaction fn -&gt;
+    MyApp.Repo.insert_all "accounts", [account]
+    MyApp.Repo.insert_all "profiles", [profile]
+  end
+
+  {:ok, registration}
+else
+  # Annotate the action so the UI shows errors
+  changeset = %{changeset | action: :registration}
+  {:error, changeset}
+end</pre>
+<p>The <code class="inline">to_account/1</code> and <code class="inline">to_profile/1</code> functions in <code class="inline">Registration</code> would receive the registration struct and split the attributes apart accordingly:</p>
+<pre data-language="elixir">def to_account(registration) do
+  Map.take(registration, [:email])
+end
+
+def to_profile(%{first_name: first, last_name: last}) do
+  %{name: "#{first} #{last}"}
+end</pre>
+<p>In the example above, by breaking apart the mapping between the database and Elixir and between Elixir and the UI, our code becomes clearer and our data structures simpler.</p>
+<p>Note we have used <code class="inline">MyApp.Repo.insert_all/2</code> to add data to both "accounts" and "profiles" tables directly. We have chosen to bypass schemas altogether. However, there is nothing stopping you from also defining both <code class="inline">Account</code> and <code class="inline">Profile</code> schemas and changing <code class="inline">to_account/1</code> and <code class="inline">to_profile/1</code> to respectively return <code class="inline">%Account{}</code> and <code class="inline">%Profile{}</code> structs. Once structs are returned, they could be inserted through the usual <code class="inline">MyApp.Repo.insert/2</code> operation. Doing so can be especially useful if there are uniqueness or other constraints that you want to check during insertion.</p>
+<h2 id="schemaless-changesets" class="section-heading">  Schemaless changesets </h2> <p>Although we chose to define a <code class="inline">Registration</code> schema to use in the changeset, Ecto also allows developers to use changesets without schemas. We can dynamically define the data and their types. Let's rewrite the registration changeset above to bypass schemas:</p>
+<pre data-language="elixir">data = %{}
+types = %{name: :string, email: :string}
+
+# The data+types tuple is equivalent to %Registration{}
+changeset =
+  {data, types}
+  |&gt; Ecto.Changeset.cast(params["sign_up"], Map.keys(types))
+  |&gt; validate_required(...)
+  |&gt; validate_length(...)</pre>
+<p>You can use this technique to validate API endpoints, search forms, and other sources of data. The choice of using schemas depends mostly if you want to use the same mapping in different places or if you desire the compile-time guarantees Elixir structs gives you. Otherwise, you can bypass schemas altogether, be it when using changesets or interacting with the repository.</p>
+<p>However, the most important lesson in this guide is not when to use or not to use schemas, but rather understand when a big problem can be broken into smaller problems that can be solved independently leading to an overall cleaner solution. The choice of using schemas or not above didn't affect the solution as much as the choice of breaking the registration problem apart.</p> <div class="bottom-actions"> <div class="bottom-actions-item"> <a href="constraints-and-upserts.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Constraints and Upserts </span> </a> </div> <div class="bottom-actions-item"> <a href="dynamic-queries.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Dynamic queries </span> </a> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2013 Plataformatec<br>&copy; 2020 Dashbit<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/ecto/data-mapping-and-validation.html" class="_attribution-link">https://hexdocs.pm/ecto/data-mapping-and-validation.html</a>
+  </p>
+</div>

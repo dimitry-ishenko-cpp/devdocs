@@ -1,0 +1,281 @@
+<h1>   <span translate="no">Phoenix.Channel</span> <small>behaviour</small>  </h1> <section id="moduledoc"> <p>Defines a Phoenix Channel.</p>
+<p>Channels provide a means for bidirectional communication from clients that integrate with the <a href="https://hexdocs.pm/phoenix_pubsub/2.1.1/Phoenix.PubSub.html"><code class="inline">Phoenix.PubSub</code></a> layer for soft-realtime functionality.</p>
+<h2 id="module-topics-callbacks" class="section-heading">  Topics &amp; Callbacks </h2> <p>Every time you join a channel, you need to choose which particular topic you want to listen to. The topic is just an identifier, but by convention it is often made of two parts: <code class="inline">"topic:subtopic"</code>. Using the <code class="inline">"topic:subtopic"</code> approach pairs nicely with the <a href="phoenix.socket.html#channel/3"><code class="inline">Phoenix.Socket.channel/3</code></a> allowing you to match on all topics starting with a given prefix by using a splat (the <code class="inline">*</code> character) as the last character in the topic pattern:</p>
+<pre data-language="elixir">channel "room:*", MyAppWeb.RoomChannel</pre>
+<p>Any topic coming into the router with the <code class="inline">"room:"</code> prefix would dispatch to <code class="inline">MyAppWeb.RoomChannel</code> in the above example. Topics can also be pattern matched in your channels' <code class="inline">join/3</code> callback to pluck out the scoped pattern:</p>
+<pre data-language="elixir"># handles the special `"lobby"` subtopic
+def join("room:lobby", _payload, socket) do
+  {:ok, socket}
+end
+
+# handles any other subtopic as the room ID, for example `"room:12"`, `"room:34"`
+def join("room:" &lt;&gt; room_id, _payload, socket) do
+  {:ok, socket}
+end</pre>
+<h2 id="module-authorization" class="section-heading">  Authorization </h2> <p>Clients must join a channel to send and receive PubSub events on that channel. Your channels must implement a <code class="inline">join/3</code> callback that authorizes the socket for the given topic. For example, you could check if the user is allowed to join that particular room.</p>
+<p>To authorize a socket in <code class="inline">join/3</code>, return <code class="inline">{:ok, socket}</code>. To refuse authorization in <code class="inline">join/3</code>, return <code class="inline">{:error, reply}</code>.</p>
+<h2 id="module-incoming-events" class="section-heading">  Incoming Events </h2> <p>After a client has successfully joined a channel, incoming events from the client are routed through the channel's <code class="inline">handle_in/3</code> callbacks. Within these callbacks, you can perform any action. Typically you'll either forward a message to all listeners with <a href="#broadcast!/3"><code class="inline">broadcast!/3</code></a>, or push a message directly down the socket with <a href="#push/3"><code class="inline">push/3</code></a>. Incoming callbacks must return the <code class="inline">socket</code> to maintain ephemeral state.</p>
+<p>Here's an example of receiving an incoming <code class="inline">"new_msg"</code> event from one client, and broadcasting the message to all topic subscribers for this socket.</p>
+<pre data-language="elixir">def handle_in("new_msg", %{"uid" =&gt; uid, "body" =&gt; body}, socket) do
+  broadcast!(socket, "new_msg", %{uid: uid, body: body})
+  {:noreply, socket}
+end</pre>
+<p>General message payloads are received as maps, and binary data payloads are passed as a <code class="inline">{:binary, data}</code> tuple:</p>
+<pre data-language="elixir">def handle_in("file_chunk", {:binary, chunk}, socket) do
+  ...
+  {:reply, :ok, socket}
+end</pre>
+<p>You can also push a message directly down the socket, in the form of a map, or a tagged <code class="inline">{:binary, data}</code> tuple:</p>
+<pre data-language="elixir"># client asks for their current rank, push sent directly as a new event.
+def handle_in("current_rank", _, socket) do
+  push(socket, "current_rank", %{val: Game.get_rank(socket.assigns[:user])})
+  push(socket, "photo", {:binary, File.read!(socket.assigns.photo_path)})
+  {:noreply, socket}
+end</pre>
+<h2 id="module-replies" class="section-heading">  Replies </h2> <p>In addition to pushing messages out when you receive a <code class="inline">handle_in</code> event, you can also reply directly to a client event for request/response style messaging. This is useful when a client must know the result of an operation or to simply ack messages.</p>
+<p>For example, imagine creating a resource and replying with the created record:</p>
+<pre data-language="elixir">def handle_in("create:post", attrs, socket) do
+  changeset = Post.changeset(%Post{}, attrs)
+
+  if changeset.valid? do
+    post = Repo.insert!(changeset)
+    response = MyAppWeb.PostView.render("show.json", %{post: post})
+    {:reply, {:ok, response}, socket}
+  else
+    response = MyAppWeb.ChangesetView.render("errors.json", %{changeset: changeset})
+    {:reply, {:error, response}, socket}
+  end
+end</pre>
+<p>Alternatively, you may just want to ack the status of the operation:</p>
+<pre data-language="elixir">def handle_in("create:post", attrs, socket) do
+  changeset = Post.changeset(%Post{}, attrs)
+
+  if changeset.valid? do
+    Repo.insert!(changeset)
+    {:reply, :ok, socket}
+  else
+    {:reply, :error, socket}
+  end
+end</pre>
+<p>Like binary pushes, binary data is also supported with replies via a <code class="inline">{:binary, data}</code> tuple:</p>
+<pre data-language="elixir">{:reply, {:ok, {:binary, bin}}, socket}</pre>
+<h2 id="module-intercepting-outgoing-events" class="section-heading">  Intercepting Outgoing Events </h2> <p>When an event is broadcasted with <a href="#broadcast/3"><code class="inline">broadcast/3</code></a>, each channel subscriber can choose to intercept the event and have their <code class="inline">handle_out/3</code> callback triggered. This allows the event's payload to be customized on a socket by socket basis to append extra information, or conditionally filter the message from being delivered. If the event is not intercepted with <a href="#intercept/1"><code class="inline">Phoenix.Channel.intercept/1</code></a>, then the message is pushed directly to the client:</p>
+<pre data-language="elixir">intercept ["new_msg", "user_joined"]
+
+# for every socket subscribing to this topic, append an `is_editable`
+# value for client metadata.
+def handle_out("new_msg", msg, socket) do
+  push(socket, "new_msg", Map.merge(msg,
+    %{is_editable: User.can_edit_message?(socket.assigns[:user], msg)}
+  ))
+  {:noreply, socket}
+end
+
+# do not send broadcasted `"user_joined"` events if this socket's user
+# is ignoring the user who joined.
+def handle_out("user_joined", msg, socket) do
+  unless User.ignoring?(socket.assigns[:user], msg.user_id) do
+    push(socket, "user_joined", msg)
+  end
+  {:noreply, socket}
+end</pre>
+<h2 id="module-broadcasting-to-an-external-topic" class="section-heading">  Broadcasting to an external topic </h2> <p>In some cases, you will want to broadcast messages without the context of a <code class="inline">socket</code>. This could be for broadcasting from within your channel to an external topic, or broadcasting from elsewhere in your application like a controller or another process. Such can be done via your endpoint:</p>
+<pre data-language="elixir"># within channel
+def handle_in("new_msg", %{"uid" =&gt; uid, "body" =&gt; body}, socket) do
+  ...
+  broadcast_from!(socket, "new_msg", %{uid: uid, body: body})
+  MyAppWeb.Endpoint.broadcast_from!(self(), "room:superadmin",
+    "new_msg", %{uid: uid, body: body})
+  {:noreply, socket}
+end
+
+# within controller
+def create(conn, params) do
+  ...
+  MyAppWeb.Endpoint.broadcast!("room:" &lt;&gt; rid, "new_msg", %{uid: uid, body: body})
+  MyAppWeb.Endpoint.broadcast!("room:superadmin", "new_msg", %{uid: uid, body: body})
+  redirect(conn, to: "/")
+end</pre>
+<h2 id="module-terminate" class="section-heading">  Terminate </h2> <p>On termination, the channel callback <code class="inline">terminate/2</code> will be invoked with the error reason and the socket.</p>
+<p>If we are terminating because the client left, the reason will be <code class="inline">{:shutdown, :left}</code>. Similarly, if we are terminating because the client connection was closed, the reason will be <code class="inline">{:shutdown, :closed}</code>.</p>
+<p>If any of the callbacks return a <code class="inline">:stop</code> tuple, it will also trigger terminate with the reason given in the tuple.</p>
+<p><code class="inline">terminate/2</code>, however, won't be invoked in case of errors nor in case of exits. This is the same behaviour as you find in Elixir abstractions like <a href="https://hexdocs.pm/elixir/GenServer.html"><code class="inline">GenServer</code></a> and others. Similar to <a href="https://hexdocs.pm/elixir/GenServer.html"><code class="inline">GenServer</code></a>, it would also be possible <code class="inline">:trap_exit</code> to guarantee that <code class="inline">terminate/2</code> is invoked. This practice is not encouraged though.</p>
+<p>Typically speaking, if you want to clean something up, it is better to monitor your channel process and do the clean up from another process. All channel callbacks including <code class="inline">join/3</code> are called from within the channel process. Therefore, <code class="inline">self()</code> in any of them returns the PID to be monitored.</p>
+<h2 id="module-exit-reasons-when-stopping-a-channel" class="section-heading">  Exit reasons when stopping a channel </h2> <p>When the channel callbacks return a <code class="inline">:stop</code> tuple, such as:</p>
+<pre data-language="elixir">{:stop, :shutdown, socket}
+{:stop, {:error, :enoent}, socket}</pre>
+<p>the second argument is the exit reason, which follows the same behaviour as standard <a href="https://hexdocs.pm/elixir/GenServer.html"><code class="inline">GenServer</code></a> exits.</p>
+<p>You have three options to choose from when shutting down a channel:</p>
+<ul>
+<li><p><code class="inline">:normal</code> - in such cases, the exit won't be logged and linked processes do not exit</p></li>
+<li><p><code class="inline">:shutdown</code> or <code class="inline">{:shutdown, term}</code> - in such cases, the exit won't be logged and linked processes exit with the same reason unless they're trapping exits</p></li>
+<li><p>any other term - in such cases, the exit will be logged and linked processes exit with the same reason unless they're trapping exits</p></li>
+</ul>
+<h2 id="module-subscribing-to-external-topics" class="section-heading">  Subscribing to external topics </h2> <p>Sometimes you may need to programmatically subscribe a socket to external topics in addition to the internal <code class="inline">socket.topic</code>. For example, imagine you have a bidding system where a remote client dynamically sets preferences on products they want to receive bidding notifications on. Instead of requiring a unique channel process and topic per preference, a more efficient and simple approach would be to subscribe a single channel to relevant notifications via your endpoint. For example:</p>
+<pre data-language="elixir">defmodule MyAppWeb.Endpoint.NotificationChannel do
+  use Phoenix.Channel
+
+  def join("notification:" &lt;&gt; user_id, %{"ids" =&gt; ids}, socket) do
+    topics = for product_id &lt;- ids, do: "product:#{product_id}"
+
+    {:ok, socket
+          |&gt; assign(:topics, [])
+          |&gt; put_new_topics(topics)}
+  end
+
+  def handle_in("watch", %{"product_id" =&gt; id}, socket) do
+    {:reply, :ok, put_new_topics(socket, ["product:#{id}"])}
+  end
+
+  def handle_in("unwatch", %{"product_id" =&gt; id}, socket) do
+    {:reply, :ok, MyAppWeb.Endpoint.unsubscribe("product:#{id}")}
+  end
+
+  defp put_new_topics(socket, topics) do
+    Enum.reduce(topics, socket, fn topic, acc -&gt;
+      topics = acc.assigns.topics
+      if topic in topics do
+        acc
+      else
+        :ok = MyAppWeb.Endpoint.subscribe(topic)
+        assign(acc, :topics, [topic | topics])
+      end
+    end)
+  end
+end</pre>
+<p>Note: the caller must be responsible for preventing duplicate subscriptions. After calling <code class="inline">subscribe/1</code> from your endpoint, the same flow applies to handling regular Elixir messages within your channel. Most often, you'll simply relay the <code class="inline">%Phoenix.Socket.Broadcast{}</code> event and payload:</p>
+<pre data-language="elixir">alias Phoenix.Socket.Broadcast
+def handle_info(%Broadcast{topic: _, event: event, payload: payload}, socket) do
+  push(socket, event, payload)
+  {:noreply, socket}
+end</pre>
+<h2 id="module-hibernation" class="section-heading">  Hibernation </h2> <p>From Erlang/OTP 20, channels automatically hibernate to save memory after 15_000 milliseconds of inactivity. This can be customized by passing the <code class="inline">:hibernate_after</code> option to <code class="inline">use Phoenix.Channel</code>:</p>
+<pre data-language="elixir">use Phoenix.Channel, hibernate_after: 60_000</pre>
+<p>You can also set it to <code class="inline">:infinity</code> to fully disable it.</p>
+<h2 id="module-shutdown" class="section-heading">  Shutdown </h2> <p>You can configure the shutdown of each channel used when your application is shutting down by setting the <code class="inline">:shutdown</code> value on use:</p>
+<pre data-language="elixir">use Phoenix.Channel, shutdown: 5_000</pre>
+<p>It defaults to 5_000.</p>
+<h2 id="module-logging" class="section-heading">  Logging </h2> <p>By default, channel <code class="inline">"join"</code> and <code class="inline">"handle_in"</code> events are logged, using the level <code class="inline">:info</code> and <code class="inline">:debug</code>, respectively. Logs can be customized per event type or disabled by setting the <code class="inline">:log_join</code> and <code class="inline">:log_handle_in</code> options when using <a href="phoenix.channel.html#content"><code class="inline">Phoenix.Channel</code></a>. For example, the following configuration logs join events as <code class="inline">:info</code>, but disables logging for incoming events:</p>
+<pre data-language="elixir">use Phoenix.Channel, log_join: :info, log_handle_in: false</pre> </section> <section id="summary" class="details-list"> <h1 class="section-heading">  Summary </h1> <h2> Types </h2>
+<dl class="summary-types summary">  <div class="summary-row"> <dt class="summary-signature"> <a href="#t:payload/0" translate="no">payload()</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:reply/0" translate="no">reply()</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:socket_ref/0" translate="no">socket_ref()</a> </dt> </div> </dl> <h2> Callbacks </h2>
+<dl class="summary-callbacks summary">  <div class="summary-row"> <dt class="summary-signature"> <a href="#c:code_change/3" translate="no">code_change(old_vsn, t, extra)</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:handle_call/3" translate="no">handle_call(msg, from, socket)</a> </dt> <dd class="summary-synopsis"><p>Handle regular GenServer call messages.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:handle_cast/2" translate="no">handle_cast(msg, socket)</a> </dt> <dd class="summary-synopsis"><p>Handle regular GenServer cast messages.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:handle_in/3" translate="no">handle_in(event, payload, socket)</a> </dt> <dd class="summary-synopsis"><p>Handle incoming <code class="inline">event</code>s.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:handle_info/2" translate="no">handle_info(msg, socket)</a> </dt> <dd class="summary-synopsis"><p>Handle regular Elixir process messages.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:handle_out/3" translate="no">handle_out(event, payload, socket)</a> </dt> <dd class="summary-synopsis"><p>Intercepts outgoing <code class="inline">event</code>s.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:join/3" translate="no">join(topic, payload, socket)</a> </dt> <dd class="summary-synopsis"><p>Handle channel joins by <code class="inline">topic</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:terminate/2" translate="no">terminate( reason, t )</a> </dt> <dd class="summary-synopsis"><p>Invoked when the channel process is about to exit.</p></dd> </div> </dl> <h2> Functions </h2>
+<dl class="summary-functions summary">  <div class="summary-row"> <dt class="summary-signature"> <a href="#broadcast!/3" translate="no">broadcast!(socket, event, message)</a> </dt> <dd class="summary-synopsis"><p>Same as <a href="#broadcast/3"><code class="inline">broadcast/3</code></a>, but raises if broadcast fails.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#broadcast/3" translate="no">broadcast(socket, event, message)</a> </dt> <dd class="summary-synopsis"><p>Broadcast an event to all subscribers of the socket topic.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#broadcast_from!/3" translate="no">broadcast_from!(socket, event, message)</a> </dt> <dd class="summary-synopsis"><p>Same as <a href="#broadcast_from/3"><code class="inline">broadcast_from/3</code></a>, but raises if broadcast fails.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#broadcast_from/3" translate="no">broadcast_from(socket, event, message)</a> </dt> <dd class="summary-synopsis"><p>Broadcast event from pid to all subscribers of the socket topic.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#intercept/1" translate="no">intercept(events)</a> </dt> <dd class="summary-synopsis"><p>Defines which Channel events to intercept for <code class="inline">handle_out/3</code> callbacks.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#push/3" translate="no">push(socket, event, message)</a> </dt> <dd class="summary-synopsis"><p>Sends event to the socket.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#reply/2" translate="no">reply(socket_ref, status)</a> </dt> <dd class="summary-synopsis"><p>Replies asynchronously to a socket push.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#socket_ref/1" translate="no">socket_ref(socket)</a> </dt> <dd class="summary-synopsis"><p>Generates a <code class="inline">socket_ref</code> for an async reply.</p></dd> </div> </dl> </section> <section id="types" class="details-list"> <h1 class="section-heading">  Types </h1> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:payload/0">payload()<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L303" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type payload() :: map() | {:binary, binary()}</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:reply/0">reply()<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L304" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type reply() :: status :: atom() | {status :: atom(), response :: payload()}</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:socket_ref/0">socket_ref()<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L305" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type socket_ref() ::
+  {transport_pid :: Pid, serializer :: module(), topic :: binary(),
+   ref :: binary(), join_ref :: binary()}</pre> </div> </section> </section> </div> </section> <section id="callbacks" class="details-list"> <h1 class="section-heading">  Callbacks </h1> <div class="callbacks-list"> <section class="detail"> <h3 class="detail-header" id="c:code_change/3">code_change(old_vsn, t, extra)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L387" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback code_change(old_vsn, Phoenix.Socket.t(), extra :: term()) ::
+  {:ok, Phoenix.Socket.t()} | {:error, reason :: term()}
+when old_vsn: term() | {:down, term()}</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:handle_call/3">handle_call(msg, from, socket)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L372" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback handle_call(
+  msg :: term(),
+  from :: {pid(), tag :: term()},
+  socket :: Phoenix.Socket.t()
+) ::
+  {:reply, response :: term(), Phoenix.Socket.t()}
+  | {:noreply, Phoenix.Socket.t()}
+  | {:stop, reason :: term(), Phoenix.Socket.t()}</pre> </div> <p>Handle regular GenServer call messages.</p>
+<p>See <a href="https://hexdocs.pm/elixir/GenServer.html#c:handle_call/3"><code class="inline">GenServer.handle_call/3</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:handle_cast/2">handle_cast(msg, socket)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L382" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback handle_cast(msg :: term(), socket :: Phoenix.Socket.t()) ::
+  {:noreply, Phoenix.Socket.t()} | {:stop, reason :: term(), Phoenix.Socket.t()}</pre> </div> <p>Handle regular GenServer cast messages.</p>
+<p>See <a href="https://hexdocs.pm/elixir/GenServer.html#c:handle_cast/2"><code class="inline">GenServer.handle_cast/2</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:handle_in/3">handle_in(event, payload, socket)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L341" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback handle_in(
+  event :: String.t(),
+  payload :: payload(),
+  socket :: Phoenix.Socket.t()
+) ::
+  {:noreply, Phoenix.Socket.t()}
+  | {:noreply, Phoenix.Socket.t(), timeout() | :hibernate}
+  | {:reply, reply(), Phoenix.Socket.t()}
+  | {:stop, reason :: term(), Phoenix.Socket.t()}
+  | {:stop, reason :: term(), reply(), Phoenix.Socket.t()}</pre> </div> <p>Handle incoming <code class="inline">event</code>s.</p>
+<h4 id="c:handle_in/3-example" class="section-heading">  Example </h4> <pre data-language="elixir">def handle_in("ping", payload, socket) do
+  {:reply, {:ok, payload}, socket}
+end</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:handle_info/2">handle_info(msg, socket)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L363" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback handle_info(msg :: term(), socket :: Phoenix.Socket.t()) ::
+  {:noreply, Phoenix.Socket.t()} | {:stop, reason :: term(), Phoenix.Socket.t()}</pre> </div> <p>Handle regular Elixir process messages.</p>
+<p>See <a href="https://hexdocs.pm/elixir/GenServer.html#c:handle_info/2"><code class="inline">GenServer.handle_info/2</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:handle_out/3">handle_out(event, payload, socket)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L353" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback handle_out(
+  event :: String.t(),
+  payload :: payload(),
+  socket :: Phoenix.Socket.t()
+) ::
+  {:noreply, Phoenix.Socket.t()}
+  | {:noreply, Phoenix.Socket.t(), timeout() | :hibernate}
+  | {:stop, reason :: term(), Phoenix.Socket.t()}</pre> </div> <p>Intercepts outgoing <code class="inline">event</code>s.</p>
+<p>See <a href="#intercept/1"><code class="inline">intercept/1</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:join/3">join(topic, payload, socket)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L326" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback join(topic :: binary(), payload :: payload(), socket :: Phoenix.Socket.t()) ::
+  {:ok, Phoenix.Socket.t()}
+  | {:ok, reply :: payload(), Phoenix.Socket.t()}
+  | {:error, reason :: map()}</pre> </div> <p>Handle channel joins by <code class="inline">topic</code>.</p>
+<p>To authorize a socket, return <code class="inline">{:ok, socket}</code> or <code class="inline">{:ok, reply, socket}</code>. To refuse authorization, return <code class="inline">{:error, reason}</code>.</p>
+<h4 id="c:join/3-example" class="section-heading">  Example </h4> <pre data-language="elixir">def join("room:lobby", payload, socket) do
+  if authorized?(payload) do
+    {:ok, socket}
+  else
+    {:error, %{reason: "unauthorized"}}
+  end
+end</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:terminate/2">terminate( reason, t )<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L400" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback terminate(
+  reason :: :normal | :shutdown | {:shutdown, :left | :closed | term()},
+  Phoenix.Socket.t()
+) :: term()</pre> </div> <p>Invoked when the channel process is about to exit.</p>
+<p>See <a href="https://hexdocs.pm/elixir/GenServer.html#c:terminate/2"><code class="inline">GenServer.terminate/2</code></a>.</p> </section> </section> </div> </section> <section id="functions" class="details-list"> <h1 class="section-heading">  Functions </h1> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="broadcast!/3">broadcast!(socket, event, message)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L528" class="source">Source</a>
+</h3> <section class="docstring"> <p>Same as <a href="#broadcast/3"><code class="inline">broadcast/3</code></a>, but raises if broadcast fails.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="broadcast/3">broadcast(socket, event, message)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L520" class="source">Source</a>
+</h3> <section class="docstring"> <p>Broadcast an event to all subscribers of the socket topic.</p>
+<p>The event's message must be a serializable map or a tagged <code class="inline">{:binary, data}</code> tuple where <code class="inline">data</code> is binary data.</p>
+<h4 id="broadcast/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; broadcast(socket, "new_message", %{id: 1, content: "hello"})
+:ok
+
+iex&gt; broadcast(socket, "new_message", {:binary, "hello"})
+:ok</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="broadcast_from!/3">broadcast_from!(socket, event, message)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L559" class="source">Source</a>
+</h3> <section class="docstring"> <p>Same as <a href="#broadcast_from/3"><code class="inline">broadcast_from/3</code></a>, but raises if broadcast fails.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="broadcast_from/3">broadcast_from(socket, event, message)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L549" class="source">Source</a>
+</h3> <section class="docstring"> <p>Broadcast event from pid to all subscribers of the socket topic.</p>
+<p>The channel that owns the socket will not receive the published message. The event's message must be a serializable map or a tagged <code class="inline">{:binary, data}</code> tuple where <code class="inline">data</code> is binary data.</p>
+<h4 id="broadcast_from/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; broadcast_from(socket, "new_message", %{id: 1, content: "hello"})
+:ok
+
+iex&gt; broadcast_from(socket, "new_message", {:binary, "hello"})
+:ok</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="intercept/1">intercept(events)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L483" class="source">Source</a>
+</h3> <section class="docstring"> <p>Defines which Channel events to intercept for <code class="inline">handle_out/3</code> callbacks.</p>
+<p>By default, broadcasted events are pushed directly to the client, but intercepting events gives your channel a chance to customize the event for the client to append extra information or filter the message from being delivered.</p>
+<p><em>Note</em>: intercepting events can introduce significantly more overhead if a large number of subscribers must customize a message since the broadcast will be encoded N times instead of a single shared encoding across all subscribers.</p>
+<h4 id="intercept/1-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">intercept ["new_msg"]
+
+def handle_out("new_msg", payload, socket) do
+  push(socket, "new_msg", Map.merge(payload,
+    is_editable: User.can_edit_message?(socket.assigns[:user], payload)
+  ))
+  {:noreply, socket}
+end</pre>
+<p><code class="inline">handle_out/3</code> callbacks must return one of:</p>
+<pre data-language="elixir">{:noreply, Socket.t} |
+{:noreply, Socket.t, timeout | :hibernate} |
+{:stop, reason :: term, Socket.t}</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="push/3">push(socket, event, message)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L581" class="source">Source</a>
+</h3> <section class="docstring"> <p>Sends event to the socket.</p>
+<p>The event's message must be a serializable map or a tagged <code class="inline">{:binary, data}</code> tuple where <code class="inline">data</code> is binary data.</p>
+<h4 id="push/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; push(socket, "new_message", %{id: 1, content: "hello"})
+:ok
+
+iex&gt; push(socket, "new_message", {:binary, "hello"})
+:ok</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="reply/2">reply(socket_ref, status)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L615" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec reply(socket_ref(), reply()) :: :ok</pre> </div> <p>Replies asynchronously to a socket push.</p>
+<p>Useful when you need to reply to a push that can't otherwise be handled using the <code class="inline">{:reply, {status, payload}, socket}</code> return from your <code class="inline">handle_in</code> callbacks. <a href="#reply/2"><code class="inline">reply/2</code></a> will be used in the rare cases you need to perform work in another process and reply when finished by generating a reference to the push with <a href="#socket_ref/1"><code class="inline">socket_ref/1</code></a>.</p>
+<p><em>Note</em>: In such cases, a <code class="inline">socket_ref</code> should be generated and passed to the external process, so the <code class="inline">socket</code> itself is not leaked outside the channel. The <code class="inline">socket</code> holds information such as assigns and transport configuration, so it's important to not copy this information outside of the channel that owns it.</p>
+<h4 id="reply/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">def handle_in("work", payload, socket) do
+  Worker.perform(payload, socket_ref(socket))
+  {:noreply, socket}
+end
+
+def handle_info({:work_complete, result, ref}, socket) do
+  reply(ref, {:ok, result})
+  {:noreply, socket}
+end</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="socket_ref/1">socket_ref(socket)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/channel.ex#L629" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec socket_ref(Phoenix.Socket.t()) :: socket_ref()</pre> </div> <p>Generates a <code class="inline">socket_ref</code> for an async reply.</p>
+<p>See <a href="#reply/2"><code class="inline">reply/2</code></a> for example usage.</p> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2014 Chris McCord<br>Licensed under the MIT License.<br>
+    <a href="https://hexdocs.pm/phoenix/Phoenix.Channel.html" class="_attribution-link">https://hexdocs.pm/phoenix/Phoenix.Channel.html</a>
+  </p>
+</div>

@@ -1,0 +1,318 @@
+<h1>   <span>Polymorphic associations with many to many</span> </h1> <p>Besides <code class="inline">belongs_to</code>, <code class="inline">has_many</code>, <code class="inline">has_one</code> and <code class="inline">:through</code> associations, Ecto also includes <code class="inline">many_to_many</code>. <code class="inline">many_to_many</code> relationships, as the name says, allows a record from table X to have many associated entries from table Y and vice-versa. Although <code class="inline">many_to_many</code> associations can be written as <code class="inline">has_many :through</code>, using <code class="inline">many_to_many</code> may considerably simplify some workflows.</p>
+<p>In this guide, we will talk about polymorphic associations and how <code class="inline">many_to_many</code> can remove boilerplate from certain approaches compared to <code class="inline">has_many :through</code>.</p>
+<h2 id="todo-lists-v65131" class="section-heading">  Todo lists v65131 </h2> <p>The internet has seen its share of todo list applications. But that won't stop us from creating our own!</p>
+<p>In our case, there is one aspect of todo list applications we are interested in, which is the relationship where the todo list has many todo items. This exact scenario is explored in detail in a post about <a href="https://dashbit.co/blog/working-with-ecto-associations-and-embeds">nested associations and embeds</a> from Dashbit's blog. Let's recap the important points.</p>
+<p>Our todo list app has two schemas, <code class="inline">Todo.List</code> and <code class="inline">Todo.Item</code>:</p>
+<pre data-language="elixir">defmodule MyApp.TodoList do
+  use Ecto.Schema
+
+  schema "todo_lists" do
+    field :title
+    has_many :todo_items, MyApp.TodoItem
+    timestamps()
+  end
+end
+
+defmodule MyApp.TodoItem do
+  use Ecto.Schema
+
+  schema "todo_items" do
+    field :description
+    timestamps()
+  end
+end</pre>
+<p>One of the ways to introduce a todo list with multiple items into the database is to couple our UI representation to our schemas. That's the approach we took in the blog post with Phoenix. Roughly:</p>
+<pre data-language="elixir">&lt;%= form_for @todo_list_changeset,
+             todo_list_path(@conn, :create),
+             fn f -&gt; %&gt;
+  &lt;%= text_input f, :title %&gt;
+  &lt;%= inputs_for f, :todo_items, fn i -&gt; %&gt;
+    ...
+  &lt;% end %&gt;
+&lt;% end %&gt;</pre>
+<p>When such a form is submitted in Phoenix, it will send parameters with the following shape:</p>
+<pre data-language="elixir">%{
+  "todo_list" =&gt; %{
+    "title" =&gt; "shopping list",
+    "todo_items" =&gt; %{
+      0 =&gt; %{"description" =&gt; "bread"},
+      1 =&gt; %{"description" =&gt; "eggs"}
+    }
+  }
+}</pre>
+<p>We could then retrieve those parameters and pass it to an Ecto changeset and Ecto would automatically figure out what to do:</p>
+<pre data-language="elixir"># In MyApp.TodoList
+def changeset(struct, params \\ %{}) do
+  struct
+  |&gt; Ecto.Changeset.cast(params, [:title])
+  |&gt; Ecto.Changeset.cast_assoc(:todo_items, required: true)
+end
+
+# And then in MyApp.TodoItem
+def changeset(struct, params \\ %{}) do
+  struct
+  |&gt; Ecto.Changeset.cast(params, [:description])
+end</pre>
+<p>By calling <a href="ecto.changeset.html#cast_assoc/3"><code class="inline">Ecto.Changeset.cast_assoc/3</code></a>, Ecto will look for a "todo_items" key inside the parameters given on cast, and compare those parameters with the items stored in the todo list struct. Ecto will automatically generate instructions to insert, update or delete todo items such that:</p>
+<ul>
+<li>if a todo item sent as parameter has an ID and it matches an existing associated todo item, we consider that todo item should be updated</li>
+<li>if a todo item sent as parameter does not have an ID (nor a matching ID), we consider that todo item should be inserted</li>
+<li>if a todo item is currently associated but its ID was not sent as parameter, we consider the todo item is being replaced and we act according to the <code class="inline">:on_replace</code> callback. By default <code class="inline">:on_replace</code> will raise so you choose a behaviour between replacing, deleting, ignoring or nilifying the association</li>
+</ul>
+<p>The advantage of using <code class="inline">cast_assoc/3</code> is that Ecto is able to do all of the hard work of keeping the entries associated, <strong>as long as we pass the data exactly in the format that Ecto expects</strong>. However, such approach is not always preferable and in many situations it is better to design our associations differently or decouple our UIs from our database representation.</p>
+<h2 id="polymorphic-todo-items" class="section-heading">  Polymorphic todo items </h2> <p>To show an example of where using <code class="inline">cast_assoc/3</code> is just too complicated to be worth it, let's imagine you want your "todo items" to be polymorphic. For example, you want to be able to add todo items not only to "todo lists" but to many other parts of your application, such as projects, milestones, you name it.</p>
+<p>First of all, it is important to remember Ecto does not provide the same type of polymorphic associations available in frameworks such as Rails and Laravel. In such frameworks, a polymorphic association uses two columns, the <code class="inline">parent_id</code> and <code class="inline">parent_type</code>. For example, one todo item would have <code class="inline">parent_id</code> of 1 with <code class="inline">parent_type</code> of "TodoList" while another would have <code class="inline">parent_id</code> of 1 with <code class="inline">parent_type</code> of "Project".</p>
+<p>The issue with the design above is that it breaks database references. The database is no longer capable of guaranteeing the item you associate to exists or will continue to exist in the future. This leads to an inconsistent database which end-up pushing workarounds to your application.</p>
+<p>The design above is also extremely inefficient, especially if you're working with large tables. Bear in mind that if that's your case, you might be forced to remove such polymorphic references in the future when frequent polymorphic queries start grinding the database to a halt even after adding indexes and optimizing the database.</p>
+<p>Luckily, the documentation for the <a href="ecto.schema.html#belongs_to/3"><code class="inline">Ecto.Schema.belongs_to/3</code></a> macro includes a section named "Polymorphic associations" with some examples on how to design sane and performant associations. One of those approaches consists in using several join tables. Besides the "todo_lists" and "projects" tables and the "todo_items" table, we would create "todo_list_items" and "project_items" to associate todo items to todo lists and todo items to projects respectively. In terms of migrations, we are looking at the following:</p>
+<pre data-language="elixir">create table(:todo_lists)  do
+  add :title
+  timestamps()
+end
+
+create table(:projects)  do
+  add :name
+  timestamps()
+end
+
+create table(:todo_items)  do
+  add :description
+  timestamps()
+end
+
+create table(:todo_list_items) do
+  add :todo_item_id, references(:todo_items)
+  add :todo_list_id, references(:todo_lists)
+  timestamps()
+end
+
+create table(:project_items) do
+  add :todo_item_id, references(:todo_items)
+  add :project_id, references(:projects)
+  timestamps()
+end</pre>
+<p>By adding one table per association pair, we keep database references and can efficiently perform queries that relies on indexes.</p>
+<p>First let's see how to implement this functionality in Ecto using a <code class="inline">has_many :through</code> and then use <code class="inline">many_to_many</code> to remove a lot of the boilerplate we were forced to introduce.</p>
+<h2 id="polymorphism-with-has_many-through" class="section-heading">  Polymorphism with has_many :through </h2> <p>Given we want our todo items to be polymorphic, we can no longer associate a todo list to todo items directly. Instead we will create an intermediate schema to tie <code class="inline">MyApp.TodoList</code> and <code class="inline">MyApp.TodoItem</code> together.</p>
+<pre data-language="elixir">defmodule MyApp.TodoList do
+  use Ecto.Schema
+
+  schema "todo_lists" do
+    field :title
+    has_many :todo_list_items, MyApp.TodoListItem
+    has_many :todo_items,
+      through: [:todo_list_items, :todo_item]
+    timestamps()
+  end
+end
+
+defmodule MyApp.TodoListItem do
+  use Ecto.Schema
+
+  schema "todo_list_items" do
+    belongs_to :todo_list, MyApp.TodoList
+    belongs_to :todo_item, MyApp.TodoItem
+    timestamps()
+  end
+end
+
+defmodule MyApp.TodoItem do
+  use Ecto.Schema
+
+  schema "todo_items" do
+    field :description
+    timestamps()
+  end
+end</pre>
+<p>Although we introduced <code class="inline">MyApp.TodoListItem</code> as an intermediate schema, <code class="inline">has_many :through</code> allows us to access all todo items for any todo list transparently:</p>
+<pre data-language="elixir">todo_lists |&gt; Repo.preload(:todo_items)</pre>
+<p>The trouble is that <code class="inline">:through</code> associations are <strong>read-only</strong> since Ecto does not have enough information to fill in the intermediate schema. This means that, if we still want to use <code class="inline">cast_assoc</code> to insert a todo list with many todo items directly from the UI, we cannot use the <code class="inline">:through</code> association and instead must go step by step. We would need to first <code class="inline">cast_assoc(:todo_list_items)</code> from <code class="inline">TodoList</code> and then call <code class="inline">cast_assoc(:todo_item)</code> from the <code class="inline">TodoListItem</code> schema:</p>
+<pre data-language="elixir"># In MyApp.TodoList
+def changeset(struct, params \\ %{}) do
+  struct
+  |&gt; Ecto.Changeset.cast(params, [:title])
+  |&gt; Ecto.Changeset.cast_assoc(
+    :todo_list_items,
+    required: true
+  )
+end
+
+# And then in the MyApp.TodoListItem
+def changeset(struct, params \\ %{}) do
+  struct
+  |&gt; Ecto.Changeset.cast_assoc(:todo_item, required: true)
+end
+
+# And then in MyApp.TodoItem
+def changeset(struct, params \\ %{}) do
+  struct
+  |&gt; Ecto.Changeset.cast(params, [:description])
+end</pre>
+<p>To further complicate things, remember <code class="inline">cast_assoc</code> expects a particular shape of data that reflects your associations. In this case, because of the intermediate schema, the data sent through your forms in Phoenix would have to look as follows:</p>
+<pre data-language="elixir">%{"todo_list" =&gt; %{
+  "title" =&gt; "shipping list",
+  "todo_list_items" =&gt; %{
+    0 =&gt; %{"todo_item" =&gt; %{"description" =&gt; "bread"}},
+    1 =&gt; %{"todo_item" =&gt; %{"description" =&gt; "eggs"}},
+  }
+}}</pre>
+<p>To make matters worse, you would have to duplicate this logic for every intermediate schema, and introduce <code class="inline">MyApp.TodoListItem</code> for todo lists, <code class="inline">MyApp.ProjectItem</code> for projects, etc.</p>
+<p>Luckily, <code class="inline">many_to_many</code> allows us to remove all of this boilerplate.</p>
+<h2 id="polymorphism-with-many_to_many" class="section-heading">  Polymorphism with many_to_many </h2> <p>In a way, the idea behind <code class="inline">many_to_many</code> associations is that it allows us to associate two schemas via an intermediate schema while automatically taking care of all details about the intermediate schema. Let's rewrite the schemas above to use <code class="inline">many_to_many</code>:</p>
+<pre data-language="elixir">defmodule MyApp.TodoList do
+  use Ecto.Schema
+
+  schema "todo_lists" do
+    field :title
+    many_to_many :todo_items, MyApp.TodoItem,
+      join_through: MyApp.TodoListItem
+    timestamps()
+  end
+end
+
+defmodule MyApp.TodoListItem do
+  use Ecto.Schema
+
+  schema "todo_list_items" do
+    belongs_to :todo_list, MyApp.TodoList
+    belongs_to :todo_item, MyApp.TodoItem
+    timestamps()
+  end
+end
+
+defmodule MyApp.TodoItem do
+  use Ecto.Schema
+
+  schema "todo_items" do
+    field :description
+    timestamps()
+  end
+end</pre>
+<p>Notice <code class="inline">MyApp.TodoList</code> no longer needs to define a <code class="inline">has_many</code> association pointing to the <code class="inline">MyApp.TodoListItem</code> schema and instead we can just associate to <code class="inline">:todo_items</code> using <code class="inline">many_to_many</code>.</p>
+<p>Differently from <code class="inline">has_many :through</code>, <code class="inline">many_to_many</code> associations are also writable. This means we can send data through our forms exactly as we did at the beginning of this guide:</p>
+<pre data-language="elixir">%{"todo_list" =&gt; %{
+  "title" =&gt; "shipping list",
+  "todo_items" =&gt; %{
+    0 =&gt; %{"description" =&gt; "bread"},
+    1 =&gt; %{"description" =&gt; "eggs"},
+  }
+}}</pre>
+<p>And we no longer need to define a changeset function in the intermediate schema:</p>
+<pre data-language="elixir"># In MyApp.TodoList
+def changeset(struct, params \\ %{}) do
+  struct
+  |&gt; Ecto.Changeset.cast(params, [:title])
+  |&gt; Ecto.Changeset.cast_assoc(:todo_items, required: true)
+end
+
+# And then in MyApp.TodoItem
+def changeset(struct, params \\ %{}) do
+  struct
+  |&gt; Ecto.Changeset.cast(params, [:description])
+end</pre>
+<p>In other words, we can use exactly the same code we had in the "todo lists has_many todo items" case. So even when external constraints require us to use a join table, <code class="inline">many_to_many</code> associations can automatically manage them for us. Everything you know about associations will just work with <code class="inline">many_to_many</code> associations as well.</p>
+<p>Finally, even though we have specified a schema as the <code class="inline">:join_through</code> option in <code class="inline">many_to_many</code>, <code class="inline">many_to_many</code> can also work without intermediate schemas altogether by simply giving it a table name:</p>
+<pre data-language="elixir">defmodule MyApp.TodoList do
+  use Ecto.Schema
+
+  schema "todo_lists" do
+    field :title
+    many_to_many :todo_items, MyApp.TodoItem,
+      join_through: "todo_list_items"
+    timestamps()
+  end
+end</pre>
+<p>In this case, you can completely remove the <code class="inline">MyApp.TodoListItem</code> schema from your application and the code above will still work. The only difference is that when using tables, any autogenerated value that is filled by Ecto schema, such as timestamps, won't be filled as we no longer have a schema. To solve this, you can either drop those fields from your migrations or set a default at the database level.</p>
+<h2 id="summary" class="section-heading">  Summary </h2> <p>In this guide we used <code class="inline">many_to_many</code> associations to drastically improve a polymorphic association design that relied on <code class="inline">has_many :through</code>. Our goal was to allow "todo_items" to associate to different entities in our code base, such as "todo_lists" and "projects". We have done this by creating intermediate tables and by using <code class="inline">many_to_many</code> associations to automatically manage those join tables.</p>
+<p>At the end, our schemas may look like:</p>
+<pre data-language="elixir">defmodule MyApp.TodoList do
+  use Ecto.Schema
+
+  schema "todo_lists" do
+    field :title
+    many_to_many :todo_items, MyApp.TodoItem,
+      join_through: "todo_list_items"
+    timestamps()
+  end
+
+  def changeset(struct, params \\ %{}) do
+    struct
+    |&gt; Ecto.Changeset.cast(params, [:title])
+    |&gt; Ecto.Changeset.cast_assoc(
+      :todo_items,
+      required: true
+    )
+  end
+end
+
+defmodule MyApp.Project do
+  use Ecto.Schema
+
+  schema "projects" do
+    field :name
+    many_to_many :todo_items, MyApp.TodoItem,
+      join_through: "project_items"
+    timestamps()
+  end
+
+  def changeset(struct, params \\ %{}) do
+    struct
+    |&gt; Ecto.Changeset.cast(params, [:name])
+    |&gt; Ecto.Changeset.cast_assoc(
+      :todo_items,
+      required: true
+    )
+  end
+end
+
+defmodule MyApp.TodoItem do
+  use Ecto.Schema
+
+  schema "todo_items" do
+    field :description
+    timestamps()
+  end
+
+  def changeset(struct, params \\ %{}) do
+    struct
+    |&gt; Ecto.Changeset.cast(params, [:description])
+  end
+end</pre>
+<p>And the database migration:</p>
+<pre data-language="elixir">create table("todo_lists")  do
+  add :title
+  timestamps()
+end
+
+create table("projects")  do
+  add :name
+  timestamps()
+end
+
+create table("todo_items")  do
+  add :description
+  timestamps()
+end
+
+# Primary key and timestamps are not required if
+# using many_to_many without schemas
+create table("todo_list_items", primary_key: false) do
+  add :todo_item_id, references(:todo_items)
+  add :todo_list_id, references(:todo_lists)
+  # timestamps()
+end
+
+# Primary key and timestamps are not required if
+# using many_to_many without schemas
+create table("project_items", primary_key: false) do
+  add :todo_item_id, references(:todo_items)
+  add :project_id, references(:projects)
+  # timestamps()
+end</pre>
+<p>Overall our code looks structurally the same as <code class="inline">has_many</code> would, although at the database level our relationships are expressed with join tables.</p>
+<p>While in this guide we changed our code to cope with the parameter format required by <code class="inline">cast_assoc</code>, in <a href="constraints-and-upserts.html">Constraints and Upserts</a> we drop <code class="inline">cast_assoc</code> altogether and use <code class="inline">put_assoc</code> which brings more flexibilities when working with associations.</p> <div class="bottom-actions"> <div class="bottom-actions-item"> <a href="self-referencing-many-to-many.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Self-referencing many to many </span> </a> </div> <div class="bottom-actions-item"> <a href="replicas-and-dynamic-repositories.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Replicas and dynamic repositories </span> </a> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2013 Plataformatec<br>&copy; 2020 Dashbit<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/ecto/polymorphic-associations-with-many-to-many.html" class="_attribution-link">https://hexdocs.pm/ecto/polymorphic-associations-with-many-to-many.html</a>
+  </p>
+</div>

@@ -1,0 +1,168 @@
+<h1>   <span>Multi tenancy with foreign keys</span> </h1> <p>In <a href="multi-tenancy-with-query-prefixes.html">Multi tenancy with query prefixes</a>, we have learned how to set up multi tenant applications by using separate query prefixes, known as DDL Schemas in PostgreSQL and MSSQL and simply a separate database in MySQL.</p>
+<p>Each query prefix is isolated, having their own tables and data, which provides the security guarantees we need. On the other hand, such approach for multi tenancy may be too expensive, as each schema needs to be created, migrated, and versioned separately.</p>
+<p>Therefore, some applications may prefer a cheaper mechanism for multi tenancy, by relying on foreign keys. The idea here is that most - if not all - resources in the system belong to a tenant. The tenant is typically an organization or a user and all resources have an <code class="inline">org_id</code> (or <code class="inline">user_id</code>) foreign key pointing directly to it.</p>
+<p>In this guide, we will show how to leverage Ecto constructs to guarantee that all Ecto queries in your application are properly scoped to a chosen <code class="inline">org_id</code>.</p>
+<h2 id="adding-org_id-to-read-operations" class="section-heading">  Adding org_id to read operations </h2> <p>The first step in our implementation is to make the repository aware of <code class="inline">org_id</code>. We want to allow commands such as:</p>
+<pre data-language="elixir">MyApp.Repo.all Post, org_id: 13</pre>
+<p>Where the repository will automatically scope all posts to the organization with <code class="inline">ID=13</code>. We can achieve this with the <a href="ecto.repo.html#c:prepare_query/3"><code class="inline">Ecto.Repo.prepare_query/3</code></a> repository callback:</p>
+<pre data-language="elixir">defmodule MyApp.Repo do
+  use Ecto.Repo, otp_app: :my_app
+
+  require Ecto.Query
+
+  @impl true
+  def prepare_query(_operation, query, opts) do
+    cond do
+      opts[:skip_org_id] || opts[:schema_migration] -&gt;
+        {query, opts}
+
+      org_id = opts[:org_id] -&gt;
+        {Ecto.Query.where(query, org_id: ^org_id), opts}
+
+      true -&gt;
+        raise "expected org_id or skip_org_id to be set"
+    end
+  end
+end</pre>
+<p>Now we can pass <code class="inline">:org_id</code> to all READ operations, such as <code class="inline">get</code>, <code class="inline">get_by</code>, <code class="inline">preload</code>, etc and all query operations, such <code class="inline">all</code>, <code class="inline">update_all</code>, and <code class="inline">delete_all</code>. Note we have intentionally made the <code class="inline">:org_id</code> required, with the exception of two scenarios:</p>
+<ul>
+<li><p>if you explicitly set <code class="inline">:skip_org_id</code> to true, it won't require an <code class="inline">:org_id</code>. This reduces the odds of a developer forgetting to scope their queries, which can accidentally expose private data to other users</p></li>
+<li><p>if the <code class="inline">:schema_migration</code> option is set. This means the repository operation was issued by Ecto itself when migrating our database and we don't want to apply an <code class="inline">org_id</code> to them</p></li>
+</ul>
+<p>Still, setting the <code class="inline">org_id</code> for every operation is cumbersome and error prone. We will be better served if all operations attempt to set an <code class="inline">org_id</code>.</p>
+<h2 id="setting-org_id-by-default" class="section-heading">  Setting <code class="inline">org_id</code> by default </h2> <p>To make sure our read operations use the <code class="inline">org_id</code> by default, we will make two additional changes to the repository.</p>
+<p>First, we will store the <code class="inline">org_id</code> in the process dictionary. The process dictionary is a storage that is exclusive to each process. For example, each test in your project runs in a separate process. Each request in a web application runs in a separate process too. Each of these processes have their own dictionary which we will store and read from. Let's add these functions:</p>
+<pre data-language="elixir">defmodule MyApp.Repo do
+  ...
+
+  @tenant_key {__MODULE__, :org_id}
+
+  def put_org_id(org_id) do
+    Process.put(@tenant_key, org_id)
+  end
+
+  def get_org_id() do
+    Process.get(@tenant_key)
+  end
+end</pre>
+<p>We added two new functions. The first, <code class="inline">put_org_id</code>, stores the organization id in the process dictionary. <code class="inline">get_org_id</code> reads the value in the process dictionary.</p>
+<p>You will want to call <code class="inline">put_org_id</code> on every process before you use the repository. For example, on every request in a web application, as soon as you read the current organization from the request parameter or the session, you should call <code class="inline">MyApp.Repo.put_org_id(params_org_id)</code>. In tests, you want to explicitly set the <code class="inline">put_org_id</code> or pass the <code class="inline">:org_id</code> option as in the previous section.</p>
+<p>The second change we need to do is to set the <code class="inline">org_id</code> as a default option on all repository operations. The value of <code class="inline">org_id</code> will be precisely the value in the process dictionary. We can do so trivially by implementing the <code class="inline">default_options</code> callback:</p>
+<pre data-language="elixir">defmodule MyApp.Repo do
+  ...
+
+  @impl true
+  def default_options(_operation) do
+    [org_id: get_org_id()]
+  end
+end</pre>
+<p>With these changes, we will always set the <code class="inline">org_id</code> field in our Ecto queries, unless we explicitly set <code class="inline">skip_org_id: true</code> when calling the repository. The only remaining step is to make sure the <code class="inline">org_id</code> field is not null in your database tables and make sure the <code class="inline">org_id</code> is set whenever inserting into the database.</p>
+<p>To better understand how our database schema should look like, let's discuss some other techniques that we can use to tighten up multi tenant support, especially in regards to associations.</p>
+<h2 id="working-with-multi-tenant-associations" class="section-heading">  Working with multi tenant associations </h2> <p>Let's expand our data domain a little bit.</p>
+<p>So far we have assumed there is an organization schema. However, instead of naming its primary key <code class="inline">id</code>, we will name it <code class="inline">org_id</code>, so <code class="inline">Repo.one(Org, org_id: 13)</code> just works:</p>
+<pre data-language="elixir">defmodule MyApp.Organization do
+  use Ecto.Schema
+
+  @primary_key {:org_id, :id, autogenerate: true}
+  schema "orgs" do
+    field :name
+    timestamps()
+  end
+end</pre>
+<p>Let's also say that you may have multiple posts in an organization and the posts themselves may have multiple comments:</p>
+<pre data-language="elixir">defmodule MyApp.Post do
+  use Ecto.Schema
+
+  schema "posts" do
+    field :title
+    field :org_id, :integer
+    has_many :comments, MyApp.Comment
+    timestamps()
+  end
+end
+
+defmodule MyApp.Comment do
+  use Ecto.Schema
+
+  schema "comments" do
+    field :body
+    field :org_id, :integer
+    belongs_to :post, MyApp.Post
+    timestamps()
+  end
+end</pre>
+<p>One thing to have in mind is that, our <code class="inline">prepare_query</code> callback will apply to all queries, but it won't apply to joins inside the same query. Therefore, if you write this query:</p>
+<pre data-language="elixir">MyApp.Repo.put_org_id(some_org_id)
+
+MyApp.Repo.all(
+  from p in Post, join: c in assoc(p, :comments)
+)</pre>
+<p><code class="inline">prepare_query</code> will apply the <code class="inline">org_id</code> only to posts but not to the <code class="inline">join</code>. While this may seem problematic, in practice it is not an issue, because when you insert posts and comments in the database, <strong>they will always have the same <code class="inline">org_id</code></strong>. If posts and comments do not have the same <code class="inline">org_id</code>, then there is a bug: the data either got corrupted or there is a bug in our software when inserting data.</p>
+<p>Luckily, we can leverage database's foreign keys to guarantee that the <code class="inline">org_id</code>s always match between posts and comments. Our first stab at defining these schema migrations would look like this:</p>
+<pre data-language="elixir">create table(:orgs, primary_key: false) do
+  add :org_id, :bigserial, primary_key: true
+  add :name, :string
+  timestamps()
+end
+
+create table(:posts) do
+  add :title, :string
+
+  add :org_id,
+      references(:orgs, column: :org_id),
+      null: false
+
+  timestamps()
+end
+
+create table(:comments) do
+  add :body, :string
+  add :org_id, references(:orgs), null: false
+  add :post_id, references(:posts), null: false
+  timestamps()
+end</pre>
+<p>So far the only noteworthy change compared to a regular migration is the <code class="inline">primary_key: false</code> option to the <code class="inline">:orgs</code> table, as we want to mirror the primary key of <code class="inline">org_id</code> given to the schema. While the schema above works and guarantees that posts references an existing organization and that comments references existing posts and organizations, it does not guarantee that all posts and their related comments belong to the same organization.</p>
+<p>We can tighten up this requirement by using composite foreign keys with the following changes:</p>
+<pre data-language="elixir">create unique_index(:posts, [:id, :org_id])
+
+create table(:comments) do
+  add :body, :string
+
+  # There is no need to define a reference for org_id
+  add :org_id, :integer, null: false
+
+  # Instead define a composite foreign key
+  add :post_id,
+      references(:posts, with: [org_id: :org_id]),
+      null: false
+
+  timestamps()
+end</pre>
+<p>Instead of defining both <code class="inline">post_id</code> and <code class="inline">org_id</code> as individual foreign keys, we define <code class="inline">org_id</code> as a regular integer and then we define <code class="inline">post_id+org_id</code> as a composite foreign key by passing the <code class="inline">:with</code> option to <code class="inline">Ecto.Migration.references/2</code>. This makes sure comments point to posts which point to orgs, where all <code class="inline">org_id</code>s match.</p>
+<p>Given composite foreign keys require the referenced keys to be unique, we also defined a unique index on the posts table <strong>before</strong> we defined the composite foreign key.</p>
+<p>If you are using PostgreSQL and you want to tighten these guarantees even further, you can pass the <code class="inline">match: :full</code> option to <code class="inline">references</code>:</p>
+<pre data-language="elixir">references(:posts, with: [org_id: :org_id], match: :full)</pre>
+<p>which will help enforce none of the columns in the foreign key can be <code class="inline">nil</code>.</p>
+<h2 id="summary" class="section-heading">  Summary </h2> <p>In this guide, we have changed our repository interface to guarantee our queries are always scoped to an <code class="inline">org_id</code>, unless we explicitly opt out. We also learned how to leverage database features to enforce the data is always valid.</p>
+<p>When it comes to associations, you will want to apply composite foreign keys whenever possible. For example, imagine comments belongs to posts (which belong to an organization) and also to user (which belong to an organization). The comments schema migration should be defined like this:</p>
+<pre data-language="elixir">create table(:comments) do
+  add :body, :string
+  add :org_id, :integer, null: false
+
+  add :post_id,
+      references(:posts, with: [org_id: :org_id]),
+      null: false
+
+  add :user_id,
+      references(:users, with: [org_id: :org_id]),
+      null: false
+
+  timestamps()
+end</pre>
+<p>As long as all schemas have an <code class="inline">org_id</code>, all operations will be safely contained by the current tenant.</p>
+<p>If by any chance you have schemas that are not tied to an <code class="inline">org_id</code>, you can even consider keeping them in a separate query prefix or in a separate database altogether, so you keep non-tenant data completely separated from tenant-specific data.</p> <div class="bottom-actions"> <div class="bottom-actions-item"> <a href="multi-tenancy-with-query-prefixes.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Multi tenancy with query prefixes </span> </a> </div> <div class="bottom-actions-item"> <a href="self-referencing-many-to-many.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Self-referencing many to many </span> </a> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2013 Plataformatec<br>&copy; 2020 Dashbit<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/ecto/multi-tenancy-with-foreign-keys.html" class="_attribution-link">https://hexdocs.pm/ecto/multi-tenancy-with-foreign-keys.html</a>
+  </p>
+</div>

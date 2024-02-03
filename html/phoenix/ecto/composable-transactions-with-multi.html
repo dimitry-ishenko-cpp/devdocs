@@ -1,0 +1,244 @@
+<h1>   <span>Composable transactions with Multi</span> </h1> <p>Ecto relies on database transactions when multiple operations must be performed atomically. The most common example used for transactions are bank transfers between two people:</p>
+<pre data-language="elixir">Repo.transaction(fn -&gt;
+  mary_update =
+    from Account,
+      where: [id: ^mary.id],
+      update: [inc: [balance: +10]]
+
+  {1, _} = Repo.update_all(mary_update)
+
+  john_update =
+    from Account,
+      where: [id: ^john.id],
+      update: [inc: [balance: -10]]
+
+  {1, _} = Repo.update_all(john_update)
+end)</pre>
+<p>In Ecto, transactions can be performed via the <code class="inline">Repo.transaction</code> function. When we expect both operations to succeed, as above, transactions are quite straight-forward. However, transactions get more complicated if we need to check the status of each operation along the way:</p>
+<pre data-language="elixir">Repo.transaction(fn -&gt;
+  mary_update =
+    from Account,
+      where: [id: ^mary.id],
+      update: [inc: [balance: +10]]
+
+  case Repo.update_all mary_update do
+    {1, _} -&gt;
+      john_update =
+        from Account,
+          where: [id: ^john.id],
+          update: [inc: [balance: -10]]
+
+      case Repo.update_all john_update do
+        {1, _} -&gt; {mary, john}
+        {_, _} -&gt; Repo.rollback({:failed_transfer, john})
+      end
+
+    {_, _} -&gt;
+      Repo.rollback({:failed_transfer, mary})
+  end
+end)</pre>
+<p>Transactions in Ecto can also be nested arbitrarily. For example, imagine the transaction above is moved into its own function that receives both accounts, defined as <code class="inline">transfer_money(mary, john, 10)</code>, and besides transferring money we also want to log the transfer:</p>
+<pre data-language="elixir">Repo.transaction(fn -&gt;
+  case transfer_money(mary, john, 10) do
+    {:ok, {mary, john}} -&gt;
+      transfer = %Transfer{
+        from: mary.id,
+        to: john.id,
+        amount: 10
+      }
+
+      Repo.insert!(transfer)
+
+    {:error, error} -&gt;
+      Repo.rollback(error)
+  end
+end)</pre>
+<p>The snippet above starts a transaction and then calls <code class="inline">transfer_money/3</code> that also runs in a transaction. In the case of multiple transactions, they are all flattened, which means a failure in an inner transaction causes the outer transaction to also fail. That's why matching and rolling back on <code class="inline">{:error, error}</code> is important.</p>
+<p>While nesting transactions can improve the code readability by breaking large transactions into multiple smaller transactions, there is still a lot of boilerplate involved in handling the success and failure scenarios. Furthermore, composition is quite limited, as all operations must still be performed inside transaction blocks.</p>
+<p>A more declarative approach when working with transactions would be to define all operations we want to perform in a transaction decoupled from the transaction execution. This way we would be able to compose transactions operations without worrying about its execution context or about each individual success/failure scenario. That's exactly what <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a> allows us to do.</p>
+<h2 id="composing-with-data-structures" class="section-heading">  Composing with data structures </h2> <p>Let's rewrite the snippets above using <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a>. The first snippet that transfers money between Mary and John can be rewritten to:</p>
+<pre data-language="elixir">mary_update =
+  from Account,
+    where: [id: ^mary.id],
+    update: [inc: [balance: +10]]
+
+john_update =
+  from Account,
+    where: [id: ^john.id],
+    update: [inc: [balance: -10]]
+
+Ecto.Multi.new()
+|&gt; Ecto.Multi.update_all(:mary, mary_update)
+|&gt; Ecto.Multi.update_all(:john, john_update)</pre>
+<p><a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a> is a data structure that defines multiple operations that must be performed together, without worrying about when they will be executed. <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a> mirrors most of the <a href="ecto.repo.html"><code class="inline">Ecto.Repo</code></a> API, with the difference that each operation must be explicitly named. In the example above, we have defined two update operations, named <code class="inline">:mary</code> and <code class="inline">:john</code>. As we will see later, the names are important when handling the transaction results.</p>
+<p>Since <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a> is just a data structure, we can pass it as argument to other functions, as well as return it. Assuming the multi above is moved into its own function, defined as <code class="inline">transfer_money(mary, john, value)</code>, we can add a new operation to the multi that logs the transfer as follows:</p>
+<pre data-language="elixir">transfer = %Transfer{
+  from: mary.id,
+  to: john.id,
+  amount: 10
+}
+
+transfer_money(mary, john, 10)
+|&gt; Ecto.Multi.insert(:transfer, transfer)</pre>
+<p>This is considerably simpler than the nested transaction approach we have seen earlier. Once all operations are defined in the multi, we can finally call <code class="inline">Repo.transaction</code>, this time passing the multi:</p>
+<pre data-language="elixir">transfer = %Transfer{
+  from: mary.id,
+  to: john.id,
+  amount: 10
+}
+
+transfer_money(mary, john, 10)
+|&gt; Ecto.Multi.insert(:transfer, transfer)
+|&gt; Repo.transaction()
+|&gt; case do
+  {:ok, %{transfer: transfer}} -&gt;
+    # Handle success case
+  {:error, name, value, changes_so_far} -&gt;
+    # Handle failure case
+end</pre>
+<p>If all operations in the multi succeed, it returns <code class="inline">{:ok, map}</code> where the map contains the name of all operations as keys and their success value. If any operation in the multi fails, the transaction is rolled back and <code class="inline">Repo.transaction</code> returns <code class="inline">{:error, name, value, changes_so_far}</code>, where <code class="inline">name</code> is the name of the failed operation, <code class="inline">value</code> is the failure value and <code class="inline">changes_so_far</code> is a map of the previously successful multi operations that have been rolled back due to the failure.</p>
+<p>In other words, <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a> takes care of all the flow control boilerplate while decoupling the transaction definition from its execution, allowing us to compose operations as needed.</p>
+<h2 id="dependent-values" class="section-heading">  Dependent values </h2> <p>Besides operations such as <code class="inline">insert</code>, <code class="inline">update</code> and <code class="inline">delete</code>, <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a> also provides functions for handling more complex scenarios. For example, <code class="inline">prepend</code> and <code class="inline">append</code> can be used to merge multis together. And more generally, the functions <a href="ecto.multi.html#run/3"><code class="inline">Ecto.Multi.run/3</code></a> and <a href="ecto.multi.html#run/5"><code class="inline">Ecto.Multi.run/5</code></a> can be used to define any operation that depends on the results of a previous multi operation. In addition, <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a> also gives us <code class="inline">put</code> and <code class="inline">inspect</code>, which allow us to dynamically update and inspect changes.</p>
+<p>Let's study a more practical example. In <a href="constraints-and-upserts.html">Constraints and Upserts</a>, we want to modify a post while possibly giving it a list of tags as a string separated by commas. At the end of the guide, we present a solution that inserts any missing tag and then fetches all of them using only two queries:</p>
+<pre data-language="elixir">defmodule MyApp.Post do
+  use Ecto.Schema
+
+  # Schema is the same
+  schema "posts" do
+    field :title
+    field :body
+    many_to_many :tags, MyApp.Tag,
+      join_through: "posts_tags",
+      on_replace: :delete
+    timestamps()
+  end
+
+  # Changeset is the same
+  def changeset(struct, params \\ %{}) do
+    struct
+    |&gt; Ecto.Changeset.cast(params, [:title, :body])
+    |&gt; Ecto.Changeset.put_assoc(:tags, parse_tags(params))
+  end
+
+  # Parse tags has slightly changed
+  defp parse_tags(params)  do
+    (params["tags"] || "")
+    |&gt; String.split(",")
+    |&gt; Enum.map(&amp;String.trim/1)
+    |&gt; Enum.reject(&amp; &amp;1 == "")
+    |&gt; insert_and_get_all()
+  end
+
+  defp insert_and_get_all([]) do
+    []
+  end
+
+  defp insert_and_get_all(names) do
+    timestamp =
+      NaiveDateTime.utc_now()
+      |&gt; NaiveDateTime.truncate(:second)
+
+    maps =
+      Enum.map(names, &amp;%{
+        name: &amp;1,
+        inserted_at: timestamp,
+        updated_at: timestamp
+      })
+
+    Repo.insert_all(MyApp.Tag, maps, on_conflict: :nothing)
+
+    Repo.all(from t in MyApp.Tag, where: t.name in ^names)
+  end
+end</pre>
+<p>While <code class="inline">insert_and_get_all/1</code> is idempotent, allowing us to run it multiple times and get the same result back, it does not run inside a transaction, so any failure while attempting to modify the parent post struct would end-up creating tags that have no posts associated to them.</p>
+<p>Let's fix the problem above by introducing using <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a>. Let's start by splitting the logic into both <code class="inline">Post</code> and <code class="inline">Tag</code> modules and keeping it free from side-effects such as database operations:</p>
+<pre data-language="elixir">defmodule MyApp.Post do
+  use Ecto.Schema
+
+  schema "posts" do
+    field :title
+    field :body
+    many_to_many :tags, MyApp.Tag,
+      join_through: "posts_tags",
+      on_replace: :delete
+    timestamps()
+  end
+
+  def changeset(struct, tags, params) do
+    struct
+    |&gt; Ecto.Changeset.cast(params, [:title, :body])
+    |&gt; Ecto.Changeset.put_assoc(:tags, tags)
+  end
+end
+
+defmodule MyApp.Tag do
+  use Ecto.Schema
+
+  schema "tags" do
+    field :name
+    timestamps()
+  end
+
+  def parse(tags) do
+    (tags || "")
+    |&gt; String.split(",")
+    |&gt; Enum.map(&amp;String.trim/1)
+    |&gt; Enum.reject(&amp; &amp;1 == "")
+  end
+end</pre>
+<p>Now, whenever we need to introduce a post with tags, we can create a multi that wraps all operations and the repository access:</p>
+<pre data-language="elixir">alias MyApp.Tag
+
+def insert_or_update_post_with_tags(post, params) do
+  Ecto.Multi.new()
+  |&gt; Ecto.Multi.run(:tags, fn _repo, changes -&gt;
+    insert_and_get_all_tags(changes, params)
+  end)
+  |&gt; Ecto.Multi.run(:post, fn _repo, changes -&gt;
+    insert_or_update_post(changes, post, params)
+  end)
+  |&gt; Repo.transaction()
+end
+
+defp insert_and_get_all_tags(_changes, params) do
+  case MyApp.Tag.parse(params["tags"]) do
+    [] -&gt;
+      {:ok, []}
+
+    names -&gt;
+      timestamp =
+        NaiveDateTime.utc_now()
+        |&gt; NaiveDateTime.truncate(:second)
+
+      maps =
+        Enum.map(names, &amp;%{
+          name: &amp;1,
+          inserted_at: timestamp,
+          updated_at: timestamp
+        })
+
+      Repo.insert_all(Tag, maps, on_conflict: :nothing)
+
+      query = from t in Tag, where: t.name in ^names
+
+      {:ok, Repo.all(query)}
+  end
+end
+
+defp insert_or_update_post(%{tags: tags}, post, params) do
+  post
+  |&gt; MyApp.Post.changeset(tags, params)
+  |&gt; Repo.insert_or_update()
+end</pre>
+<p>In the example above we have used <a href="ecto.multi.html#run/3"><code class="inline">Ecto.Multi.run/3</code></a> twice, albeit for two different reasons.</p>
+<ol>
+<li><p>In <code class="inline">Ecto.Multi.run(:tags, ...)</code>, we used <code class="inline">run/3</code> because we need to perform both <code class="inline">insert_all</code> and <code class="inline">all</code> operations, and while the multi exposes <a href="ecto.multi.html#insert_all/4"><code class="inline">Ecto.Multi.insert_all/4</code></a>, it does not have an equivalent to <code class="inline">Ecto.Repo.all</code>. Whenever we need to perform a repository operation that is not supported by <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a>, we can always fallback to <code class="inline">run/3</code> or <code class="inline">run/5</code>.</p></li>
+<li><p>In <code class="inline">Ecto.Multi.run(:post, ...)</code>, we used <code class="inline">run/3</code> because we need to access the value of a previous multi operation. The function given to <code class="inline">run/3</code> receives, as second argument, a map with the results of the operations performed so far. To grab the tags returned in the previous step, we simply pattern match on <code class="inline">%{tags: tags}</code> on <code class="inline">insert_or_update_post</code>.</p></li>
+</ol>
+<blockquote><p>Note: The first argument received by the function given to <code class="inline">run/3</code> is the repo in which the transaction is executing.</p></blockquote>
+<p>While <code class="inline">run/3</code> is very handy when we need to go beyond the functionalities provided natively by <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a>, it has the downside that operations defined with <a href="ecto.multi.html#run/3"><code class="inline">Ecto.Multi.run/3</code></a> are opaque and therefore they cannot be inspected by functions such as <a href="ecto.multi.html#to_list/1"><code class="inline">Ecto.Multi.to_list/1</code></a>. Still, <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a> allows us to greatly simplify control flow logic and remove boilerplate when working with transactions.</p> <div class="bottom-actions"> <div class="bottom-actions-item"> <a href="aggregates-and-subqueries.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Aggregates and subqueries </span> </a> </div> <div class="bottom-actions-item"> <a href="constraints-and-upserts.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Constraints and Upserts </span> </a> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2013 Plataformatec<br>&copy; 2020 Dashbit<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/ecto/composable-transactions-with-multi.html" class="_attribution-link">https://hexdocs.pm/ecto/composable-transactions-with-multi.html</a>
+  </p>
+</div>

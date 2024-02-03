@@ -1,0 +1,165 @@
+<h1>   <span>Dynamic queries</span> </h1> <p>Ecto was designed from the ground up to have an expressive query API that leverages Elixir syntax to write queries that are pre-compiled for performance and safety. When building queries, we may use the keywords syntax</p>
+<pre data-language="elixir">import Ecto.Query
+
+from p in Post,
+  where: p.author == "José" and p.category == "Elixir",
+  where: p.published_at &gt; ^minimum_date,
+  order_by: [desc: p.published_at]</pre>
+<p>or the pipe-based one</p>
+<pre data-language="elixir">import Ecto.Query
+
+Post
+|&gt; where([p], p.author == "José" and p.category == "Elixir")
+|&gt; where([p], p.published_at &gt; ^minimum_date)
+|&gt; order_by([p], desc: p.published_at)</pre>
+<p>While many developers prefer the pipe-based syntax, having to repeat the binding <code class="inline">p</code> made it quite verbose compared to the keyword one.</p>
+<p>Another problem with the pre-compiled query syntax is that it has limited options to compose the queries dynamically. Imagine for example a web application that provides search functionality on top of existing posts. The user should be able to specify multiple criteria, such as the author name, the post category, publishing interval, etc.</p>
+<p>To solve those problems, Ecto also provides a data-structure centric API to build queries as well as a very powerful mechanism for dynamic queries. Let's take a look.</p>
+<h2 id="focusing-on-data-structures" class="section-heading">  Focusing on data structures </h2> <p>Ecto provides a simpler API for both keyword and pipe based queries by making data structures first-class. Let's see an example:</p>
+<pre data-language="elixir">from p in Post,
+  where: [author: "José", category: "Elixir"],
+  where: p.published_at &gt; ^minimum_date,
+  order_by: [desc: :published_at]</pre>
+<p>and</p>
+<pre data-language="elixir">Post
+|&gt; where(author: "José", category: "Elixir")
+|&gt; where([p], p.published_at &gt; ^minimum_date)
+|&gt; order_by(desc: :published_at)</pre>
+<p>Notice how we were able to ditch the <code class="inline">p</code> selector in most expressions. In Ecto, all constructs, from <code class="inline">select</code> and <code class="inline">order_by</code> to <code class="inline">where</code> and <code class="inline">group_by</code>, accept data structures as input. The data structure can be specified at compile-time, as above, and also dynamically at runtime, shown below:</p>
+<pre data-language="elixir">where = [author: "José", category: "Elixir"]
+order_by = [desc: :published_at]
+Post
+|&gt; where(^where)
+|&gt; where([p], p.published_at &gt; ^minimum_date)
+|&gt; order_by(^order_by)</pre>
+<p>While using data-structures already brings a good amount of flexibility to Ecto queries, not all expressions can be converted to data structures. For example, <code class="inline">where</code> converts a key-value to a <code class="inline">key == value</code> comparison, and therefore order-based comparisons such as <code class="inline">p.published_at &gt; ^minimum_date</code> need to be written as before.</p>
+<h2 id="dynamic-fragments" class="section-heading">  Dynamic fragments </h2> <p>For cases where we cannot rely on data structures but still desire to build queries dynamically, Ecto includes the <a href="ecto.query.html#dynamic/2"><code class="inline">Ecto.Query.dynamic/2</code></a> macro.</p>
+<p>The <code class="inline">dynamic</code> macro allows us to conditionally build query fragments and interpolate them in the main query. For example, imagine that in the example above you may optionally filter posts by a date of publication. You could of course write it like this:</p>
+<pre data-language="elixir">query =
+  Post
+  |&gt; where(^where)
+  |&gt; order_by(^order_by)
+
+query =
+  if published_at = params["published_at"] do
+    where(query, [p], p.published_at &lt; ^published_at)
+  else
+    query
+  end</pre>
+<p>But with dynamic fragments, you can also write it as:</p>
+<pre data-language="elixir">where = [author: "José", category: "Elixir"]
+order_by = [desc: :published_at]
+
+filter_published_at =
+  if published_at = params["published_at"] do
+    dynamic([p], p.published_at &lt; ^published_at)
+  else
+    true
+  end
+
+Post
+|&gt; where(^where)
+|&gt; where(^filter_published_at)
+|&gt; order_by(^order_by)</pre>
+<p>The <code class="inline">dynamic</code> macro allows us to build dynamic expressions that are later interpolated into the query. <code class="inline">dynamic</code> expressions can also be interpolated into dynamic expressions, allowing developers to build complex expressions dynamically without hassle.</p>
+<p>By using dynamic fragments, we can decouple the processing of parameters from the query generation. Let's see a more complex example.</p>
+<h2 id="building-dynamic-queries" class="section-heading">  Building dynamic queries </h2> <p>Let's go back to the original problem. We want to build a search functionality where the user can configure how to traverse all posts in many different ways. For example, the user may choose how to order the data, filter by author and category, as well as select posts published after a certain date.</p>
+<p>To tackle this in Ecto, we can break our problem into a bunch of small functions, that build either data structures or dynamic fragments, and then we interpolate it into the query:</p>
+<pre data-language="elixir">def filter(params) do
+  Post
+  |&gt; order_by(^filter_order_by(params["order_by"]))
+  |&gt; where(^filter_where(params))
+end
+
+def filter_order_by("published_at_desc"),
+  do: [desc: dynamic([p], p.published_at)]
+
+def filter_order_by("published_at"),
+  do: [asc: dynamic([p], p.published_at)]
+
+def filter_order_by(_),
+  do: []
+
+def filter_where(params) do
+  Enum.reduce(params, dynamic(true), fn
+    {"author", value}, dynamic -&gt;
+      dynamic([p], ^dynamic and p.author == ^value)
+
+    {"category", value}, dynamic -&gt;
+      dynamic([p], ^dynamic and p.category == ^value)
+
+    {"published_at", value}, dynamic -&gt;
+      dynamic([p], ^dynamic and p.published_at &gt; ^value)
+
+    {_, _}, dynamic -&gt;
+      # Not a where parameter
+      dynamic
+  end)
+end</pre>
+<p>Because we were able to break our problem into smaller functions that receive regular data structures, we can use all the tools available in Elixir to work with data. For handling the <code class="inline">order_by</code> parameter, it may be best to simply pattern match on the <code class="inline">order_by</code> parameter. For building the <code class="inline">where</code> clause, we can use <code class="inline">reduce</code> to start with an empty dynamic (that always returns true) and refine it with new conditions as we traverse the parameters.</p>
+<p>Testing also becomes simpler as we can test each function in isolation, even when using dynamic queries:</p>
+<pre data-language="elixir">test "filter published at based on the given date" do
+  assert dynamic_match?(
+           filter_where(%{}),
+           "true"
+         )
+
+  assert dynamic_match?(
+           filter_where(%{"published_at" =&gt; "2010-04-17"}),
+           "true and q.published_at &gt; ^\"2010-04-17\""
+         )
+end
+
+defp dynamic_match?(dynamic, string) do
+  inspect(dynamic) == "dynamic([q], #{string})"
+end</pre>
+<p>In the example above, we created a small helper that allows us to assert on the dynamic contents by matching on the results of <code class="inline">inspect(dynamic)</code>.</p>
+<h2 id="dynamic-and-joins" class="section-heading">  Dynamic and joins </h2> <p>Even query joins can be tackled dynamically. For example, let's do two modifications to the example above. Let's say we can also sort by author name ("author_name" and "author_name_desc") and at the same time let's say that authors are in a separate table, which means our authors filter in <code class="inline">filter_where</code> now need to go through the join table.</p>
+<p>Our final solution would look like this:</p>
+<pre data-language="elixir">def filter(params) do
+  Post
+  # 1. Add named join binding
+  |&gt; join(:inner, [p], assoc(p, :authors), as: :authors)
+  |&gt; order_by(^filter_order_by(params["order_by"]))
+  |&gt; where(^filter_where(params))
+end
+
+# 2. Returned dynamic with join binding
+def filter_order_by("published_at_desc"),
+  do: [desc: dynamic([p], p.published_at)]
+
+def filter_order_by("published_at"),
+  do: dynamic([p], p.published_at)
+
+def filter_order_by("author_name_desc"),
+  do: [desc: dynamic([authors: a], a.name)]
+
+def filter_order_by("author_name"),
+  do: dynamic([authors: a], a.name)
+
+def filter_order_by(_),
+  do: []
+
+# 3. Change the authors clause inside reduce
+def filter_where(params) do
+  Enum.reduce(params, dynamic(true), fn
+    {"author", value}, dynamic -&gt;
+      dynamic([authors: a], ^dynamic and a.name == ^value)
+
+    {"category", value}, dynamic -&gt;
+      dynamic([p], ^dynamic and p.category == ^value)
+
+    {"published_at", value}, dynamic -&gt;
+      dynamic([p], ^dynamic and p.published_at &gt; ^value)
+
+    {_, _}, dynamic -&gt;
+      # Not a where parameter
+      dynamic
+  end)
+end</pre>
+<p>Adding more filters in the future is simply a matter of adding more clauses to the <a href="https://hexdocs.pm/elixir/Enum.html#reduce/3"><code class="inline">Enum.reduce/3</code></a> call in <code class="inline">filter_where</code>.</p> <div class="bottom-actions"> <div class="bottom-actions-item"> <a href="data-mapping-and-validation.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Data mapping and validation </span> </a> </div> <div class="bottom-actions-item"> <a href="multi-tenancy-with-query-prefixes.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Multi tenancy with query prefixes </span> </a> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2013 Plataformatec<br>&copy; 2020 Dashbit<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/ecto/dynamic-queries.html" class="_attribution-link">https://hexdocs.pm/ecto/dynamic-queries.html</a>
+  </p>
+</div>

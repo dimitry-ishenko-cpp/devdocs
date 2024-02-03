@@ -1,0 +1,995 @@
+<h1>   <span translate="no">Ecto.Changeset</span>  </h1> <section id="moduledoc"> <p>Changesets allow filtering, casting, validation and definition of constraints when manipulating structs.</p>
+<p>There is an example of working with changesets in the introductory documentation in the <a href="ecto.html"><code class="inline">Ecto</code></a> module. The functions <a href="#cast/4"><code class="inline">cast/4</code></a> and <a href="#change/2"><code class="inline">change/2</code></a> are the usual entry points for creating changesets. The first one is used to cast and validate external parameters, such as parameters sent through a form, API, command line, etc. The second one is used to change data directly from your application.</p>
+<p>The remaining functions in this module, such as validations, constraints, association handling, are about manipulating changesets. Let's discuss some of this extra functionality.</p>
+<h2 id="module-external-vs-internal-data" class="section-heading">  External vs internal data </h2> <p>Changesets allow working with both kinds of data:</p>
+<ul>
+<li><p>internal to the application - for example programmatically generated, or coming from other subsystems. This use case is primarily covered by the <a href="#change/2"><code class="inline">change/2</code></a> and <a href="#put_change/3"><code class="inline">put_change/3</code></a> functions.</p></li>
+<li><p>external to the application - for example data provided by the user in a form that needs to be type-converted and properly validated. This use case is primarily covered by the <a href="#cast/4"><code class="inline">cast/4</code></a> function.</p></li>
+</ul>
+<h2 id="module-validations-and-constraints" class="section-heading">  Validations and constraints </h2> <p>Ecto changesets provide both validations and constraints which are ultimately turned into errors in case something goes wrong.</p>
+<p>The difference between them is that most validations can be executed without a need to interact with the database and, therefore, are always executed before attempting to insert or update the entry in the database. Validations run immediately when a validation function is called on the data that is contained in the changeset at that time.</p>
+<p>Some validations may happen against the database but they are inherently unsafe. Those validations start with a <code class="inline">unsafe_</code> prefix, such as <a href="#unsafe_validate_unique/3"><code class="inline">unsafe_validate_unique/3</code></a>.</p>
+<p>On the other hand, constraints rely on the database and are always safe. As a consequence, validations are always checked before constraints. Constraints won't even be checked in case validations failed.</p>
+<p>Let's see an example:</p>
+<pre data-language="elixir">defmodule User do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  schema "users" do
+    field :name
+    field :email
+    field :age, :integer
+  end
+
+  def changeset(user, params \\ %{}) do
+    user
+    |&gt; cast(params, [:name, :email, :age])
+    |&gt; validate_required([:name, :email])
+    |&gt; validate_format(:email, ~r/@/)
+    |&gt; validate_inclusion(:age, 18..100)
+    |&gt; unique_constraint(:email)
+  end
+end</pre>
+<p>In the <code class="inline">changeset/2</code> function above, we define three validations. They check that <code class="inline">name</code> and <code class="inline">email</code> fields are present in the changeset, the e-mail is of the specified format, and the age is between 18 and 100 - as well as a unique constraint in the email field.</p>
+<p>Let's suppose the e-mail is given but the age is invalid. The changeset would have the following errors:</p>
+<pre data-language="elixir">changeset = User.changeset(%User{}, %{age: 0, email: "mary@example.com"})
+{:error, changeset} = Repo.insert(changeset)
+changeset.errors #=&gt; [age: {"is invalid", []}, name: {"can't be blank", []}]</pre>
+<p>In this case, we haven't checked the unique constraint in the e-mail field because the data did not validate. Let's fix the age and the name, and assume that the e-mail already exists in the database:</p>
+<pre data-language="elixir">changeset = User.changeset(%User{}, %{age: 42, name: "Mary", email: "mary@example.com"})
+{:error, changeset} = Repo.insert(changeset)
+changeset.errors #=&gt; [email: {"has already been taken", []}]</pre>
+<p>Validations and constraints define an explicit boundary when the check happens. By moving constraints to the database, we also provide a safe, correct and data-race free means of checking the user input.</p>
+<h3 id="module-deferred-constraints" class="section-heading">  Deferred constraints </h3> <p>Some databases support deferred constraints, i.e., constraints which are checked at the end of the transaction rather than at the end of each statement.</p>
+<p>Changesets do not support this type of constraints. When working with deferred constraints, a violation while invoking <a href="ecto.repo.html#c:insert/2"><code class="inline">Ecto.Repo.insert/2</code></a> or <a href="ecto.repo.html#c:update/2"><code class="inline">Ecto.Repo.update/2</code></a> won't return <code class="inline">{:error, changeset}</code>, but rather raise an error at the end of the transaction.</p>
+<h2 id="module-empty-values" class="section-heading">  Empty values </h2> <p>Many times, the data given on cast needs to be further pruned, specially regarding empty values. For example, if you are gathering data to be cast from the command line or through an HTML form or any other text-based format, it is likely those means cannot express nil values. For those reasons, changesets include the concept of empty values, which are values that will be automatically converted to the field's default value on <a href="#cast/4"><code class="inline">cast/4</code></a>. Those values are stored in the changeset <code class="inline">empty_values</code> field and default to <code class="inline">[""]</code>. You can also pass the <code class="inline">:empty_values</code> option to <a href="#cast/4"><code class="inline">cast/4</code></a> in case you want to change how a particular <a href="#cast/4"><code class="inline">cast/4</code></a> work.</p>
+<h2 id="module-associations-embeds-and-on-replace" class="section-heading">  Associations, embeds and on replace </h2> <p>Using changesets you can work with associations as well as with embedded structs. There are two primary APIs:</p>
+<ul>
+<li><p><a href="#cast_assoc/3"><code class="inline">cast_assoc/3</code></a> and <a href="#cast_embed/3"><code class="inline">cast_embed/3</code></a> - those functions are used when working with external data. In particular, they allow you to change associations and embeds alongside the parent struct, all at once.</p></li>
+<li><p><a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a> and <a href="#put_embed/4"><code class="inline">put_embed/4</code></a> - it allows you to replace the association or embed as a whole. This can be used to move associated data from one entry to another, to completely remove or replace existing entries.</p></li>
+</ul>
+<p>See the documentation for those functions for more information.</p>
+<h3 id="module-the-on_replace-option" class="section-heading">  The <code class="inline">:on_replace</code> option </h3> <p>When using any of those APIs, you may run into situations where Ecto sees data is being replaced. For example, imagine a Post has many Comments where the comments have IDs 1, 2 and 3. If you call <a href="#cast_assoc/3"><code class="inline">cast_assoc/3</code></a> passing only the IDs 1 and 2, Ecto will consider 3 is being "replaced" and it will raise by default. Such behaviour can be changed when defining the relation by setting <code class="inline">:on_replace</code> option when defining your association/embed according to the values below:</p>
+<ul>
+<li>
+<code class="inline">:raise</code> (default) - do not allow removing association or embedded data via parent changesets</li>
+<li>
+<code class="inline">:mark_as_invalid</code> - if attempting to remove the association or embedded data via parent changeset - an error will be added to the parent changeset, and it will be marked as invalid</li>
+<li>
+<code class="inline">:nilify</code> - sets owner reference column to <code class="inline">nil</code> (available only for associations). Use this on a <code class="inline">belongs_to</code> column to allow the association to be cleared out so that it can be set to a new value. Will set <code class="inline">action</code> on associated changesets to <code class="inline">:replace</code>
+</li>
+<li>
+<code class="inline">:update</code> - updates the association, available only for <code class="inline">has_one</code>, <code class="inline">belongs_to</code> and <code class="inline">embeds_one</code>. This option will update all the fields given to the changeset including the id for the association</li>
+<li>
+<code class="inline">:delete</code> - removes the association or related data from the database. This option has to be used carefully (see below). Will set <code class="inline">action</code> on associated changesets to <code class="inline">:replace</code>
+</li>
+<li>
+<code class="inline">:delete_if_exists</code> - like <code class="inline">:delete</code> except that it ignores any stale entry error. For instance, if you set <code class="inline">on_replace: :delete</code> but the replaced resource was already deleted by a separate request, it will raise a <a href="ecto.staleentryerror.html"><code class="inline">Ecto.StaleEntryError</code></a>. <code class="inline">:delete_if_exists</code> makes it so it will only delete if the entry still exists</li>
+</ul>
+<p>The <code class="inline">:delete</code> and <code class="inline">:delete_if_exists</code> options must be used carefully as they allow users to delete any associated data by simply not sending the associated data. If you need deletion, it is often preferred to add a separate boolean virtual field in the schema and manually mark the changeset for deletion if the <code class="inline">:delete</code> field is set in the params, as in the example below. Note that we don't call <a href="#cast/4"><code class="inline">cast/4</code></a> in this case because we don't want to prevent deletion if a change is invalid (changes are irrelevant if the entity needs to be deleted).</p>
+<pre data-language="elixir">defmodule Comment do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  schema "comments" do
+    field :body, :string
+    field :delete, :boolean, virtual: true
+  end
+
+  def changeset(comment, %{"delete" =&gt; "true"}) do
+    %{Ecto.Changeset.change(comment, delete: true) | action: :delete}
+  end
+
+  def changeset(comment, params) do
+    cast(comment, params, [:body])
+  end
+end</pre>
+<h2 id="module-schemaless-changesets" class="section-heading">  Schemaless changesets </h2> <p>In the changeset examples so far, we have always used changesets to validate and cast data contained in a struct defined by an Ecto schema, such as the <code class="inline">%User{}</code> struct defined by the <code class="inline">User</code> module.</p>
+<p>However, changesets can also be used with "regular" structs too by passing a tuple with the data and its types:</p>
+<pre data-language="elixir">user = %User{}
+types = %{first_name: :string, last_name: :string, email: :string}
+changeset =
+  {user, types}
+  |&gt; Ecto.Changeset.cast(params, Map.keys(types))
+  |&gt; Ecto.Changeset.validate_required(...)
+  |&gt; Ecto.Changeset.validate_length(...)</pre>
+<p>where the user struct refers to the definition in the following module:</p>
+<pre data-language="elixir">defmodule User do
+  defstruct [:name, :age]
+end</pre>
+<p>Changesets can also be used with data in a plain map, by following the same API:</p>
+<pre data-language="elixir">data  = %{}
+types = %{name: :string}
+params = %{name: "Callum"}
+changeset =
+  {data, types}
+  |&gt; Ecto.Changeset.cast(params, Map.keys(types))
+  |&gt; Ecto.Changeset.validate_required(...)
+  |&gt; Ecto.Changeset.validate_length(...)</pre>
+<p>Such functionality makes Ecto extremely useful to cast, validate and prune data even if it is not meant to be persisted to the database.</p>
+<h3 id="module-changeset-actions" class="section-heading">  Changeset actions </h3> <p>Changesets have an action field which is usually set by <a href="ecto.repo.html"><code class="inline">Ecto.Repo</code></a> whenever one of the operations such as <code class="inline">insert</code> or <code class="inline">update</code> is called:</p>
+<pre data-language="elixir">changeset = User.changeset(%User{}, %{age: 42, email: "mary@example.com"})
+{:error, changeset} = Repo.insert(changeset)
+changeset.action
+#=&gt; :insert</pre>
+<p>This means that when working with changesets that are not meant to be persisted to the database, such as schemaless changesets, you may need to explicitly set the action to one specific value. Frameworks such as Phoenix use the action value to define how HTML forms should act.</p>
+<p>Instead of setting the action manually, you may use <a href="#apply_action/2"><code class="inline">apply_action/2</code></a> that emulates operations such as <code class="inline">c:Ecto.Repo.insert</code>. <a href="#apply_action/2"><code class="inline">apply_action/2</code></a> will return <code class="inline">{:ok, changes}</code> if the changeset is valid or <code class="inline">{:error, changeset}</code>, with the given <code class="inline">action</code> set in the changeset in case of errors.</p>
+<h2 id="module-the-ecto-changeset-struct" class="section-heading">  The Ecto.Changeset struct </h2> <p>The public fields are:</p>
+<ul>
+<li>
+<code class="inline">valid?</code> - Stores if the changeset is valid</li>
+<li>
+<code class="inline">data</code> - The changeset source data, for example, a struct</li>
+<li>
+<code class="inline">params</code> - The parameters as given on changeset creation</li>
+<li>
+<code class="inline">changes</code> - The <code class="inline">changes</code> from parameters that were approved in casting</li>
+<li>
+<code class="inline">errors</code> - All errors from validations</li>
+<li>
+<code class="inline">required</code> - All required fields as a list of atoms</li>
+<li>
+<code class="inline">action</code> - The action to be performed with the changeset</li>
+<li>
+<code class="inline">types</code> - Cache of the data's field types</li>
+<li>
+<code class="inline">empty_values</code> - A list of values to be considered empty</li>
+<li>
+<code class="inline">repo</code> - The repository applying the changeset (only set after a Repo function is called)</li>
+<li>
+<code class="inline">repo_opts</code> - A keyword list of options given to the underlying repository operation</li>
+</ul>
+<p>The following fields are private and must not be accessed directly.</p>
+<ul>
+<li><code class="inline">validations</code></li>
+<li><code class="inline">constraints</code></li>
+<li><code class="inline">filters</code></li>
+<li><code class="inline">prepare</code></li>
+</ul>
+<h3 id="module-redacting-fields-in-inspect" class="section-heading">  Redacting fields in inspect </h3> <p>To hide a field's value from the inspect protocol of <a href="ecto.changeset.html#content"><code class="inline">Ecto.Changeset</code></a>, mark the field as <code class="inline">redact: true</code> in the schema, and it will display with the value <code class="inline">**redacted**</code>.</p> </section> <section id="summary" class="details-list"> <h1 class="section-heading">  Summary </h1> <h2> Types </h2>
+<dl class="summary-types summary">  <div class="summary-row"> <dt class="summary-signature"> <a href="#t:action/0" translate="no">action()</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:constraint/0" translate="no">constraint()</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:data/0" translate="no">data()</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:error/0" translate="no">error()</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:t/0" translate="no">t()</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:t/1" translate="no">t(data_type)</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:types/0" translate="no">types()</a> </dt> </div> </dl> <h2> Functions </h2>
+<dl class="summary-functions summary">  <div class="summary-row"> <dt class="summary-signature"> <a href="#add_error/4" translate="no">add_error(changeset, key, message, keys \\ [])</a> </dt> <dd class="summary-synopsis"><p>Adds an error to the changeset.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#apply_action!/2" translate="no">apply_action!(changeset, action)</a> </dt> <dd class="summary-synopsis"><p>Applies the changeset action if the changes are valid or raises an error.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#apply_action/2" translate="no">apply_action(changeset, action)</a> </dt> <dd class="summary-synopsis"><p>Applies the changeset action only if the changes are valid.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#apply_changes/1" translate="no">apply_changes(changeset)</a> </dt> <dd class="summary-synopsis"><p>Applies the changeset changes to the changeset data.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#assoc_constraint/3" translate="no">assoc_constraint(changeset, assoc, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Checks the associated field exists.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#cast/4" translate="no">cast(data, params, permitted, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Applies the given <code class="inline">params</code> as changes on the <code class="inline">data</code> according to the set of <code class="inline">permitted</code> keys. Returns a changeset.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#cast_assoc/3" translate="no">cast_assoc(changeset, name, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Casts the given association with the changeset parameters.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#cast_embed/3" translate="no">cast_embed(changeset, name, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Casts the given embed with the changeset parameters.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#change/2" translate="no">change(data, changes \\ %{})</a> </dt> <dd class="summary-synopsis"><p>Wraps the given data in a changeset or adds changes to a changeset.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#check_constraint/3" translate="no">check_constraint(changeset, field, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Checks for a check constraint in the given field.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#constraints/1" translate="no">constraints(changeset)</a> </dt> <dd class="summary-synopsis"><p>Returns all constraints in a changeset.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#delete_change/2" translate="no">delete_change(changeset, key)</a> </dt> <dd class="summary-synopsis"><p>Deletes a change with the given key.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#exclusion_constraint/3" translate="no">exclusion_constraint(changeset, field, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Checks for an exclusion constraint in the given field.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#fetch_change!/2" translate="no">fetch_change!(changeset, key)</a> </dt> <dd class="summary-synopsis"><p>Same as <a href="#fetch_change/2"><code class="inline">fetch_change/2</code></a> but returns the value or raises if the given key was not found.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#fetch_change/2" translate="no">fetch_change(changeset, key)</a> </dt> <dd class="summary-synopsis"><p>Fetches a change from the given changeset.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#fetch_field!/2" translate="no">fetch_field!(changeset, key)</a> </dt> <dd class="summary-synopsis"><p>Same as <a href="#fetch_field/2"><code class="inline">fetch_field/2</code></a> but returns the value or raises if the given key was not found.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#fetch_field/2" translate="no">fetch_field(changeset, key)</a> </dt> <dd class="summary-synopsis"><p>Fetches the given field from changes or from the data.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#force_change/3" translate="no">force_change(changeset, key, value)</a> </dt> <dd class="summary-synopsis"><p>Forces a change on the given <code class="inline">key</code> with <code class="inline">value</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#foreign_key_constraint/3" translate="no">foreign_key_constraint(changeset, field, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Checks for foreign key constraint in the given field.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#get_change/3" translate="no">get_change(changeset, key, default \\ nil)</a> </dt> <dd class="summary-synopsis"><p>Gets a change or returns a default value.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#get_field/3" translate="no">get_field(changeset, key, default \\ nil)</a> </dt> <dd class="summary-synopsis"><p>Gets a field from changes or from the data.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#merge/2" translate="no">merge(changeset1, changeset2)</a> </dt> <dd class="summary-synopsis"><p>Merges two changesets.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#no_assoc_constraint/3" translate="no">no_assoc_constraint(changeset, assoc, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Checks the associated field does not exist.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#optimistic_lock/3" translate="no">optimistic_lock(data_or_changeset, field, incrementer \\ &amp;increment_with_rollover/1)</a> </dt> <dd class="summary-synopsis"><p>Applies optimistic locking to the changeset.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#prepare_changes/2" translate="no">prepare_changes(changeset, function)</a> </dt> <dd class="summary-synopsis"><p>Provides a function executed by the repository on insert/update/delete.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#put_assoc/4" translate="no">put_assoc(changeset, name, value, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Puts the given association entry or entries as a change in the changeset.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#put_change/3" translate="no">put_change(changeset, key, value)</a> </dt> <dd class="summary-synopsis"><p>Puts a change on the given <code class="inline">key</code> with <code class="inline">value</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#put_embed/4" translate="no">put_embed(changeset, name, value, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Puts the given embed entry or entries as a change in the changeset.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#traverse_errors/2" translate="no">traverse_errors(changeset, msg_func)</a> </dt> <dd class="summary-synopsis"><p>Traverses changeset errors and applies the given function to error messages.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#traverse_validations/2" translate="no">traverse_validations(changeset, msg_func)</a> </dt> <dd class="summary-synopsis"><p>Traverses changeset validations and applies the given function to validations.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#unique_constraint/3" translate="no">unique_constraint(changeset, field_or_fields, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Checks for a unique constraint in the given field or list of fields.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#unsafe_validate_unique/4" translate="no">unsafe_validate_unique(changeset, fields, repo, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Validates that no existing record with a different primary key has the same values for these fields.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#update_change/3" translate="no">update_change(changeset, key, function)</a> </dt> <dd class="summary-synopsis"><p>Updates a change.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_acceptance/3" translate="no">validate_acceptance(changeset, field, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Validates the given parameter is true.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_change/3" translate="no">validate_change(changeset, field, validator)</a> </dt> <dd class="summary-synopsis"><p>Validates the given <code class="inline">field</code> change.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_change/4" translate="no">validate_change(changeset, field, metadata, validator)</a> </dt> <dd class="summary-synopsis"><p>Stores the validation <code class="inline">metadata</code> and validates the given <code class="inline">field</code> change.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_confirmation/3" translate="no">validate_confirmation(changeset, field, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Validates that the given parameter matches its confirmation.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_exclusion/4" translate="no">validate_exclusion(changeset, field, data, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Validates a change is not included in the given enumerable.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_format/4" translate="no">validate_format(changeset, field, format, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Validates a change has the given format.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_inclusion/4" translate="no">validate_inclusion(changeset, field, data, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Validates a change is included in the given enumerable.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_length/3" translate="no">validate_length(changeset, field, opts)</a> </dt> <dd class="summary-synopsis"><p>Validates a change is a string or list of the given length.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_number/3" translate="no">validate_number(changeset, field, opts)</a> </dt> <dd class="summary-synopsis"><p>Validates the properties of a number.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_required/3" translate="no">validate_required(changeset, fields, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Validates that one or more fields are present in the changeset.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validate_subset/4" translate="no">validate_subset(changeset, field, data, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Validates a change, of type enum, is a subset of the given enumerable.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#validations/1" translate="no">validations(changeset)</a> </dt> <dd class="summary-synopsis"><p>Returns a keyword list of the validations for this changeset.</p></dd> </div> </dl> </section> <section id="types" class="details-list"> <h1 class="section-heading">  Types </h1> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:action/0">action()<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L309" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type action() :: nil | :insert | :update | :delete | :replace | :ignore | atom()</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:constraint/0">constraint()<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L310" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type constraint() :: %{
+  type: :check | :exclusion | :foreign_key | :unique,
+  constraint: String.t(),
+  match: :exact | :suffix | :prefix,
+  field: atom(),
+  error_message: String.t(),
+  error_type: atom()
+}</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:data/0">data()<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L313" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type data() :: map()</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:error/0">error()<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L308" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type error() :: {String.t(), Keyword.t()}</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:t/0">t()<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L307" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type t() :: t(Ecto.Schema.t() | map() | nil)</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:t/1">t(data_type)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L290" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type t(data_type) :: %Ecto.Changeset{
+  action: action(),
+  changes: %{optional(atom()) =&gt; term()},
+  constraints: [constraint()],
+  data: data_type,
+  empty_values: term(),
+  errors: [{atom(), error()}],
+  filters: %{optional(atom()) =&gt; term()},
+  params: %{optional(String.t()) =&gt; term()} | nil,
+  prepare: [(t() -&gt; t())],
+  repo: atom() | nil,
+  repo_opts: Keyword.t(),
+  required: [atom()],
+  types:
+    nil
+    | %{required(atom()) =&gt; Ecto.Type.t() | {:assoc, term()} | {:embed, term()}},
+  valid?: boolean(),
+  validations: [{atom(), term()}]
+}</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:types/0">types()<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L314" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type types() :: map()</pre> </div> </section> </section> </div> </section> <section id="functions" class="details-list"> <h1 class="section-heading">  Functions </h1> <div class="functions-list"> <section class="detail">  <h3 class="detail-header" id="add_error/4">add_error(changeset, key, message, keys \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1674" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec add_error(t(), atom(), String.t(), Keyword.t()) :: t()</pre> </div> <p>Adds an error to the changeset.</p>
+<p>An additional keyword list <code class="inline">keys</code> can be passed to provide additional contextual information for the error. This is useful when using <a href="#traverse_errors/2"><code class="inline">traverse_errors/2</code></a> and when translating errors with <code class="inline">Gettext</code></p>
+<h4 id="add_error/4-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{}, %{title: ""})
+iex&gt; changeset = add_error(changeset, :title, "empty")
+iex&gt; changeset.errors
+[title: {"empty", []}]
+iex&gt; changeset.valid?
+false
+
+iex&gt; changeset = change(%Post{}, %{title: ""})
+iex&gt; changeset = add_error(changeset, :title, "empty", additional: "info")
+iex&gt; changeset.errors
+[title: {"empty", [additional: "info"]}]
+iex&gt; changeset.valid?
+false
+
+iex&gt; changeset = change(%Post{}, %{tags: ["ecto", "elixir", "x"]})
+iex&gt; changeset = add_error(changeset, :tags, "tag '%{val}' is too short", val: "x")
+iex&gt; changeset.errors
+[tags: {"tag '%{val}' is too short", [val: "x"]}]
+iex&gt; changeset.valid?
+false</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="apply_action!/2">apply_action!(changeset, action)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1574" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec apply_action!(t(), atom()) :: Ecto.Schema.t() | data()</pre> </div> <p>Applies the changeset action if the changes are valid or raises an error.</p>
+<h4 id="apply_action!/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{author: "bar"}, %{title: "foo"})
+iex&gt; apply_action!(changeset, :update)
+%Post{author: "bar", title: "foo"}
+
+iex&gt; changeset = change(%Post{author: "bar"}, %{title: :bad})
+iex&gt; apply_action!(changeset, :update)
+** (Ecto.InvalidChangesetError) could not perform update because changeset is invalid.</pre>
+<p>See <a href="#apply_action/2"><code class="inline">apply_action/2</code></a> for more information.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="apply_action/2">apply_action(changeset, action)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1546" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec apply_action(t(), atom()) :: {:ok, Ecto.Schema.t() | data()} | {:error, t()}</pre> </div> <p>Applies the changeset action only if the changes are valid.</p>
+<p>If the changes are valid, all changes are applied to the changeset data. If the changes are invalid, no changes are applied, and an error tuple is returned with the changeset containing the action that was attempted to be applied.</p>
+<p>The action may be any atom.</p>
+<h4 id="apply_action/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; {:ok, data} = apply_action(changeset, :update)
+
+iex&gt; {:error, changeset} = apply_action(changeset, :update)
+%Ecto.Changeset{action: :update}</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="apply_changes/1">apply_changes(changeset)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1510" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec apply_changes(t()) :: Ecto.Schema.t() | data()</pre> </div> <p>Applies the changeset changes to the changeset data.</p>
+<p>This operation will return the underlying data with changes regardless if the changeset is valid or not. See <a href="#apply_action/2"><code class="inline">apply_action/2</code></a> for a similar function that ensures the changeset is valid.</p>
+<h4 id="apply_changes/1-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{author: "bar"}, %{title: "foo"})
+iex&gt; apply_changes(changeset)
+%Post{author: "bar", title: "foo"}</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="assoc_constraint/3">assoc_constraint(changeset, assoc, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2852" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec assoc_constraint(t(), atom(), Keyword.t()) :: t()</pre> </div> <p>Checks the associated field exists.</p>
+<p>This is similar to <a href="#foreign_key_constraint/3"><code class="inline">foreign_key_constraint/3</code></a> except that the field is inferred from the association definition. This is useful to guarantee that a child will only be created if the parent exists in the database too. Therefore, it only applies to <code class="inline">belongs_to</code> associations.</p>
+<p>As the name says, a constraint is required in the database for this function to work. Such constraint is often added as a reference to the child table:</p>
+<pre data-language="elixir">create table(:comments) do
+  add :post_id, references(:posts)
+end</pre>
+<p>Now, when inserting a comment, it is possible to forbid any comment to be added if the associated post does not exist:</p>
+<pre data-language="elixir">comment
+|&gt; Ecto.Changeset.cast(params, [:post_id])
+|&gt; Ecto.Changeset.assoc_constraint(:post)
+|&gt; Repo.insert</pre>
+<h4 id="assoc_constraint/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:message</code> - the message in case the constraint check fails, defaults to "does not exist"</li>
+<li>
+<code class="inline">:name</code> - the constraint name. By default, the constraint name is inferred from the table + association field. May be required explicitly for complex cases</li>
+<li>
+<code class="inline">:match</code> - how the changeset constraint name is matched against the repo constraint, may be <code class="inline">:exact</code>, <code class="inline">:suffix</code> or <code class="inline">:prefix</code>. Defaults to <code class="inline">:exact</code>. <code class="inline">:suffix</code> matches any repo constraint which <code class="inline">ends_with?</code> <code class="inline">:name</code> to this changeset constraint. <code class="inline">:prefix</code> matches any repo constraint which <code class="inline">starts_with?</code> <code class="inline">:name</code> to this changeset constraint.</li>
+</ul> </section> </section> <section class="detail">  <h3 class="detail-header" id="cast/4">cast(data, params, permitted, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L478" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec cast(
+  Ecto.Schema.t() | t() | {data(), types()},
+  %{required(binary()) =&gt; term()} | %{required(atom()) =&gt; term()} | :invalid,
+  [atom()],
+  Keyword.t()
+) :: t()</pre> </div> <p>Applies the given <code class="inline">params</code> as changes on the <code class="inline">data</code> according to the set of <code class="inline">permitted</code> keys. Returns a changeset.</p>
+<p><code class="inline">data</code> may be either a changeset, a schema struct or a <code class="inline">{data, types}</code> tuple. The second argument is a map of <code class="inline">params</code> that are cast according to the type information from <code class="inline">data</code>. <code class="inline">params</code> is a map with string keys or a map with atom keys, containing potentially invalid data. Mixed keys are not allowed.</p>
+<p>During casting, all <code class="inline">permitted</code> parameters whose values match the specified type information will have their key name converted to an atom and stored together with the value as a change in the <code class="inline">:changes</code> field of the changeset. All parameters that are not explicitly permitted are ignored.</p>
+<p>If casting of all fields is successful, the changeset is returned as valid.</p>
+<p>Note that <a href="#cast/4"><code class="inline">cast/4</code></a> validates the types in the <code class="inline">params</code>, but not in the given <code class="inline">data</code>.</p>
+<h4 id="cast/4-options" class="section-heading">  Options </h4> <ul><li>
+<code class="inline">:empty_values</code> - a list of values to be considered as empty when casting. Empty values are always replaced by the default value of the respective key. Defaults to <code class="inline">[""]</code>
+</li></ul>
+<h4 id="cast/4-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = cast(post, params, [:title])
+iex&gt; if changeset.valid? do
+...&gt;   Repo.update!(changeset)
+...&gt; end</pre>
+<p>Passing a changeset as the first argument:</p>
+<pre data-language="elixir">iex&gt; changeset = cast(post, %{title: "Hello"}, [:title])
+iex&gt; new_changeset = cast(changeset, %{title: "Foo", body: "World"}, [:body])
+iex&gt; new_changeset.params
+%{"title" =&gt; "Hello", "body" =&gt; "World"}</pre>
+<p>Or creating a changeset from a simple map with types:</p>
+<pre data-language="elixir">iex&gt; data = %{title: "hello"}
+iex&gt; types = %{title: :string}
+iex&gt; changeset = cast({data, types}, %{title: "world"}, [:title])
+iex&gt; apply_changes(changeset)
+%{title: "world"}</pre>
+<h4 id="cast/4-composing-casts" class="section-heading">  Composing casts </h4> <p><a href="#cast/4"><code class="inline">cast/4</code></a> also accepts a changeset as its first argument. In such cases, all the effects caused by the call to <a href="#cast/4"><code class="inline">cast/4</code></a> (additional errors and changes) are simply added to the ones already present in the argument changeset. Parameters are merged (<strong>not deep-merged</strong>) and the ones passed to <a href="#cast/4"><code class="inline">cast/4</code></a> take precedence over the ones already in the changeset.</p> </section> </section> <section class="detail">  <h3 class="detail-header" id="cast_assoc/3">cast_assoc(changeset, name, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L748" class="source">Source</a>
+</h3> <section class="docstring"> <p>Casts the given association with the changeset parameters.</p>
+<p>This function should be used when working with the entire association at once (and not a single element of a many-style association) and receiving data external to the application.</p>
+<p><a href="#cast_assoc/3"><code class="inline">cast_assoc/3</code></a> works matching the records extracted from the database and compares it with the parameters received from an external source. Therefore, it is expected that the data in the changeset has explicitly preloaded the association being cast and that all of the IDs exist and are unique.</p>
+<p>For example, imagine a user has many addresses relationship where post data is sent as follows</p>
+<pre data-language="elixir">%{"name" =&gt; "john doe", "addresses" =&gt; [
+  %{"street" =&gt; "somewhere", "country" =&gt; "brazil", "id" =&gt; 1},
+  %{"street" =&gt; "elsewhere", "country" =&gt; "poland"},
+]}</pre>
+<p>and then</p>
+<pre data-language="elixir">User
+|&gt; Repo.get!(id)
+|&gt; Repo.preload(:addresses) # Only required when updating data
+|&gt; Ecto.Changeset.cast(params, [])
+|&gt; Ecto.Changeset.cast_assoc(:addresses, with: &amp;MyApp.Address.changeset/2)</pre>
+<p>The parameters for the given association will be retrieved from <code class="inline">changeset.params</code>. Those parameters are expected to be a map with attributes, similar to the ones passed to <a href="#cast/4"><code class="inline">cast/4</code></a>. Once parameters are retrieved, <a href="#cast_assoc/3"><code class="inline">cast_assoc/3</code></a> will match those parameters with the associations already in the changeset record.</p>
+<p>Once <a href="#cast_assoc/3"><code class="inline">cast_assoc/3</code></a> is called, Ecto will compare each parameter with the user's already preloaded addresses and act as follows:</p>
+<ul>
+<li>If the parameter does not contain an ID, the parameter data will be passed to <code class="inline">MyApp.Address.changeset/2</code> with a new struct and become an insert operation</li>
+<li>If the parameter contains an ID and there is no associated child with such ID, the parameter data will be passed to <code class="inline">MyApp.Address.changeset/2</code> with a new struct and become an insert operation</li>
+<li>If the parameter contains an ID and there is an associated child with such ID, the parameter data will be passed to <code class="inline">MyApp.Address.changeset/2</code> with the existing struct and become an update operation</li>
+<li>If there is an associated child with an ID and its ID is not given as parameter, the <code class="inline">:on_replace</code> callback for that association will be invoked (see the "On replace" section on the module documentation)</li>
+</ul>
+<p>Every time the <code class="inline">MyApp.Address.changeset/2</code> function is invoked, it must return a changeset. Once the parent changeset is given to an <a href="ecto.repo.html"><code class="inline">Ecto.Repo</code></a> function, all entries will be inserted/updated/deleted within the same transaction.</p>
+<p>Note developers are allowed to explicitly set the <code class="inline">:action</code> field of a changeset to instruct Ecto how to act in certain situations. Let's suppose that, if one of the associations has only empty fields, you want to ignore the entry altogether instead of showing an error. The changeset function could be written like this:</p>
+<pre data-language="elixir">def changeset(struct, params) do
+  struct
+  |&gt; cast(params, [:title, :body])
+  |&gt; validate_required([:title, :body])
+  |&gt; case do
+    %{valid?: false, changes: changes} = changeset when changes == %{} -&gt;
+      # If the changeset is invalid and has no changes, it is
+      # because all required fields are missing, so we ignore it.
+      %{changeset | action: :ignore}
+    changeset -&gt;
+      changeset
+  end
+end</pre>
+<h4 id="cast_assoc/3-partial-changes-for-many-style-associations" class="section-heading">  Partial changes for many-style associations </h4> <p>By preloading an association using a custom query you can confine the behavior of <a href="#cast_assoc/3"><code class="inline">cast_assoc/3</code></a>. This opens up the possibility to work on a subset of the data, instead of all associations in the database.</p>
+<p>Taking the initial example of users having addresses imagine those addresses are set up to belong to a country. If you want to allow users to bulk edit all addresses that belong to a single country, you can do so by changing the preload query:</p>
+<pre data-language="elixir">query = from MyApp.Address, where: [country: ^edit_country]
+
+User
+|&gt; Repo.get!(id)
+|&gt; Repo.preload(addresses: query)
+|&gt; Ecto.Changeset.cast(params, [])
+|&gt; Ecto.Changeset.cast_assoc(:addresses)</pre>
+<p>This will allow you to cast and update only the association for the given country. The important point for partial changes is that any addresses, which were not preloaded won't be changed.</p>
+<h4 id="cast_assoc/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:required</code> - if the association is a required field</li>
+<li>
+<code class="inline">:required_message</code> - the message on failure, defaults to "can't be blank"</li>
+<li>
+<code class="inline">:invalid_message</code> - the message on failure, defaults to "is invalid"</li>
+<li>
+<code class="inline">:force_update_on_change</code> - force the parent record to be updated in the repository if there is a change, defaults to <code class="inline">true</code>
+</li>
+<li>
+<code class="inline">:with</code> - the function to build the changeset from params. Defaults to the <code class="inline">changeset/2</code> function of the associated module. It can be changed by passing an anonymous function or an MFA tuple. If using an MFA, the default changeset and parameters arguments will be prepended to the given args. For example, using <code class="inline">with: {Author, :special_changeset, ["hello"]}</code> will be invoked as <code class="inline">Author.special_changeset(changeset, params, "hello")</code>
+</li>
+</ul> </section> </section> <section class="detail">  <h3 class="detail-header" id="cast_embed/3">cast_embed(changeset, name, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L780" class="source">Source</a>
+</h3> <section class="docstring"> <p>Casts the given embed with the changeset parameters.</p>
+<p>The parameters for the given embed will be retrieved from <code class="inline">changeset.params</code>. Those parameters are expected to be a map with attributes, similar to the ones passed to <a href="#cast/4"><code class="inline">cast/4</code></a>. Once parameters are retrieved, <a href="#cast_embed/3"><code class="inline">cast_embed/3</code></a> will match those parameters with the embeds already in the changeset record. See <a href="#cast_assoc/3"><code class="inline">cast_assoc/3</code></a> for an example of working with casts and associations which would also apply for embeds.</p>
+<p>The changeset must have been previously <code class="inline">cast</code> using <a href="#cast/4"><code class="inline">cast/4</code></a> before this function is invoked.</p>
+<h4 id="cast_embed/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:required</code> - if the embed is a required field</li>
+<li>
+<code class="inline">:required_message</code> - the message on failure, defaults to "can't be blank"</li>
+<li>
+<code class="inline">:invalid_message</code> - the message on failure, defaults to "is invalid"</li>
+<li>
+<code class="inline">:force_update_on_change</code> - force the parent record to be updated in the repository if there is a change, defaults to <code class="inline">true</code>
+</li>
+<li>
+<code class="inline">:with</code> - the function to build the changeset from params. Defaults to the <code class="inline">changeset/2</code> function of the embedded module. It can be changed by passing an anonymous function or an MFA tuple. If using an MFA, the default changeset and parameters arguments will be prepended to the given args. For example, using <code class="inline">with: {Author, :special_changeset, ["hello"]}</code> will be invoked as <code class="inline">Author.special_changeset(changeset, params, "hello")</code>
+</li>
+</ul> </section> </section> <section class="detail">  <h3 class="detail-header" id="change/2">change(data, changes \\ %{})<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L383" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec change(
+  Ecto.Schema.t() | t() | {data(), types()},
+  %{required(atom()) =&gt; term()} | Keyword.t()
+) ::
+  t()</pre> </div> <p>Wraps the given data in a changeset or adds changes to a changeset.</p>
+<p><code class="inline">changes</code> is a map or keyword where the key is an atom representing a field, association or embed and the value is a term. Note the <code class="inline">value</code> is directly stored in the changeset with no validation whatsoever. For this reason, this function is meant for working with data internal to the application.</p>
+<p>When changing embeds and associations, see <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a> for a complete reference on the accepted values.</p>
+<p>This function is useful for:</p>
+<ul>
+<li>wrapping a struct inside a changeset</li>
+<li>directly changing a struct without performing castings nor validations</li>
+<li>directly bulk-adding changes to a changeset</li>
+</ul>
+<p>Changed attributes will only be added if the change does not have the same value as the field in the data.</p>
+<p>When a changeset is passed as the first argument, the changes passed as the second argument are merged over the changes already in the changeset if they differ from the values in the struct.</p>
+<p>When a <code class="inline">{data, types}</code> is passed as the first argument, a changeset is created with the given data and types and marked as valid.</p>
+<p>See <a href="#cast/4"><code class="inline">cast/4</code></a> if you'd prefer to cast and validate external parameters.</p>
+<h4 id="change/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{})
+%Ecto.Changeset{...}
+iex&gt; changeset.valid?
+true
+iex&gt; changeset.changes
+%{}
+
+iex&gt; changeset = change(%Post{author: "bar"}, title: "title")
+iex&gt; changeset.changes
+%{title: "title"}
+
+iex&gt; changeset = change(%Post{title: "title"}, title: "title")
+iex&gt; changeset.changes
+%{}
+
+iex&gt; changeset = change(changeset, %{title: "new title", body: "body"})
+iex&gt; changeset.changes.title
+"new title"
+iex&gt; changeset.changes.body
+"body"</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="check_constraint/3">check_constraint(changeset, field, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2619" class="source">Source</a>
+</h3> <section class="docstring"> <p>Checks for a check constraint in the given field.</p>
+<p>The check constraint works by relying on the database to check if the check constraint has been violated or not and, if so, Ecto converts it into a changeset error.</p>
+<p>In order to use the check constraint, the first step is to define the check constraint in a migration:</p>
+<pre data-language="elixir">create constraint("users", :age_must_be_positive, check: "age &gt; 0")</pre>
+<p>Now that a constraint exists, when modifying users, we could annotate the changeset with a check constraint so Ecto knows how to convert it into an error message:</p>
+<pre data-language="elixir">cast(user, params, [:age])
+|&gt; check_constraint(:age, name: :age_must_be_positive)</pre>
+<p>Now, when invoking <a href="ecto.repo.html#c:insert/2"><code class="inline">Ecto.Repo.insert/2</code></a> or <a href="ecto.repo.html#c:update/2"><code class="inline">Ecto.Repo.update/2</code></a>, if the age is not positive, it will be converted into an error and <code class="inline">{:error, changeset}</code> returned by the repository. Note that the error will occur only after hitting the database so it will not be visible until all other validations pass.</p>
+<h4 id="check_constraint/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:message</code> - the message in case the constraint check fails. Defaults to "is invalid"</li>
+<li>
+<code class="inline">:name</code> - the name of the constraint. Required.</li>
+<li>
+<code class="inline">:match</code> - how the changeset constraint name is matched against the repo constraint, may be <code class="inline">:exact</code>, <code class="inline">:suffix</code> or <code class="inline">:prefix</code>. Defaults to <code class="inline">:exact</code>. <code class="inline">:suffix</code> matches any repo constraint which <code class="inline">ends_with?</code> <code class="inline">:name</code> to this changeset constraint. <code class="inline">:prefix</code> matches any repo constraint which <code class="inline">starts_with?</code> <code class="inline">:name</code> to this changeset constraint.</li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="constraints/1">constraints(changeset)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2578" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec constraints(t()) :: [constraint()]</pre> </div> <p>Returns all constraints in a changeset.</p>
+<p>A constraint is a map with the following fields:</p>
+<ul>
+<li>
+<code class="inline">:type</code> - the type of the constraint that will be checked in the database, such as <code class="inline">:check</code>, <code class="inline">:unique</code>, etc</li>
+<li>
+<code class="inline">:constraint</code> - the database constraint name as a string</li>
+<li>
+<code class="inline">:match</code> - the type of match Ecto will perform on a violated constraint against the <code class="inline">:constraint</code> value. It is <code class="inline">:exact</code>, <code class="inline">:suffix</code> or <code class="inline">:prefix</code>
+</li>
+<li>
+<code class="inline">:field</code> - the field a violated constraint will apply the error to</li>
+<li>
+<code class="inline">:error_message</code> - the error message in case of violated constraints</li>
+<li>
+<code class="inline">:error_type</code> - the type of error that identifies the error message</li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="delete_change/2">delete_change(changeset, key)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1490" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec delete_change(t(), atom()) :: t()</pre> </div> <p>Deletes a change with the given key.</p>
+<h4 id="delete_change/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{}, %{title: "foo"})
+iex&gt; changeset = delete_change(changeset, :title)
+iex&gt; get_change(changeset, :title)
+nil</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="exclusion_constraint/3">exclusion_constraint(changeset, field, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2945" class="source">Source</a>
+</h3> <section class="docstring"> <p>Checks for an exclusion constraint in the given field.</p>
+<p>The exclusion constraint works by relying on the database to check if the exclusion constraint has been violated or not and, if so, Ecto converts it into a changeset error.</p>
+<h4 id="exclusion_constraint/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:message</code> - the message in case the constraint check fails, defaults to "violates an exclusion constraint"</li>
+<li>
+<code class="inline">:name</code> - the constraint name. By default, the constraint name is inferred from the table + field. May be required explicitly for complex cases</li>
+<li>
+<code class="inline">:match</code> - how the changeset constraint name is matched against the repo constraint, may be <code class="inline">:exact</code>, <code class="inline">:suffix</code> or <code class="inline">:prefix</code>. Defaults to <code class="inline">:exact</code>. <code class="inline">:suffix</code> matches any repo constraint which <code class="inline">ends_with?</code> <code class="inline">:name</code> to this changeset constraint. <code class="inline">:prefix</code> matches any repo constraint which <code class="inline">starts_with?</code> <code class="inline">:name</code> to this changeset constraint.</li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="fetch_change!/2">fetch_change!(changeset, key)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1113" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec fetch_change!(t(), atom()) :: term()</pre> </div> <p>Same as <a href="#fetch_change/2"><code class="inline">fetch_change/2</code></a> but returns the value or raises if the given key was not found.</p>
+<h4 id="fetch_change!/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{body: "foo"}, %{title: "bar"})
+iex&gt; fetch_change!(changeset, :title)
+"bar"
+iex&gt; fetch_change!(changeset, :body)
+** (KeyError) key :body not found in: %{title: "bar"}</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="fetch_change/2">fetch_change(changeset, key)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1097" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec fetch_change(t(), atom()) :: {:ok, term()} | :error</pre> </div> <p>Fetches a change from the given changeset.</p>
+<p>This function only looks at the <code class="inline">:changes</code> field of the given <code class="inline">changeset</code> and returns <code class="inline">{:ok, value}</code> if the change is present or <code class="inline">:error</code> if it's not.</p>
+<h4 id="fetch_change/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{body: "foo"}, %{title: "bar"})
+iex&gt; fetch_change(changeset, :title)
+{:ok, "bar"}
+iex&gt; fetch_change(changeset, :body)
+:error</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="fetch_field!/2">fetch_field!(changeset, key)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1021" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec fetch_field!(t(), atom()) :: term()</pre> </div> <p>Same as <a href="#fetch_field/2"><code class="inline">fetch_field/2</code></a> but returns the value or raises if the given key was not found.</p>
+<h4 id="fetch_field!/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; post = %Post{title: "Foo", body: "Bar baz bong"}
+iex&gt; changeset = change(post, %{title: "New title"})
+iex&gt; fetch_field!(changeset, :title)
+"New title"
+iex&gt; fetch_field!(changeset, :other)
+** (KeyError) key :other not found in: %Post{...}</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="fetch_field/2">fetch_field(changeset, key)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L996" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec fetch_field(t(), atom()) :: {:changes, term()} | {:data, term()} | :error</pre> </div> <p>Fetches the given field from changes or from the data.</p>
+<p>While <a href="#fetch_change/2"><code class="inline">fetch_change/2</code></a> only looks at the current <code class="inline">changes</code> to retrieve a value, this function looks at the changes and then falls back on the data, finally returning <code class="inline">:error</code> if no value is available.</p>
+<p>For relations, these functions will return the changeset original data with changes applied. To retrieve raw changesets, please use <a href="#fetch_change/2"><code class="inline">fetch_change/2</code></a>.</p>
+<h4 id="fetch_field/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; post = %Post{title: "Foo", body: "Bar baz bong"}
+iex&gt; changeset = change(post, %{title: "New title"})
+iex&gt; fetch_field(changeset, :title)
+{:changes, "New title"}
+iex&gt; fetch_field(changeset, :body)
+{:data, "Bar baz bong"}
+iex&gt; fetch_field(changeset, :not_a_field)
+:error</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="force_change/3">force_change(changeset, key, value)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1462" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec force_change(t(), atom(), term()) :: t()</pre> </div> <p>Forces a change on the given <code class="inline">key</code> with <code class="inline">value</code>.</p>
+<p>If the change is already present, it is overridden with the new value.</p>
+<h4 id="force_change/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{author: "bar"}, %{title: "foo"})
+iex&gt; changeset = force_change(changeset, :title, "bar")
+iex&gt; changeset.changes
+%{title: "bar"}
+
+iex&gt; changeset = force_change(changeset, :author, "bar")
+iex&gt; changeset.changes
+%{title: "bar", author: "bar"}</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="foreign_key_constraint/3">foreign_key_constraint(changeset, field, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2806" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec foreign_key_constraint(t(), atom(), Keyword.t()) :: t()</pre> </div> <p>Checks for foreign key constraint in the given field.</p>
+<p>The foreign key constraint works by relying on the database to check if the associated data exists or not. This is useful to guarantee that a child will only be created if the parent exists in the database too.</p>
+<p>In order to use the foreign key constraint the first step is to define the foreign key in a migration. This is often done with references. For example, imagine you are creating a comments table that belongs to posts. One would have:</p>
+<pre data-language="elixir">create table(:comments) do
+  add :post_id, references(:posts)
+end</pre>
+<p>By default, Ecto will generate a foreign key constraint with name "comments_post_id_fkey" (the name is configurable).</p>
+<p>Now that a constraint exists, when creating comments, we could annotate the changeset with foreign key constraint so Ecto knows how to convert it into an error message:</p>
+<pre data-language="elixir">cast(comment, params, [:post_id])
+|&gt; foreign_key_constraint(:post_id)</pre>
+<p>Now, when invoking <a href="ecto.repo.html#c:insert/2"><code class="inline">Ecto.Repo.insert/2</code></a> or <a href="ecto.repo.html#c:update/2"><code class="inline">Ecto.Repo.update/2</code></a>, if the associated post does not exist, it will be converted into an error and <code class="inline">{:error, changeset}</code> returned by the repository.</p>
+<h4 id="foreign_key_constraint/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:message</code> - the message in case the constraint check fails, defaults to "does not exist"</li>
+<li>
+<code class="inline">:name</code> - the constraint name. By default, the constraint name is inferred from the table + field. May be required explicitly for complex cases</li>
+<li>
+<code class="inline">:match</code> - how the changeset constraint name is matched against the repo constraint, may be <code class="inline">:exact</code>, <code class="inline">:suffix</code> or <code class="inline">:prefix</code>. Defaults to <code class="inline">:exact</code>. <code class="inline">:suffix</code> matches any repo constraint which <code class="inline">ends_with?</code> <code class="inline">:name</code> to this changeset constraint. <code class="inline">:prefix</code> matches any repo constraint which <code class="inline">starts_with?</code> <code class="inline">:name</code> to this changeset constraint.</li>
+</ul> </section> </section> <section class="detail">  <h3 class="detail-header" id="get_change/3">get_change(changeset, key, default \\ nil)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1136" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec get_change(t(), atom(), term()) :: term()</pre> </div> <p>Gets a change or returns a default value.</p>
+<h4 id="get_change/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{body: "foo"}, %{title: "bar"})
+iex&gt; get_change(changeset, :title)
+"bar"
+iex&gt; get_change(changeset, :body)
+nil</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="get_field/3">get_field(changeset, key, default \\ nil)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1051" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec get_field(t(), atom(), term()) :: term()</pre> </div> <p>Gets a field from changes or from the data.</p>
+<p>While <a href="#get_change/3"><code class="inline">get_change/3</code></a> only looks at the current <code class="inline">changes</code> to retrieve a value, this function looks at the changes and then falls back on the data, finally returning <code class="inline">default</code> if no value is available.</p>
+<p>For relations, these functions will return the changeset data with changes applied. To retrieve raw changesets, please use <a href="#get_change/3"><code class="inline">get_change/3</code></a>.</p>
+<pre data-language="elixir">iex&gt; post = %Post{title: "A title", body: "My body is a cage"}
+iex&gt; changeset = change(post, %{title: "A new title"})
+iex&gt; get_field(changeset, :title)
+"A new title"
+iex&gt; get_field(changeset, :not_a_field, "Told you, not a field!")
+"Told you, not a field!"</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="merge/2">merge(changeset1, changeset2)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L932" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec merge(t(), t()) :: t()</pre> </div> <p>Merges two changesets.</p>
+<p>This function merges two changesets provided they have been applied to the same data (their <code class="inline">:data</code> field is equal); if the data differs, an <a href="https://hexdocs.pm/elixir/ArgumentError.html"><code class="inline">ArgumentError</code></a> exception is raised. If one of the changesets has a <code class="inline">:repo</code> field which is not <code class="inline">nil</code>, then the value of that field is used as the <code class="inline">:repo</code> field of the resulting changeset; if both changesets have a non-<code class="inline">nil</code> and different <code class="inline">:repo</code> field, an <a href="https://hexdocs.pm/elixir/ArgumentError.html"><code class="inline">ArgumentError</code></a> exception is raised.</p>
+<p>The other fields are merged with the following criteria:</p>
+<ul>
+<li>
+<code class="inline">params</code> - params are merged (not deep-merged) giving precedence to the params of <code class="inline">changeset2</code> in case of a conflict. If both changesets have their <code class="inline">:params</code> fields set to <code class="inline">nil</code>, the resulting changeset will have its params set to <code class="inline">nil</code> too.</li>
+<li>
+<code class="inline">changes</code> - changes are merged giving precedence to the <code class="inline">changeset2</code> changes.</li>
+<li>
+<code class="inline">errors</code> and <code class="inline">validations</code> - they are simply concatenated.</li>
+<li>
+<code class="inline">required</code> - required fields are merged; all the fields that appear in the required list of both changesets are moved to the required list of the resulting changeset.</li>
+</ul>
+<h4 id="merge/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset1 = cast(%Post{}, %{title: "Title"}, [:title])
+iex&gt; changeset2 = cast(%Post{}, %{title: "New title", body: "Body"}, [:title, :body])
+iex&gt; changeset = merge(changeset1, changeset2)
+iex&gt; changeset.changes
+%{body: "Body", title: "New title"}
+
+iex&gt; changeset1 = cast(%Post{body: "Body"}, %{title: "Title"}, [:title])
+iex&gt; changeset2 = cast(%Post{}, %{title: "New title"}, [:title])
+iex&gt; merge(changeset1, changeset2)
+** (ArgumentError) different :data when merging changesets</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="no_assoc_constraint/3">no_assoc_constraint(changeset, assoc, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2908" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec no_assoc_constraint(t(), atom(), Keyword.t()) :: t()</pre> </div> <p>Checks the associated field does not exist.</p>
+<p>This is similar to <a href="#foreign_key_constraint/3"><code class="inline">foreign_key_constraint/3</code></a> except that the field is inferred from the association definition. This is useful to guarantee that parent can only be deleted (or have its primary key changed) if no child exists in the database. Therefore, it only applies to <code class="inline">has_*</code> associations.</p>
+<p>As the name says, a constraint is required in the database for this function to work. Such constraint is often added as a reference to the child table:</p>
+<pre data-language="elixir">create table(:comments) do
+  add :post_id, references(:posts)
+end</pre>
+<p>Now, when deleting the post, it is possible to forbid any post to be deleted if they still have comments attached to it:</p>
+<pre data-language="elixir">post
+|&gt; Ecto.Changeset.change
+|&gt; Ecto.Changeset.no_assoc_constraint(:comments)
+|&gt; Repo.delete</pre>
+<h4 id="no_assoc_constraint/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:message</code> - the message in case the constraint check fails, defaults to "is still associated with this entry" (for <code class="inline">has_one</code>) and "are still associated with this entry" (for <code class="inline">has_many</code>)</li>
+<li>
+<code class="inline">:name</code> - the constraint name. By default, the constraint name is inferred from the association table + association field. May be required explicitly for complex cases</li>
+<li>
+<code class="inline">:match</code> - how the changeset constraint name is matched against the repo constraint, may be <code class="inline">:exact</code>, <code class="inline">:suffix</code> or <code class="inline">:prefix</code>. Defaults to <code class="inline">:exact</code>. <code class="inline">:suffix</code> matches any repo constraint which <code class="inline">ends_with?</code> <code class="inline">:name</code> to this changeset constraint. <code class="inline">:prefix</code> matches any repo constraint which <code class="inline">starts_with?</code> <code class="inline">:name</code> to this changeset constraint.</li>
+</ul> </section> </section> <section class="detail">  <h3 class="detail-header" id="optimistic_lock/3">optimistic_lock(data_or_changeset, field, incrementer \\ &amp;increment_with_rollover/1)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2496" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec optimistic_lock(Ecto.Schema.t() | t(), atom(), (term() -&gt; term())) :: t()</pre> </div> <p>Applies optimistic locking to the changeset.</p>
+<p><a href="https://en.wikipedia.org/wiki/Optimistic_concurrency_control">Optimistic locking</a> (or <em>optimistic concurrency control</em>) is a technique that allows concurrent edits on a single record. While pessimistic locking works by locking a resource for an entire transaction, optimistic locking only checks if the resource changed before updating it.</p>
+<p>This is done by regularly fetching the record from the database, then checking whether another user has made changes to the record <em>only when updating the record</em>. This behaviour is ideal in situations where the chances of concurrent updates to the same record are low; if they're not, pessimistic locking or other concurrency patterns may be more suited.</p>
+<h4 id="optimistic_lock/3-usage" class="section-heading">  Usage </h4> <p>Optimistic locking works by keeping a "version" counter for each record; this counter gets incremented each time a modification is made to a record. Hence, in order to use optimistic locking, a field must exist in your schema for versioning purpose. Such field is usually an integer but other types are supported.</p>
+<h4 id="optimistic_lock/3-examples" class="section-heading">  Examples </h4> <p>Assuming we have a <code class="inline">Post</code> schema (stored in the <code class="inline">posts</code> table), the first step is to add a version column to the <code class="inline">posts</code> table:</p>
+<pre data-language="elixir">alter table(:posts) do
+  add :lock_version, :integer, default: 1
+end</pre>
+<p>The column name is arbitrary and doesn't need to be <code class="inline">:lock_version</code>. Now add a field to the schema too:</p>
+<pre data-language="elixir">defmodule Post do
+  use Ecto.Schema
+
+  schema "posts" do
+    field :title, :string
+    field :lock_version, :integer, default: 1
+  end
+
+  def changeset(:update, struct, params \\ %{}) do
+    struct
+    |&gt; Ecto.Changeset.cast(params, [:title])
+    |&gt; Ecto.Changeset.optimistic_lock(:lock_version)
+  end
+end</pre>
+<p>Now let's take optimistic locking for a spin:</p>
+<pre data-language="elixir">iex&gt; post = Repo.insert!(%Post{title: "foo"})
+%Post{id: 1, title: "foo", lock_version: 1}
+iex&gt; valid_change = Post.changeset(:update, post, %{title: "bar"})
+iex&gt; stale_change = Post.changeset(:update, post, %{title: "baz"})
+iex&gt; Repo.update!(valid_change)
+%Post{id: 1, title: "bar", lock_version: 2}
+iex&gt; Repo.update!(stale_change)
+** (Ecto.StaleEntryError) attempted to update a stale entry:
+
+%Post{id: 1, title: "baz", lock_version: 1}</pre>
+<p>When a conflict happens (a record which has been previously fetched is being updated, but that same record has been modified since it was fetched), an <a href="ecto.staleentryerror.html"><code class="inline">Ecto.StaleEntryError</code></a> exception is raised.</p>
+<p>Optimistic locking also works with delete operations. Just call the <a href="#optimistic_lock/3"><code class="inline">optimistic_lock/3</code></a> function with the data before delete:</p>
+<pre data-language="elixir">iex&gt; changeset = Ecto.Changeset.optimistic_lock(post, :lock_version)
+iex&gt; Repo.delete(changeset)</pre>
+<p><a href="#optimistic_lock/3"><code class="inline">optimistic_lock/3</code></a> by default assumes the field being used as a lock is an integer. If you want to use another type, you need to pass the third argument customizing how the next value is generated:</p>
+<pre data-language="elixir">iex&gt; Ecto.Changeset.optimistic_lock(post, :lock_uuid, fn _ -&gt; Ecto.UUID.generate end)</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="prepare_changes/2">prepare_changes(changeset, function)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2556" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec prepare_changes(t(), (t() -&gt; t())) :: t()</pre> </div> <p>Provides a function executed by the repository on insert/update/delete.</p>
+<p>If the changeset given to the repository is valid, the function given to <a href="#prepare_changes/2"><code class="inline">prepare_changes/2</code></a> will be called with the changeset and must return a changeset, allowing developers to do final adjustments to the changeset or to issue data consistency commands. The repository itself can be accessed inside the function under the <code class="inline">repo</code> field in the changeset. If the changeset given to the repository is invalid, the function will not be invoked.</p>
+<p>The given function is guaranteed to run inside the same transaction as the changeset operation for databases that do support transactions.</p>
+<h4 id="prepare_changes/2-example" class="section-heading">  Example </h4> <p>A common use case is updating a counter cache, in this case updating a post's comment count when a comment is created:</p>
+<pre data-language="elixir">def create_comment(comment, params) do
+  comment
+  |&gt; cast(params, [:body, :post_id])
+  |&gt; prepare_changes(fn changeset -&gt;
+       if post_id = get_change(changeset, :post_id) do
+         query = from Post, where: [id: ^post_id]
+         changeset.repo.update_all(query, inc: [comment_count: 1])
+       end
+       changeset
+     end)
+end</pre>
+<p>We retrieve the repo from the comment changeset itself and use update_all to update the counter cache in one query. Finally, the original changeset must be returned.</p> </section> </section> <section class="detail">  <h3 class="detail-header" id="put_assoc/4">put_assoc(changeset, name, value, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1406" class="source">Source</a>
+</h3> <section class="docstring"> <p>Puts the given association entry or entries as a change in the changeset.</p>
+<p>This function is used to work with associations as a whole. For example, if a Post has many Comments, it allows you to add, remove or change all comments at once. If your goal is to simply add a new comment to a post, then it is preferred to do so manually, as we will describe later in the "Example: Adding a comment to a post" section.</p>
+<p>This function requires the associated data to have been preloaded, except when the parent changeset has been newly built and not yet persisted. Missing data will invoke the <code class="inline">:on_replace</code> behaviour defined on the association.</p>
+<p>For associations with cardinality one, <code class="inline">nil</code> can be used to remove the existing entry. For associations with many entries, an empty list may be given instead.</p>
+<p>If the association has no changes, it will be skipped. If the association is invalid, the changeset will be marked as invalid. If the given value is not any of values below, it will raise.</p>
+<p>The associated data may be given in different formats:</p>
+<ul>
+<li>
+<p>a map or a keyword list representing changes to be applied to the associated data. A map or keyword list can be given to update the associated data as long as they have matching primary keys. For example, <code class="inline">put_assoc(changeset, :comments, [%{id: 1, title: "changed"}])</code> will locate the comment with <code class="inline">:id</code> of 1 and update its title. If no comment with such id exists, one is created on the fly. Since only a single comment was given, any other associated comment will be replaced. On all cases, it is expected the keys to be atoms. Opposite to <code class="inline">cast_assoc</code> and <code class="inline">embed_assoc</code>, the given map (or struct) is not validated in any way and will be inserted as is. This API is mostly used in scripts and tests, to make it straight- forward to create schemas with associations at once, such as:</p>
+<pre data-language="elixir">Ecto.Changeset.change(
+  %Post{},
+  title: "foo",
+  comments: [
+    %{body: "first"},
+    %{body: "second"}
+  ]
+)</pre>
+</li>
+<li><p>changesets - when changesets are given, they are treated as the canonical data and the associated data currently stored in the association is either updated or replaced. For example, if you call <code class="inline">put_assoc(post_changeset, :comments, [list_of_comments_changesets])</code>, all comments with matching IDs will be updated according to the changesets. New comments or comments not associated to any post will be correctly associated. Currently associated comments that do not have a matching ID in the list of changesets will act according to the <code class="inline">:on_replace</code> association configuration (you can chose to raise, ignore the operation, update or delete them). If there are changes in any of the changesets, they will be persisted too.</p></li>
+<li><p>structs - when structs are given, they are treated as the canonical data and the associated data currently stored in the association is replaced. For example, if you call <code class="inline">put_assoc(post_changeset, :comments, [list_of_comments_structs])</code>, all comments with matching IDs will be replaced by the new structs. New comments or comments not associated to any post will be correctly associated. Currently associated comments that do not have a matching ID in the list of changesets will act according to the <code class="inline">:on_replace</code> association configuration (you can chose to raise, ignore the operation, update or delete them). Different to passing changesets, structs are not change tracked in any fashion. In other words, if you change a comment struct and give it to <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a>, the updates in the struct won't be persisted. You must use changesets instead. <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a> with structs only takes care of guaranteeing that the comments and the parent data are associated. This is extremely useful when associating existing data, as we will see in the "Example: Adding tags to a post" section.</p></li>
+</ul>
+<p>Once the parent changeset is given to an <a href="ecto.repo.html"><code class="inline">Ecto.Repo</code></a> function, all entries will be inserted/updated/deleted within the same transaction.</p>
+<h4 id="put_assoc/4-example-adding-a-comment-to-a-post" class="section-heading">  Example: Adding a comment to a post </h4> <p>Imagine a relationship where Post has many comments and you want to add a new comment to an existing post. While it is possible to use <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a> for this, it would be unnecessarily complex. Let's see an example.</p>
+<p>First, let's fetch the post with all existing comments:</p>
+<pre data-language="elixir">post = Post |&gt; Repo.get!(1) |&gt; Repo.preload(:comments)</pre>
+<p>The following approach is <strong>wrong</strong>:</p>
+<pre data-language="elixir">post
+|&gt; Ecto.Changeset.change()
+|&gt; Ecto.Changeset.put_assoc(:comments, [%Comment{body: "bad example!"}])
+|&gt; Repo.update!()</pre>
+<p>The reason why the example above is wrong is because <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a> always works with the <strong>full data</strong>. So the example above will effectively <strong>erase all previous comments</strong> and only keep the comment you are currently adding. Instead, you could try:</p>
+<pre data-language="elixir">post
+|&gt; Ecto.Changeset.change()
+|&gt; Ecto.Changeset.put_assoc(:comments, [%Comment{body: "so-so example!"} | post.comments])
+|&gt; Repo.update!()</pre>
+<p>In this example, we prepend the new comment to the list of existing comments. Ecto will diff the list of comments currently in <code class="inline">post</code> with the list of comments given, and correctly insert the new comment to the database. Note, however, Ecto is doing a lot of work just to figure out something we knew since the beginning, which is that there is only one new comment.</p>
+<p>In cases like above, when you want to work only on a single entry, it is much easier to simply work on the associated directly. For example, we could instead set the <code class="inline">post</code> association in the comment:</p>
+<pre data-language="elixir">%Comment{body: "better example"}
+|&gt; Ecto.Changeset.change()
+|&gt; Ecto.Changeset.put_assoc(:post, post)
+|&gt; Repo.insert!()</pre>
+<p>Alternatively, we can make sure that when we create a comment, it is already associated to the post:</p>
+<pre data-language="elixir">Ecto.build_assoc(post, :comments)
+|&gt; Ecto.Changeset.change(body: "great example!")
+|&gt; Repo.insert!()</pre>
+<p>Or we can simply set the post_id in the comment itself:</p>
+<pre data-language="elixir">%Comment{body: "better example", post_id: post.id}
+|&gt; Repo.insert!()</pre>
+<p>In other words, when you find yourself wanting to work only with a subset of the data, then using <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a> is most likely unnecessary. Instead, you want to work on the other side of the association.</p>
+<p>Let's see an example where using <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a> is a good fit.</p>
+<h4 id="put_assoc/4-example-adding-tags-to-a-post" class="section-heading">  Example: Adding tags to a post </h4> <p>Imagine you are receiving a set of tags you want to associate to a post. Let's imagine that those tags exist upfront and are all persisted to the database. Imagine we get the data in this format:</p>
+<pre data-language="elixir">params = %{"title" =&gt; "new post", "tags" =&gt; ["learner"]}</pre>
+<p>Now, since the tags already exist, we will bring all of them from the database and put them directly in the post:</p>
+<pre data-language="elixir">tags = Repo.all(from t in Tag, where: t.name in ^params["tags"])
+
+post
+|&gt; Repo.preload(:tags)
+|&gt; Ecto.Changeset.cast(params, [:title]) # No need to allow :tags as we put them directly
+|&gt; Ecto.Changeset.put_assoc(:tags, tags) # Explicitly set the tags</pre>
+<p>Since in this case we always require the user to pass all tags directly, using <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a> is a great fit. It will automatically remove any tag not given and properly associate all of the given tags with the post.</p>
+<p>Furthermore, since the tag information is given as structs read directly from the database, Ecto will treat the data as correct and only do the minimum necessary to guarantee that posts and tags are associated, without trying to update or diff any of the fields in the tag struct.</p>
+<p>Although it accepts an <code class="inline">opts</code> argument, there are no options currently supported by <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="put_change/3">put_change(changeset, key, value)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1195" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec put_change(t(), atom(), term()) :: t()</pre> </div> <p>Puts a change on the given <code class="inline">key</code> with <code class="inline">value</code>.</p>
+<p><code class="inline">key</code> is an atom that represents any field, embed or association in the changeset. Note the <code class="inline">value</code> is directly stored in the changeset with no validation whatsoever. For this reason, this function is meant for working with data internal to the application.</p>
+<p>If the change is already present, it is overridden with the new value. If the change has the same value as in the changeset data, it is not added to the list of changes.</p>
+<p>When changing embeds and associations, see <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a> for a complete reference on the accepted values.</p>
+<h4 id="put_change/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{}, %{title: "foo"})
+iex&gt; changeset = put_change(changeset, :title, "bar")
+iex&gt; changeset.changes
+%{title: "bar"}
+
+iex&gt; changeset = change(%Post{title: "foo"})
+iex&gt; changeset = put_change(changeset, :title, "foo")
+iex&gt; changeset.changes
+%{}</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="put_embed/4">put_embed(changeset, name, value, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1427" class="source">Source</a>
+</h3> <section class="docstring"> <p>Puts the given embed entry or entries as a change in the changeset.</p>
+<p>This function is used to work with embeds as a whole. For embeds with cardinality one, <code class="inline">nil</code> can be used to remove the existing entry. For embeds with many entries, an empty list may be given instead.</p>
+<p>If the embed has no changes, it will be skipped. If the embed is invalid, the changeset will be marked as invalid.</p>
+<p>The list of supported values and their behaviour is described in <a href="#put_assoc/4"><code class="inline">put_assoc/4</code></a>. If the given value is not any of values listed there, it will raise.</p>
+<p>Although this function accepts an <code class="inline">opts</code> argument, there are no options currently supported by <a href="#put_embed/4"><code class="inline">put_embed/4</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="traverse_errors/2">traverse_errors(changeset, msg_func)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L3036" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec traverse_errors(
+  t(),
+  (error() -&gt; String.t()) | (t(), atom(), error() -&gt; String.t())
+) :: %{
+  required(atom()) =&gt; [term()]
+}</pre> </div> <p>Traverses changeset errors and applies the given function to error messages.</p>
+<p>This function is particularly useful when associations and embeds are cast in the changeset as it will traverse all associations and embeds and place all errors in a series of nested maps.</p>
+<p>A changeset is supplied along with a function to apply to each error message as the changeset is traversed. The error message function receives an error tuple <code class="inline">{msg, opts}</code>, for example:</p>
+<pre data-language="elixir">{"should be at least %{count} characters", [count: 3, validation: :length, min: 3]}</pre>
+<h4 id="traverse_errors/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; traverse_errors(changeset, fn {msg, opts} -&gt;
+...&gt;   Regex.replace(~r"%{(\w+)}", msg, fn _, key -&gt;
+...&gt;     opts |&gt; Keyword.get(String.to_existing_atom(key), key) |&gt; to_string()
+...&gt;   end)
+...&gt; end)
+%{title: ["should be at least 3 characters"]}</pre>
+<p>Optionally function can accept three arguments: <code class="inline">changeset</code>, <code class="inline">field</code> and error tuple <code class="inline">{msg, opts}</code>. It is useful whenever you want to extract validations rules from <code class="inline">changeset.validations</code> to build detailed error description.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="traverse_validations/2">traverse_validations(changeset, msg_func)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L3125" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec traverse_validations(
+  t(),
+  (error() -&gt; String.t()) | (t(), atom(), error() -&gt; String.t())
+) :: %{
+  required(atom()) =&gt; [term()]
+}</pre> </div> <p>Traverses changeset validations and applies the given function to validations.</p>
+<p>This behaves the same as <a href="#traverse_errors/2"><code class="inline">traverse_errors/2</code></a>, but operates on changeset validations instead of errors.</p>
+<h4 id="traverse_validations/2-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; traverse_validations(changeset, &amp;(&amp;1))
+%{title: [format: ~r/pattern/, length: [min: 1, max: 20]]}
+
+iex&gt; traverse_validations(changeset, fn
+...&gt;   {:length, opts} -&gt; {:length, "#{Keyword.get(opts, :min, 0)}-#{Keyword.get(opts, :max, 32)}"}
+...&gt;   {:format, %Regex{source: source}} -&gt; {:format, "/#{source}/"}
+...&gt;   {other, opts} -&gt; {other, inspect(opts)}
+...&gt; end)
+%{title: [format: "/pattern/", length: "1-20"]}</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="unique_constraint/3">unique_constraint(changeset, field_or_fields, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2741" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec unique_constraint(t(), atom() | [atom(), ...], Keyword.t()) :: t()</pre> </div> <p>Checks for a unique constraint in the given field or list of fields.</p>
+<p>The unique constraint works by relying on the database to check if the unique constraint has been violated or not and, if so, Ecto converts it into a changeset error.</p>
+<p>In order to use the uniqueness constraint, the first step is to define the unique index in a migration:</p>
+<pre data-language="elixir">create unique_index(:users, [:email])</pre>
+<p>Now that a constraint exists, when modifying users, we could annotate the changeset with a unique constraint so Ecto knows how to convert it into an error message:</p>
+<pre data-language="elixir">cast(user, params, [:email])
+|&gt; unique_constraint(:email)</pre>
+<p>Now, when invoking <a href="ecto.repo.html#c:insert/2"><code class="inline">Ecto.Repo.insert/2</code></a> or <a href="ecto.repo.html#c:update/2"><code class="inline">Ecto.Repo.update/2</code></a>, if the email already exists, it will be converted into an error and <code class="inline">{:error, changeset}</code> returned by the repository. Note that the error will occur only after hitting the database so it will not be visible until all other validations pass.</p>
+<h4 id="unique_constraint/3-options" class="section-heading">  Options </h4> <ul>
+<li><p><code class="inline">:message</code> - the message in case the constraint check fails, defaults to "has already been taken"</p></li>
+<li><p><code class="inline">:name</code> - the constraint name. By default, the constraint name is inferred from the table + field(s). May be required explicitly for complex cases</p></li>
+<li><p><code class="inline">:match</code> - how the changeset constraint name is matched against the repo constraint, may be <code class="inline">:exact</code>, <code class="inline">:suffix</code> or <code class="inline">:prefix</code>. Defaults to <code class="inline">:exact</code>. <code class="inline">:suffix</code> matches any repo constraint which <code class="inline">ends_with?</code> <code class="inline">:name</code> to this changeset constraint. <code class="inline">:prefix</code> matches any repo constraint which <code class="inline">starts_with?</code> <code class="inline">:name</code> to this changeset constraint.</p></li>
+<li><p><code class="inline">:error_key</code> - the key to which changeset error will be added when check fails, defaults to the first field name of the given list of fields.</p></li>
+</ul>
+<h4 id="unique_constraint/3-complex-constraints" class="section-heading">  Complex constraints </h4> <p>Because the constraint logic is in the database, we can leverage all the database functionality when defining them. For example, let's suppose the e-mails are scoped by company id:</p>
+<pre data-language="elixir"># In migration
+create unique_index(:users, [:email, :company_id])
+
+# In the changeset function
+cast(user, params, [:email])
+|&gt; unique_constraint([:email, :company_id])</pre>
+<p>The first field name, <code class="inline">:email</code> in this case, will be used as the error key to the changeset errors keyword list. For example, the above <a href="#unique_constraint/3"><code class="inline">unique_constraint/3</code></a> would generate something like:</p>
+<pre data-language="elixir">Repo.insert!(%User{email: "john@elixir.org", company_id: 1})
+changeset = User.changeset(%User{}, %{email: "john@elixir.org", company_id: 1})
+{:error, changeset} = Repo.insert(changeset)
+changeset.errors #=&gt; [email: {"has already been taken", []}]</pre>
+<p>In complex cases, instead of relying on name inference, it may be best to set the constraint name explicitly:</p>
+<pre data-language="elixir"># In the migration
+create unique_index(:users, [:email, :company_id], name: :users_email_company_id_index)
+
+# In the changeset function
+cast(user, params, [:email])
+|&gt; unique_constraint(:email, name: :users_email_company_id_index)</pre>
+<h3 id="unique_constraint/3-partitioning" class="section-heading">  Partitioning </h3> <p>If your table is partitioned, then your unique index might look different per partition, e.g. Postgres adds p&lt;number&gt; to the middle of your key, like:</p>
+<pre data-language="elixir">users_p0_email_key
+users_p1_email_key
+...
+users_p99_email_key</pre>
+<p>In this case you can use the name and suffix options together to match on these dynamic indexes, like:</p>
+<pre data-language="elixir">cast(user, params, [:email])
+|&gt; unique_constraint(:email, name: :email_key, match: :suffix)</pre>
+<h4 id="unique_constraint/3-case-sensitivity" class="section-heading">  Case sensitivity </h4> <p>Unfortunately, different databases provide different guarantees when it comes to case-sensitiveness. For example, in MySQL, comparisons are case-insensitive by default. In Postgres, users can define case insensitive column by using the <code class="inline">:citext</code> type/extension. In your migration:</p>
+<pre data-language="elixir">execute "CREATE EXTENSION IF NOT EXISTS citext"
+create table(:users) do
+  ...
+  add :email, :citext
+  ...
+end</pre>
+<p>If for some reason your database does not support case insensitive columns, you can explicitly downcase values before inserting/updating them:</p>
+<pre data-language="elixir">cast(data, params, [:email])
+|&gt; update_change(:email, &amp;String.downcase/1)
+|&gt; unique_constraint(:email)</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="unsafe_validate_unique/4">unsafe_validate_unique(changeset, fields, repo, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1870" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec unsafe_validate_unique(t(), atom() | [atom(), ...], Ecto.Repo.t(), Keyword.t()) ::
+  t()</pre> </div> <p>Validates that no existing record with a different primary key has the same values for these fields.</p>
+<p>This function exists to provide quick feedback to users of your application. It should not be relied on for any data guarantee as it has race conditions and is inherently unsafe. For example, if this check happens twice in the same time interval (because the user submitted a form twice), both checks may pass and you may end-up with duplicate entries in the database. Therefore, a <a href="#unique_constraint/3"><code class="inline">unique_constraint/3</code></a> should also be used to ensure your data won't get corrupted.</p>
+<p>However, because constraints are only checked if all validations succeed, this function can be used as an early check to provide early feedback to users, since most conflicting data will have been inserted prior to the current validation phase.</p>
+<h4 id="unsafe_validate_unique/4-options" class="section-heading">  Options </h4> <ul>
+<li><p><code class="inline">:message</code> - the message in case the constraint check fails, defaults to "has already been taken".</p></li>
+<li><p><code class="inline">:match</code> - how the changeset constraint name is matched against the repo constraint, may be <code class="inline">:exact</code> or <code class="inline">:suffix</code>. Defaults to <code class="inline">:exact</code>. <code class="inline">:suffix</code> matches any repo constraint which <code class="inline">ends_with?</code> <code class="inline">:name</code> to this changeset constraint.</p></li>
+<li><p><code class="inline">:error_key</code> - the key to which changeset error will be added when check fails, defaults to the first field name of the given list of fields.</p></li>
+<li><p><code class="inline">:prefix</code> - the prefix to run the query on (such as the schema path in Postgres or the database in MySQL). See <a href="ecto.repo.html"><code class="inline">Ecto.Repo</code></a> documentation for more information.</p></li>
+<li><p><code class="inline">:repo_opts</code> - the options to pass to the <a href="ecto.repo.html"><code class="inline">Ecto.Repo</code></a> call.</p></li>
+<li><p><code class="inline">:query</code> - the base query to use for the check. Defaults to the schema of the changeset. If the primary key is set, a clause will be added to exclude the changeset row itself from the check.</p></li>
+</ul>
+<h4 id="unsafe_validate_unique/4-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">unsafe_validate_unique(changeset, :city_name, repo)
+unsafe_validate_unique(changeset, [:city_name, :state_name], repo)
+unsafe_validate_unique(changeset, [:city_name, :state_name], repo, message: "city must be unique within state")
+unsafe_validate_unique(changeset, [:city_name, :state_name], repo, prefix: "public")
+unsafe_validate_unique(changeset, [:city_name, :state_name], repo, query: from(c in City, where: is_nil(c.deleted_at)))</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="update_change/3">update_change(changeset, key, function)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1156" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec update_change(t(), atom(), (term() -&gt; term())) :: t()</pre> </div> <p>Updates a change.</p>
+<p>The given <code class="inline">function</code> is invoked with the change value only if there is a change for <code class="inline">key</code>. Note that the value of the change can still be <code class="inline">nil</code> (unless the field was marked as required on <a href="#validate_required/3"><code class="inline">validate_required/3</code></a>).</p>
+<h4 id="update_change/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{}, %{impressions: 1})
+iex&gt; changeset = update_change(changeset, :impressions, &amp;(&amp;1 + 1))
+iex&gt; changeset.changes.impressions
+2</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="validate_acceptance/3">validate_acceptance(changeset, field, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2390" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_acceptance(t(), atom(), Keyword.t()) :: t()</pre> </div> <p>Validates the given parameter is true.</p>
+<p>Note this validation only checks the parameter itself is true, never the field in the schema. That's because acceptance parameters do not need to be persisted, as by definition they would always be stored as <code class="inline">true</code>.</p>
+<h4 id="validate_acceptance/3-options" class="section-heading">  Options </h4> <ul><li>
+<code class="inline">:message</code> - the message on failure, defaults to "must be accepted"</li></ul>
+<h4 id="validate_acceptance/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">validate_acceptance(changeset, :terms_of_service)
+validate_acceptance(changeset, :rules, message: "please accept rules")</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="validate_change/3">validate_change(changeset, field, validator)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1706" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_change(
+  t(),
+  atom(),
+  (atom(), term() -&gt;
+     [{atom(), String.t()} | {atom(), {String.t(), Keyword.t()}}])
+) :: t()</pre> </div> <p>Validates the given <code class="inline">field</code> change.</p>
+<p>It invokes the <code class="inline">validator</code> function to perform the validation only if a change for the given <code class="inline">field</code> exists and the change value is not <code class="inline">nil</code>. The function must return a list of errors (with an empty list meaning no errors).</p>
+<p>In case there's at least one error, the list of errors will be appended to the <code class="inline">:errors</code> field of the changeset and the <code class="inline">:valid?</code> flag will be set to <code class="inline">false</code>.</p>
+<h4 id="validate_change/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{}, %{title: "foo"})
+iex&gt; changeset = validate_change changeset, :title, fn :title, title  -&gt;
+...&gt;   # Value must not be "foo"!
+...&gt;   if title == "foo" do
+...&gt;     [title: "cannot be foo"]
+...&gt;   else
+...&gt;     []
+...&gt;   end
+...&gt; end
+iex&gt; changeset.errors
+[title: {"cannot be foo", []}]</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="validate_change/4">validate_change(changeset, field, metadata, validator)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1745" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_change(
+  t(),
+  atom(),
+  term(),
+  (atom(), term() -&gt;
+     [{atom(), String.t()} | {atom(), {String.t(), Keyword.t()}}])
+) :: t()</pre> </div> <p>Stores the validation <code class="inline">metadata</code> and validates the given <code class="inline">field</code> change.</p>
+<p>Similar to <a href="#validate_change/3"><code class="inline">validate_change/3</code></a> but stores the validation metadata into the changeset validators. The validator metadata is often used as a reflection mechanism, to automatically generate code based on the available validations.</p>
+<h4 id="validate_change/4-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">iex&gt; changeset = change(%Post{}, %{title: "foo"})
+iex&gt; changeset = validate_change changeset, :title, :useless_validator, fn
+...&gt;   _, _ -&gt; []
+...&gt; end
+iex&gt; changeset.validations
+[title: :useless_validator]</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="validate_confirmation/3">validate_confirmation(changeset, field, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2337" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_confirmation(t(), atom(), Keyword.t()) :: t()</pre> </div> <p>Validates that the given parameter matches its confirmation.</p>
+<p>By calling <code class="inline">validate_confirmation(changeset, :email)</code>, this validation will check if both "email" and "email_confirmation" in the parameter map matches. Note this validation only looks at the parameters themselves, never the fields in the schema. As such as, the "email_confirmation" field does not need to be added as a virtual field in your schema.</p>
+<p>Note that if the confirmation field is nil or missing, this does not add a validation error. You can specify that the confirmation parameter is required in the options (see below).</p>
+<h4 id="validate_confirmation/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:message</code> - the message on failure, defaults to "does not match confirmation"</li>
+<li>
+<code class="inline">:required</code> - boolean, sets whether existence of confirmation parameter is required for addition of error. Defaults to false</li>
+</ul>
+<h4 id="validate_confirmation/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">validate_confirmation(changeset, :email)
+validate_confirmation(changeset, :password, message: "does not match password")
+
+cast(data, params, [:password])
+|&gt; validate_confirmation(:password, message: "does not match password")</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="validate_exclusion/4">validate_exclusion(changeset, field, data, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2093" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_exclusion(t(), atom(), Enum.t(), Keyword.t()) :: t()</pre> </div> <p>Validates a change is not included in the given enumerable.</p>
+<h4 id="validate_exclusion/4-options" class="section-heading">  Options </h4> <ul><li>
+<code class="inline">:message</code> - the message on failure, defaults to "is reserved"</li></ul>
+<h4 id="validate_exclusion/4-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">validate_exclusion(changeset, :name, ~w(admin superadmin))</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="validate_format/4">validate_format(changeset, field, format, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2010" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_format(t(), atom(), Regex.t(), Keyword.t()) :: t()</pre> </div> <p>Validates a change has the given format.</p>
+<p>The format has to be expressed as a regular expression.</p>
+<h4 id="validate_format/4-options" class="section-heading">  Options </h4> <ul><li>
+<code class="inline">:message</code> - the message on failure, defaults to "has invalid format"</li></ul>
+<h4 id="validate_format/4-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">validate_format(changeset, :email, ~r/@/)</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="validate_inclusion/4">validate_inclusion(changeset, field, data, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2030" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_inclusion(t(), atom(), Enum.t(), Keyword.t()) :: t()</pre> </div> <p>Validates a change is included in the given enumerable.</p>
+<h4 id="validate_inclusion/4-options" class="section-heading">  Options </h4> <ul><li>
+<code class="inline">:message</code> - the message on failure, defaults to "is invalid"</li></ul>
+<h4 id="validate_inclusion/4-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">validate_inclusion(changeset, :cardinal_direction, ["north", "east", "south", "west"])
+validate_inclusion(changeset, :age, 0..99)</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="validate_length/3">validate_length(changeset, field, opts)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2142" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_length(t(), atom(), Keyword.t()) :: t()</pre> </div> <p>Validates a change is a string or list of the given length.</p>
+<p>Note that the length of a string is counted in graphemes by default. If using this validation to match a character limit of a database backend, it's likely that the limit ignores graphemes and limits the number of unicode characters. Then consider using the <code class="inline">:count</code> option to limit the number of codepoints (<code class="inline">:codepoints</code>), or limit the number of bytes (<code class="inline">:bytes</code>).</p>
+<h4 id="validate_length/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:is</code> - the length must be exactly this value</li>
+<li>
+<code class="inline">:min</code> - the length must be greater than or equal to this value</li>
+<li>
+<code class="inline">:max</code> - the length must be less than or equal to this value</li>
+<li>
+<code class="inline">:count</code> - what length to count for string, <code class="inline">:graphemes</code> (default), <code class="inline">:codepoints</code> or <code class="inline">:bytes</code>
+</li>
+<li>
+<code class="inline">:message</code> - the message on failure, depending on the validation, is one of:<ul>
+<li>for strings:<ul>
+<li>"should be %{count} character(s)"</li>
+<li>"should be at least %{count} character(s)"</li>
+<li>"should be at most %{count} character(s)"</li>
+</ul>
+</li>
+<li>for binary:<ul>
+<li>"should be %{count} byte(s)"</li>
+<li>"should be at least %{count} byte(s)"</li>
+<li>"should be at most %{count} byte(s)"</li>
+</ul>
+</li>
+<li>for lists:<ul>
+<li>"should have %{count} item(s)"</li>
+<li>"should have at least %{count} item(s)"</li>
+<li>"should have at most %{count} item(s)"</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4 id="validate_length/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">validate_length(changeset, :title, min: 3)
+validate_length(changeset, :title, max: 100)
+validate_length(changeset, :title, min: 3, max: 100)
+validate_length(changeset, :code, is: 9)
+validate_length(changeset, :topics, is: 2)
+validate_length(changeset, :icon, count: :bytes, max: 1024 * 16)</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="validate_number/3">validate_number(changeset, field, opts)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2229" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_number(t(), atom(), Keyword.t()) :: t()</pre> </div> <p>Validates the properties of a number.</p>
+<h4 id="validate_number/3-options" class="section-heading">  Options </h4> <ul>
+<li><code class="inline">:less_than</code></li>
+<li><code class="inline">:greater_than</code></li>
+<li><code class="inline">:less_than_or_equal_to</code></li>
+<li><code class="inline">:greater_than_or_equal_to</code></li>
+<li><code class="inline">:equal_to</code></li>
+<li><code class="inline">:not_equal_to</code></li>
+<li>
+<code class="inline">:message</code> - the message on failure, defaults to one of:<ul>
+<li>"must be less than %{number}"</li>
+<li>"must be greater than %{number}"</li>
+<li>"must be less than or equal to %{number}"</li>
+<li>"must be greater than or equal to %{number}"</li>
+<li>"must be equal to %{number}"</li>
+<li>"must be not equal to %{number}"</li>
+</ul>
+</li>
+</ul>
+<h4 id="validate_number/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">validate_number(changeset, :count, less_than: 3)
+validate_number(changeset, :pi, greater_than: 3, less_than: 4)
+validate_number(changeset, :the_answer_to_life_the_universe_and_everything, equal_to: 42)</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="validate_required/3">validate_required(changeset, fields, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1794" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_required(t(), list() | atom(), Keyword.t()) :: t()</pre> </div> <p>Validates that one or more fields are present in the changeset.</p>
+<p>You can pass a single field name or a list of field names that are required.</p>
+<p>If the value of a field is <code class="inline">nil</code> or a string made only of whitespace, the changeset is marked as invalid, the field is removed from the changeset's changes, and an error is added. An error won't be added if the field already has an error.</p>
+<p>If a field is given to <a href="#validate_required/3"><code class="inline">validate_required/3</code></a> but it has not been passed as parameter during <a href="#cast/3"><code class="inline">cast/3</code></a> (i.e. it has not been changed), then <a href="#validate_required/3"><code class="inline">validate_required/3</code></a> will check for its current value in the data. If the data contains an non-empty value for the field, then no error is added. This allows developers to use <a href="#validate_required/3"><code class="inline">validate_required/3</code></a> to perform partial updates. For example, on <code class="inline">insert</code> all fields would be required, because their default values on the data are all <code class="inline">nil</code>, but on <code class="inline">update</code>, if you don't want to change a field that has been previously set, you are not required to pass it as a parameter, since <a href="#validate_required/3"><code class="inline">validate_required/3</code></a> won't add an error for missing changes as long as the value in the data given to the <code class="inline">changeset</code> is not empty.</p>
+<p>Do not use this function to validate associations that are required, instead pass the <code class="inline">:required</code> option to <a href="#cast_assoc/3"><code class="inline">cast_assoc/3</code></a> or <a href="#cast_embed/3"><code class="inline">cast_embed/3</code></a>.</p>
+<p>Opposite to other validations, calling this function does not store the validation under the <code class="inline">changeset.validations</code> key. Instead, it stores all required fields under <code class="inline">changeset.required</code>.</p>
+<h4 id="validate_required/3-options" class="section-heading">  Options </h4> <ul>
+<li>
+<code class="inline">:message</code> - the message on failure, defaults to "can't be blank"</li>
+<li>
+<code class="inline">:trim</code> - a boolean that sets whether whitespaces are removed before running the validation on binaries/strings, defaults to true</li>
+</ul>
+<h4 id="validate_required/3-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">validate_required(changeset, :title)
+validate_required(changeset, [:title, :body])</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="validate_subset/4">validate_subset(changeset, field, data, opts \\ [])<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L2060" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validate_subset(t(), atom(), Enum.t(), Keyword.t()) :: t()</pre> </div> <p>Validates a change, of type enum, is a subset of the given enumerable.</p>
+<p>This validates if a list of values belongs to the given enumerable. If you need to validate if a single value is inside the given enumerable, you should use <a href="#validate_inclusion/4"><code class="inline">validate_inclusion/4</code></a> instead.</p>
+<p>Type of the field must be array.</p>
+<h4 id="validate_subset/4-options" class="section-heading">  Options </h4> <ul><li>
+<code class="inline">:message</code> - the message on failure, defaults to "has an invalid entry"</li></ul>
+<h4 id="validate_subset/4-examples" class="section-heading">  Examples </h4> <pre data-language="elixir">validate_subset(changeset, :pets, ["cat", "dog", "parrot"])
+validate_subset(changeset, :lottery_numbers, 0..99)</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="validations/1">validations(changeset)<a href="https://github.com/elixir-ecto/ecto/blob/v3.8.4/lib/ecto/changeset.ex#L1639" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec validations(t()) :: [{atom(), term()}]</pre> </div> <p>Returns a keyword list of the validations for this changeset.</p>
+<p>The keys in the list are the names of fields, and the values are a validation associated with the field. A field may occur multiple times in the list.</p>
+<h4 id="validations/1-example" class="section-heading">  Example </h4> <pre data-language="elixir">%Post{}
+|&gt; change()
+|&gt; validate_format(:title, ~r/^\w+:\s/, message: "must start with a topic")
+|&gt; validate_length(:title, max: 100)
+|&gt; validations()
+#=&gt; [
+  title: {:length, [ max: 100 ]},
+  title: {:format, ~r/^\w+:\s/}
+]</pre>
+<p>The following validations may be included in the result. The list is not necessarily exhaustive. For example, custom validations written by the developer will also appear in our return value.</p>
+<p>This first group contains validations that hold a keyword list of validators. This list may also include a <code class="inline">:message</code> key.</p>
+<ul>
+<li>
+<p><code class="inline">{:length, [option]}</code></p>
+<ul>
+<li><code class="inline">min: n</code></li>
+<li><code class="inline">max: n</code></li>
+<li><code class="inline">is: n</code></li>
+<li><p><code class="inline">count: :graphemes | :codepoints</code></p></li>
+</ul>
+</li>
+<li>
+<p><code class="inline">{:number, [option]}</code></p>
+<ul>
+<li><code class="inline">equal_to: n</code></li>
+<li><code class="inline">greater_than: n</code></li>
+<li><code class="inline">greater_than_or_equal_to: n</code></li>
+<li><code class="inline">less_than: n</code></li>
+<li><code class="inline">less_than_or_equal_to: n</code></li>
+</ul>
+</li>
+</ul>
+<p>The other validators simply take a value:</p>
+<ul>
+<li><code class="inline">{:exclusion, Enum.t}</code></li>
+<li><code class="inline">{:format, ~r/pattern/}</code></li>
+<li><code class="inline">{:inclusion, Enum.t}</code></li>
+<li><code class="inline">{:subset, Enum.t}</code></li>
+</ul>
+<p>Note that calling <a href="#validate_required/3"><code class="inline">validate_required/3</code></a> does not store the validation under the <code class="inline">changeset.validations</code> key (and so won't be included in the result of this function). The required fields are stored under the <code class="inline">changeset.required</code> key.</p> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2013 Plataformatec<br>&copy; 2020 Dashbit<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/ecto/Ecto.Changeset.html" class="_attribution-link">https://hexdocs.pm/ecto/Ecto.Changeset.html</a>
+  </p>
+</div>

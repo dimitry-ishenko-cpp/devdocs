@@ -1,0 +1,132 @@
+<h1>   <span translate="no">Phoenix.Presence</span> <small>behaviour</small>  </h1> <section id="moduledoc"> <p>Provides Presence tracking to processes and channels.</p>
+<p>This behaviour provides presence features such as fetching presences for a given topic, as well as handling diffs of join and leave events as they occur in real-time. Using this module defines a supervisor and a module that implements the <a href="https://hexdocs.pm/phoenix_pubsub/2.1.1/Phoenix.Tracker.html"><code class="inline">Phoenix.Tracker</code></a> behaviour that uses <a href="https://hexdocs.pm/phoenix_pubsub/2.1.1/Phoenix.PubSub.html"><code class="inline">Phoenix.PubSub</code></a> to broadcast presence updates.</p>
+<p>In case you want to use only a subset of the functionality provided by <a href="phoenix.presence.html#content"><code class="inline">Phoenix.Presence</code></a>, such as tracking processes but without broadcasting updates, we recommend that you look at the <a href="https://hexdocs.pm/phoenix_pubsub/2.1.1/Phoenix.Tracker.html"><code class="inline">Phoenix.Tracker</code></a> functionality from the <code class="inline">phoenix_pubsub</code> project.</p>
+<h2 id="module-example-usage" class="section-heading">  Example Usage </h2> <p>Start by defining a presence module within your application which uses <a href="phoenix.presence.html#content"><code class="inline">Phoenix.Presence</code></a> and provide the <code class="inline">:otp_app</code> which holds your configuration, as well as the <code class="inline">:pubsub_server</code>.</p>
+<pre data-language="elixir">defmodule MyAppWeb.Presence do
+  use Phoenix.Presence,
+    otp_app: :my_app,
+    pubsub_server: MyApp.PubSub
+end</pre>
+<p>The <code class="inline">:pubsub_server</code> must point to an existing pubsub server running in your application, which is included by default as <code class="inline">MyApp.PubSub</code> for new applications.</p>
+<p>Next, add the new supervisor to your supervision tree in <code class="inline">lib/my_app/application.ex</code>. It must be after the PubSub child and before the endpoint:</p>
+<pre data-language="elixir">children = [
+  ...
+  {Phoenix.PubSub, name: MyApp.PubSub},
+  MyAppWeb.Presence,
+  MyAppWeb.Endpoint
+]</pre>
+<p>Once added, presences can be tracked in your channel after joining:</p>
+<pre data-language="elixir">defmodule MyAppWeb.MyChannel do
+  use MyAppWeb, :channel
+  alias MyAppWeb.Presence
+
+  def join("some:topic", _params, socket) do
+    send(self(), :after_join)
+    {:ok, assign(socket, :user_id, ...)}
+  end
+
+  def handle_info(:after_join, socket) do
+    {:ok, _} = Presence.track(socket, socket.assigns.user_id, %{
+      online_at: inspect(System.system_time(:second))
+    })
+
+    push(socket, "presence_state", Presence.list(socket))
+    {:noreply, socket}
+  end
+end</pre>
+<p>In the example above, <code class="inline">Presence.track</code> is used to register this channel's process as a presence for the socket's user ID, with a map of metadata. Next, the current presence information for the socket's topic is pushed to the client as a <code class="inline">"presence_state"</code> event.</p>
+<p>Finally, a diff of presence join and leave events will be sent to the client as they happen in real-time with the "presence_diff" event. The diff structure will be a map of <code class="inline">:joins</code> and <code class="inline">:leaves</code> of the form:</p>
+<pre data-language="elixir">%{
+  joins: %{"123" =&gt; %{metas: [%{status: "away", phx_ref: ...}]}},
+  leaves: %{"456" =&gt; %{metas: [%{status: "online", phx_ref: ...}]}}
+},</pre>
+<p>See <a href="#c:list/1"><code class="inline">list/1</code></a> for more information on the presence data structure.</p>
+<h2 id="module-fetching-presence-information" class="section-heading">  Fetching Presence Information </h2> <p>Presence metadata should be minimized and used to store small, ephemeral state, such as a user's "online" or "away" status. More detailed information, such as user details that need to be fetched from the database, can be achieved by overriding the <a href="#c:fetch/2"><code class="inline">fetch/2</code></a> function.</p>
+<p>The <a href="#c:fetch/2"><code class="inline">fetch/2</code></a> callback is triggered when using <a href="#c:list/1"><code class="inline">list/1</code></a> and on every update, and it serves as a mechanism to fetch presence information a single time, before broadcasting the information to all channel subscribers. This prevents N query problems and gives you a single place to group isolated data fetching to extend presence metadata.</p>
+<p>The function must return a map of data matching the outlined Presence data structure, including the <code class="inline">:metas</code> key, but can extend the map of information to include any additional information. For example:</p>
+<pre data-language="elixir">def fetch(_topic, presences) do
+  users = presences |&gt; Map.keys() |&gt; Accounts.get_users_map()
+
+  for {key, %{metas: metas}} &lt;- presences, into: %{} do
+    {key, %{metas: metas, user: users[String.to_integer(key)]}}
+  end
+end</pre>
+<p>Where <code class="inline">Account.get_users_map/1</code> could be implemented like:</p>
+<pre data-language="elixir">def get_users_map(ids) do
+  query =
+    from u in User,
+      where: u.id in ^ids,
+      select: {u.id, u}
+
+  query |&gt; Repo.all() |&gt; Enum.into(%{})
+end</pre>
+<p>The <code class="inline">fetch/2</code> function above fetches all users from the database who have registered presences for the given topic. The presences information is then extended with a <code class="inline">:user</code> key of the user's information, while maintaining the required <code class="inline">:metas</code> field from the original presence data.</p>
+<h2 id="module-testing-with-presence" class="section-heading">  Testing with Presence </h2> <p>Every time the <code class="inline">fetch</code> callback is invoked, it is done from a separate process. Given those processes run asynchronously, it is often necessary to guarantee they have been shutdown at the end of every test. This can be done by using ExUnit's <code class="inline">on_exit</code> hook plus <code class="inline">fetchers_pids</code> function:</p>
+<pre data-language="elixir">on_exit(fn -&gt;
+  for pid &lt;- MyAppWeb.Presence.fetchers_pids() do
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, _, _, _}, 1000
+  end
+end)</pre> </section> <section id="summary" class="details-list"> <h1 class="section-heading">  Summary </h1> <h2> Types </h2>
+<dl class="summary-types summary">  <div class="summary-row"> <dt class="summary-signature"> <a href="#t:presence/0" translate="no">presence()</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:presences/0" translate="no">presences()</a> </dt> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:topic/0" translate="no">topic()</a> </dt> </div> </dl> <h2> Callbacks </h2>
+<dl class="summary-callbacks summary">  <div class="summary-row"> <dt class="summary-signature"> <a href="#c:fetch/2" translate="no">fetch(topic, presences)</a> </dt> <dd class="summary-synopsis"><p>Extend presence information with additional data.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:get_by_key/2" translate="no">get_by_key(arg1, key)</a> </dt> <dd class="summary-synopsis"><p>Returns the map of presence metadata for a socket/topic-key pair.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:list/1" translate="no">list(arg1)</a> </dt> <dd class="summary-synopsis"><p>Returns presences for a socket/topic.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:track/3" translate="no">track(socket, key, meta)</a> </dt> <dd class="summary-synopsis"><p>Track a channel's process as a presence.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:track/4" translate="no">track(pid, topic, key, meta)</a> </dt> <dd class="summary-synopsis"><p>Track an arbitrary process as a presence.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:untrack/2" translate="no">untrack(socket, key)</a> </dt> <dd class="summary-synopsis"><p>Stop tracking a channel's process.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:untrack/3" translate="no">untrack(pid, topic, key)</a> </dt> <dd class="summary-synopsis"><p>Stop tracking a process.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:update/3" translate="no">update(socket, key, meta)</a> </dt> <dd class="summary-synopsis"><p>Update a channel presence's metadata.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#c:update/4" translate="no">update(pid, topic, key, meta)</a> </dt> <dd class="summary-synopsis"><p>Update a process presence's metadata.</p></dd> </div> </dl> </section> <section id="types" class="details-list"> <h1 class="section-heading">  Types </h1> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:presence/0">presence()<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L141" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type presence() :: %{key: String.t(), meta: map()}</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:presences/0">presences()<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L140" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type presences() :: %{required(String.t()) =&gt; %{metas: [map()]}}</pre> </div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:topic/0">topic()<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L142" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type topic() :: String.t()</pre> </div> </section> </section> </div> </section> <section id="callbacks" class="details-list"> <h1 class="section-heading">  Callbacks </h1> <div class="callbacks-list"> <section class="detail"> <h3 class="detail-header" id="c:fetch/2">fetch(topic, presences)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L278" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback fetch(topic(), presences()) :: presences()</pre> </div> <p>Extend presence information with additional data.</p>
+<p>When <a href="#c:list/1"><code class="inline">list/1</code></a> is used to list all presences of the given <code class="inline">topic</code>, this callback is triggered once to modify the result before it is broadcasted to all channel subscribers. This avoids N query problems and provides a single place to extend presence metadata. You must return a map of data matching the original result, including the <code class="inline">:metas</code> key, but can extend the map to include any additional information.</p>
+<p>The default implementation simply passes <code class="inline">presences</code> through unchanged.</p>
+<h4 id="c:fetch/2-example" class="section-heading">  Example </h4> <pre data-language="elixir">def fetch(_topic, presences) do
+  query =
+    from u in User,
+      where: u.id in ^Map.keys(presences),
+      select: {u.id, u}
+
+  users = query |&gt; Repo.all() |&gt; Enum.into(%{})
+  for {key, %{metas: metas}} &lt;- presences, into: %{} do
+    {key, %{metas: metas, user: users[key]}}
+  end
+end</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:get_by_key/2">get_by_key(arg1, key)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L249" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback get_by_key(Phoenix.Socket.t() | topic(), key :: String.t()) :: presences()</pre> </div> <p>Returns the map of presence metadata for a socket/topic-key pair.</p>
+<h4 id="c:get_by_key/2-examples" class="section-heading">  Examples </h4> <p>Uses the same data format as <a href="#c:list/1"><code class="inline">list/1</code></a>, but only returns metadata for the presences under a topic and key pair. For example, a user with key <code class="inline">"user1"</code>, connected to the same chat room <code class="inline">"room:1"</code> from two devices, could return:</p>
+<pre data-language="elixir">iex&gt; MyPresence.get_by_key("room:1", "user1")
+[%{name: "User 1", metas: [%{device: "Desktop"}, %{device: "Mobile"}]}]</pre>
+<p>Like <a href="#c:list/1"><code class="inline">list/1</code></a>, the presence metadata is passed to the <code class="inline">fetch</code> callback of your presence module to fetch any additional information.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:list/1">list(arg1)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L231" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback list(Phoenix.Socket.t() | topic()) :: presences()</pre> </div> <p>Returns presences for a socket/topic.</p>
+<h4 id="c:list/1-presence-data-structure" class="section-heading">  Presence data structure </h4> <p>The presence information is returned as a map with presences grouped by key, cast as a string, and accumulated metadata, with the following form:</p>
+<pre data-language="elixir">%{key =&gt; %{metas: [%{phx_ref: ..., ...}, ...]}}</pre>
+<p>For example, imagine a user with id <code class="inline">123</code> online from two different devices, as well as a user with id <code class="inline">456</code> online from just one device. The following presence information might be returned:</p>
+<pre data-language="elixir">%{"123" =&gt; %{metas: [%{status: "away", phx_ref: ...},
+                     %{status: "online", phx_ref: ...}]},
+  "456" =&gt; %{metas: [%{status: "online", phx_ref: ...}]}}</pre>
+<p>The keys of the map will usually point to a resource ID. The value will contain a map with a <code class="inline">:metas</code> key containing a list of metadata for each resource. Additionally, every metadata entry will contain a <code class="inline">:phx_ref</code> key which can be used to uniquely identify metadata for a given key. In the event that the metadata was previously updated, a <code class="inline">:phx_ref_prev</code> key will be present containing the previous <code class="inline">:phx_ref</code> value.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:track/3">track(socket, key, meta)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L163" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback track(socket :: Phoenix.Socket.t(), key :: String.t(), meta :: map()) ::
+  {:ok, ref :: binary()} | {:error, reason :: term()}</pre> </div> <p>Track a channel's process as a presence.</p>
+<p>Tracked presences are grouped by <code class="inline">key</code>, cast as a string. For example, to group each user's channels together, use user IDs as keys. Each presence can be associated with a map of metadata to store small, ephemeral state, such as a user's online status. To store detailed information, see <a href="#c:fetch/2"><code class="inline">fetch/2</code></a>.</p>
+<h4 id="c:track/3-example" class="section-heading">  Example </h4> <pre data-language="elixir">alias MyApp.Presence
+def handle_info(:after_join, socket) do
+  {:ok, _} = Presence.track(socket, socket.assigns.user_id, %{
+    online_at: inspect(System.system_time(:second))
+  })
+  {:noreply, socket}
+end</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:track/4">track(pid, topic, key, meta)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L172" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback track(pid(), topic(), key :: String.t(), meta :: map()) ::
+  {:ok, ref :: binary()} | {:error, reason :: term()}</pre> </div> <p>Track an arbitrary process as a presence.</p>
+<p>Same with <code class="inline">track/3</code>, except track any process by <code class="inline">topic</code> and <code class="inline">key</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:untrack/2">untrack(socket, key)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L179" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback untrack(socket :: Phoenix.Socket.t(), key :: String.t()) :: :ok</pre> </div> <p>Stop tracking a channel's process.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:untrack/3">untrack(pid, topic, key)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L184" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback untrack(pid(), topic(), key :: String.t()) :: :ok</pre> </div> <p>Stop tracking a process.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:update/3">update(socket, key, meta)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L192" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback update(
+  socket :: Phoenix.Socket.t(),
+  key :: String.t(),
+  meta :: map() | (map() -&gt; map())
+) ::
+  {:ok, ref :: binary()} | {:error, reason :: term()}</pre> </div> <p>Update a channel presence's metadata.</p>
+<p>Replace a presence's metadata by passing a new map or a function that takes the current map and returns a new one.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:update/4">update(pid, topic, key, meta)<a href="https://github.com/phoenixframework/phoenix/blob/v1.6.11/lib/phoenix/presence.ex#L201" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@callback update(pid(), topic(), key :: String.t(), meta :: map() | (map() -&gt; map())) ::
+  {:ok, ref :: binary()} | {:error, reason :: term()}</pre> </div> <p>Update a process presence's metadata.</p>
+<p>Same as <code class="inline">update/3</code>, but with an arbitrary process.</p> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2014 Chris McCord<br>Licensed under the MIT License.<br>
+    <a href="https://hexdocs.pm/phoenix/Phoenix.Presence.html" class="_attribution-link">https://hexdocs.pm/phoenix/Phoenix.Presence.html</a>
+  </p>
+</div>

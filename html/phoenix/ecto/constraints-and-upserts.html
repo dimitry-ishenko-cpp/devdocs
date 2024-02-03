@@ -1,0 +1,180 @@
+<h1>   <span>Constraints and Upserts</span> </h1> <p>In this guide we will learn how to use constraints and upserts. To showcase those features, we will work on a practical scenario: which is by studying a many to many relationship between posts and tags.</p>
+<h2 id="put_assoc-vs-cast_assoc" class="section-heading">  put_assoc vs cast_assoc </h2> <p>Imagine we are building an application that has blog posts and such posts may have many tags. Not only that, a given tag may also belong to many posts. This is a classic scenario where we would use <code class="inline">many_to_many</code> associations. Our migrations would look like:</p>
+<pre data-language="elixir">create table(:posts) do
+  add :title, :string
+  add :body, :text
+  timestamps()
+end
+
+create table(:tags) do
+  add :name, :string
+  timestamps()
+end
+
+create unique_index(:tags, [:name])
+
+create table(:posts_tags, primary_key: false) do
+  add :post_id, references(:posts)
+  add :tag_id, references(:tags)
+end</pre>
+<p>Note we added a unique index to the tag name because we don't want to have duplicated tags in our database. It is important to add an index at the database level instead of using a validation since there is always a chance two tags with the same name would be validated and inserted simultaneously, passing the validation and leading to duplicated entries.</p>
+<p>Now let's also imagine we want the user to input such tags as a list of words split by comma, such as: "elixir, erlang, ecto". Once this data is received in the server, we will break it apart into multiple tags and associate them to the post, creating any tag that does not yet exist in the database.</p>
+<p>While the constraints above sound reasonable, that's exactly what put us in trouble with <code class="inline">cast_assoc/3</code>. The <code class="inline">cast_assoc/3</code> changeset function was designed to receive external parameters and compare them with the associated data in our structs. To do so correctly, Ecto requires tags to be sent as a list of maps. We can see an example of this in <a href="polymorphic-associations-with-many-to-many.html">Polymorphic associations with many to many</a>. However, here we expect tags to be sent in a string separated by comma.</p>
+<p>Furthermore, <code class="inline">cast_assoc/3</code> relies on the primary key field for each tag sent in order to decide if it should be inserted, updated or deleted. Again, because the user is simply passing a string, we don't have the ID information at hand.</p>
+<p>When we can't cope with <code class="inline">cast_assoc/3</code>, it is time to use <code class="inline">put_assoc/4</code>. In <code class="inline">put_assoc/4</code>, we give Ecto structs or changesets instead of parameters, giving us the ability to manipulate the data as we want. Let's define the schema and the changeset function for a post which may receive tags as a string:</p>
+<pre data-language="elixir">defmodule MyApp.Post do
+  use Ecto.Schema
+
+  schema "posts" do
+    field :title
+    field :body
+
+    many_to_many :tags, MyApp.Tag,
+      join_through: "posts_tags",
+      on_replace: :delete
+
+    timestamps()
+  end
+
+  def changeset(struct, params \\ %{}) do
+    struct
+    |&gt; Ecto.Changeset.cast(params, [:title, :body])
+    |&gt; Ecto.Changeset.put_assoc(:tags, parse_tags(params))
+  end
+
+  defp parse_tags(params)  do
+    (params["tags"] || "")
+    |&gt; String.split(",")
+    |&gt; Enum.map(&amp;String.trim/1)
+    |&gt; Enum.reject(&amp; &amp;1 == "")
+    |&gt; Enum.map(&amp;get_or_insert_tag/1)
+  end
+
+  defp get_or_insert_tag(name) do
+    Repo.get_by(MyApp.Tag, name: name) ||
+      Repo.insert!(%Tag{name: name})
+  end
+end</pre>
+<p>In the changeset function above, we moved all the handling of tags to a separate function, called <code class="inline">parse_tags/1</code>, which checks for the parameter, breaks each tag apart via <a href="https://hexdocs.pm/elixir/String.html#split/2"><code class="inline">String.split/2</code></a>, then removes any left over whitespace with <a href="https://hexdocs.pm/elixir/String.html#trim/1"><code class="inline">String.trim/1</code></a>, rejects any empty string and finally checks if the tag exists in the database or not, creating one in case none exists.</p>
+<p>The <code class="inline">parse_tags/1</code> function is going to return a list of <code class="inline">MyApp.Tag</code> structs which are then passed to <code class="inline">put_assoc/4</code>. By calling <code class="inline">put_assoc/4</code>, we are telling Ecto those should be the tags associated to the post from now on. In case a previous tag was associated to the post and not given in <code class="inline">put_assoc/4</code>, Ecto will invoke the behaviour defined in the <code class="inline">:on_replace</code> option, which we have set to <code class="inline">:delete</code>. The <code class="inline">:delete</code> behaviour will remove the association between the post and the removed tag from the database.</p>
+<p>And that's all we need to use <code class="inline">many_to_many</code> associations with <code class="inline">put_assoc/4</code>. <code class="inline">put_assoc/4</code> is very useful when we want to have more explicit control over our associations and it also works with <code class="inline">has_many</code>, <code class="inline">belongs_to</code> and all others association types.</p>
+<p>However, our code is not yet ready for production. Let's see why.</p>
+<h2 id="constraints-and-race-conditions" class="section-heading">  Constraints and race conditions </h2> <p>Remember we added a unique index to the tag <code class="inline">:name</code> column when creating the tags table. We did so to protect us from having duplicate tags in the database.</p>
+<p>By adding the unique index and then using <code class="inline">get_by</code> with a <code class="inline">insert!</code> to get or insert a tag, we introduced a potential error in our application. If two posts are submitted at the same time with a similar tag, there is a chance we will check if the tag exists at the same time, leading both submissions to believe there is no such tag in the database. When that happens, only one of the submissions will succeed while the other one will fail. That's a race condition: your code will error from time to time, only when certain conditions are met. And those conditions are time sensitive.</p>
+<p>Luckily Ecto gives us a mechanism to handle constraint errors from the database.</p>
+<h2 id="checking-for-constraint-errors" class="section-heading">  Checking for constraint errors </h2> <p>Since our <code class="inline">get_or_insert_tag(name)</code> function fails when a tag already exists in the database, we need to handle such scenarios accordingly. Let's rewrite it taking race conditions into account:</p>
+<pre data-language="elixir">defp get_or_insert_tag(name) do
+  %Tag{}
+  |&gt; Ecto.Changeset.change(name: name)
+  |&gt; Ecto.Changeset.unique_constraint(:name)
+  |&gt; Repo.insert()
+  |&gt; case do
+    {:ok, tag} -&gt; tag
+    {:error, _} -&gt; Repo.get_by!(MyApp.Tag, name: name)
+  end
+end</pre>
+<p>Instead of inserting the tag directly, we now build a changeset, which allows us to use the <code class="inline">unique_constraint</code> annotation. Now if the <code class="inline">Repo.insert</code> operation fails because the unique index for <code class="inline">:name</code> is violated, Ecto won't raise, but return an <code class="inline">{:error, changeset}</code> tuple. Therefore, if <code class="inline">Repo.insert</code> succeeds, it is because the tag was saved, otherwise the tag already exists, which we then fetch with <code class="inline">Repo.get_by!</code>.</p>
+<p>While the mechanism above fixes the race condition, it is a quite expensive one: we need to perform two queries for every tag that already exists in the database: the (failed) insert and then the repository lookup. Given that's the most common scenario, we may want to rewrite it to the following:</p>
+<pre data-language="elixir">defp get_or_insert_tag(name) do
+  Repo.get_by(MyApp.Tag, name: name) ||
+    maybe_insert_tag(name)
+end
+
+defp maybe_insert_tag(name) do
+  %Tag{}
+  |&gt; Ecto.Changeset.change(name: name)
+  |&gt; Ecto.Changeset.unique_constraint(:name)
+  |&gt; Repo.insert
+  |&gt; case do
+    {:ok, tag} -&gt; tag
+    {:error, _} -&gt; Repo.get_by!(MyApp.Tag, name: name)
+  end
+end</pre>
+<p>The above performs 1 query for every tag that already exists, 2 queries for every new tag and possibly 3 queries in the case of race conditions. While the above would perform slightly better on average, Ecto has a better option in stock.</p>
+<h2 id="upserts" class="section-heading">  Upserts </h2> <p>Ecto supports the so-called "upsert" command which is an abbreviation for "update or insert". The idea is that we try to insert a record and in case it conflicts with an existing entry, for example due to a unique index, we can choose how we want the database to act by either raising an error (the default behaviour), ignoring the insert (no error) or by updating the conflicting database entries.</p>
+<p>"upsert" in Ecto is done with the <code class="inline">:on_conflict</code> option. Let's rewrite <code class="inline">get_or_insert_tag(name)</code> once more but this time using the <code class="inline">:on_conflict</code> option. Remember that "upsert" is a new feature in PostgreSQL 9.5, so make sure you are up to date.</p>
+<p>Your first try in using <code class="inline">:on_conflict</code> may be by setting it to <code class="inline">:nothing</code>, as below:</p>
+<pre data-language="elixir">defp get_or_insert_tag(name) do
+  Repo.insert!(
+    %MyApp.Tag{name: name},
+    on_conflict: :nothing
+  )
+end</pre>
+<p>While the above won't raise an error in case of conflicts, it also won't update the struct given, so it will return a tag without ID. One solution is to force an update to happen in case of conflicts, even if the update is about setting the tag name to its current name. In such cases, PostgreSQL also requires the <code class="inline">:conflict_target</code> option to be given, which is the column (or a list of columns) we are expecting the conflict to happen:</p>
+<pre data-language="elixir">defp get_or_insert_tag(name) do
+  Repo.insert!(
+    %MyApp.Tag{name: name},
+    on_conflict: [set: [name: name]],
+    conflict_target: :name
+  )
+end</pre>
+<p>And that's it! We try to insert a tag with the given name and if such tag already exists, we tell Ecto to update its name to the current value, updating the tag and fetching its id. While the above is certainly a step up from all solutions so far, it still performs one query per tag. If 10 tags are sent, we will perform 10 queries. Can we further improve this?</p>
+<h2 id="upserts-and-insert_all" class="section-heading">  Upserts and insert_all </h2> <p>Ecto accepts the <code class="inline">:on_conflict</code> option not only in <a href="ecto.repo.html#c:insert/2"><code class="inline">Ecto.Repo.insert/2</code></a> but also in the <a href="ecto.repo.html#c:insert_all/3"><code class="inline">Ecto.Repo.insert_all/3</code></a> function. This means we can build one query that attempts to insert all missing tags and then another query that fetches all of them at once. Let's see how our <code class="inline">Post</code> schema will look like after those changes:</p>
+<pre data-language="elixir">defmodule MyApp.Post do
+  use Ecto.Schema
+
+  # We need to import Ecto.Query
+  import Ecto.Query
+
+  # Schema is the same
+  schema "posts" do
+    add :title
+    add :body
+
+    many_to_many :tags, MyApp.Tag,
+      join_through: "posts_tags",
+      on_replace: :delete
+
+    timestamps()
+  end
+
+  # Changeset is the same
+  def changeset(struct, params \\ %{}) do
+    struct
+    |&gt; Ecto.Changeset.cast(params, [:title, :body])
+    |&gt; Ecto.Changeset.put_assoc(:tags, parse_tags(params))
+  end
+
+  # Parse tags has slightly changed
+  defp parse_tags(params)  do
+    (params["tags"] || "")
+    |&gt; String.split(",")
+    |&gt; Enum.map(&amp;String.trim/1)
+    |&gt; Enum.reject(&amp; &amp;1 == "")
+    |&gt; insert_and_get_all()
+  end
+
+  defp insert_and_get_all([]) do
+    []
+  end
+  defp insert_and_get_all(names) do
+    timestamp =
+      NaiveDateTime.utc_now()
+      |&gt; NaiveDateTime.truncate(:second)
+
+    placeholders = %{timestamp: timestamp}
+
+    maps =
+      Enum.map(names, &amp;%{
+        name: &amp;1,
+        inserted_at: {:placeholder, :timestamp},
+        updated_at: {:placeholder, :timestamp}
+      })
+
+    Repo.insert_all(
+      MyApp.Tag,
+      maps,
+      placeholders: placeholders,
+      on_conflict: :nothing
+    )
+
+    Repo.all(from t in MyApp.Tag, where: t.name in ^names)
+  end
+end</pre>
+<p>Instead of getting and inserting each tag individually, the code above works on all tags at once, first by building a list of maps which is given to <code class="inline">insert_all</code>. Then we look up all tags with the given names. Regardless of how many tags are sent, we will perform only 2 queries - unless no tag is sent, in which we return an empty list back promptly. This solution is only possible thanks to the <code class="inline">:on_conflict</code> option, which guarantees <code class="inline">insert_all</code> won't fail in case a unique index is violated, such as from duplicate tag names. Remember, <code class="inline">insert_all</code> won't autogenerate values like timestamps. That's why we define a timestamp placeholder and reuse it across <code class="inline">inserted_at</code> and <code class="inline">updated_at</code> fields.</p>
+<p>Finally, keep in mind that we haven't used transactions in any of the examples so far. That decision was deliberate as we relied on the fact that getting or inserting tags is an idempotent operation, i.e. we can repeat it many times for a given input and it will always give us the same result back. Therefore, even if we fail to introduce the post to the database due to a validation error, the user will be free to resubmit the form and we will just attempt to get or insert the same tags once again. The downside of this approach is that tags will be created even if creating the post fails, which means some tags may not have posts associated to them. In case that's not desired, the whole operation could be wrapped in a transaction or modeled with <a href="ecto.multi.html"><code class="inline">Ecto.Multi</code></a>.</p> <div class="bottom-actions"> <div class="bottom-actions-item"> <a href="composable-transactions-with-multi.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Composable transactions with Multi </span> </a> </div> <div class="bottom-actions-item"> <a href="data-mapping-and-validation.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Data mapping and validation </span> </a> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2013 Plataformatec<br>&copy; 2020 Dashbit<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/ecto/constraints-and-upserts.html" class="_attribution-link">https://hexdocs.pm/ecto/constraints-and-upserts.html</a>
+  </p>
+</div>

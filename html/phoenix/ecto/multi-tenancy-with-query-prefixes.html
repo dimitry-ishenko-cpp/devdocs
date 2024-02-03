@@ -1,0 +1,192 @@
+<h1>   <span>Multi tenancy with query prefixes</span> </h1> <p>With Ecto we can run queries in different prefixes using a single pool of database connections. For databases engines such as Postgres, Ecto's prefix <a href="https://www.postgresql.org/docs/current/static/ddl-schemas.html">maps to Postgres' DDL schemas</a>. For MySQL, each prefix is a different database on its own.</p>
+<p>Query prefixes may be useful in different scenarios. For example, multi tenant apps running on PostgreSQL would define multiple prefixes, usually one per client, under a single database. The idea is that prefixes will provide data isolation between the different users of the application, guaranteeing either globally or at the data level that queries and commands act on a specific tenants.</p>
+<p>Prefixes may also be useful on high-traffic applications where data is partitioned upfront. For example, a gaming platform may break game data into isolated partitions, each named after a different prefix. A partition for a given player is either chosen at random or calculated based on the player information.</p>
+<p>Given each tenant has its own database structure, multi tenancy with query prefixes is expensive to setup. For example, migrations have to run individually for each prefix. Therefore this approach is useful when there is a limited or a slowly growing number of tenants.</p>
+<p>Let's get started. Note all the examples below assume you are using PostgreSQL. Other databases engines may require slightly different solutions.</p>
+<h2 id="connection-prefixes" class="section-heading">  Connection prefixes </h2> <p>As a starting point, let's start with a simple scenario: your application must connect to a particular prefix when running in production. This may be due to infrastructure conditions, database administration rules or others.</p>
+<p>Let's define a repository and a schema to get started:</p>
+<pre data-language="elixir"># lib/repo.ex
+defmodule MyApp.Repo do
+  use Ecto.Repo,
+    otp_app: :my_app,
+    adapter: Ecto.Adapters.Postgres
+end
+
+# lib/sample.ex
+defmodule MyApp.Sample do
+  use Ecto.Schema
+
+  schema "samples" do
+    field :name
+    timestamps
+  end
+end</pre>
+<p>Now let's configure the repository:</p>
+<pre data-language="elixir"># config/config.exs
+config :my_app, MyApp.Repo,
+  username: "postgres",
+  password: "postgres",
+  database: "demo",
+  hostname: "localhost",
+  pool_size: 10</pre>
+<p>And define a migration:</p>
+<pre data-language="elixir"># priv/repo/migrations/20160101000000_create_sample.exs
+defmodule MyApp.Repo.Migrations.CreateSample do
+  use Ecto.Migration
+
+  def change do
+    create table(:samples) do
+      add :name, :string
+      timestamps()
+    end
+  end
+end</pre>
+<p>Now let's create the database, migrate it and then start an IEx session:</p>
+<pre data-language="elixir">$ mix ecto.create
+$ mix ecto.migrate
+$ iex -S mix
+Interactive Elixir - press Ctrl+C to exit
+iex(1)&gt; MyApp.Repo.all MyApp.Sample
+[]
+</pre>
+<p>We haven't done anything unusual so far. We created our database instance, made it up to date by running migrations and then successfully made a query against the "samples" table, which returned an empty list.</p>
+<p>By default, connections to Postgres' databases run on the "public" prefix. When we run migrations and queries, they are all running against the "public" prefix. However imagine your application has a requirement to run on a particular prefix in production, let's call it "connection_prefix".</p>
+<p>Luckily Postgres allows us to change the prefix our database connections run on by setting the "schema search path". The best moment to change the search path is right after we setup the database connection, ensuring all of our queries will run on that particular prefix, throughout the connection life-cycle.</p>
+<p>To do so, let's change our database configuration in "config/config.exs" and specify an <code class="inline">:after_connect</code> option. <code class="inline">:after_connect</code> expects a tuple with module, function and arguments it will invoke with the connection process, as soon as a database connection is established:</p>
+<pre data-language="elixir">query_args = ["SET search_path TO connection_prefix", []]
+
+config :my_app, MyApp.Repo,
+  username: "postgres",
+  password: "postgres",
+  database: "demo_dev",
+  hostname: "localhost",
+  pool_size: 10,
+  after_connect: {Postgrex, :query!, query_args}</pre>
+<p>Now let's try to run the same query as before:</p>
+<pre data-language="elixir">$ iex -S mix
+Interactive Elixir - press Ctrl+C to exit
+iex(1)&gt; MyApp.Repo.all MyApp.Sample
+** (Postgrex.Error) ERROR (undefined_table):
+   relation "samples" does not exist
+</pre>
+<p>Our previously successful query now fails because there is no table "samples" under the new prefix. Let's try to fix that by running migrations:</p>
+<pre data-language="elixir">$ mix ecto.migrate
+** (Postgrex.Error) ERROR (invalid_schema_name):
+   no schema has been selected to create in
+</pre>
+<p>Oops. Now migration says there is no such schema name. That's because Postgres automatically creates the "public" prefix every time we create a new database. If we want to use a different prefix, we must explicitly create it on the database we are running on:</p>
+<pre data-language="elixir">$ psql -d demo_dev -c "CREATE SCHEMA connection_prefix"
+</pre>
+<p>Now we are ready to migrate and run our queries:</p>
+<pre data-language="elixir">$ mix ecto.migrate
+$ iex -S mix
+Interactive Elixir - press Ctrl+C to exit
+iex(1)&gt; MyApp.Repo.all MyApp.Sample
+[]
+</pre>
+<p>Data in different prefixes are isolated. Writing to the "samples" table in one prefix cannot be accessed by the other unless we change the prefix in the connection or use the Ecto conveniences we will discuss next.</p>
+<h2 id="schema-prefixes" class="section-heading">  Schema prefixes </h2> <p>Ecto also allows you to set a particular schema to run on a specific prefix. Imagine you are building a multi-tenant application. Each client data belongs to a particular prefix, such as "client_foo", "client_bar" and so forth. Yet your application may still rely on a set of tables that are shared across all clients. One of such tables may be exactly the table that maps the Client ID to its database prefix. Let's assume we want to store this data in a prefix named "main":</p>
+<pre data-language="elixir">defmodule MyApp.Mapping do
+  use Ecto.Schema
+
+  @schema_prefix "main"
+  schema "mappings" do
+    field :client_id, :integer
+    field :db_prefix
+    timestamps
+  end
+end</pre>
+<p>Now running <code class="inline">MyApp.Repo.all MyApp.Mapping</code> will by default run on the "main" prefix, regardless of the value configured for the connection on the <code class="inline">:after_connect</code> callback. However, we may want to override the schema prefix too and Ecto gives us the opportunity to do so, let's see how.</p>
+<h2 id="per-query-and-per-struct-prefixes" class="section-heading">  Per-query and per-struct prefixes </h2> <p>Now, suppose that while still configured to connect to the "connection_prefix" on <code class="inline">:after_connect</code>, we run the following queries:</p>
+<pre data-language="elixir">iex(1)&gt; alias MyApp.Sample
+MyApp.Sample
+iex(2)&gt; MyApp.Repo.all(Sample)
+[]
+iex(3)&gt; MyApp.Repo.insert(%Sample{name: "mary"})
+{:ok, %MyApp.Sample{...}}
+iex(4)&gt; MyApp.Repo.all(Sample)
+[%MyApp.Sample{...}]</pre>
+<p>The operations above ran on the "connection_prefix". So what happens if we try to run the sample query on the "public" prefix? All Ecto repository operations support the <code class="inline">:prefix</code> option. So let's set it to public.</p>
+<pre data-language="elixir">iex(7)&gt; MyApp.Repo.all(Sample)
+[%MyApp.Sample{...}]
+iex(8)&gt; MyApp.Repo.all(Sample, prefix: "public")
+[]</pre>
+<p>Notice how we were able to change the prefix the query runs on. Back in the default "public" prefix, there is no data.</p>
+<p>One interesting aspect of prefixes in Ecto is that the prefix information is carried along each struct returned by a query:</p>
+<pre data-language="elixir">iex(9)&gt; [sample] = MyApp.Repo.all(Sample)
+[%MyApp.Sample{}]
+iex(10)&gt; Ecto.get_meta(sample, :prefix)
+nil</pre>
+<p>The example above returned nil, which means no prefix was specified by Ecto, and therefore the database connection default will be used. In this case, "connection_prefix" will be used because of the <code class="inline">:after_connect</code> callback we added at the beginning of this guide.</p>
+<p>Since the prefix data is carried in the struct, we can use such to copy data from one prefix to the other. Let's copy the sample above from the "connection_prefix" to the "public" one:</p>
+<pre data-language="elixir">iex(11)&gt; new_sample = Ecto.put_meta(sample, prefix: "public")
+%MyApp.Sample{}
+iex(12)&gt; MyApp.Repo.insert(new_sample)
+{:ok, %MyApp.Sample{}}
+iex(13)&gt; [sample] = MyApp.Repo.all(Sample, prefix: "public")
+[%MyApp.Sample{}]
+iex(14)&gt; Ecto.get_meta(sample, :prefix)
+"public"</pre>
+<p>Now we have data inserted in both prefixes. Note how we passed the <code class="inline">:prefix</code> option to <code class="inline">MyApp.Repo.all</code>. Almost all Repo operations accept <code class="inline">:prefix</code> as an option, with one important distinction:</p>
+<ul>
+<li><p>the <code class="inline">:prefix</code> option in query operations (<code class="inline">all/2</code>, <code class="inline">update_all/2</code>, and <code class="inline">delete_all/2</code>) is a fallback. It will only be used when a <code class="inline">@schema_prefix</code> or a query prefix was not previously specified</p></li>
+<li><p>the <code class="inline">:prefix</code> option in schema operations (<code class="inline">insert_all/3</code>, <code class="inline">insert/2</code>, <code class="inline">update/2</code>, etc) will override the <code class="inline">@schema_prefix</code> as well as any prefix in the struct/changeset</p></li>
+</ul>
+<p>This difference in behaviour is by design: we want to allow flexibility when writing queries but we want to enforce struct/changeset operations to always work isolated within a given prefix. In fact, if call <code class="inline">MyApp.Repo.insert(post)</code> or <code class="inline">MyApp.Repo.update(post)</code>, and the post includes associations, the associated data will also be inserted/updated in the same prefix as <code class="inline">post</code>.</p>
+<h2 id="per-from-join-prefixes" class="section-heading">  Per from/join prefixes </h2> <p>Finally, Ecto allows you to set the prefix individually for each <code class="inline">from</code> and <code class="inline">join</code> expression. Here's an example:</p>
+<pre data-language="elixir">from p in Post, prefix: "foo",
+  join: c in Comment, prefix: "bar"</pre>
+<p>Those will take precedence over all other prefixes we have defined so far. For each join/from in the query, the prefix used will be determined by the following order:</p>
+<ol>
+<li>If the prefix option is given exclusively to join/from</li>
+<li>If the <code class="inline">@schema_prefix</code> is set in the related schema</li>
+<li>If the <code class="inline">:prefix</code> field given to the repo operation (i.e. <code class="inline">Repo.all(query, prefix: prefix)</code>)</li>
+<li>The connection prefix</li>
+</ol>
+<h2 id="migration-prefixes" class="section-heading">  Migration prefixes </h2> <p>When the connection prefix is set, it also changes the prefix migrations run on. However it is also possible to set the prefix through the command line or per table in the migration itself.</p>
+<p>For example, imagine you are a gaming company where the game is broken in 128 partitions, named "prefix_1", "prefix_2", "prefix_3" up to "prefix_128". Now, whenever you need to migrate data, you need to migrate data on all different 128 prefixes. There are two ways of achieve that.</p>
+<p>The first mechanism is to invoke <code class="inline">mix ecto.migrate</code> multiple times, once per prefix, passing the <code class="inline">--prefix</code> option:</p>
+<pre data-language="elixir">$ mix ecto.migrate --prefix "prefix_1"
+$ mix ecto.migrate --prefix "prefix_2"
+$ mix ecto.migrate --prefix "prefix_3"
+...
+$ mix ecto.migrate --prefix "prefix_128"
+</pre>
+<p>The other approach is by changing each desired migration to run across multiple prefixes. For example:</p>
+<pre data-language="elixir">defmodule MyApp.Repo.Migrations.CreateSample do
+  use Ecto.Migration
+
+  def change do
+    for i &lt;- 1..128 do
+      prefix = "prefix_#{i}"
+      create table(:samples, prefix: prefix) do
+        add :name, :string
+        timestamps()
+      end
+
+      # Execute the commands on the current prefix
+      # before moving on to the next prefix
+      flush()
+    end
+  end
+end</pre>
+<h2 id="summing-up" class="section-heading">  Summing up </h2> <p>Ecto provides many conveniences for working with querying prefixes. Those conveniences allow developers to configure prefixes with different precedence, starting with the highest one. When executing queries with <code class="inline">all</code>, <code class="inline">update_all</code> or <code class="inline">delete_all</code>, the prefix is computed as follows:</p>
+<ol>
+<li>from/join prefixes</li>
+<li>schema prefixes</li>
+<li>the <code class="inline">:prefix</code> option</li>
+<li>connection prefixes</li>
+</ol>
+<p>When working with schemas and changesets in <code class="inline">insert_all</code>, <code class="inline">insert</code>, <code class="inline">update</code>, and so forth, the precedence is:</p>
+<ol>
+<li>the <code class="inline">:prefix</code> option</li>
+<li>changeset prefixes</li>
+<li>schema prefixes</li>
+<li>connection prefixes</li>
+</ol>
+<p>This way developers can tackle different scenarios from production requirements to multi-tenant applications.</p> <div class="bottom-actions"> <div class="bottom-actions-item"> <a href="dynamic-queries.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Dynamic queries </span> </a> </div> <div class="bottom-actions-item"> <a href="multi-tenancy-with-foreign-keys.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Multi tenancy with foreign keys </span> </a> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2013 Plataformatec<br>&copy; 2020 Dashbit<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/ecto/multi-tenancy-with-query-prefixes.html" class="_attribution-link">https://hexdocs.pm/ecto/multi-tenancy-with-query-prefixes.html</a>
+  </p>
+</div>

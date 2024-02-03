@@ -1,0 +1,305 @@
+<h1>   <span>Channels</span> </h1> <blockquote><p><strong>Requirement</strong>: This guide expects that you have gone through the <a href="installation.html">introductory guides</a> and got a Phoenix application <a href="up_and_running.html">up and running</a>.</p></blockquote>
+<p>Channels are an exciting part of Phoenix that enable soft real-time communication with and between millions of connected clients.</p>
+<p>Some possible use cases include:</p>
+<ul>
+<li>Chat rooms and APIs for messaging apps</li>
+<li>Breaking news, like "a goal was scored" or "an earthquake is coming"</li>
+<li>Tracking trains, trucks, or race participants on a map</li>
+<li>Events in multiplayer games</li>
+<li>Monitoring sensors and controlling lights</li>
+<li>Notifying a browser that a page's CSS or JavaScript has changed (this is handy in development)</li>
+</ul>
+<p>Conceptually, Channels are pretty simple.</p>
+<p>First, clients connect to the server using some transport, like WebSocket. Once connected, they join one or more topics. For example, to interact with a public chat room clients may join a topic called <code class="inline">public_chat</code>, and to receive updates from a product with ID 7, they may need to join a topic called <code class="inline">product_updates:7</code>.</p>
+<p>Clients can push messages to the topics they've joined, and can also receive messages from them. The other way around, Channel servers receive messages from their connected clients, and can push messages to them too.</p>
+<p>Servers are able to broadcast messages to all clients subscribed to a certain topic. This is illustrated in the following diagram:</p>
+<pre data-language="elixir">                                                                  +----------------+
+                                                     +--Topic X--&gt;| Mobile Client  |
+                                                     |            +----------------+
+                              +-------------------+  |
++----------------+            |                   |  |            +----------------+
+| Browser Client |--Topic X--&gt;| Phoenix Server(s) |--+--Topic X--&gt;| Desktop Client |
++----------------+            |                   |  |            +----------------+
+                              +-------------------+  |
+                                                     |            +----------------+
+                                                     +--Topic X--&gt;|   IoT Client   |
+                                                                  +----------------+</pre>
+<p>Broadcasts work even if the application runs on several nodes/computers. That is, if two clients have their socket connected to different application nodes and are subscribed to the same topic <code class="inline">T</code>, both of them will receive messages broadcasted to <code class="inline">T</code>. That is possible thanks to an internal PubSub mechanism.</p>
+<p>Channels can support any kind of client: a browser, native app, smart watch, embedded device, or anything else that can connect to a network. All the client needs is a suitable library; see the <a href="#client-libraries">Client Libraries</a> section below. Each client library communicates using one of the "transports" that Channels understand. Currently, that's either Websockets or long polling, but other transports may be added in the future.</p>
+<p>Unlike stateless HTTP connections, Channels support long-lived connections, each backed by a lightweight BEAM process, working in parallel and maintaining its own state.</p>
+<p>This architecture scales well; Phoenix Channels <a href="https://phoenixframework.org/blog/the-road-to-2-million-websocket-connections">can support millions of subscribers with reasonable latency on a single box</a>, passing hundreds of thousands of messages per second. And that capacity can be multiplied by adding more nodes to the cluster.</p>
+<h2 id="the-moving-parts" class="section-heading">  The Moving Parts </h2> <p>Although Channels are simple to use from a client perspective, there are a number of components involved in routing messages to clients across a cluster of servers. Let's take a look at them.</p>
+<h3 id="overview" class="section-heading">  Overview </h3> <p>To start communicating, a client connects to a node (a Phoenix server) using a transport (e.g., Websockets or long polling) and joins one or more channels using that single network connection. One channel server lightweight process is created per client, per topic. Each channel holds onto the <code class="inline">%Phoenix.Socket{}</code> and can maintain any state it needs within its <code class="inline">socket.assigns</code>.</p>
+<p>Once the connection is established, each incoming message from a client is routed, based on its topic, to the correct channel server. If the channel server asks to broadcast a message, that message is sent to the local PubSub, which sends it out to any clients connected to the same server and subscribed to that topic.</p>
+<p>If there are other nodes in the cluster, the local PubSub also forwards the message to their PubSubs, which send it out to their own subscribers. Because only one message has to be sent per additional node, the performance cost of adding nodes is negligible, while each new node supports many more subscribers.</p>
+<p>The message flow looks something like this:</p>
+<pre data-language="elixir">                                 Channel   +-------------------------+      +--------+
+                                  route    | Sending Client, Topic 1 |      | Local  |
+                              +-----------&gt;|     Channel.Server      |-----&gt;| PubSub |--+
++----------------+            |            +-------------------------+      +--------+  |
+| Sending Client |-Transport--+                                                  |      |
++----------------+                         +-------------------------+           |      |
+                                           | Sending Client, Topic 2 |           |      |
+                                           |     Channel.Server      |           |      |
+                                           +-------------------------+           |      |
+                                                                                 |      |
+                                           +-------------------------+           |      |
++----------------+                         | Browser Client, Topic 1 |           |      |
+| Browser Client |&lt;-------Transport--------|     Channel.Server      |&lt;----------+      |
++----------------+                         +-------------------------+                  |
+                                                                                        |
+                                                                                        |
+                                                                                        |
+                                           +-------------------------+                  |
++----------------+                         |  Phone Client, Topic 1  |                  |
+|  Phone Client  |&lt;-------Transport--------|     Channel.Server      |&lt;-+               |
++----------------+                         +-------------------------+  |   +--------+  |
+                                                                        |   | Remote |  |
+                                           +-------------------------+  +---| PubSub |&lt;-+
++----------------+                         |  Watch Client, Topic 1  |  |   +--------+  |
+|  Watch Client  |&lt;-------Transport--------|     Channel.Server      |&lt;-+               |
++----------------+                         +-------------------------+                  |
+                                                                                        |
+                                                                                        |
+                                           +-------------------------+      +--------+  |
++----------------+                         |   IoT Client, Topic 1   |      | Remote |  |
+|   IoT Client   |&lt;-------Transport--------|     Channel.Server      |&lt;-----| PubSub |&lt;-+
++----------------+                         +-------------------------+      +--------+</pre>
+<h3 id="endpoint" class="section-heading">  Endpoint </h3> <p>In your Phoenix app's <code class="inline">Endpoint</code> module, a <code class="inline">socket</code> declaration specifies which socket handler will receive connections on a given URL.</p>
+<pre data-language="elixir">socket "/socket", HelloWeb.UserSocket,
+  websocket: true,
+  longpoll: false</pre>
+<p>Phoenix comes with two default transports: websocket and longpoll. You can configure them directly via the <code class="inline">socket</code> declaration.</p>
+<h3 id="socket-handlers" class="section-heading">  Socket Handlers </h3> <p>On the client side, you will establish a socket connection to the route above:</p>
+<pre data-language="elixir">let socket = new Socket("/socket", {params: {token: window.userToken}})</pre>
+<p>On the server, Phoenix will invoke <code class="inline">HelloWeb.UserSocket.connect/2</code>, passing your parameters and the initial socket state. Within the socket, you can authenticate and identify a socket connection and set default socket assigns. The socket is also where you define your channel routes.</p>
+<h3 id="channel-routes" class="section-heading">  Channel Routes </h3> <p>Channel routes match on the topic string and dispatch matching requests to the given Channel module.</p>
+<p>The star character <code class="inline">*</code> acts as a wildcard matcher, so in the following example route, requests for <code class="inline">room:lobby</code> and <code class="inline">room:123</code> would both be dispatched to the <code class="inline">RoomChannel</code>. In your <code class="inline">UserSocket</code>, you would have:</p>
+<pre data-language="elixir">channel "room:*", HelloWeb.RoomChannel</pre>
+<h3 id="channels" class="section-heading">  Channels </h3> <p>Channels handle events from clients, so they are similar to Controllers, but there are two key differences. Channel events can go both directions - incoming and outgoing. Channel connections also persist beyond a single request/response cycle. Channels are the highest level abstraction for real-time communication components in Phoenix.</p>
+<p>Each Channel will implement one or more clauses of each of these four callback functions - <code class="inline">join/3</code>, <code class="inline">terminate/2</code>, <code class="inline">handle_in/3</code>, and <code class="inline">handle_out/3</code>.</p>
+<h3 id="topics" class="section-heading">  Topics </h3> <p>Topics are string identifiers - names that the various layers use in order to make sure messages end up in the right place. As we saw above, topics can use wildcards. This allows for a useful <code class="inline">"topic:subtopic"</code> convention. Often, you'll compose topics using record IDs from your application layer, such as <code class="inline">"users:123"</code>.</p>
+<h3 id="messages" class="section-heading">  Messages </h3> <p>The <a href="phoenix.socket.message.html"><code class="inline">Phoenix.Socket.Message</code></a> module defines a struct with the following keys which denotes a valid message. From the <a href="phoenix.socket.message.html">Phoenix.Socket.Message docs</a>.</p>
+<ul>
+<li>
+<code class="inline">topic</code> - The string topic or <code class="inline">"topic:subtopic"</code> pair namespace, such as <code class="inline">"messages"</code> or <code class="inline">"messages:123"</code>
+</li>
+<li>
+<code class="inline">event</code> - The string event name, for example <code class="inline">"phx_join"</code>
+</li>
+<li>
+<code class="inline">payload</code> - The message payload</li>
+<li>
+<code class="inline">ref</code> - The unique string ref</li>
+</ul>
+<h3 id="pubsub" class="section-heading">  PubSub </h3> <p>PubSub is provided by the <a href="https://hexdocs.pm/phoenix_pubsub/2.1.1/Phoenix.PubSub.html"><code class="inline">Phoenix.PubSub</code></a> module. Interested parties can receive events by subscribing to topics. Other processes can broadcast events to certain topics.</p>
+<p>This is useful to broadcast messages on channel and also for application development in general. For instance, letting all connected <a href="https://github.com/phoenixframework/phoenix_live_view">live views</a> to know that a new comment has been added to a post.</p>
+<p>The PubSub system takes care of getting messages from one node to another so that they can be sent to all subscribers across the cluster. By default, this is done using <a href="../phoenix_pubsub/phoenix.pubsub.pg2.html">Phoenix.PubSub.PG2</a>, which uses native BEAM messaging.</p>
+<p>If your deployment environment does not support distributed Elixir or direct communication between servers, Phoenix also ships with a <a href="https://hexdocs.pm/phoenix_pubsub_redis/Phoenix.PubSub.Redis.html">Redis Adapter</a> that uses Redis to exchange PubSub data. Please see the <a href="../phoenix_pubsub/phoenix.pubsub.html">Phoenix.PubSub docs</a> for more information.</p>
+<h3 id="client-libraries" class="section-heading">  Client Libraries </h3> <p>Any networked device can connect to Phoenix Channels as long as it has a client library. The following libraries exist today, and new ones are always welcome.</p>
+<h4>Official</h4>
+<p>Phoenix ships with a JavaScript client that is available when generating a new Phoenix project. The documentation for the JavaScript module is available at <a href="https://hexdocs.pm/phoenix/js/">https://hexdocs.pm/phoenix/js/</a>; the code is in <a href="https://github.com/phoenixframework/phoenix/blob/master/assets/js/phoenix/">multiple js files</a>.</p>
+<h4>3rd Party</h4>
+<ul>
+<li>Swift (iOS)<ul><li><a href="https://github.com/davidstump/SwiftPhoenixClient">SwiftPhoenix</a></li></ul>
+</li>
+<li>Java (Android)<ul><li><a href="https://github.com/eoinsha/JavaPhoenixChannels">JavaPhoenixChannels</a></li></ul>
+</li>
+<li>Kotlin (Android)<ul><li><a href="https://github.com/dsrees/JavaPhoenixClient">JavaPhoenixClient</a></li></ul>
+</li>
+<li>C#<ul><li><a href="https://github.com/Mazyod/PhoenixSharp">PhoenixSharp</a></li></ul>
+</li>
+<li>Elixir<ul><li><a href="https://github.com/Aircloak/phoenix_gen_socket_client">phoenix_gen_socket_client</a></li></ul>
+</li>
+<li>GDScript (Godot Game Engine)<ul><li><a href="https://github.com/alfredbaudisch/GodotPhoenixChannels">GodotPhoenixChannels</a></li></ul>
+</li>
+</ul>
+<h2 id="tying-it-all-together" class="section-heading">  Tying it all together </h2> <p>Let's tie all these ideas together by building a simple chat application. Make sure <a href="up_and_running.html">you created a new Phoenix application</a> and now we are ready to generate the <code class="inline">UserSocket</code>.</p>
+<h3 id="generating-a-socket" class="section-heading">  Generating a socket </h3> <p>Let's invoke the socket generator to get started:</p>
+<pre data-language="elixir">$ mix phx.gen.socket User
+</pre>
+<p>It will create two files, the client code in <code class="inline">assets/js/user_socket.js</code> and the server counter-part in <code class="inline">lib/hello_web/channels/user_socket.ex</code>. After running, the generator will also ask to add the following line to <code class="inline">lib/hello_web/endpoint.ex</code>:</p>
+<pre data-language="elixir">defmodule HelloWeb.Endpoint do
+  use Phoenix.Endpoint, otp_app: :hello
+
+  socket "/socket", HelloWeb.UserSocket,
+    websocket: true,
+    longpoll: false
+
+  ...
+end</pre>
+<p>The generator also asks us to import the client code, we will do that later.</p>
+<p>Next, we will configure our socket to ensure messages get routed to the correct channel. To do that, we'll uncomment the <code class="inline">"room:*"</code> channel definition:</p>
+<pre data-language="elixir">defmodule HelloWeb.UserSocket do
+  use Phoenix.Socket
+
+  ## Channels
+  channel "room:*", HelloWeb.RoomChannel
+  ...</pre>
+<p>Now, whenever a client sends a message whose topic starts with <code class="inline">"room:"</code>, it will be routed to our RoomChannel. Next, we'll define a <code class="inline">HelloWeb.RoomChannel</code> module to manage our chat room messages.</p>
+<h3 id="joining-channels" class="section-heading">  Joining Channels </h3> <p>The first priority of your channels is to authorize clients to join a given topic. For authorization, we must implement <code class="inline">join/3</code> in <code class="inline">lib/hello_web/channels/room_channel.ex</code>.</p>
+<pre data-language="elixir">defmodule HelloWeb.RoomChannel do
+  use Phoenix.Channel
+
+  def join("room:lobby", _message, socket) do
+    {:ok, socket}
+  end
+
+  def join("room:" &lt;&gt; _private_room_id, _params, _socket) do
+    {:error, %{reason: "unauthorized"}}
+  end
+end</pre>
+<p>For our chat app, we'll allow anyone to join the <code class="inline">"room:lobby"</code> topic, but any other room will be considered private and special authorization, say from a database, will be required. (We won't worry about private chat rooms for this exercise, but feel free to explore after we finish.)</p>
+<p>With our channel in place, let's get the client and server talking.</p>
+<p>The generated <code class="inline">assets/js/user_socket.js</code> defines a simple client based on the socket implementation that ships with Phoenix.</p>
+<p>We can use that library to connect to our socket and join our channel, we just need to set our room name to <code class="inline">"room:lobby"</code> in that file.</p>
+<pre data-language="elixir">// assets/js/user_socket.js
+// ...
+socket.connect()
+
+// Now that you are connected, you can join channels with a topic:
+let channel = socket.channel("room:lobby", {})
+channel.join()
+  .receive("ok", resp =&gt; { console.log("Joined successfully", resp) })
+  .receive("error", resp =&gt; { console.log("Unable to join", resp) })
+
+export default socket</pre>
+<p>After that, we need to make sure <code class="inline">assets/js/user_socket.js</code> gets imported into our application JavaScript file. To do that, uncomment this line in <code class="inline">assets/js/app.js</code>.</p>
+<pre data-language="elixir">// ...
+import "./user_socket.js"</pre>
+<p>Save the file and your browser should auto refresh, thanks to the Phoenix live reloader. If everything worked, we should see "Joined successfully" in the browser's JavaScript console. Our client and server are now talking over a persistent connection. Now let's make it useful by enabling chat.</p>
+<p>In <code class="inline">lib/hello_web/templates/page/index.html.heex</code>, we'll replace the existing code with a container to hold our chat messages, and an input field to send them:</p>
+<pre data-language="elixir">&lt;div id="messages" role="log" aria-live="polite"&gt;&lt;/div&gt;
+&lt;input id="chat-input" type="text"&gt;</pre>
+<p>Now let's add a couple of event listeners to <code class="inline">assets/js/user_socket.js</code>:</p>
+<pre data-language="elixir">// ...
+let channel           = socket.channel("room:lobby", {})
+let chatInput         = document.querySelector("#chat-input")
+let messagesContainer = document.querySelector("#messages")
+
+chatInput.addEventListener("keypress", event =&gt; {
+  if(event.key === 'Enter'){
+    channel.push("new_msg", {body: chatInput.value})
+    chatInput.value = ""
+  }
+})
+
+channel.join()
+  .receive("ok", resp =&gt; { console.log("Joined successfully", resp) })
+  .receive("error", resp =&gt; { console.log("Unable to join", resp) })
+
+export default socket</pre>
+<p>All we had to do is detect that enter was pressed and then <code class="inline">push</code> an event over the channel with the message body. We named the event <code class="inline">"new_msg"</code>. With this in place, let's handle the other piece of a chat application, where we listen for new messages and append them to our messages container.</p>
+<pre data-language="elixir">// ...
+let channel           = socket.channel("room:lobby", {})
+let chatInput         = document.querySelector("#chat-input")
+let messagesContainer = document.querySelector("#messages")
+
+chatInput.addEventListener("keypress", event =&gt; {
+  if(event.key === 'Enter'){
+    channel.push("new_msg", {body: chatInput.value})
+    chatInput.value = ""
+  }
+})
+
+channel.on("new_msg", payload =&gt; {
+  let messageItem = document.createElement("p")
+  messageItem.innerText = `[${Date()}] ${payload.body}`
+  messagesContainer.appendChild(messageItem)
+})
+
+channel.join()
+  .receive("ok", resp =&gt; { console.log("Joined successfully", resp) })
+  .receive("error", resp =&gt; { console.log("Unable to join", resp) })
+
+export default socket</pre>
+<p>We listen for the <code class="inline">"new_msg"</code> event using <code class="inline">channel.on</code>, and then append the message body to the DOM. Now let's handle the incoming and outgoing events on the server to complete the picture.</p>
+<h3 id="incoming-events" class="section-heading">  Incoming Events </h3> <p>We handle incoming events with <code class="inline">handle_in/3</code>. We can pattern match on the event names, like <code class="inline">"new_msg"</code>, and then grab the payload that the client passed over the channel. For our chat application, we simply need to notify all other <code class="inline">room:lobby</code> subscribers of the new message with <code class="inline">broadcast!/3</code>.</p>
+<pre data-language="elixir">defmodule HelloWeb.RoomChannel do
+  use Phoenix.Channel
+
+  def join("room:lobby", _message, socket) do
+    {:ok, socket}
+  end
+
+  def join("room:" &lt;&gt; _private_room_id, _params, _socket) do
+    {:error, %{reason: "unauthorized"}}
+  end
+
+  def handle_in("new_msg", %{"body" =&gt; body}, socket) do
+    broadcast!(socket, "new_msg", %{body: body})
+    {:noreply, socket}
+  end
+end</pre>
+<p><code class="inline">broadcast!/3</code> will notify all joined clients on this <code class="inline">socket</code>'s topic and invoke their <code class="inline">handle_out/3</code> callbacks. <code class="inline">handle_out/3</code> isn't a required callback, but it allows us to customize and filter broadcasts before they reach each client. By default, <code class="inline">handle_out/3</code> is implemented for us and simply pushes the message on to the client. Hooking into outgoing events allows for powerful message customization and filtering. Let's see how.</p>
+<h3 id="intercepting-outgoing-events" class="section-heading">  Intercepting Outgoing Events </h3> <p>We won't implement this for our application, but imagine our chat app allowed users to ignore messages about new users joining a room. We could implement that behavior like this, where we explicitly tell Phoenix which outgoing event we want to intercept and then define a <code class="inline">handle_out/3</code> callback for those events. (Of course, this assumes that we have an <code class="inline">Accounts</code> context with an <code class="inline">ignoring_user?/2</code> function, and that we pass a user in via the <code class="inline">assigns</code> map). It is important to note that the <code class="inline">handle_out/3</code> callback will be called for every recipient of a message, so more expensive operations like hitting the database should be considered carefully before being included in <code class="inline">handle_out/3</code>.</p>
+<pre data-language="elixir">intercept ["user_joined"]
+
+def handle_out("user_joined", msg, socket) do
+  if Accounts.ignoring_user?(socket.assigns[:user], msg.user_id) do
+    {:noreply, socket}
+  else
+    push(socket, "user_joined", msg)
+    {:noreply, socket}
+  end
+end</pre>
+<p>That's all there is to our basic chat app. Fire up multiple browser tabs and you should see your messages being pushed and broadcasted to all windows!</p>
+<h2 id="using-token-authentication" class="section-heading">  Using Token Authentication </h2> <p>When we connect, we'll often need to authenticate the client. Fortunately, this is a 4-step process with <a href="phoenix.token.html">Phoenix.Token</a>.</p>
+<p><strong>Step 1 - Assign a Token in the Connection</strong></p>
+<p>Let's say we have an authentication plug in our app called <code class="inline">OurAuth</code>. When <code class="inline">OurAuth</code> authenticates a user, it sets a value for the <code class="inline">:current_user</code> key in <code class="inline">conn.assigns</code>. Since the <code class="inline">current_user</code> exists, we can simply assign the user's token in the connection for use in the layout. We can wrap that behavior up in a private function plug, <code class="inline">put_user_token/2</code>. This could also be put in its own module as well. To make this all work, we just add <code class="inline">OurAuth</code> and <code class="inline">put_user_token/2</code> to the browser pipeline.</p>
+<pre data-language="elixir">pipeline :browser do
+  ...
+  plug OurAuth
+  plug :put_user_token
+end
+
+defp put_user_token(conn, _) do
+  if current_user = conn.assigns[:current_user] do
+    token = Phoenix.Token.sign(conn, "user socket", current_user.id)
+    assign(conn, :user_token, token)
+  else
+    conn
+  end
+end</pre>
+<p>Now our <code class="inline">conn.assigns</code> contains the <code class="inline">current_user</code> and <code class="inline">user_token</code>.</p>
+<p><strong>Step 2 - Pass the Token to the JavaScript</strong></p>
+<p>Next, we need to pass this token to JavaScript. We can do so inside a script tag in <code class="inline">web/templates/layout/app.html.heex</code> right above the app.js script, as follows:</p>
+<pre data-language="elixir">&lt;script&gt;window.userToken = "&lt;%= assigns[:user_token] %&gt;";&lt;/script&gt;
+&lt;script src={Routes.static_path(@conn, "/assets/app.js")}&gt;&lt;/script&gt;</pre>
+<p><strong>Step 3 - Pass the Token to the Socket Constructor and Verify</strong></p>
+<p>We also need to pass the <code class="inline">:params</code> to the socket constructor and verify the user token in the <code class="inline">connect/3</code> function. To do so, edit <code class="inline">web/channels/user_socket.ex</code>, as follows:</p>
+<pre data-language="elixir">def connect(%{"token" =&gt; token}, socket, _connect_info) do
+  # max_age: 1209600 is equivalent to two weeks in seconds
+  case Phoenix.Token.verify(socket, "user socket", token, max_age: 1209600) do
+    {:ok, user_id} -&gt;
+      {:ok, assign(socket, :current_user, user_id)}
+    {:error, reason} -&gt;
+      :error
+  end
+end</pre>
+<p>In our JavaScript, we can use the token set previously when constructing the Socket:</p>
+<pre data-language="elixir">let socket = new Socket("/socket", {params: {token: window.userToken}})</pre>
+<p>We used <a href="phoenix.token.html#verify/4"><code class="inline">Phoenix.Token.verify/4</code></a> to verify the user token provided by the client. <a href="phoenix.token.html#verify/4"><code class="inline">Phoenix.Token.verify/4</code></a> returns either <code class="inline">{:ok, user_id}</code> or <code class="inline">{:error, reason}</code>. We can pattern match on that return in a <code class="inline">case</code> statement. With a verified token, we set the user's id as the value to <code class="inline">:current_user</code> in the socket. Otherwise, we return <code class="inline">:error</code>.</p>
+<p><strong>Step 4 - Connect to the socket in JavaScript</strong></p>
+<p>With authentication set up, we can connect to sockets and channels from JavaScript.</p>
+<pre data-language="elixir">let socket = new Socket("/socket", {params: {token: window.userToken}})
+socket.connect()</pre>
+<p>Now that we are connected, we can join channels with a topic:</p>
+<pre data-language="elixir">let channel = socket.channel("topic:subtopic", {})
+channel.join()
+  .receive("ok", resp =&gt; { console.log("Joined successfully", resp) })
+  .receive("error", resp =&gt; { console.log("Unable to join", resp) })
+
+export default socket</pre>
+<p>Note that token authentication is preferable since it's transport agnostic and well-suited for long running-connections like channels, as opposed to using sessions or authentication approaches.</p>
+<h2 id="fault-tolerance-and-reliability-guarantees" class="section-heading">  Fault Tolerance and Reliability Guarantees </h2> <p>Servers restart, networks split, and clients lose connectivity. In order to design robust systems, we need to understand how Phoenix responds to these events and what guarantees it offers.</p>
+<h3 id="handling-reconnection" class="section-heading">  Handling Reconnection </h3> <p>Clients subscribe to topics, and Phoenix stores those subscriptions in an in-memory ETS table. If a channel crashes, the clients will need to reconnect to the topics they had previously subscribed to. Fortunately, the Phoenix JavaScript client knows how to do this. The server will notify all the clients of the crash. This will trigger each client's <code class="inline">Channel.onError</code> callback. The clients will attempt to reconnect to the server using an exponential backoff strategy. Once they reconnect, they'll attempt to rejoin the topics they had previously subscribed to. If they are successful, they'll start receiving messages from those topics as before.</p>
+<h3 id="resending-client-messages" class="section-heading">  Resending Client Messages </h3> <p>Channel clients queue outgoing messages into a <code class="inline">PushBuffer</code>, and send them to the server when there is a connection. If no connection is available, the client holds on to the messages until it can establish a new connection. With no connection, the client will hold the messages in memory until it establishes a connection, or until it receives a <code class="inline">timeout</code> event. The default timeout is set to 5000 milliseconds. The client won't persist the messages in the browser's local storage, so if the browser tab closes, the messages will be gone.</p>
+<h3 id="resending-server-messages" class="section-heading">  Resending Server Messages </h3> <p>Phoenix uses an at-most-once strategy when sending messages to clients. If the client is offline and misses the message, Phoenix won't resend it. Phoenix doesn't persist messages on the server. If the server restarts, unsent messages will be gone. If our application needs stronger guarantees around message delivery, we'll need to write that code ourselves. Common approaches involve persisting messages on the server and having clients request missing messages. For an example, see Chris McCord's Phoenix training: <a href="https://github.com/chrismccord/elixirconf_training/blob/master/web/static/js/app.js#L38-L39">client code</a> and <a href="https://github.com/chrismccord/elixirconf_training/blob/master/web/channels/document_channel.ex#L13-L19">server code</a>.</p>
+<h2 id="example-application" class="section-heading">  Example Application </h2> <p>To see an example of the application we just built, checkout the project <a href="https://github.com/chrismccord/phoenix_chat_example">phoenix_chat_example</a>.</p>
+<p>You can also see a live demo at <a href="https://phoenixchat.herokuapp.com/">https://phoenixchat.herokuapp.com/</a>.</p> <div class="bottom-actions"> <div class="bottom-actions-item"> <a href="mix_phx_gen_auth.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> mix phx.gen.auth </span> </a> </div> <div class="bottom-actions-item"> <a href="presence.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Presence </span> </a> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2014 Chris McCord<br>Licensed under the MIT License.<br>
+    <a href="https://hexdocs.pm/phoenix/channels.html" class="_attribution-link">https://hexdocs.pm/phoenix/channels.html</a>
+  </p>
+</div>

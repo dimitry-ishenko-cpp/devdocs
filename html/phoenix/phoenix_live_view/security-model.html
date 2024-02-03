@@ -1,0 +1,141 @@
+<h1>   <span>Security considerations of the LiveView model</span> </h1> <p>LiveView begins its life-cycle as a regular HTTP request. Then a stateful connection is established. Both the HTTP request and the stateful connection receive the client data via parameters and session.</p>
+<p>This means that any session validation must happen both in the HTTP request (plug pipeline) and the stateful connection (LiveView mount).</p>
+<h2 id="authentication-vs-authorization" class="section-heading">  Authentication vs authorization </h2> <p>When speaking about security, there are two terms commonly used: authentication and authorization. Authentication is about identifying a user. Authorization is about telling if a user has access to a certain resource or feature in the system.</p>
+<p>In a regular web application, once a user is authenticated, for example by entering their email and password, or by using a third-party service such as Google, Twitter, or Facebook, a token identifying the user is stored in the session, which is a cookie (a key-value pair) stored in the user's browser.</p>
+<p>Every time there is a request, we read the value from the session, and, if valid, we fetch the user stored in the session from the database. The session is automatically validated by Phoenix and tools like <a href="https://hexdocs.pm/phoenix/1.6.6/Mix.Tasks.Phx.Gen.Auth.html"><code class="inline">mix phx.gen.auth</code></a> can generate the building blocks of an authentication system for you.</p>
+<p>Once the user is authenticated, they may perform many actions on the page, and some of those actions require specific permissions. This is called authorization and the specific rules often change per application.</p>
+<p>In a regular web application, we perform authentication and authorization checks on every request. In LiveView, we should also run those exact same checks, always. Once the user is authenticated, we typically validate the sessions on the <code class="inline">mount</code> callback. Authorization rules generally happen on <code class="inline">mount</code> (for instance, is the user allowed to see this page?) and also on <code class="inline">handle_event</code> (is the user allowed to delete this item?).</p>
+<h2 id="mounting-considerations" class="section-heading">  Mounting considerations </h2> <p>If you perform user authentication and confirmation on every HTTP request via Plugs, such as this:</p>
+<pre data-language="elixir">plug :ensure_user_authenticated
+plug :ensure_user_confirmed</pre>
+<p>Then the <a href="phoenix.liveview.html#c:mount/3"><code class="inline">mount/3</code></a> callback of your LiveView should execute those same verifications:</p>
+<pre data-language="elixir">def mount(_params, %{"user_id" =&gt; user_id} = _session, socket) do
+  socket = assign(socket, current_user: Accounts.get_user!(user_id))
+
+  socket =
+    if socket.assigns.current_user.confirmed_at do
+      socket
+    else
+      redirect(socket, to: "/login")
+    end
+
+  {:ok, socket}
+end</pre>
+<p>LiveView v0.17 includes the <code class="inline">on_mount</code> (<a href="phoenix.liveview.html#on_mount/1"><code class="inline">Phoenix.LiveView.on_mount/1</code></a>) hook, which allows you to encapsulate this logic and execute it on every mount, as you would with plug:</p>
+<pre data-language="elixir">defmodule MyAppWeb.UserLiveAuth do
+  import Phoenix.LiveView
+
+  def on_mount(:default, _params, %{"user_id" =&gt; user_id} = _session, socket) do
+    socket = assign_new(socket, :current_user, fn -&gt;
+      Accounts.get_user!(user_id)
+    end)
+
+    if socket.assigns.current_user.confirmed_at do
+      {:cont, socket}
+    else
+      {:halt, redirect(socket, to: "/login")}
+    end
+  end
+end</pre>
+<p>We use <a href="phoenix.liveview.html#assign_new/3"><code class="inline">assign_new/3</code></a>. This is a convenience to avoid fetching the <code class="inline">current_user</code> multiple times across LiveViews.</p>
+<p>Now we can use the hook whenever relevant:</p>
+<pre data-language="elixir">defmodule MyAppWeb.PageLive do
+  use MyAppWeb, :live_view
+  on_mount MyAppWeb.UserLiveAuth
+
+  ...
+end</pre>
+<p>If you prefer, you can add the hook to <code class="inline">def live_view</code> under <code class="inline">MyAppWeb</code>, to run it on all LiveViews by default:</p>
+<pre data-language="elixir">def live_view do
+  quote do
+    use Phoenix.LiveView,
+      layout: {MyAppWeb.LayoutView, "live.html"}
+
+    on_mount MyAppWeb.UserLiveAuth
+    unquote(view_helpers())
+  end
+end</pre>
+<h2 id="events-considerations" class="section-heading">  Events considerations </h2> <p>Every time the user performs an action on your system, you should verify if the user is authorized to do so, regardless if you are using LiveViews or not. For example, imagine a user can see all projects in a web application, but they may not have permission to delete any of them. At the UI level, you handle this accordingly by not showing the delete button in the projects listing, but a savvy user can directly talk to the server and request a deletion anyway. For this reason, <strong>you must always verify permissions on the server</strong>.</p>
+<p>In LiveView, most actions are handled by the <code class="inline">handle_event</code> callback. Therefore, you typically authorize the user within those callbacks. In the scenario just described, one might implement this:</p>
+<pre data-language="elixir">on_mount MyAppWeb.UserLiveAuth
+
+def mount(_params, _session, socket) do
+  {:ok, load_projects(socket)}
+end
+
+def handle_event("delete_project", %{"project_id" =&gt; project_id}, socket) do
+  Project.delete!(socket.assigns.current_user, project_id)
+  {:noreply, update(socket, :projects, &amp;Enum.reject(&amp;1, fn p -&gt; p.id == project_id end)}
+end
+
+defp load_projects(socket) do
+  projects = Project.all_projects(socket.assigns.current_user)
+  assign(socket, projects: projects)
+end</pre>
+<p>First, we used <code class="inline">on_mount</code> to authenticate the user based on the data stored in the session. Then we load all projects based on the authenticated user. Now, whenever there is a request to delete a project, we still pass the current user as argument to the <code class="inline">Project</code> context, so it verifies if the user is allowed to delete it or not. In case it cannot delete, it is fine to just raise an exception. After all, users are not meant to trigger this code path anyway (unless they are fiddling with something they are not supposed to!).</p>
+<h2 id="disconnecting-all-instances-of-a-live-user" class="section-heading">  Disconnecting all instances of a live user </h2> <p>So far, the security model between LiveView and regular web applications have been remarkably similar. After all, we must always authenticate and authorize every user. The main difference between them happens on logout or when revoking access.</p>
+<p>Because LiveView is a permanent connection between client and server, if a user is logged out, or removed from the system, this change won't reflect on the LiveView part unless the user reloads the page.</p>
+<p>Luckily, it is possible to address this by setting a <code class="inline">live_socket_id</code> in the session. For example, when logging in a user, you could do:</p>
+<pre data-language="elixir">conn
+|&gt; put_session(:current_user_id, user.id)
+|&gt; put_session(:live_socket_id, "users_socket:#{user.id}")</pre>
+<p>Now all LiveView sockets will be identified and listen to the given <code class="inline">live_socket_id</code>. You can then disconnect all live users identified by said ID by broadcasting on the topic:</p>
+<pre data-language="elixir">MyAppWeb.Endpoint.broadcast("users_socket:#{user.id}", "disconnect", %{})</pre>
+<blockquote><p>Note: If you use <a href="https://hexdocs.pm/phoenix/1.6.6/Mix.Tasks.Phx.Gen.Auth.html"><code class="inline">mix phx.gen.auth</code></a> to generate your authentication system, lines to that effect are already present in the generated code. The generated code uses a <code class="inline">user_token</code> instead of referring to the <code class="inline">user_id</code>.</p></blockquote>
+<p>Once a LiveView is disconnected, the client will attempt to reestablish the connection and re-execute the <a href="phoenix.liveview.html#c:mount/3"><code class="inline">mount/3</code></a> callback. In this case, if the user is no longer logged in or it no longer has access to the current resource, <code class="inline">mount/3</code> will fail and the user will be redirected.</p>
+<p>This is the same mechanism provided by <a href="https://hexdocs.pm/phoenix/1.6.6/Phoenix.Channel.html"><code class="inline">Phoenix.Channel</code></a>s. Therefore, if your application uses both channels and LiveViews, you can use the same technique to disconnect any stateful connection.</p>
+<h2 id="live_session-and-live_redirect" class="section-heading">  <code class="inline">live_session</code> and <code class="inline">live_redirect</code> </h2> <p>LiveView supports live redirect, which allows users to navigate between pages over the LiveView connection. Whenever there is a <code class="inline">live_redirect</code>, a new LiveView will be mounted, skipping the regular HTTP requests and without going through the plug pipeline.</p>
+<p>However, if you want to draw stronger boundaries between parts of your application, you can also use <a href="phoenix.liveview.router.html#live_session/2"><code class="inline">Phoenix.LiveView.Router.live_session/2</code></a> to group your live routes. This can be handy because you can only <code class="inline">live_redirect</code> between LiveViews in the same <code class="inline">live_session</code>.</p>
+<p>For example, imagine you need to authenticate two distinct types of users. Your regular users login via email and password, and you have an admin dashboard that uses http auth. You can specify different <code class="inline">live_session</code>s for each authentication flow:</p>
+<pre data-language="elixir">live_session :default do
+  scope "/" do
+    pipe_through [:authenticate_user]
+    get ...
+    live ...
+  end
+end
+
+live_session :admin do
+  scope "/admin" do
+    pipe_through [:http_auth_admin]
+    get ...
+    live ...
+  end
+end</pre>
+<p>Now every time you try to navigate to an admin panel, and out of it, a regular page navigation will happen and a brand new live connection will be established.</p>
+<p>Once again, it is worth remembering that LiveViews require their own security checks, so we use <code class="inline">pipe_through</code> above to protect the regular routes (get, post, etc.) and the LiveViews should run their own checks using <code class="inline">on_mount</code> hooks.</p>
+<p><code class="inline">live_session</code> can also be used to enforce each LiveView group has a different root layout, since layouts are not updated between live redirects:</p>
+<pre data-language="elixir">live_session :default, root_layout: {LayoutView, "app.html"} do
+  ...
+end
+
+live_session :admin, root_layout: {LayoutView, "admin.html"} do
+  ...
+end</pre>
+<p>Finally, you can even combine <code class="inline">live_session</code> with <code class="inline">on_mount</code>. Instead of declaring <code class="inline">on_mount</code> on every LiveView, you can declare it at the router level and it will enforce it on all LiveViews under it:</p>
+<pre data-language="elixir">live_session :default, on_mount: MyAppWeb.UserLiveAuth do
+  scope "/" do
+    pipe_through [:authenticate_user]
+    live ...
+  end
+end
+
+live_session :admin, on_mount: MyAppWeb.AdminLiveAuth do
+  scope "/admin" do
+    pipe_through [:authenticate_admin]
+    live ...
+  end
+end</pre>
+<p>Each live route under the <code class="inline">:default</code> <code class="inline">live_session</code> will invoke the <code class="inline">MyAppWeb.UserLiveAuth</code> hook on mount. This module was defined earlier in this guide. We will also pipe regular web requests through <code class="inline">:authenticate_user</code>, which must execute the same checks as <code class="inline">MyAppWeb.UserLiveAuth</code>, but tailored to plug.</p>
+<p>Similarly, the <code class="inline">:admin</code> <code class="inline">live_session</code> has its own authentication flow, powered by <code class="inline">MyAppWeb.AdminLiveAuth</code>. It also defines a plug equivalent named <code class="inline">:authenticate_admin</code>, which will be used by any regular request. If there are no regular web requests defined under a live session, then the <code class="inline">pipe_through</code> checks are not necessary.</p>
+<p>Declaring the <code class="inline">on_mount</code> on <code class="inline">live_session</code> is exactly the same as declaring it in each LiveView inside the <code class="inline">live_session</code>. It will be executed every time a LiveView is mounted, even after <code class="inline">live_redirect</code>s. The important concepts to keep in mind are:</p>
+<ul>
+<li><p>If you have both LiveViews and regular web requests, then you must always authorize and authenticate your LiveViews (using on mount hooks) and your web requests (using plugs)</p></li>
+<li><p>All actions (events) must also be explicitly authorized by checking permissions. Those permissions are often domain/business specific, and typically happen in your context modules</p></li>
+<li><p><code class="inline">live_session</code> can be used to draw boundaries between groups of LiveViews. While you could use <code class="inline">live_session</code> to draw lines between different authorization rules, doing so would lead to frequent page reloads. For this reason, we typically use <code class="inline">live_session</code> to enforce different <em>authentication</em> requirements or whenever you need to change root layouts</p></li>
+</ul> <div class="bottom-actions"> <div class="bottom-actions-item"> <a href="live-navigation.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Live navigation </span> </a> </div> <div class="bottom-actions-item"> <a href="telemetry.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Telemetry </span> </a> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2018 Chris McCord<br>Licensed under the MIT License.<br>
+    <a href="https://hexdocs.pm/phoenix_live_view/security-model.html" class="_attribution-link">https://hexdocs.pm/phoenix_live_view/security-model.html</a>
+  </p>
+</div>
