@@ -1,0 +1,359 @@
+<h1 id="tutorial-3-securing-invo">Tutorial 3: Securing INVO</h1> <p>In this chapter, we continue explaining how INVO is structured, we’ll talk about the implementation of authentication, authorization using events and plugins and an access control list (ACL) managed by Phalcon.</p>  <h2 id="log-into-the-application">Log into the Application</h2> <p>A “log in” facility will allow us to work on backend controllers. The separation between backend controllers and frontend ones is only logical. All controllers are located in the same directory (app/controllers/).</p> <p>To enter the system, users must have a valid username and password. Users are stored in the table “users” in the database “invo”.</p> <p>Before we can start a session, we need to configure the connection to the database in the application. A service called “db” is set up in the service container with the connection information. As with the autoloader, we are again taking parameters from the configuration file in order to configure a service:</p> <pre class="highlight-php" data-language="php">use Phalcon\Db\Adapter\Pdo\Mysql as DbAdapter;
+
+// ...
+
+// Database connection is created based on parameters defined in the configuration file
+$di-&gt;set(
+    "db",
+    function () use ($config) {
+        return new DbAdapter(
+            [
+                "host"     =&gt; $config-&gt;database-&gt;host,
+                "username" =&gt; $config-&gt;database-&gt;username,
+                "password" =&gt; $config-&gt;database-&gt;password,
+                "dbname"   =&gt; $config-&gt;database-&gt;name,
+            ]
+        );
+    }
+);
+</pre> <p>Here, we return an instance of the MySQL connection adapter. If needed, you could do extra actions such as adding a logger, a profiler or change the adapter, setting it up as you want.</p> <p>The following simple form (app/views/session/index.volt) requests the login information. We’ve removed some HTML code to make the example more concise:</p> <pre class="highlight-html+jinja" data-language="html">{{ form("session/start") }}
+    &lt;fieldset&gt;
+        &lt;div&gt;
+            &lt;label for="email"&gt;
+                Username/Email
+            &lt;/label&gt;
+
+            &lt;div&gt;
+                {{ text_field("email") }}
+            &lt;/div&gt;
+        &lt;/div&gt;
+
+        &lt;div&gt;
+            &lt;label for="password"&gt;
+                Password
+            &lt;/label&gt;
+
+            &lt;div&gt;
+                {{ password_field("password") }}
+            &lt;/div&gt;
+        &lt;/div&gt;
+
+
+
+        &lt;div&gt;
+            {{ submit_button("Login") }}
+        &lt;/div&gt;
+    &lt;/fieldset&gt;
+{{ endForm() }}
+</pre> <p>Instead of using raw PHP as the previous tutorial, we started to use <a class="reference internal" href="volt.html"><em>Volt</em></a>. This is a built-in template engine inspired by <a class="reference external" href="http://jinja.pocoo.org/">Jinja</a> providing a simpler and friendly syntax to create templates. It will not take too long before you become familiar with Volt.</p> <p>The <code class="code docutils literal"><span class="pre">SessionController::startAction</span></code> function (app/controllers/SessionController.php) has the task of validating the data entered in the form including checking for a valid user in the database:</p> <pre class="highlight-php" data-language="php">class SessionController extends ControllerBase
+{
+    // ...
+
+    private function _registerSession($user)
+    {
+        $this-&gt;session-&gt;set(
+            "auth",
+            [
+                "id"   =&gt; $user-&gt;id,
+                "name" =&gt; $user-&gt;name,
+            ]
+        );
+    }
+
+    /**
+     * This action authenticate and logs a user into the application
+     */
+    public function startAction()
+    {
+        if ($this-&gt;request-&gt;isPost()) {
+            // Get the data from the user
+            $email    = $this-&gt;request-&gt;getPost("email");
+            $password = $this-&gt;request-&gt;getPost("password");
+
+            // Find the user in the database
+            $user = Users::findFirst(
+                [
+                    "(email = :email: OR username = :email:) AND password = :password: AND active = 'Y'",
+                    "bind" =&gt; [
+                        "email"    =&gt; $email,
+                        "password" =&gt; sha1($password),
+                    ]
+                ]
+            );
+
+            if ($user !== false) {
+                $this-&gt;_registerSession($user);
+
+                $this-&gt;flash-&gt;success(
+                    "Welcome " . $user-&gt;name
+                );
+
+                // Forward to the 'invoices' controller if the user is valid
+                return $this-&gt;dispatcher-&gt;forward(
+                    [
+                        "controller" =&gt; "invoices",
+                        "action"     =&gt; "index",
+                    ]
+                );
+            }
+
+            $this-&gt;flash-&gt;error(
+                "Wrong email/password"
+            );
+        }
+
+        // Forward to the login form again
+        return $this-&gt;dispatcher-&gt;forward(
+            [
+                "controller" =&gt; "session",
+                "action"     =&gt; "index",
+            ]
+        );
+    }
+}
+</pre> <p>For the sake of simplicity, we have used “<a class="reference external" href="http://php.net/manual/en/function.sha1.php">sha1</a>” to store the password hashes in the database, however, this algorithm is not recommended in real applications, use “<a class="reference internal" href="security.html"><em>bcrypt</em></a>” instead.</p> <p>Note that multiple public attributes are accessed in the controller like: <code class="code docutils literal"><span class="pre">$this-&gt;flash</span></code>, <code class="code docutils literal"><span class="pre">$this-&gt;request</span></code> or <code class="code docutils literal"><span class="pre">$this-&gt;session</span></code>. These are services defined in the services container from earlier (app/config/services.php). When they’re accessed the first time, they are injected as part of the controller.</p> <p>These services are “shared”, which means that we are always accessing the same instance regardless of the place where we invoke them.</p> <p>For instance, here we invoke the “session” service and then we store the user identity in the variable “auth”:</p> <pre class="highlight-php" data-language="php">$this-&gt;session-&gt;set(
+    "auth",
+    [
+        "id"   =&gt; $user-&gt;id,
+        "name" =&gt; $user-&gt;name,
+    ]
+);
+</pre> <p>Another important aspect of this section is how the user is validated as a valid one, first we validate whether the request has been made using method POST:</p> <pre class="highlight-php" data-language="php">if ($this-&gt;request-&gt;isPost()) {
+</pre> <p>Then, we receive the parameters from the form:</p> <pre class="highlight-php" data-language="php">$email    = $this-&gt;request-&gt;getPost("email");
+$password = $this-&gt;request-&gt;getPost("password");
+</pre> <p>Now, we have to check if there is one user with the same username or email and password:</p> <pre class="highlight-php" data-language="php">$user = Users::findFirst(
+    [
+        "(email = :email: OR username = :email:) AND password = :password: AND active = 'Y'",
+        "bind" =&gt; [
+            "email"    =&gt; $email,
+            "password" =&gt; sha1($password),
+        ]
+    ]
+);
+</pre> <p>Note, the use of ‘bound parameters’, placeholders :email: and :password: are placed where values should be, then the values are ‘bound’ using the parameter ‘bind’. This safely replaces the values for those columns without having the risk of a SQL injection.</p> <p>If the user is valid we register it in session and forwards him/her to the dashboard:</p> <pre class="highlight-php" data-language="php">if ($user !== false) {
+    $this-&gt;_registerSession($user);
+
+    $this-&gt;flash-&gt;success(
+        "Welcome " . $user-&gt;name
+    );
+
+    return $this-&gt;dispatcher-&gt;forward(
+        [
+            "controller" =&gt; "invoices",
+            "action"     =&gt; "index",
+        ]
+    );
+}
+</pre> <p>If the user does not exist we forward the user back again to action where the form is displayed:</p> <pre class="highlight-php" data-language="php">return $this-&gt;dispatcher-&gt;forward(
+    [
+        "controller" =&gt; "session",
+        "action"     =&gt; "index",
+    ]
+);
+</pre>   <h2 id="securing-the-backend">Securing the Backend</h2> <p>The backend is a private area where only registered users have access. Therefore, it is necessary to check that only registered users have access to these controllers. If you aren’t logged into the application and you try to access, for example, the products controller (which is private) you will see a screen like this:</p> <div class="figure align-center"> <img alt="../_images/invo-2.png" src="https://docs.phalconphp.com/en/latest/_images/invo-2.png"> </div> <p>Every time someone attempts to access any controller/action, the application verifies that the current role (in session) has access to it, otherwise it displays a message like the above and forwards the flow to the home page.</p> <p>Now let’s find out how the application accomplishes this. The first thing to know is that there is a component called <a class="reference internal" href="dispatching.html"><em>Dispatcher</em></a>. It is informed about the route found by the <a class="reference internal" href="routing.html"><em>Routing</em></a> component. Then, it is responsible for loading the appropriate controller and execute the corresponding action method.</p> <p>Normally, the framework creates the Dispatcher automatically. In our case, we want to perform a verification before executing the required action, checking if the user has access to it or not. To achieve this, we have replaced the component by creating a function in the bootstrap:</p> <pre class="highlight-php" data-language="php">use Phalcon\Mvc\Dispatcher;
+
+// ...
+
+/**
+ * MVC dispatcher
+ */
+$di-&gt;set(
+    "dispatcher",
+    function () {
+        // ...
+
+        $dispatcher = new Dispatcher();
+
+        return $dispatcher;
+    }
+);
+</pre> <p>We now have total control over the Dispatcher used in the application. Many components in the framework trigger events that allow us to modify their internal flow of operation. As the Dependency Injector component acts as glue for components, a new component called <a class="reference internal" href="events.html"><em>EventsManager</em></a> allows us to intercept the events produced by a component, routing the events to listeners.</p>  <h3 id="events-management">Events Management</h3> <p>An <a class="reference internal" href="events.html"><em>EventsManager</em></a> allows us to attach listeners to a particular type of event. The type that interests us now is “dispatch”. The following code filters all events produced by the Dispatcher:</p> <pre class="highlight-php" data-language="php">use Phalcon\Mvc\Dispatcher;
+use Phalcon\Events\Manager as EventsManager;
+
+$di-&gt;set(
+    "dispatcher",
+    function () {
+        // Create an events manager
+        $eventsManager = new EventsManager();
+
+        // Listen for events produced in the dispatcher using the Security plugin
+        $eventsManager-&gt;attach(
+            "dispatch:beforeExecuteRoute",
+            new SecurityPlugin()
+        );
+
+        // Handle exceptions and not-found exceptions using NotFoundPlugin
+        $eventsManager-&gt;attach(
+            "dispatch:beforeException",
+            new NotFoundPlugin()
+        );
+
+        $dispatcher = new Dispatcher();
+
+        // Assign the events manager to the dispatcher
+        $dispatcher-&gt;setEventsManager($eventsManager);
+
+        return $dispatcher;
+    }
+);
+</pre> <p>When an event called “beforeExecuteRoute” is triggered the following plugin will be notified:</p> <pre class="highlight-php" data-language="php">/**
+ * Check if the user is allowed to access certain action using the SecurityPlugin
+ */
+$eventsManager-&gt;attach(
+    "dispatch:beforeExecuteRoute",
+    new SecurityPlugin()
+);
+</pre> <p>When a “beforeException” is triggered then other plugin is notified:</p> <pre class="highlight-php" data-language="php">/**
+ * Handle exceptions and not-found exceptions using NotFoundPlugin
+ */
+$eventsManager-&gt;attach(
+    "dispatch:beforeException",
+    new NotFoundPlugin()
+);
+</pre> <p>SecurityPlugin is a class located at (app/plugins/SecurityPlugin.php). This class implements the method “beforeExecuteRoute”. This is the same name as one of the events produced in the Dispatcher:</p> <pre class="highlight-php" data-language="php">use Phalcon\Events\Event;
+use Phalcon\Mvc\User\Plugin;
+use Phalcon\Mvc\Dispatcher;
+
+class SecurityPlugin extends Plugin
+{
+    // ...
+
+    public function beforeExecuteRoute(Event $event, Dispatcher $dispatcher)
+    {
+        // ...
+    }
+}
+</pre> <p>The hook events always receive a first parameter that contains contextual information of the event produced (<code class="code docutils literal"><span class="pre">$event</span></code>) and a second one that is the object that produced the event itself (<code class="code docutils literal"><span class="pre">$dispatcher</span></code>). It is not mandatory that plugins extend the class <a class="reference internal" href="../api/phalcon_mvc_user_plugin.html"><em>Phalcon\Mvc\User\Plugin</em></a>, but by doing this they gain easier access to the services available in the application.</p> <p>Now, we’re verifying the role in the current session, checking if the user has access using the ACL list. If the user does not have access we redirect to the home screen as explained before:</p> <pre class="highlight-php" data-language="php">use Phalcon\Acl;
+use Phalcon\Events\Event;
+use Phalcon\Mvc\User\Plugin;
+use Phalcon\Mvc\Dispatcher;
+
+class SecurityPlugin extends Plugin
+{
+    // ...
+
+    public function beforeExecuteRoute(Event $event, Dispatcher $dispatcher)
+    {
+        // Check whether the "auth" variable exists in session to define the active role
+        $auth = $this-&gt;session-&gt;get("auth");
+
+        if (!$auth) {
+            $role = "Guests";
+        } else {
+            $role = "Users";
+        }
+
+        // Take the active controller/action from the dispatcher
+        $controller = $dispatcher-&gt;getControllerName();
+        $action     = $dispatcher-&gt;getActionName();
+
+        // Obtain the ACL list
+        $acl = $this-&gt;getAcl();
+
+        // Check if the Role have access to the controller (resource)
+        $allowed = $acl-&gt;isAllowed($role, $controller, $action);
+
+        if (!$allowed) {
+            // If he doesn't have access forward him to the index controller
+            $this-&gt;flash-&gt;error(
+                "You don't have access to this module"
+            );
+
+            $dispatcher-&gt;forward(
+                [
+                    "controller" =&gt; "index",
+                    "action"     =&gt; "index",
+                ]
+            );
+
+            // Returning "false" we tell to the dispatcher to stop the current operation
+            return false;
+        }
+    }
+}
+</pre>   <h3 id="providing-an-acl-list">Providing an ACL list</h3> <p>In the above example we have obtained the ACL using the method <code class="code docutils literal"><span class="pre">$this-&gt;getAcl()</span></code>. This method is also implemented in the Plugin. Now we are going to explain step-by-step how we built the access control list (ACL):</p> <pre class="highlight-php" data-language="php">use Phalcon\Acl;
+use Phalcon\Acl\Role;
+use Phalcon\Acl\Adapter\Memory as AclList;
+
+// Create the ACL
+$acl = new AclList();
+
+// The default action is DENY access
+$acl-&gt;setDefaultAction(
+    Acl::DENY
+);
+
+// Register two roles, Users is registered users
+// and guests are users without a defined identity
+$roles = [
+    "users"  =&gt; new Role("Users"),
+    "guests" =&gt; new Role("Guests"),
+];
+
+foreach ($roles as $role) {
+    $acl-&gt;addRole($role);
+}
+</pre> <p>Now, we define the resources for each area respectively. Controller names are resources and their actions are accesses for the resources:</p> <pre class="highlight-php" data-language="php">use Phalcon\Acl\Resource;
+
+// ...
+
+// Private area resources (backend)
+$privateResources = [
+    "companies"    =&gt; ["index", "search", "new", "edit", "save", "create", "delete"],
+    "products"     =&gt; ["index", "search", "new", "edit", "save", "create", "delete"],
+    "producttypes" =&gt; ["index", "search", "new", "edit", "save", "create", "delete"],
+    "invoices"     =&gt; ["index", "profile"],
+];
+
+foreach ($privateResources as $resourceName =&gt; $actions) {
+    $acl-&gt;addResource(
+        new Resource($resourceName),
+        $actions
+    );
+}
+
+
+
+// Public area resources (frontend)
+$publicResources = [
+    "index"    =&gt; ["index"],
+    "about"    =&gt; ["index"],
+    "register" =&gt; ["index"],
+    "errors"   =&gt; ["show404", "show500"],
+    "session"  =&gt; ["index", "register", "start", "end"],
+    "contact"  =&gt; ["index", "send"],
+];
+
+foreach ($publicResources as $resourceName =&gt; $actions) {
+    $acl-&gt;addResource(
+        new Resource($resourceName),
+        $actions
+    );
+}
+</pre> <p>The ACL now have knowledge of the existing controllers and their related actions. Role “Users” has access to all the resources of both frontend and backend. The role “Guests” only has access to the public area:</p> <pre class="highlight-php" data-language="php">// Grant access to public areas to both users and guests
+foreach ($roles as $role) {
+    foreach ($publicResources as $resource =&gt; $actions) {
+        $acl-&gt;allow(
+            $role-&gt;getName(),
+            $resource,
+            "*"
+        );
+    }
+}
+
+// Grant access to private area only to role Users
+foreach ($privateResources as $resource =&gt; $actions) {
+    foreach ($actions as $action) {
+        $acl-&gt;allow(
+            "Users",
+            $resource,
+            $action
+        );
+    }
+}
+</pre> <p>Hooray!, the ACL is now complete. In next chapter, we will see how a CRUD is implemented in Phalcon and how you can customize it.</p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2011&ndash;2017 Phalcon Framework Team<br>Licensed under the Creative Commons Attribution License 3.0.<br>
+    <a href="https://docs.phalconphp.com/en/latest/reference/tutorial-invo-2.html" class="_attribution-link">https://docs.phalconphp.com/en/latest/reference/tutorial-invo-2.html</a>
+  </p>
+</div>
