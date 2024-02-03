@@ -1,0 +1,174 @@
+    <h1>Using the sqlite3_unlock_notify() API</h1> <pre data-language="sql">
+/* This example uses the pthreads API */
+#include &lt;pthread.h&gt;
+
+/*
+** A pointer to an instance of this structure is passed as the user-context
+** pointer when registering for an unlock-notify callback.
+*/
+typedef struct UnlockNotification UnlockNotification;
+struct UnlockNotification {
+  int fired;                         /* True after unlock event has occurred */
+  pthread_cond_t cond;               /* Condition variable to wait on */
+  pthread_mutex_t mutex;             /* Mutex to protect structure */
+};
+
+/*
+** This function is an unlock-notify callback registered with SQLite.
+*/
+static void unlock_notify_cb(void **apArg, int nArg){
+  int i;
+  for(i=0; i&lt;nArg; i++){
+    UnlockNotification *p = (UnlockNotification *)apArg[i];
+    pthread_mutex_lock(&amp;p-&gt;mutex);
+    p-&gt;fired = 1;
+    pthread_cond_signal(&amp;p-&gt;cond);
+    pthread_mutex_unlock(&amp;p-&gt;mutex);
+  }
+}
+
+/*
+** This function assumes that an SQLite API call (either sqlite3_prepare_v2() 
+** or sqlite3_step()) has just returned SQLITE_LOCKED. The argument is the
+** associated database connection.
+**
+** This function calls sqlite3_unlock_notify() to register for an 
+** unlock-notify callback, then blocks until that callback is delivered 
+** and returns SQLITE_OK. The caller should then retry the failed operation.
+**
+** Or, if sqlite3_unlock_notify() indicates that to block would deadlock 
+** the system, then this function returns SQLITE_LOCKED immediately. In 
+** this case the caller should not retry the operation and should roll 
+** back the current transaction (if any).
+*/
+static int wait_for_unlock_notify(sqlite3 *db){
+  int rc;
+  UnlockNotification un;
+
+  /* Initialize the UnlockNotification structure. */
+  un.fired = 0;
+  pthread_mutex_init(&amp;un.mutex, 0);
+  pthread_cond_init(&amp;un.cond, 0);
+
+  /* Register for an unlock-notify callback. */
+  rc = sqlite3_unlock_notify(db, unlock_notify_cb, (void *)&amp;un);
+  assert( rc==SQLITE_LOCKED || rc==SQLITE_OK );
+
+  /* The call to sqlite3_unlock_notify() always returns either SQLITE_LOCKED 
+  ** or SQLITE_OK. 
+  **
+  ** If SQLITE_LOCKED was returned, then the system is deadlocked. In this
+  ** case this function needs to return SQLITE_LOCKED to the caller so 
+  ** that the current transaction can be rolled back. Otherwise, block
+  ** until the unlock-notify callback is invoked, then return SQLITE_OK.
+  */
+  if( rc==SQLITE_OK ){
+    pthread_mutex_lock(&amp;un.mutex);
+    if( !un.fired ){
+      pthread_cond_wait(&amp;un.cond, &amp;un.mutex);
+    }
+    pthread_mutex_unlock(&amp;un.mutex);
+  }
+
+  /* Destroy the mutex and condition variables. */
+  pthread_cond_destroy(&amp;un.cond);
+  pthread_mutex_destroy(&amp;un.mutex);
+
+  return rc;
+}
+
+/*
+** This function is a wrapper around the SQLite function sqlite3_step().
+** It functions in the same way as step(), except that if a required
+** shared-cache lock cannot be obtained, this function may block waiting for
+** the lock to become available. In this scenario the normal API step()
+** function always returns SQLITE_LOCKED.
+**
+** If this function returns SQLITE_LOCKED, the caller should rollback
+** the current transaction (if any) and try again later. Otherwise, the
+** system may become deadlocked.
+*/
+int sqlite3_blocking_step(sqlite3_stmt *pStmt){
+  int rc;
+  while( SQLITE_LOCKED==(rc = sqlite3_step(pStmt)) ){
+    rc = wait_for_unlock_notify(sqlite3_db_handle(pStmt));
+    if( rc!=SQLITE_OK ) break;
+    sqlite3_reset(pStmt);
+  }
+  return rc;
+}
+
+/*
+** This function is a wrapper around the SQLite function sqlite3_prepare_v2().
+** It functions in the same way as prepare_v2(), except that if a required
+** shared-cache lock cannot be obtained, this function may block waiting for
+** the lock to become available. In this scenario the normal API prepare_v2()
+** function always returns SQLITE_LOCKED.
+**
+** If this function returns SQLITE_LOCKED, the caller should rollback
+** the current transaction (if any) and try again later. Otherwise, the
+** system may become deadlocked.
+*/
+int sqlite3_blocking_prepare_v2(
+  sqlite3 *db,              /* Database handle. */
+  const char *zSql,         /* UTF-8 encoded SQL statement. */
+  int nSql,                 /* Length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+  const char **pz           /* OUT: End of parsed string */
+){
+  int rc;
+  while( SQLITE_LOCKED==(rc = sqlite3_prepare_v2(db, zSql, nSql, ppStmt, pz)) ){
+    rc = wait_for_unlock_notify(db);
+    if( rc!=SQLITE_OK ) break;
+  }
+  return rc;
+}
+</pre> <p> When two or more connections access the same database in shared-cache mode, read and write (shared and exclusive) locks on individual tables are used to ensure that concurrently executing transactions are kept isolated. Before writing to a table, a write (exclusive) lock must be obtained on that table. Before reading, a read (shared) lock must be obtained. A connection releases all held table locks when it concludes its transaction. If a connection cannot obtain a required lock, then the call to <a href="c3ref/step.html">sqlite3_step()</a> returns SQLITE_LOCKED. </p>
+<p> Although it is less common, a call to <a href="c3ref/prepare.html">sqlite3_prepare()</a> or <a href="c3ref/prepare.html">sqlite3_prepare_v2()</a> may also return SQLITE_LOCKED if it cannot obtain a read-lock on the <a href="schematab.html">sqlite_schema table</a> of each attached database. These APIs need to read the schema data contained in the sqlite_schema table in order to compile SQL statements to <a href="c3ref/stmt.html">sqlite3_stmt*</a> objects. </p>
+<p> This article presents a technique using the SQLite <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> interface such that calls to <a href="c3ref/step.html">sqlite3_step()</a> and <a href="c3ref/prepare.html">sqlite3_prepare_v2()</a> block until the required locks are available instead of returning SQLITE_LOCKED immediately. If the sqlite3_blocking_step() or sqlite3_blocking_prepare_v2() functions presented to the left return SQLITE_LOCKED, this indicates that to block would deadlock the system. </p>
+<p> The <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> API, which is only available if the library is compiled with the pre-processor symbol <a href="compile.html#enable_unlock_notify">SQLITE_ENABLE_UNLOCK_NOTIFY</a> defined, is <a href="c3ref/unlock_notify.html">documented here</a>. This article is not a substitute for reading the full API documentation! </p>
+<p> The <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> interface is designed for use in systems that have a separate thread assigned to each <a href="c3ref/sqlite3.html">database connection</a>. There is nothing in the implementation that prevents a single thread from running multiple database connections. However, the <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> interface only works on a single connection at a time, so the lock resolution logic presented here will only work for a single database connection per thread. </p>
+<p><b>The sqlite3_unlock_notify() API</b> </p>
+<p> After a call to <a href="c3ref/step.html">sqlite3_step()</a> or <a href="c3ref/prepare.html">sqlite3_prepare_v2()</a> returns SQLITE_LOCKED, the <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> API may be invoked to register for an unlock-notify callback. The unlock-notify callback is invoked by SQLite after the database connection holding the table-lock that prevented the call to <a href="c3ref/step.html">sqlite3_step()</a> or <a href="c3ref/prepare.html">sqlite3_prepare_v2()</a> from succeeding has finished its transaction and released all locks. For example, if a call to sqlite3_step() is an attempt to read from table X, and some other connection Y is holding a write-lock on table X, then sqlite3_step() will return SQLITE_LOCKED. If <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> is then called, the unlock-notify callback will be invoked after connection Y's transaction is concluded. The connection that the unlock-notify callback is waiting on, in this case connection Y, is known as the "blocking connection". </p>
+<p> If a call to sqlite3_step() that attempts to write to a database table returns SQLITE_LOCKED, then more than one other connection may be holding a read-lock on the database table in question. In this case SQLite simply selects one of those other connections arbitrarily and issues the unlock-notify callback when that connection's transaction is finished. Whether the call to sqlite3_step() was blocked by one or many connections, when the corresponding unlock-notify callback is issued it is not guaranteed that the required lock is available, only that it may be. </p>
+<p> When the unlock-notify callback is issued, it is issued from within a call to sqlite3_step() (or sqlite3_close()) associated with the blocking connection. It is illegal to invoke any sqlite3_XXX() API functions from within an unlock-notify callback. The expected use is that the unlock-notify callback will signal some other waiting thread or schedule some action to take place later. </p>
+<p> The algorithm used by the sqlite3_blocking_step() function is as follows: </p>
+<ol> <li><p> Call sqlite3_step() on the supplied statement handle. If the call returns anything other than SQLITE_LOCKED, then return this value to the caller. Otherwise, continue. </p></li>
+<li><p> Invoke <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> on the database connection handle associated with the supplied statement handle to register for an unlock-notify callback. If the call to unlock_notify() returns SQLITE_LOCKED, then return this value to the caller. </p></li>
+<li><p> Block until the unlock-notify callback is invoked by another thread. </p></li>
+<li><p> Call sqlite3_reset() on the statement handle. Since an SQLITE_LOCKED error may only occur on the first call to sqlite3_step() (it is not possible for one call to sqlite3_step() to return SQLITE_ROW and then the next SQLITE_LOCKED), the statement handle may be reset at this point without affecting the results of the query from the point of view of the caller. If sqlite3_reset() were not called at this point, the next call to sqlite3_step() would return SQLITE_MISUSE. </p></li>
+<li><p> Return to step 1. </p></li>
+</ol> <p> The algorithm used by the sqlite3_blocking_prepare_v2() function is similar, except that step 4 (resetting the statement handle) is omitted. </p>
+<p><b>Writer Starvation</b> </p>
+<p> Multiple connections may hold a read-lock simultaneously. If many threads are acquiring overlapping read-locks, it might be the case that at least one thread is always holding a read lock. Then a table waiting for a write-lock will wait forever. This scenario is called "writer starvation." </p>
+<p> SQLite helps applications avoid writer starvation. After any attempt to obtain a write-lock on a table fails (because one or more other connections are holding read-locks), all attempts to open new transactions on the shared-cache fail until one of the following is true: </p>
+<ul> <li> The current writer concludes its transaction, OR </li>
+<li> The number of open read-transactions on the shared-cache drops to zero. </li>
+</ul> <p> Failed attempts to open new read-transactions return SQLITE_LOCKED to the caller. If the caller then calls <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> to register for an unlock-notify callback, the blocking connection is the connection that currently has an open write-transaction on the shared-cache. This prevents writer-starvation since if no new read-transactions may be opened and assuming all existing read-transactions are eventually concluded, the writer will eventually have an opportunity to obtain the required write-lock. </p>
+<p><b>The pthreads API</b> </p>
+<p> By the time <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> is invoked by wait_for_unlock_notify(), it is possible that the blocking connection that prevented the sqlite3_step() or sqlite3_prepare_v2() call from succeeding has already finished its transaction. In this case, the unlock-notify callback is invoked immediately, before <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> returns. Or, it is possible that the unlock-notify callback is invoked by a second thread after <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> is called but before the thread starts waiting to be asynchronously signaled. </p>
+<p> Exactly how such a potential race-condition is handled depends on the threads and synchronization primitives interface used by the application. This example uses pthreads, the interface provided by modern UNIX-like systems, including Linux. </p>
+<p> The pthreads interface provides the pthread_cond_wait() function. This function allows the caller to simultaneously release a mutex and start waiting for an asynchronous signal. Using this function, a "fired" flag and a mutex, the race-condition described above may be eliminated as follows: </p>
+<p> When the unlock-notify callback is invoked, which may be before the thread that called <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> begins waiting for the asynchronous signal, it does the following: </p>
+<ol> <li> Obtains the mutex. </li>
+<li> Sets the "fired" flag to true. </li>
+<li> Attempts to signal a waiting thread. </li>
+<li> Releases the mutex. </li>
+</ol> <p> When the wait_for_unlock_notify() thread is ready to begin waiting for the unlock-notify callback to arrive, it: </p>
+<ol> <li> Obtains the mutex. </li>
+<li> Checks if the "fired" flag has been set. If so, the unlock-notify callback has already been invoked. Release the mutex and continue. </li>
+<li> Atomically releases the mutex and begins waiting for the asynchronous signal. When the signal arrives, continue. </li>
+</ol> <p> This way, it doesn't matter if the unlock-notify callback has already been invoked, or is being invoked, when the wait_for_unlock_notify() thread begins blocking. </p>
+<p><b>Possible Enhancements</b> </p>
+<p> The code in this article could be improved in at least two ways: </p>
+<ul> <li> It could manage thread priorities. </li>
+<li> It could handle a special case of SQLITE_LOCKED that can occur when dropping a table or index. </li>
+</ul> <p> Even though the <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> function only allows the caller to specify a single user-context pointer, an unlock-notify callback is passed an array of such context pointers. This is because if when a blocking connection concludes its transaction, if there is more than one unlock-notify registered to call the same C function, the context-pointers are marshaled into an array and a single callback issued. If each thread were assigned a priority, then instead of just signaling the threads in arbitrary order as this implementation does, higher priority threads could be signaled before lower priority threads. </p>
+<p> If a "DROP TABLE" or "DROP INDEX" SQL command is executed, and the same database connection currently has one or more actively executing SELECT statements, then SQLITE_LOCKED is returned. If <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a> is called in this case, then the specified callback will be invoked immediately. Re-attempting the "DROP TABLE" or "DROP INDEX" statement will return another SQLITE_LOCKED error. In the implementation of sqlite3_blocking_step() shown to the left, this could cause an infinite loop. </p>
+<p> The caller could distinguish between this special "DROP TABLE|INDEX" case and other cases by using <a href="rescode.html#extrc">extended error codes</a>. When it is appropriate to call <a href="c3ref/unlock_notify.html">sqlite3_unlock_notify()</a>, the extended error code is SQLITE_LOCKED_SHAREDCACHE. Otherwise, in the "DROP TABLE|INDEX" case, it is just plain SQLITE_LOCKED. Another solution might be to limit the number of times that any single query could be reattempted (to say 100). Although this might be less efficient than one might wish, the situation in question is not likely to occur often. </p>
+<div></div> <p><small><i>This page last modified on <a href="https://sqlite.org/docsrc/honeypot" id="mtimelink" data-href="https://sqlite.org/docsrc/finfo/pages/unlock_notify.in?m=490fe96500">2022-01-08 05:02:57</a> UTC </i></small></p> <div class="_attribution">
+  <p class="_attribution-p">
+    SQLite is in the Public Domain.<br>
+    <a href="https://sqlite.org/unlock_notify.html" class="_attribution-link">https://sqlite.org/unlock_notify.html</a>
+  </p>
+</div>
