@@ -1,0 +1,170 @@
+<h1>How to build a site with AMP support</h1> <p>This recipe document describes a method for creating an <a class="reference external" href="https://amp.dev/">AMP</a> version of a Wagtail site and hosting it separately to the rest of the site on a URL prefix. It also describes how to make Wagtail render images with the <code>&lt;amp-img&gt;</code> tag when a user is visiting a page on the AMP version of the site.</p> <section id="overview"> <h2>Overview</h2> <p>In the next section, we will add a new URL entry that points at Wagtail’s internal <code>serve()</code> view which will have the effect of rendering the whole site again under the <code>/amp</code> prefix.</p> <p>Then, we will add some utilities that will allow us to track whether the current request is in the <code>/amp</code> prefixed version of the site without needing a request object.</p> <p>After that, we will add a template context processor to allow us to check from within templates which version of the site is being rendered.</p> <p>Then, finally, we will modify the behaviour of the <code>{% image %}</code> tag to make it render <code>&lt;amp-img&gt;</code> tags when rendering the AMP version of the site.</p> </section> <section id="creating-the-second-page-tree"> <h2>Creating the second page tree</h2> <p>We can render the whole site at a different prefix by duplicating the Wagtail URL in the project <code>urls.py</code> file and giving it a prefix. This must be before the default URL from Wagtail, or it will try to find <code>/amp</code> as a page:</p> <pre data-language="python"># &lt;project&gt;/urls.py
+
+urlpatterns += [
+    # Add this line just before the default ``include(wagtail_urls)`` line
+    path('amp/', include(wagtail_urls)),
+
+    path('', include(wagtail_urls)),
+]
+</pre> <p>If you now open <code>http://localhost:8000/amp/</code> in your browser, you should see the homepage.</p> </section> <section id="making-pages-aware-of-amp-mode"> <h2>Making pages aware of “AMP mode”</h2> <p>All the pages will now render under the <code>/amp</code> prefix, but right now there isn’t any difference between the AMP version and the normal version.</p> <p>To make changes, we need to add a way to detect which URL was used to render the page. To do this, we will have to wrap Wagtail’s <code>serve()</code> view and set a thread-local to indicate to all downstream code that AMP mode is active.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Why a thread-local?</p> <p>(feel free to skip this part if you’re not interested)</p> <p>Modifying the <code>request</code> object would be the most common way to do this. However, the image tag rendering is performed in a part of Wagtail that does not have access to the request.</p> <p>Thread-locals are global variables that can have a different value for each running thread. As each thread only handles one request at a time, we can use it as a way to pass around data that is specific to that request without having to pass the request object everywhere.</p> <p>Django uses thread-locals internally to track the currently active language for the request.</p> <p>Python implements thread-local data through the <code>threading.local</code> class, but as of Django 3.x, multiple requests can be handled in a single thread and so thread-locals will no longer be unique to a single request. Django therefore provides <code>asgiref.Local</code> as a drop-in replacement.</p> </div> <p>Now let’s create that thread-local and some utility functions to interact with it, save this module as <code>amp_utils.py</code> in an app in your project:</p> <pre data-language="python"># &lt;app&gt;/amp_utils.py
+
+from contextlib import contextmanager
+from asgiref.local import Local
+
+_amp_mode_active = Local()
+
+@contextmanager
+def activate_amp_mode():
+    """
+    A context manager used to activate AMP mode
+    """
+    _amp_mode_active.value = True
+    try:
+        yield
+    finally:
+        del _amp_mode_active.value
+
+def amp_mode_active():
+    """
+    Returns True if AMP mode is currently active
+    """
+    return hasattr(_amp_mode_active, 'value')
+</pre> <p>This module defines two functions:</p> <ul class="simple"> <li>
+<code>activate_amp_mode</code> is a context manager which can be invoked using Python’s <code>with</code> syntax. In the body of the <code>with</code> statement, AMP mode would be active.</li> <li>
+<code>amp_mode_active</code> is a function that returns <code>True</code> when AMP mode is active.</li> </ul> <p>Next, we need to define a view that wraps Wagtail’s builtin <code>serve</code> view and invokes the <code>activate_amp_mode</code> context manager:</p> <pre data-language="python"># &lt;app&gt;/amp_views.py
+
+from django.template.response import SimpleTemplateResponse
+from wagtail.views import serve as wagtail_serve
+
+from .amp_utils import activate_amp_mode
+
+def serve(request, path):
+    with activate_amp_mode():
+        response = wagtail_serve(request, path)
+
+        # Render template responses now while AMP mode is still active
+        if isinstance(response, SimpleTemplateResponse):
+            response.render()
+
+        return response
+</pre> <p>Then we need to create a <code>amp_urls.py</code> file in the same app:</p> <pre data-language="python"># &lt;app&gt;/amp_urls.py
+
+from django.urls import re_path
+from wagtail.urls import serve_pattern
+
+from . import amp_views
+
+urlpatterns = [
+    re_path(serve_pattern, amp_views.serve, name='wagtail_amp_serve')
+]
+</pre> <p>Finally, we need to update the project’s main <code>urls.py</code> to use this new URLs file for the <code>/amp</code> prefix:</p> <pre data-language="python"># &lt;project&gt;/urls.py
+
+from myapp import amp_urls as wagtail_amp_urls
+
+urlpatterns += [
+    # Change this line to point at your amp_urls instead of Wagtail's urls
+    path('amp/', include(wagtail_amp_urls)),
+
+    re_path(r'', include(wagtail_urls)),
+]
+</pre> <p>After this, there shouldn’t be any noticeable difference to the AMP version of the site.</p> </section> <section id="write-a-template-context-processor-so-that-amp-state-can-be-checked-in-templates"> <h2>Write a template context processor so that AMP state can be checked in templates</h2> <p>This is optional, but worth doing so we can confirm that everything is working so far.</p> <p>Add a <code>amp_context_processors.py</code> file into your app that contains the following:</p> <pre data-language="python"># &lt;app&gt;/amp_context_processors.py
+
+from .amp_utils import amp_mode_active
+
+def amp(request):
+    return {
+        'amp_mode_active': amp_mode_active(),
+    }
+</pre> <p>Now add the path to this context processor to the <code>['OPTIONS']['context_processors']</code> key of the <code>TEMPLATES</code> setting:</p> <pre data-language="python"># Either &lt;project&gt;/settings.py or &lt;project&gt;/settings/base.py
+
+TEMPLATES = [
+    {
+        ...
+
+        'OPTIONS': {
+            'context_processors': [
+                ...
+                # Add this after other context processors
+                'myapp.amp_context_processors.amp',
+            ],
+        },
+    },
+]
+</pre> <p>You should now be able to use the <code>amp_mode_active</code> variable in templates. For example:</p> <pre data-language="markup">{% if amp_mode_active %}
+    AMP MODE IS ACTIVE!
+{% endif %}
+</pre> </section> <section id="using-a-different-page-template-when-amp-mode-is-active"> <h2>Using a different page template when AMP mode is active</h2> <p>You’re probably not going to want to use the same templates on the AMP site as you do on the normal web site. Let’s add some logic in to make Wagtail use a separate template whenever a page is served with AMP enabled.</p> <p>We can use a mixin, which allows us to re-use the logic on different page types. Add the following to the bottom of the amp_utils.py file that you created earlier:</p> <pre data-language="python"># &lt;app&gt;/amp_utils.py
+
+import os.path
+
+...
+
+class PageAMPTemplateMixin:
+
+    @property
+    def amp_template(self):
+        # Get the default template name and insert `_amp` before the extension
+        name, ext = os.path.splitext(self.template)
+        return name + '_amp' + ext
+
+    def get_template(self, request):
+        if amp_mode_active():
+            return self.amp_template
+
+        return super().get_template(request)
+</pre> <p>Now add this mixin to any page model, for example:</p> <pre data-language="python"># &lt;app&gt;/models.py
+
+from .amp_utils import PageAMPTemplateMixin
+
+class MyPageModel(PageAMPTemplateMixin, Page):
+    ...
+</pre> <p>When AMP mode is active, the template at <code>app_label/mypagemodel_amp.html</code> will be used instead of the default one.</p> <p>If you have a different naming convention, you can override the <code>amp_template</code> attribute on the model. For example:</p> <pre data-language="python"># &lt;app&gt;/models.py
+
+from .amp_utils import PageAMPTemplateMixin
+
+class MyPageModel(PageAMPTemplateMixin, Page):
+    amp_template = 'my_custom_amp_template.html'
+</pre> </section> <section id="overriding-the-image-tag-to-output-amp-img-tags"> <h2>Overriding the <code>{% image %}</code> tag to output <code>&lt;amp-img&gt;</code> tags</h2> <p>Finally, let’s change Wagtail’s <code>{% image %}</code> tag, so it renders an <code>&lt;amp-img&gt;</code> tags when rendering pages with AMP enabled. We’ll make the change on the <code>Rendition</code> model itself so it applies to both images rendered with the <code>{% image %}</code> tag and images rendered in rich text fields as well.</p> <p>Doing this with a <a class="reference internal" href="images/custom_image_model.html#custom-image-model"><span class="std std-ref">Custom image model</span></a> is easier, as you can override the <code>img_tag</code> method on your custom <code>Rendition</code> model to return a different tag.</p> <p>For example:</p> <pre data-language="python">from django.forms.utils import flatatt
+from django.utils.safestring import mark_safe
+
+from wagtail.images.models import AbstractRendition
+
+...
+
+class CustomRendition(AbstractRendition):
+    def img_tag(self, extra_attributes):
+        attrs = self.attrs_dict.copy()
+        attrs.update(extra_attributes)
+
+        if amp_mode_active():
+            return mark_safe('&lt;amp-img{}&gt;'.format(flatatt(attrs)))
+        else:
+            return mark_safe('&lt;img{}&gt;'.format(flatatt(attrs)))
+
+    ...
+</pre> <p>Without a custom image model, you will have to monkey-patch the builtin <code>Rendition</code> model. Add this anywhere in your project where it would be imported on start:</p> <pre data-language="python">from django.forms.utils import flatatt
+from django.utils.safestring import mark_safe
+
+from wagtail.images.models import Rendition
+
+def img_tag(rendition, extra_attributes={}):
+    """
+    Replacement implementation for Rendition.img_tag
+
+    When AMP mode is on, this returns an &lt;amp-img&gt; tag instead of an &lt;img&gt; tag
+    """
+    attrs = rendition.attrs_dict.copy()
+    attrs.update(extra_attributes)
+
+    if amp_mode_active():
+        return mark_safe('&lt;amp-img{}&gt;'.format(flatatt(attrs)))
+    else:
+        return mark_safe('&lt;img{}&gt;'.format(flatatt(attrs)))
+
+Rendition.img_tag = img_tag
+</pre> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2014-present Torchbox Ltd and individual contributors.<br>All rights are reserved.<br>Licensed under the BSD License.<br>
+    <a href="https://docs.wagtail.org/en/stable/advanced_topics/amp.html" class="_attribution-link">https://docs.wagtail.org/en/stable/advanced_topics/amp.html</a>
+  </p>
+</div>
