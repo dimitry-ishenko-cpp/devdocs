@@ -1,0 +1,338 @@
+<h1 title="Class StampedLock" class="title">Class StampedLock</h1> <div class="inheritance" title="Inheritance Tree">
+<a href="../../../lang/object.html" title="class in java.lang">java.lang.Object</a> <div class="inheritance">java.util.concurrent.locks.StampedLock</div> </div> <section class="class-description" id="class-description"> <dl class="notes"> <dt>All Implemented Interfaces:</dt> <dd><code><a href="../../../io/serializable.html" title="interface in java.io">Serializable</a></code></dd> </dl>  <pre class="lang-java" data-language="java">public class StampedLock extends Object implements Serializable</pre> <div class="block">A capability-based lock with three modes for controlling read/write access. The state of a StampedLock consists of a version and mode. Lock acquisition methods return a stamp that represents and controls access with respect to a lock state; "try" versions of these methods may instead return the special value zero to represent failure to acquire access. Lock release and conversion methods require stamps as arguments, and fail if they do not match the state of the lock. The three modes are: <ul> <li>
+<b>Writing.</b> Method <a href="#writeLock()"><code>writeLock()</code></a> possibly blocks waiting for exclusive access, returning a stamp that can be used in method <a href="#unlockWrite(long)"><code>unlockWrite(long)</code></a> to release the lock. Untimed and timed versions of <code>tryWriteLock</code> are also provided. When the lock is held in write mode, no read locks may be obtained, and all optimistic read validations will fail. </li>
+<li>
+<b>Reading.</b> Method <a href="#readLock()"><code>readLock()</code></a> possibly blocks waiting for non-exclusive access, returning a stamp that can be used in method <a href="#unlockRead(long)"><code>unlockRead(long)</code></a> to release the lock. Untimed and timed versions of <code>tryReadLock</code> are also provided. </li>
+<li>
+<b>Optimistic Reading.</b> Method <a href="#tryOptimisticRead()"><code>tryOptimisticRead()</code></a> returns a non-zero stamp only if the lock is not currently held in write mode. Method <a href="#validate(long)"><code>validate(long)</code></a> returns true if the lock has not been acquired in write mode since obtaining a given stamp, in which case all actions prior to the most recent write lock release happen-before actions following the call to <code>tryOptimisticRead</code>. This mode can be thought of as an extremely weak version of a read-lock, that can be broken by a writer at any time. The use of optimistic read mode for short read-only code segments often reduces contention and improves throughput. However, its use is inherently fragile. Optimistic read sections should only read fields and hold them in local variables for later use after validation. Fields read while in optimistic read mode may be wildly inconsistent, so usage applies only when you are familiar enough with data representations to check consistency and/or repeatedly invoke method <code>validate()</code>. For example, such steps are typically required when first reading an object or array reference, and then accessing one of its fields, elements or methods. </li>
+</ul> <p>This class also supports methods that conditionally provide conversions across the three modes. For example, method <a href="#tryConvertToWriteLock(long)"><code>tryConvertToWriteLock(long)</code></a> attempts to "upgrade" a mode, returning a valid write stamp if (1) already in writing mode (2) in reading mode and there are no other readers or (3) in optimistic read mode and the lock is available. The forms of these methods are designed to help reduce some of the code bloat that otherwise occurs in retry-based designs. </p>
+<p>StampedLocks are designed for use as internal utilities in the development of thread-safe components. Their use relies on knowledge of the internal properties of the data, objects, and methods they are protecting. They are not reentrant, so locked bodies should not call other unknown methods that may try to re-acquire locks (although you may pass a stamp to other methods that can use or convert it). The use of read lock modes relies on the associated code sections being side-effect-free. Unvalidated optimistic read sections cannot call methods that are not known to tolerate potential inconsistencies. Stamps use finite representations, and are not cryptographically secure (i.e., a valid stamp may be guessable). Stamp values may recycle after (no sooner than) one year of continuous operation. A stamp held without use or validation for longer than this period may fail to validate correctly. StampedLocks are serializable, but always deserialize into initial unlocked state, so they are not useful for remote locking. </p>
+<p>Like <a href="../semaphore.html" title="class in java.util.concurrent"><code>Semaphore</code></a>, but unlike most <a href="lock.html" title="interface in java.util.concurrent.locks"><code>Lock</code></a> implementations, StampedLocks have no notion of ownership. Locks acquired in one thread can be released or converted in another. </p>
+<p>The scheduling policy of StampedLock does not consistently prefer readers over writers or vice versa. All "try" methods are best-effort and do not necessarily conform to any scheduling or fairness policy. A zero return from any "try" method for acquiring or converting locks does not carry any information about the state of the lock; a subsequent invocation may succeed. </p>
+<p>Because it supports coordinated usage across multiple lock modes, this class does not directly implement the <a href="lock.html" title="interface in java.util.concurrent.locks"><code>Lock</code></a> or <a href="readwritelock.html" title="interface in java.util.concurrent.locks"><code>ReadWriteLock</code></a> interfaces. However, a StampedLock may be viewed <a href="#asReadLock()"><code>asReadLock()</code></a>, <a href="#asWriteLock()"><code>asWriteLock()</code></a>, or <a href="#asReadWriteLock()"><code>asReadWriteLock()</code></a> in applications requiring only the associated set of functionality. </p>
+<p><b>Memory Synchronization.</b> Methods with the effect of successfully locking in any mode have the same memory synchronization effects as a <em>Lock</em> action, as described in Chapter 17 of <cite>The Java Language Specification</cite>. Methods successfully unlocking in write mode have the same memory synchronization effects as an <em>Unlock</em> action. In optimistic read usages, actions prior to the most recent write mode unlock action are guaranteed to happen-before those following a tryOptimisticRead only if a later validate returns true; otherwise there is no guarantee that the reads between tryOptimisticRead and validate obtain a consistent snapshot. </p>
+<p><b>Sample Usage.</b> The following illustrates some usage idioms in a class that maintains simple two-dimensional points. The sample code illustrates some try/catch conventions even though they are not strictly needed here because no exceptions can occur in their bodies. </p>
+<pre class="lang-java" data-language="java"> <code>
+ class Point {
+   private double x, y;
+   private final StampedLock sl = new StampedLock();
+
+   // an exclusively locked method
+   void move(double deltaX, double deltaY) {
+     long stamp = sl.writeLock();
+     try {
+       x += deltaX;
+       y += deltaY;
+     } finally {
+       sl.unlockWrite(stamp);
+     }
+   }
+
+   // a read-only method
+   // upgrade from optimistic read to read lock
+   double distanceFromOrigin() {
+     long stamp = sl.tryOptimisticRead();
+     try {
+       retryHoldingLock: for (;; stamp = sl.readLock()) {
+         if (stamp == 0L)
+           continue retryHoldingLock;
+         // possibly racy reads
+         double currentX = x;
+         double currentY = y;
+         if (!sl.validate(stamp))
+           continue retryHoldingLock;
+         return Math.hypot(currentX, currentY);
+       }
+     } finally {
+       if (StampedLock.isReadLockStamp(stamp))
+         sl.unlockRead(stamp);
+     }
+   }
+
+   // upgrade from optimistic read to write lock
+   void moveIfAtOrigin(double newX, double newY) {
+     long stamp = sl.tryOptimisticRead();
+     try {
+       retryHoldingLock: for (;; stamp = sl.writeLock()) {
+         if (stamp == 0L)
+           continue retryHoldingLock;
+         // possibly racy reads
+         double currentX = x;
+         double currentY = y;
+         if (!sl.validate(stamp))
+           continue retryHoldingLock;
+         if (currentX != 0.0 || currentY != 0.0)
+           break;
+         stamp = sl.tryConvertToWriteLock(stamp);
+         if (stamp == 0L)
+           continue retryHoldingLock;
+         // exclusive access
+         x = newX;
+         y = newY;
+         return;
+       }
+     } finally {
+       if (StampedLock.isWriteLockStamp(stamp))
+         sl.unlockWrite(stamp);
+     }
+   }
+
+   // upgrade read lock to write lock
+   void moveIfAtOrigin2(double newX, double newY) {
+     long stamp = sl.readLock();
+     try {
+       while (x == 0.0 &amp;&amp; y == 0.0) {
+         long ws = sl.tryConvertToWriteLock(stamp);
+         if (ws != 0L) {
+           stamp = ws;
+           x = newX;
+           y = newY;
+           break;
+         }
+         else {
+           sl.unlockRead(stamp);
+           stamp = sl.writeLock();
+         }
+       }
+     } finally {
+       sl.unlock(stamp);
+     }
+   }
+ }</code></pre>
+</div> <dl class="notes">
+<dt>See <i>Java Language Specification</i>:</dt> <dd> <a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html#jls-17.4">17.4 Memory Model</a><br>
+</dd> <dt>Since:</dt> <dd>1.8</dd> <dt>See Also:</dt> <dd> <ul class="tag-list"> <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/serialized-form.html#java.util.concurrent.locks.StampedLock">Serialized Form</a></li> </ul> </dd> </dl> </section> <section class="summary"> <section class="constructor-summary" id="constructor-summary"> <h2>Constructor Summary</h2>  <table class="summary-table two-column-summary">     <tr>
+<th>Constructor</th>
+<th>Description</th>
+</tr>
+<tr>
+<td><code><a href="#%3Cinit%3E()" class="member-name-link">StampedLock</a>()</code></td>
+<td> <div class="block">Creates a new lock, initially in unlocked state.</div> </td>
+</tr>
+</table> </section><section class="method-summary" id="method-summary"> <h2>Method Summary</h2> <div id="method-summary-table">  <div id="method-summary-table.tabpanel" role="tabpanel"> <table class="summary-table three-column-summary" aria-labelledby="method-summary-table-tab0">                                                                                           <tr>
+<th>Modifier and Type</th>
+<th>Method</th>
+<th>Description</th>
+</tr>
+<tr>
+<td><code><a href="lock.html" title="interface in java.util.concurrent.locks">Lock</a></code></td>
+<td><code><a href="#asReadLock()" class="member-name-link">asReadLock</a>()</code></td>
+<td> <div class="block">Returns a plain <a href="lock.html" title="interface in java.util.concurrent.locks"><code>Lock</code></a> view of this StampedLock in which the <a href="lock.html#lock()"><code>Lock.lock()</code></a> method is mapped to <a href="#readLock()"><code>readLock()</code></a>, and similarly for other methods.</div> </td>
+</tr>
+<tr>
+<td><code><a href="readwritelock.html" title="interface in java.util.concurrent.locks">ReadWriteLock</a></code></td>
+<td><code><a href="#asReadWriteLock()" class="member-name-link">asReadWriteLock</a>()</code></td>
+<td> <div class="block">Returns a <a href="readwritelock.html" title="interface in java.util.concurrent.locks"><code>ReadWriteLock</code></a> view of this StampedLock in which the <a href="readwritelock.html#readLock()"><code>ReadWriteLock.readLock()</code></a> method is mapped to <a href="#asReadLock()"><code>asReadLock()</code></a>, and <a href="readwritelock.html#writeLock()"><code>ReadWriteLock.writeLock()</code></a> to <a href="#asWriteLock()"><code>asWriteLock()</code></a>.</div> </td>
+</tr>
+<tr>
+<td><code><a href="lock.html" title="interface in java.util.concurrent.locks">Lock</a></code></td>
+<td><code><a href="#asWriteLock()" class="member-name-link">asWriteLock</a>()</code></td>
+<td> <div class="block">Returns a plain <a href="lock.html" title="interface in java.util.concurrent.locks"><code>Lock</code></a> view of this StampedLock in which the <a href="lock.html#lock()"><code>Lock.lock()</code></a> method is mapped to <a href="#writeLock()"><code>writeLock()</code></a>, and similarly for other methods.</div> </td>
+</tr>
+<tr>
+<td><code>int</code></td>
+<td><code><a href="#getReadLockCount()" class="member-name-link">getReadLockCount</a>()</code></td>
+<td> <div class="block">Queries the number of read locks held for this lock.</div> </td>
+</tr>
+<tr>
+<td><code>static boolean</code></td>
+<td><code><a href="#isLockStamp(long)" class="member-name-link">isLockStamp</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">Tells whether a stamp represents holding a lock.</div> </td>
+</tr>
+<tr>
+<td><code>static boolean</code></td>
+<td><code><a href="#isOptimisticReadStamp(long)" class="member-name-link">isOptimisticReadStamp</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">Tells whether a stamp represents a successful optimistic read.</div> </td>
+</tr>
+<tr>
+<td><code>boolean</code></td>
+<td><code><a href="#isReadLocked()" class="member-name-link">isReadLocked</a>()</code></td>
+<td> <div class="block">Returns <code>true</code> if the lock is currently held non-exclusively.</div> </td>
+</tr>
+<tr>
+<td><code>static boolean</code></td>
+<td><code><a href="#isReadLockStamp(long)" class="member-name-link">isReadLockStamp</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">Tells whether a stamp represents holding a lock non-exclusively.</div> </td>
+</tr>
+<tr>
+<td><code>boolean</code></td>
+<td><code><a href="#isWriteLocked()" class="member-name-link">isWriteLocked</a>()</code></td>
+<td> <div class="block">Returns <code>true</code> if the lock is currently held exclusively.</div> </td>
+</tr>
+<tr>
+<td><code>static boolean</code></td>
+<td><code><a href="#isWriteLockStamp(long)" class="member-name-link">isWriteLockStamp</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">Tells whether a stamp represents holding a lock exclusively.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#readLock()" class="member-name-link">readLock</a>()</code></td>
+<td> <div class="block">Non-exclusively acquires the lock, blocking if necessary until available.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#readLockInterruptibly()" class="member-name-link">readLockInterruptibly</a>()</code></td>
+<td> <div class="block">Non-exclusively acquires the lock, blocking if necessary until available or the current thread is interrupted.</div> </td>
+</tr>
+<tr>
+<td><code><a href="../../../lang/string.html" title="class in java.lang">String</a></code></td>
+<td><code><a href="#toString()" class="member-name-link">toString</a>()</code></td>
+<td> <div class="block">Returns a string identifying this lock, as well as its lock state.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#tryConvertToOptimisticRead(long)" class="member-name-link">tryConvertToOptimisticRead</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">If the lock state matches the given stamp then, atomically, if the stamp represents holding a lock, releases it and returns an observation stamp.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#tryConvertToReadLock(long)" class="member-name-link">tryConvertToReadLock</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">If the lock state matches the given stamp, atomically performs one of the following actions.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#tryConvertToWriteLock(long)" class="member-name-link">tryConvertToWriteLock</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">If the lock state matches the given stamp, atomically performs one of the following actions.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#tryOptimisticRead()" class="member-name-link">tryOptimisticRead</a>()</code></td>
+<td> <div class="block">Returns a stamp that can later be validated, or zero if exclusively locked.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#tryReadLock()" class="member-name-link">tryReadLock</a>()</code></td>
+<td> <div class="block">Non-exclusively acquires the lock if it is immediately available.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#tryReadLock(long,java.util.concurrent.TimeUnit)" class="member-name-link">tryReadLock</a><wbr>(long time,
+ <a href="../timeunit.html" title="enum class in java.util.concurrent">TimeUnit</a> unit)</wbr></code></td>
+<td> <div class="block">Non-exclusively acquires the lock if it is available within the given time and the current thread has not been interrupted.</div> </td>
+</tr>
+<tr>
+<td><code>boolean</code></td>
+<td><code><a href="#tryUnlockRead()" class="member-name-link">tryUnlockRead</a>()</code></td>
+<td> <div class="block">Releases one hold of the read lock if it is held, without requiring a stamp value.</div> </td>
+</tr>
+<tr>
+<td><code>boolean</code></td>
+<td><code><a href="#tryUnlockWrite()" class="member-name-link">tryUnlockWrite</a>()</code></td>
+<td> <div class="block">Releases the write lock if it is held, without requiring a stamp value.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#tryWriteLock()" class="member-name-link">tryWriteLock</a>()</code></td>
+<td> <div class="block">Exclusively acquires the lock if it is immediately available.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#tryWriteLock(long,java.util.concurrent.TimeUnit)" class="member-name-link">tryWriteLock</a><wbr>(long time,
+ <a href="../timeunit.html" title="enum class in java.util.concurrent">TimeUnit</a> unit)</wbr></code></td>
+<td> <div class="block">Exclusively acquires the lock if it is available within the given time and the current thread has not been interrupted.</div> </td>
+</tr>
+<tr>
+<td><code>void</code></td>
+<td><code><a href="#unlock(long)" class="member-name-link">unlock</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">If the lock state matches the given stamp, releases the corresponding mode of the lock.</div> </td>
+</tr>
+<tr>
+<td><code>void</code></td>
+<td><code><a href="#unlockRead(long)" class="member-name-link">unlockRead</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">If the lock state matches the given stamp, releases the non-exclusive lock.</div> </td>
+</tr>
+<tr>
+<td><code>void</code></td>
+<td><code><a href="#unlockWrite(long)" class="member-name-link">unlockWrite</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">If the lock state matches the given stamp, releases the exclusive lock.</div> </td>
+</tr>
+<tr>
+<td><code>boolean</code></td>
+<td><code><a href="#validate(long)" class="member-name-link">validate</a><wbr>(long stamp)</wbr></code></td>
+<td> <div class="block">Returns true if the lock has not been exclusively acquired since issuance of the given stamp.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#writeLock()" class="member-name-link">writeLock</a>()</code></td>
+<td> <div class="block">Exclusively acquires the lock, blocking if necessary until available.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#writeLockInterruptibly()" class="member-name-link">writeLockInterruptibly</a>()</code></td>
+<td> <div class="block">Exclusively acquires the lock, blocking if necessary until available or the current thread is interrupted.</div> </td>
+</tr>
+</table> </div> </div> <div class="inherited-list"> <h3 id="methods-inherited-from-class-java.lang.Object">Methods declared in class java.lang.<a href="../../../lang/object.html" title="class in java.lang">Object</a>
+</h3> <code><a href="../../../lang/object.html#clone()">clone</a>, <a href="../../../lang/object.html#equals(java.lang.Object)">equals</a>, <a href="../../../lang/object.html#finalize()">finalize</a>, <a href="../../../lang/object.html#getClass()">getClass</a>, <a href="../../../lang/object.html#hashCode()">hashCode</a>, <a href="../../../lang/object.html#notify()">notify</a>, <a href="../../../lang/object.html#notifyAll()">notifyAll</a>, <a href="../../../lang/object.html#wait()">wait</a>, <a href="../../../lang/object.html#wait(long)">wait</a>, <a href="../../../lang/object.html#wait(long,int)">wait</a></code>
+</div> </section> </section> <section class="details"> <section class="constructor-details" id="constructor-detail"> <h2>Constructor Details</h2>  </section><section class="detail" id="&lt;init&gt;()"> <h3>StampedLock</h3> <pre class="lang-java" data-language="java">public StampedLock()</pre> <div class="block">Creates a new lock, initially in unlocked state.</div> </section><section class="method-details" id="method-detail"> <h2>Method Details</h2>  </section><section class="detail" id="writeLock()"> <h3>writeLock</h3> <pre class="lang-java" data-language="java">public long writeLock()</pre> <div class="block">Exclusively acquires the lock, blocking if necessary until available.</div> <dl class="notes"> <dt>Returns:</dt> <dd>a write stamp that can be used to unlock or convert mode</dd> </dl> </section><section class="detail" id="tryWriteLock()"> <h3>tryWriteLock</h3> <pre class="lang-java" data-language="java">public long tryWriteLock()</pre> <div class="block">Exclusively acquires the lock if it is immediately available.</div> <dl class="notes"> <dt>Returns:</dt> <dd>a write stamp that can be used to unlock or convert mode, or zero if the lock is not available</dd> </dl> </section><section class="detail" id="tryWriteLock(long,java.util.concurrent.TimeUnit)"> <h3>tryWriteLock</h3> <pre class="lang-java" data-language="java">public long tryWriteLock(long time, TimeUnit unit) throws InterruptedException</pre> <div class="block">Exclusively acquires the lock if it is available within the given time and the current thread has not been interrupted. Behavior under timeout and interruption matches that specified for method <a href="lock.html#tryLock(long,java.util.concurrent.TimeUnit)"><code>Lock.tryLock(long,TimeUnit)</code></a>.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>time</code> - the maximum time to wait for the lock</dd> <dd>
+<code>unit</code> - the time unit of the <code>time</code> argument</dd> <dt>Returns:</dt> <dd>a write stamp that can be used to unlock or convert mode, or zero if the lock is not available</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../../lang/interruptedexception.html" title="class in java.lang">InterruptedException</a></code> - if the current thread is interrupted before acquiring the lock</dd> </dl> </section><section class="detail" id="writeLockInterruptibly()"> <h3>writeLockInterruptibly</h3> <pre class="lang-java" data-language="java">public long writeLockInterruptibly() throws InterruptedException</pre> <div class="block">Exclusively acquires the lock, blocking if necessary until available or the current thread is interrupted. Behavior under interruption matches that specified for method <a href="lock.html#lockInterruptibly()"><code>Lock.lockInterruptibly()</code></a>.</div> <dl class="notes"> <dt>Returns:</dt> <dd>a write stamp that can be used to unlock or convert mode</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../../lang/interruptedexception.html" title="class in java.lang">InterruptedException</a></code> - if the current thread is interrupted before acquiring the lock</dd> </dl> </section><section class="detail" id="readLock()"> <h3>readLock</h3> <pre class="lang-java" data-language="java">public long readLock()</pre> <div class="block">Non-exclusively acquires the lock, blocking if necessary until available.</div> <dl class="notes"> <dt>Returns:</dt> <dd>a read stamp that can be used to unlock or convert mode</dd> </dl> </section><section class="detail" id="tryReadLock()"> <h3>tryReadLock</h3> <pre class="lang-java" data-language="java">public long tryReadLock()</pre> <div class="block">Non-exclusively acquires the lock if it is immediately available.</div> <dl class="notes"> <dt>Returns:</dt> <dd>a read stamp that can be used to unlock or convert mode, or zero if the lock is not available</dd> </dl> </section><section class="detail" id="tryReadLock(long,java.util.concurrent.TimeUnit)"> <h3>tryReadLock</h3> <pre class="lang-java" data-language="java">public long tryReadLock(long time, TimeUnit unit) throws InterruptedException</pre> <div class="block">Non-exclusively acquires the lock if it is available within the given time and the current thread has not been interrupted. Behavior under timeout and interruption matches that specified for method <a href="lock.html#tryLock(long,java.util.concurrent.TimeUnit)"><code>Lock.tryLock(long,TimeUnit)</code></a>.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>time</code> - the maximum time to wait for the lock</dd> <dd>
+<code>unit</code> - the time unit of the <code>time</code> argument</dd> <dt>Returns:</dt> <dd>a read stamp that can be used to unlock or convert mode, or zero if the lock is not available</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../../lang/interruptedexception.html" title="class in java.lang">InterruptedException</a></code> - if the current thread is interrupted before acquiring the lock</dd> </dl> </section><section class="detail" id="readLockInterruptibly()"> <h3>readLockInterruptibly</h3> <pre class="lang-java" data-language="java">public long readLockInterruptibly() throws InterruptedException</pre> <div class="block">Non-exclusively acquires the lock, blocking if necessary until available or the current thread is interrupted. Behavior under interruption matches that specified for method <a href="lock.html#lockInterruptibly()"><code>Lock.lockInterruptibly()</code></a>.</div> <dl class="notes"> <dt>Returns:</dt> <dd>a read stamp that can be used to unlock or convert mode</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../../lang/interruptedexception.html" title="class in java.lang">InterruptedException</a></code> - if the current thread is interrupted before acquiring the lock</dd> </dl> </section><section class="detail" id="tryOptimisticRead()"> <h3>tryOptimisticRead</h3> <pre class="lang-java" data-language="java">public long tryOptimisticRead()</pre> <div class="block">Returns a stamp that can later be validated, or zero if exclusively locked.</div> <dl class="notes"> <dt>Returns:</dt> <dd>a valid optimistic read stamp, or zero if exclusively locked</dd> </dl> </section><section class="detail" id="validate(long)"> <h3>validate</h3> <pre class="lang-java" data-language="java">public boolean validate(long stamp)</pre> <div class="block">Returns true if the lock has not been exclusively acquired since issuance of the given stamp. Always returns false if the stamp is zero. Always returns true if the stamp represents a currently held lock. Invoking this method with a value not obtained from <a href="#tryOptimisticRead()"><code>tryOptimisticRead()</code></a> or a locking method for this lock has no defined effect or result.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp</dd> <dt>Returns:</dt> <dd>
+<code>true</code> if the lock has not been exclusively acquired since issuance of the given stamp; else false</dd> </dl> </section><section class="detail" id="unlockWrite(long)"> <h3>unlockWrite</h3> <pre class="lang-java" data-language="java">public void unlockWrite(long stamp)</pre> <div class="block">If the lock state matches the given stamp, releases the exclusive lock.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp returned by a write-lock operation</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../../lang/illegalmonitorstateexception.html" title="class in java.lang">IllegalMonitorStateException</a></code> - if the stamp does not match the current state of this lock</dd> </dl> </section><section class="detail" id="unlockRead(long)"> <h3>unlockRead</h3> <pre class="lang-java" data-language="java">public void unlockRead(long stamp)</pre> <div class="block">If the lock state matches the given stamp, releases the non-exclusive lock.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp returned by a read-lock operation</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../../lang/illegalmonitorstateexception.html" title="class in java.lang">IllegalMonitorStateException</a></code> - if the stamp does not match the current state of this lock</dd> </dl> </section><section class="detail" id="unlock(long)"> <h3>unlock</h3> <pre class="lang-java" data-language="java">public void unlock(long stamp)</pre> <div class="block">If the lock state matches the given stamp, releases the corresponding mode of the lock.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp returned by a lock operation</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../../lang/illegalmonitorstateexception.html" title="class in java.lang">IllegalMonitorStateException</a></code> - if the stamp does not match the current state of this lock</dd> </dl> </section><section class="detail" id="tryConvertToWriteLock(long)"> <h3>tryConvertToWriteLock</h3> <pre class="lang-java" data-language="java">public long tryConvertToWriteLock(long stamp)</pre> <div class="block">If the lock state matches the given stamp, atomically performs one of the following actions. If the stamp represents holding a write lock, returns it. Or, if a read lock, if the write lock is available, releases the read lock and returns a write stamp. Or, if an optimistic read, returns a write stamp only if immediately available. This method returns zero in all other cases.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp</dd> <dt>Returns:</dt> <dd>a valid write stamp, or zero on failure</dd> </dl> </section><section class="detail" id="tryConvertToReadLock(long)"> <h3>tryConvertToReadLock</h3> <pre class="lang-java" data-language="java">public long tryConvertToReadLock(long stamp)</pre> <div class="block">If the lock state matches the given stamp, atomically performs one of the following actions. If the stamp represents holding a write lock, releases it and obtains a read lock. Or, if a read lock, returns it. Or, if an optimistic read, acquires a read lock and returns a read stamp only if immediately available. This method returns zero in all other cases.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp</dd> <dt>Returns:</dt> <dd>a valid read stamp, or zero on failure</dd> </dl> </section><section class="detail" id="tryConvertToOptimisticRead(long)"> <h3>tryConvertToOptimisticRead</h3> <pre class="lang-java" data-language="java">public long tryConvertToOptimisticRead(long stamp)</pre> <div class="block">If the lock state matches the given stamp then, atomically, if the stamp represents holding a lock, releases it and returns an observation stamp. Or, if an optimistic read, returns it if validated. This method returns zero in all other cases, and so may be useful as a form of "tryUnlock".</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp</dd> <dt>Returns:</dt> <dd>a valid optimistic read stamp, or zero on failure</dd> </dl> </section><section class="detail" id="tryUnlockWrite()"> <h3>tryUnlockWrite</h3> <pre class="lang-java" data-language="java">public boolean tryUnlockWrite()</pre> <div class="block">Releases the write lock if it is held, without requiring a stamp value. This method may be useful for recovery after errors.</div> <dl class="notes"> <dt>Returns:</dt> <dd>
+<code>true</code> if the lock was held, else false</dd> </dl> </section><section class="detail" id="tryUnlockRead()"> <h3>tryUnlockRead</h3> <pre class="lang-java" data-language="java">public boolean tryUnlockRead()</pre> <div class="block">Releases one hold of the read lock if it is held, without requiring a stamp value. This method may be useful for recovery after errors.</div> <dl class="notes"> <dt>Returns:</dt> <dd>
+<code>true</code> if the read lock was held, else false</dd> </dl> </section><section class="detail" id="isWriteLocked()"> <h3>isWriteLocked</h3> <pre class="lang-java" data-language="java">public boolean isWriteLocked()</pre> <div class="block">Returns <code>true</code> if the lock is currently held exclusively.</div> <dl class="notes"> <dt>Returns:</dt> <dd>
+<code>true</code> if the lock is currently held exclusively</dd> </dl> </section><section class="detail" id="isReadLocked()"> <h3>isReadLocked</h3> <pre class="lang-java" data-language="java">public boolean isReadLocked()</pre> <div class="block">Returns <code>true</code> if the lock is currently held non-exclusively.</div> <dl class="notes"> <dt>Returns:</dt> <dd>
+<code>true</code> if the lock is currently held non-exclusively</dd> </dl> </section><section class="detail" id="isWriteLockStamp(long)"> <h3>isWriteLockStamp</h3> <pre class="lang-java" data-language="java">public static boolean isWriteLockStamp(long stamp)</pre> <div class="block">Tells whether a stamp represents holding a lock exclusively. This method may be useful in conjunction with <a href="#tryConvertToWriteLock(long)"><code>tryConvertToWriteLock(long)</code></a>, for example: <pre class="lang-java" data-language="java"> <code>
+ long stamp = sl.tryOptimisticRead();
+ try {
+   ...
+   stamp = sl.tryConvertToWriteLock(stamp);
+   ...
+ } finally {
+   if (StampedLock.isWriteLockStamp(stamp))
+     sl.unlockWrite(stamp);
+ }</code></pre>
+</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp returned by a previous StampedLock operation</dd> <dt>Returns:</dt> <dd>
+<code>true</code> if the stamp was returned by a successful write-lock operation</dd> <dt>Since:</dt> <dd>10</dd> </dl> </section><section class="detail" id="isReadLockStamp(long)"> <h3>isReadLockStamp</h3> <pre class="lang-java" data-language="java">public static boolean isReadLockStamp(long stamp)</pre> <div class="block">Tells whether a stamp represents holding a lock non-exclusively. This method may be useful in conjunction with <a href="#tryConvertToReadLock(long)"><code>tryConvertToReadLock(long)</code></a>, for example: <pre class="lang-java" data-language="java"> <code>
+ long stamp = sl.tryOptimisticRead();
+ try {
+   ...
+   stamp = sl.tryConvertToReadLock(stamp);
+   ...
+ } finally {
+   if (StampedLock.isReadLockStamp(stamp))
+     sl.unlockRead(stamp);
+ }</code></pre>
+</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp returned by a previous StampedLock operation</dd> <dt>Returns:</dt> <dd>
+<code>true</code> if the stamp was returned by a successful read-lock operation</dd> <dt>Since:</dt> <dd>10</dd> </dl> </section><section class="detail" id="isLockStamp(long)"> <h3>isLockStamp</h3> <pre class="lang-java" data-language="java">public static boolean isLockStamp(long stamp)</pre> <div class="block">Tells whether a stamp represents holding a lock. This method may be useful in conjunction with <a href="#tryConvertToReadLock(long)"><code>tryConvertToReadLock(long)</code></a> and <a href="#tryConvertToWriteLock(long)"><code>tryConvertToWriteLock(long)</code></a>, for example: <pre class="lang-java" data-language="java"> <code>
+ long stamp = sl.tryOptimisticRead();
+ try {
+   ...
+   stamp = sl.tryConvertToReadLock(stamp);
+   ...
+   stamp = sl.tryConvertToWriteLock(stamp);
+   ...
+ } finally {
+   if (StampedLock.isLockStamp(stamp))
+     sl.unlock(stamp);
+ }</code></pre>
+</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp returned by a previous StampedLock operation</dd> <dt>Returns:</dt> <dd>
+<code>true</code> if the stamp was returned by a successful read-lock or write-lock operation</dd> <dt>Since:</dt> <dd>10</dd> </dl> </section><section class="detail" id="isOptimisticReadStamp(long)"> <h3>isOptimisticReadStamp</h3> <pre class="lang-java" data-language="java">public static boolean isOptimisticReadStamp(long stamp)</pre> <div class="block">Tells whether a stamp represents a successful optimistic read.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>stamp</code> - a stamp returned by a previous StampedLock operation</dd> <dt>Returns:</dt> <dd>
+<code>true</code> if the stamp was returned by a successful optimistic read operation, that is, a non-zero return from <a href="#tryOptimisticRead()"><code>tryOptimisticRead()</code></a> or <a href="#tryConvertToOptimisticRead(long)"><code>tryConvertToOptimisticRead(long)</code></a>
+</dd> <dt>Since:</dt> <dd>10</dd> </dl> </section><section class="detail" id="getReadLockCount()"> <h3>getReadLockCount</h3> <pre class="lang-java" data-language="java">public int getReadLockCount()</pre> <div class="block">Queries the number of read locks held for this lock. This method is designed for use in monitoring system state, not for synchronization control.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the number of read locks held</dd> </dl> </section><section class="detail" id="toString()"> <h3>toString</h3> <pre class="lang-java" data-language="java">public String toString()</pre> <div class="block">Returns a string identifying this lock, as well as its lock state. The state, in brackets, includes the String <code>
+ "Unlocked"</code> or the String <code>"Write-locked"</code> or the String <code>"Read-locks:"</code> followed by the current number of read-locks held.</div> <dl class="notes"> <dt>Overrides:</dt> <dd>
+<code><a href="../../../lang/object.html#toString()">toString</a></code> in class <code><a href="../../../lang/object.html" title="class in java.lang">Object</a></code>
+</dd> <dt>Returns:</dt> <dd>a string identifying this lock, as well as its lock state</dd> </dl> </section><section class="detail" id="asReadLock()"> <h3>asReadLock</h3> <pre class="lang-java" data-language="java">public Lock asReadLock()</pre> <div class="block">Returns a plain <a href="lock.html" title="interface in java.util.concurrent.locks"><code>Lock</code></a> view of this StampedLock in which the <a href="lock.html#lock()"><code>Lock.lock()</code></a> method is mapped to <a href="#readLock()"><code>readLock()</code></a>, and similarly for other methods. The returned Lock does not support a <a href="condition.html" title="interface in java.util.concurrent.locks"><code>Condition</code></a>; method <a href="lock.html#newCondition()"><code>Lock.newCondition()</code></a> throws <code>UnsupportedOperationException</code>.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the lock</dd> </dl> </section><section class="detail" id="asWriteLock()"> <h3>asWriteLock</h3> <pre class="lang-java" data-language="java">public Lock asWriteLock()</pre> <div class="block">Returns a plain <a href="lock.html" title="interface in java.util.concurrent.locks"><code>Lock</code></a> view of this StampedLock in which the <a href="lock.html#lock()"><code>Lock.lock()</code></a> method is mapped to <a href="#writeLock()"><code>writeLock()</code></a>, and similarly for other methods. The returned Lock does not support a <a href="condition.html" title="interface in java.util.concurrent.locks"><code>Condition</code></a>; method <a href="lock.html#newCondition()"><code>Lock.newCondition()</code></a> throws <code>UnsupportedOperationException</code>.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the lock</dd> </dl> </section><section class="detail" id="asReadWriteLock()"> <h3>asReadWriteLock</h3> <pre class="lang-java" data-language="java">public ReadWriteLock asReadWriteLock()</pre> <div class="block">Returns a <a href="readwritelock.html" title="interface in java.util.concurrent.locks"><code>ReadWriteLock</code></a> view of this StampedLock in which the <a href="readwritelock.html#readLock()"><code>ReadWriteLock.readLock()</code></a> method is mapped to <a href="#asReadLock()"><code>asReadLock()</code></a>, and <a href="readwritelock.html#writeLock()"><code>ReadWriteLock.writeLock()</code></a> to <a href="#asWriteLock()"><code>asWriteLock()</code></a>.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the lock</dd> </dl> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 1993, 2023, Oracle and/or its affiliates. All rights reserved.<br>Documentation extracted from Debian's OpenJDK Development Kit package.<br>Licensed under the GNU General Public License, version 2, with the Classpath Exception.<br>Various third party code in OpenJDK is licensed under different licenses (see Debian package).<br>Java and OpenJDK are trademarks or registered trademarks of Oracle and/or its affiliates.<br>
+    <a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/StampedLock.html" class="_attribution-link">https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/StampedLock.html</a>
+  </p>
+</div>

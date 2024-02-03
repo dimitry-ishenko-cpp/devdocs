@@ -1,0 +1,214 @@
+<h1 title="Class SubmissionPublisher" class="title">Class SubmissionPublisher&lt;T&gt;</h1> <div class="inheritance" title="Inheritance Tree">
+<a href="../../lang/object.html" title="class in java.lang">java.lang.Object</a> <div class="inheritance">java.util.concurrent.SubmissionPublisher&lt;T&gt;</div> </div> <section class="class-description" id="class-description"> <dl class="notes"> <dt>Type Parameters:</dt> <dd>
+<code>T</code> - the published item type</dd> </dl> <dl class="notes"> <dt>All Implemented Interfaces:</dt> <dd>
+<code><a href="../../lang/autocloseable.html" title="interface in java.lang">AutoCloseable</a></code>, <code><a href="flow.publisher.html" title="interface in java.util.concurrent">Flow.Publisher</a>&lt;T&gt;</code>
+</dd> </dl>  <pre class="lang-java" data-language="java">public class SubmissionPublisher&lt;T&gt; extends Object implements Flow.Publisher&lt;T&gt;, AutoCloseable</pre> <div class="block">A <a href="flow.publisher.html" title="interface in java.util.concurrent"><code>Flow.Publisher</code></a> that asynchronously issues submitted (non-null) items to current subscribers until it is closed. Each current subscriber receives newly submitted items in the same order unless drops or exceptions are encountered. Using a SubmissionPublisher allows item generators to act as compliant <a href="http://www.reactive-streams.org/"> reactive-streams</a> Publishers relying on drop handling and/or blocking for flow control. <p>A SubmissionPublisher uses the <a href="executor.html" title="interface in java.util.concurrent"><code>Executor</code></a> supplied in its constructor for delivery to subscribers. The best choice of Executor depends on expected usage. If the generator(s) of submitted items run in separate threads, and the number of subscribers can be estimated, consider using a <a href="executors.html#newFixedThreadPool(int)"><code>Executors.newFixedThreadPool(int)</code></a>. Otherwise consider using the default, normally the <a href="forkjoinpool.html#commonPool()"><code>ForkJoinPool.commonPool()</code></a>. </p>
+<p>Buffering allows producers and consumers to transiently operate at different rates. Each subscriber uses an independent buffer. Buffers are created upon first use and expanded as needed up to the given maximum. (The enforced capacity may be rounded up to the nearest power of two and/or bounded by the largest value supported by this implementation.) Invocations of <a href="flow.subscription.html#request(long)"><code>request</code></a> do not directly result in buffer expansion, but risk saturation if unfilled requests exceed the maximum capacity. The default value of <a href="flow.html#defaultBufferSize()"><code>Flow.defaultBufferSize()</code></a> may provide a useful starting point for choosing a capacity based on expected rates, resources, and usages. </p>
+<p>A single SubmissionPublisher may be shared among multiple sources. Actions in a source thread prior to publishing an item or issuing a signal <a href="package-summary.html#MemoryVisibility"> <i>happen-before</i></a> actions subsequent to the corresponding access by each subscriber. But reported estimates of lag and demand are designed for use in monitoring, not for synchronization control, and may reflect stale or inaccurate views of progress. </p>
+<p>Publication methods support different policies about what to do when buffers are saturated. Method <a href="#submit(T)"><code>submit</code></a> blocks until resources are available. This is simplest, but least responsive. The <code>offer</code> methods may drop items (either immediately or with bounded timeout), but provide an opportunity to interpose a handler and then retry. </p>
+<p>If any Subscriber method throws an exception, its subscription is cancelled. If a handler is supplied as a constructor argument, it is invoked before cancellation upon an exception in method <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a>, but exceptions in methods <a href="flow.subscriber.html#onSubscribe(java.util.concurrent.Flow.Subscription)"><code>onSubscribe</code></a>, <a href="flow.subscriber.html#onError(java.lang.Throwable)"><code>onError</code></a> and <a href="flow.subscriber.html#onComplete()"><code>onComplete</code></a> are not recorded or handled before cancellation. If the supplied Executor throws <a href="rejectedexecutionexception.html" title="class in java.util.concurrent"><code>RejectedExecutionException</code></a> (or any other RuntimeException or Error) when attempting to execute a task, or a drop handler throws an exception when processing a dropped item, then the exception is rethrown. In these cases, not all subscribers will have been issued the published item. It is usually good practice to <a href="#closeExceptionally(java.lang.Throwable)"><code>closeExceptionally</code></a> in these cases. </p>
+<p>Method <a href="#consume(java.util.function.Consumer)"><code>consume(Consumer)</code></a> simplifies support for a common case in which the only action of a subscriber is to request and process all items using a supplied function. </p>
+<p>This class may also serve as a convenient base for subclasses that generate items, and use the methods in this class to publish them. For example here is a class that periodically publishes the items generated from a supplier. (In practice you might add methods to independently start and stop generation, to share Executors among publishers, and so on, or use a SubmissionPublisher as a component rather than a superclass.) </p>
+<pre class="lang-java" data-language="java"> <code>
+ class PeriodicPublisher&lt;T&gt; extends SubmissionPublisher&lt;T&gt; {
+   final ScheduledFuture&lt;?&gt; periodicTask;
+   final ScheduledExecutorService scheduler;
+   PeriodicPublisher(Executor executor, int maxBufferCapacity,
+                     Supplier&lt;? extends T&gt; supplier,
+                     long period, TimeUnit unit) {
+     super(executor, maxBufferCapacity);
+     scheduler = new ScheduledThreadPoolExecutor(1);
+     periodicTask = scheduler.scheduleAtFixedRate(
+       () -&gt; submit(supplier.get()), 0, period, unit);
+   }
+   public void close() {
+     periodicTask.cancel(false);
+     scheduler.shutdown();
+     super.close();
+   }
+ }</code></pre> <p>Here is an example of a <a href="flow.processor.html" title="interface in java.util.concurrent"><code>Flow.Processor</code></a> implementation. It uses single-step requests to its publisher for simplicity of illustration. A more adaptive version could monitor flow using the lag estimate returned from <code>submit</code>, along with other utility methods. </p>
+<pre class="lang-java" data-language="java"> <code>
+ class TransformProcessor&lt;S,T&gt; extends SubmissionPublisher&lt;T&gt;
+   implements Flow.Processor&lt;S,T&gt; {
+   final Function&lt;? super S, ? extends T&gt; function;
+   Flow.Subscription subscription;
+   TransformProcessor(Executor executor, int maxBufferCapacity,
+                      Function&lt;? super S, ? extends T&gt; function) {
+     super(executor, maxBufferCapacity);
+     this.function = function;
+   }
+   public void onSubscribe(Flow.Subscription subscription) {
+     (this.subscription = subscription).request(1);
+   }
+   public void onNext(S item) {
+     subscription.request(1);
+     submit(function.apply(item));
+   }
+   public void onError(Throwable ex) { closeExceptionally(ex); }
+   public void onComplete() { close(); }
+ }</code></pre>
+</div> <dl class="notes"> <dt>Since:</dt> <dd>9</dd> </dl> </section> <section class="summary"> <section class="constructor-summary" id="constructor-summary"> <h2>Constructor Summary</h2>  <table class="summary-table two-column-summary">         <tr>
+<th>Constructor</th>
+<th>Description</th>
+</tr>
+<tr>
+<td><code><a href="#%3Cinit%3E()" class="member-name-link">SubmissionPublisher</a>()</code></td>
+<td> <div class="block">Creates a new SubmissionPublisher using the <a href="forkjoinpool.html#commonPool()"><code>ForkJoinPool.commonPool()</code></a> for async delivery to subscribers (unless it does not support a parallelism level of at least two, in which case, a new Thread is created to run each task), with maximum buffer capacity of <a href="flow.html#defaultBufferSize()"><code>Flow.defaultBufferSize()</code></a>, and no handler for Subscriber exceptions in method <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a>.</div> </td>
+</tr>
+<tr>
+<td><code><a href="#%3Cinit%3E(java.util.concurrent.Executor,int)" class="member-name-link">SubmissionPublisher</a><wbr>(<a href="executor.html" title="interface in java.util.concurrent">Executor</a> executor,
+ int maxBufferCapacity)</wbr></code></td>
+<td> <div class="block">Creates a new SubmissionPublisher using the given Executor for async delivery to subscribers, with the given maximum buffer size for each subscriber, and no handler for Subscriber exceptions in method <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a>.</div> </td>
+</tr>
+<tr>
+<td><code><a href="#%3Cinit%3E(java.util.concurrent.Executor,int,java.util.function.BiConsumer)" class="member-name-link">SubmissionPublisher</a><wbr>(<a href="executor.html" title="interface in java.util.concurrent">Executor</a> executor,
+ int maxBufferCapacity,
+ <a href="../function/biconsumer.html" title="interface in java.util.function">BiConsumer</a>&lt;? super <a href="flow.subscriber.html" title="interface in java.util.concurrent">Flow.Subscriber</a>&lt;? super <a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt;,<wbr>? super <a href="../../lang/throwable.html" title="class in java.lang">Throwable</a>&gt; handler)</wbr></wbr></code></td>
+<td> <div class="block">Creates a new SubmissionPublisher using the given Executor for async delivery to subscribers, with the given maximum buffer size for each subscriber, and, if non-null, the given handler invoked when any Subscriber throws an exception in method <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a>.</div> </td>
+</tr>
+</table> </section><section class="method-summary" id="method-summary"> <h2>Method Summary</h2> <div id="method-summary-table">  <div id="method-summary-table.tabpanel" role="tabpanel"> <table class="summary-table three-column-summary" aria-labelledby="method-summary-table-tab0">                                                       <tr>
+<th>Modifier and Type</th>
+<th>Method</th>
+<th>Description</th>
+</tr>
+<tr>
+<td><code>void</code></td>
+<td><code><a href="#close()" class="member-name-link">close</a>()</code></td>
+<td> <div class="block">Unless already closed, issues <a href="flow.subscriber.html#onComplete()"><code>onComplete</code></a> signals to current subscribers, and disallows subsequent attempts to publish.</div> </td>
+</tr>
+<tr>
+<td><code>void</code></td>
+<td><code><a href="#closeExceptionally(java.lang.Throwable)" class="member-name-link">closeExceptionally</a><wbr>(<a href="../../lang/throwable.html" title="class in java.lang">Throwable</a> error)</wbr></code></td>
+<td> <div class="block">Unless already closed, issues <a href="flow.subscriber.html#onError(java.lang.Throwable)"><code>onError</code></a> signals to current subscribers with the given error, and disallows subsequent attempts to publish.</div> </td>
+</tr>
+<tr>
+<td><code><a href="completablefuture.html" title="class in java.util.concurrent">CompletableFuture</a><wbr>&lt;<a href="../../lang/void.html" title="class in java.lang">Void</a>&gt;</wbr></code></td>
+<td><code><a href="#consume(java.util.function.Consumer)" class="member-name-link">consume</a><wbr>(<a href="../function/consumer.html" title="interface in java.util.function">Consumer</a>&lt;? super <a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt; consumer)</wbr></code></td>
+<td> <div class="block">Processes all published items using the given Consumer function.</div> </td>
+</tr>
+<tr>
+<td><code>int</code></td>
+<td><code><a href="#estimateMaximumLag()" class="member-name-link">estimateMaximumLag</a>()</code></td>
+<td> <div class="block">Returns an estimate of the maximum number of items produced but not yet consumed among all current subscribers.</div> </td>
+</tr>
+<tr>
+<td><code>long</code></td>
+<td><code><a href="#estimateMinimumDemand()" class="member-name-link">estimateMinimumDemand</a>()</code></td>
+<td> <div class="block">Returns an estimate of the minimum number of items requested (via <a href="flow.subscription.html#request(long)"><code>request</code></a>) but not yet produced, among all current subscribers.</div> </td>
+</tr>
+<tr>
+<td><code><a href="../../lang/throwable.html" title="class in java.lang">Throwable</a></code></td>
+<td><code><a href="#getClosedException()" class="member-name-link">getClosedException</a>()</code></td>
+<td> <div class="block">Returns the exception associated with <a href="#closeExceptionally(java.lang.Throwable)"><code>closeExceptionally</code></a>, or null if not closed or if closed normally.</div> </td>
+</tr>
+<tr>
+<td><code><a href="executor.html" title="interface in java.util.concurrent">Executor</a></code></td>
+<td><code><a href="#getExecutor()" class="member-name-link">getExecutor</a>()</code></td>
+<td> <div class="block">Returns the Executor used for asynchronous delivery.</div> </td>
+</tr>
+<tr>
+<td><code>int</code></td>
+<td><code><a href="#getMaxBufferCapacity()" class="member-name-link">getMaxBufferCapacity</a>()</code></td>
+<td> <div class="block">Returns the maximum per-subscriber buffer capacity.</div> </td>
+</tr>
+<tr>
+<td><code>int</code></td>
+<td><code><a href="#getNumberOfSubscribers()" class="member-name-link">getNumberOfSubscribers</a>()</code></td>
+<td> <div class="block">Returns the number of current subscribers.</div> </td>
+</tr>
+<tr>
+<td><code><a href="../list.html" title="interface in java.util">List</a><wbr>&lt;<a href="flow.subscriber.html" title="interface in java.util.concurrent">Flow.Subscriber</a>&lt;? super <a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt;&gt;</wbr></code></td>
+<td><code><a href="#getSubscribers()" class="member-name-link">getSubscribers</a>()</code></td>
+<td> <div class="block">Returns a list of current subscribers for monitoring and tracking purposes, not for invoking <a href="flow.subscriber.html" title="interface in java.util.concurrent"><code>Flow.Subscriber</code></a> methods on the subscribers.</div> </td>
+</tr>
+<tr>
+<td><code>boolean</code></td>
+<td><code><a href="#hasSubscribers()" class="member-name-link">hasSubscribers</a>()</code></td>
+<td> <div class="block">Returns true if this publisher has any subscribers.</div> </td>
+</tr>
+<tr>
+<td><code>boolean</code></td>
+<td><code><a href="#isClosed()" class="member-name-link">isClosed</a>()</code></td>
+<td> <div class="block">Returns true if this publisher is not accepting submissions.</div> </td>
+</tr>
+<tr>
+<td><code>boolean</code></td>
+<td><code><a href="#isSubscribed(java.util.concurrent.Flow.Subscriber)" class="member-name-link">isSubscribed</a><wbr>(<a href="flow.subscriber.html" title="interface in java.util.concurrent">Flow.Subscriber</a>&lt;? super <a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt; subscriber)</wbr></code></td>
+<td> <div class="block">Returns true if the given Subscriber is currently subscribed.</div> </td>
+</tr>
+<tr>
+<td><code>int</code></td>
+<td><code><a href="#offer(T,long,java.util.concurrent.TimeUnit,java.util.function.BiPredicate)" class="member-name-link">offer</a><wbr>(<a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a> item,
+ long timeout,
+ <a href="timeunit.html" title="enum class in java.util.concurrent">TimeUnit</a> unit,
+ <a href="../function/bipredicate.html" title="interface in java.util.function">BiPredicate</a>&lt;<a href="flow.subscriber.html" title="interface in java.util.concurrent">Flow.Subscriber</a>&lt;? super <a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt;,<wbr>? super <a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt; onDrop)</wbr></wbr></code></td>
+<td> <div class="block">Publishes the given item, if possible, to each current subscriber by asynchronously invoking its <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a> method, blocking while resources for any subscription are unavailable, up to the specified timeout or until the caller thread is interrupted, at which point the given handler (if non-null) is invoked, and if it returns true, retried once.</div> </td>
+</tr>
+<tr>
+<td><code>int</code></td>
+<td><code><a href="#offer(T,java.util.function.BiPredicate)" class="member-name-link">offer</a><wbr>(<a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a> item,
+ <a href="../function/bipredicate.html" title="interface in java.util.function">BiPredicate</a>&lt;<a href="flow.subscriber.html" title="interface in java.util.concurrent">Flow.Subscriber</a>&lt;? super <a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt;,<wbr>? super <a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt; onDrop)</wbr></wbr></code></td>
+<td> <div class="block">Publishes the given item, if possible, to each current subscriber by asynchronously invoking its <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a> method.</div> </td>
+</tr>
+<tr>
+<td><code>int</code></td>
+<td><code><a href="#submit(T)" class="member-name-link">submit</a><wbr>(<a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a> item)</wbr></code></td>
+<td> <div class="block">Publishes the given item to each current subscriber by asynchronously invoking its <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a> method, blocking uninterruptibly while resources for any subscriber are unavailable.</div> </td>
+</tr>
+<tr>
+<td><code>void</code></td>
+<td><code><a href="#subscribe(java.util.concurrent.Flow.Subscriber)" class="member-name-link">subscribe</a><wbr>(<a href="flow.subscriber.html" title="interface in java.util.concurrent">Flow.Subscriber</a>&lt;? super <a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt; subscriber)</wbr></code></td>
+<td> <div class="block">Adds the given Subscriber unless already subscribed.</div> </td>
+</tr>
+</table> </div> </div> <div class="inherited-list"> <h3 id="methods-inherited-from-class-java.lang.Object">Methods declared in class java.lang.<a href="../../lang/object.html" title="class in java.lang">Object</a>
+</h3> <code><a href="../../lang/object.html#clone()">clone</a>, <a href="../../lang/object.html#equals(java.lang.Object)">equals</a>, <a href="../../lang/object.html#finalize()">finalize</a>, <a href="../../lang/object.html#getClass()">getClass</a>, <a href="../../lang/object.html#hashCode()">hashCode</a>, <a href="../../lang/object.html#notify()">notify</a>, <a href="../../lang/object.html#notifyAll()">notifyAll</a>, <a href="../../lang/object.html#toString()">toString</a>, <a href="../../lang/object.html#wait()">wait</a>, <a href="../../lang/object.html#wait(long)">wait</a>, <a href="../../lang/object.html#wait(long,int)">wait</a></code>
+</div> </section> </section> <section class="details"> <section class="constructor-details" id="constructor-detail"> <h2>Constructor Details</h2>  </section><section class="detail" id="&lt;init&gt;(java.util.concurrent.Executor,int,java.util.function.BiConsumer)"> <h3>SubmissionPublisher</h3> <pre class="lang-java" data-language="java">public SubmissionPublisher(Executor executor, int maxBufferCapacity, BiConsumer&lt;? super Flow.Subscriber&lt;? super T&gt;,? super Throwable&gt; handler)</pre> <div class="block">Creates a new SubmissionPublisher using the given Executor for async delivery to subscribers, with the given maximum buffer size for each subscriber, and, if non-null, the given handler invoked when any Subscriber throws an exception in method <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a>.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>executor</code> - the executor to use for async delivery, supporting creation of at least one independent thread</dd> <dd>
+<code>maxBufferCapacity</code> - the maximum capacity for each subscriber's buffer (the enforced capacity may be rounded up to the nearest power of two and/or bounded by the largest value supported by this implementation; method <a href="#getMaxBufferCapacity()"><code>getMaxBufferCapacity()</code></a> returns the actual value)</dd> <dd>
+<code>handler</code> - if non-null, procedure to invoke upon exception thrown in method <code>onNext</code>
+</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../lang/nullpointerexception.html" title="class in java.lang">NullPointerException</a></code> - if executor is null</dd> <dd>
+<code><a href="../../lang/illegalargumentexception.html" title="class in java.lang">IllegalArgumentException</a></code> - if maxBufferCapacity not positive</dd> </dl> </section><section class="detail" id="&lt;init&gt;(java.util.concurrent.Executor,int)"> <h3>SubmissionPublisher</h3> <pre class="lang-java" data-language="java">public SubmissionPublisher(Executor executor, int maxBufferCapacity)</pre> <div class="block">Creates a new SubmissionPublisher using the given Executor for async delivery to subscribers, with the given maximum buffer size for each subscriber, and no handler for Subscriber exceptions in method <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a>.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>executor</code> - the executor to use for async delivery, supporting creation of at least one independent thread</dd> <dd>
+<code>maxBufferCapacity</code> - the maximum capacity for each subscriber's buffer (the enforced capacity may be rounded up to the nearest power of two and/or bounded by the largest value supported by this implementation; method <a href="#getMaxBufferCapacity()"><code>getMaxBufferCapacity()</code></a> returns the actual value)</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../lang/nullpointerexception.html" title="class in java.lang">NullPointerException</a></code> - if executor is null</dd> <dd>
+<code><a href="../../lang/illegalargumentexception.html" title="class in java.lang">IllegalArgumentException</a></code> - if maxBufferCapacity not positive</dd> </dl> </section><section class="detail" id="&lt;init&gt;()"> <h3>SubmissionPublisher</h3> <pre class="lang-java" data-language="java">public SubmissionPublisher()</pre> <div class="block">Creates a new SubmissionPublisher using the <a href="forkjoinpool.html#commonPool()"><code>ForkJoinPool.commonPool()</code></a> for async delivery to subscribers (unless it does not support a parallelism level of at least two, in which case, a new Thread is created to run each task), with maximum buffer capacity of <a href="flow.html#defaultBufferSize()"><code>Flow.defaultBufferSize()</code></a>, and no handler for Subscriber exceptions in method <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a>.</div> </section><section class="method-details" id="method-detail"> <h2>Method Details</h2>  </section><section class="detail" id="subscribe(java.util.concurrent.Flow.Subscriber)"> <h3>subscribe</h3> <pre class="lang-java" data-language="java">public void subscribe(Flow.Subscriber&lt;? super T&gt; subscriber)</pre> <div class="block">Adds the given Subscriber unless already subscribed. If already subscribed, the Subscriber's <a href="flow.subscriber.html#onError(java.lang.Throwable)"><code>onError</code></a> method is invoked on the existing subscription with an <a href="../../lang/illegalstateexception.html" title="class in java.lang"><code>IllegalStateException</code></a>. Otherwise, upon success, the Subscriber's <a href="flow.subscriber.html#onSubscribe(java.util.concurrent.Flow.Subscription)"><code>onSubscribe</code></a> method is invoked asynchronously with a new <a href="flow.subscription.html" title="interface in java.util.concurrent"><code>Flow.Subscription</code></a>. If <a href="flow.subscriber.html#onSubscribe(java.util.concurrent.Flow.Subscription)"><code>onSubscribe</code></a> throws an exception, the subscription is cancelled. Otherwise, if this SubmissionPublisher was closed exceptionally, then the subscriber's <a href="flow.subscriber.html#onError(java.lang.Throwable)"><code>onError</code></a> method is invoked with the corresponding exception, or if closed without exception, the subscriber's <a href="flow.subscriber.html#onComplete()"><code>onComplete</code></a> method is invoked. Subscribers may enable receiving items by invoking the <a href="flow.subscription.html#request(long)"><code>request</code></a> method of the new Subscription, and may unsubscribe by invoking its <a href="flow.subscription.html#cancel()"><code>cancel</code></a> method.</div> <dl class="notes"> <dt>Specified by:</dt> <dd>
+<code><a href="flow.publisher.html#subscribe(java.util.concurrent.Flow.Subscriber)">subscribe</a></code> in interface <code><a href="flow.publisher.html" title="interface in java.util.concurrent">Flow.Publisher</a>&lt;<a href="submissionpublisher.html" title="type parameter in SubmissionPublisher">T</a>&gt;</code>
+</dd> <dt>Parameters:</dt> <dd>
+<code>subscriber</code> - the subscriber</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../lang/nullpointerexception.html" title="class in java.lang">NullPointerException</a></code> - if subscriber is null</dd> </dl> </section><section class="detail" id="submit(T)"> <h3 id="submit(java.lang.Object)">submit</h3> <pre class="lang-java" data-language="java">public int submit(T item)</pre> <div class="block">Publishes the given item to each current subscriber by asynchronously invoking its <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a> method, blocking uninterruptibly while resources for any subscriber are unavailable. This method returns an estimate of the maximum lag (number of items submitted but not yet consumed) among all current subscribers. This value is at least one (accounting for this submitted item) if there are any subscribers, else zero. <p>If the Executor for this publisher throws a RejectedExecutionException (or any other RuntimeException or Error) when attempting to asynchronously notify subscribers, then this exception is rethrown, in which case not all subscribers will have been issued this item.</p>
+</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>item</code> - the (non-null) item to publish</dd> <dt>Returns:</dt> <dd>the estimated maximum lag among subscribers</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../lang/illegalstateexception.html" title="class in java.lang">IllegalStateException</a></code> - if closed</dd> <dd>
+<code><a href="../../lang/nullpointerexception.html" title="class in java.lang">NullPointerException</a></code> - if item is null</dd> <dd>
+<code><a href="rejectedexecutionexception.html" title="class in java.util.concurrent">RejectedExecutionException</a></code> - if thrown by Executor</dd> </dl> </section><section class="detail" id="offer(T,java.util.function.BiPredicate)"> <h3 id="offer(java.lang.Object,java.util.function.BiPredicate)">offer</h3> <pre class="lang-java" data-language="java">public int offer(T item, BiPredicate&lt;Flow.Subscriber&lt;? super T&gt;,? super T&gt; onDrop)</pre> <div class="block">Publishes the given item, if possible, to each current subscriber by asynchronously invoking its <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a> method. The item may be dropped by one or more subscribers if resource limits are exceeded, in which case the given handler (if non-null) is invoked, and if it returns true, retried once. Other calls to methods in this class by other threads are blocked while the handler is invoked. Unless recovery is assured, options are usually limited to logging the error and/or issuing an <a href="flow.subscriber.html#onError(java.lang.Throwable)"><code>onError</code></a> signal to the subscriber. <p>This method returns a status indicator: If negative, it represents the (negative) number of drops (failed attempts to issue the item to a subscriber). Otherwise it is an estimate of the maximum lag (number of items submitted but not yet consumed) among all current subscribers. This value is at least one (accounting for this submitted item) if there are any subscribers, else zero. </p>
+<p>If the Executor for this publisher throws a RejectedExecutionException (or any other RuntimeException or Error) when attempting to asynchronously notify subscribers, or the drop handler throws an exception when processing a dropped item, then this exception is rethrown.</p>
+</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>item</code> - the (non-null) item to publish</dd> <dd>
+<code>onDrop</code> - if non-null, the handler invoked upon a drop to a subscriber, with arguments of the subscriber and item; if it returns true, an offer is re-attempted (once)</dd> <dt>Returns:</dt> <dd>if negative, the (negative) number of drops; otherwise an estimate of maximum lag</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../lang/illegalstateexception.html" title="class in java.lang">IllegalStateException</a></code> - if closed</dd> <dd>
+<code><a href="../../lang/nullpointerexception.html" title="class in java.lang">NullPointerException</a></code> - if item is null</dd> <dd>
+<code><a href="rejectedexecutionexception.html" title="class in java.util.concurrent">RejectedExecutionException</a></code> - if thrown by Executor</dd> </dl> </section><section class="detail" id="offer(T,long,java.util.concurrent.TimeUnit,java.util.function.BiPredicate)"> <h3 id="offer(java.lang.Object,long,java.util.concurrent.TimeUnit,java.util.function.BiPredicate)">offer</h3> <pre class="lang-java" data-language="java">public int offer(T item, long timeout, TimeUnit unit, BiPredicate&lt;Flow.Subscriber&lt;? super T&gt;,? super T&gt; onDrop)</pre> <div class="block">Publishes the given item, if possible, to each current subscriber by asynchronously invoking its <a href="flow.subscriber.html#onNext(T)"><code>onNext</code></a> method, blocking while resources for any subscription are unavailable, up to the specified timeout or until the caller thread is interrupted, at which point the given handler (if non-null) is invoked, and if it returns true, retried once. (The drop handler may distinguish timeouts from interrupts by checking whether the current thread is interrupted.) Other calls to methods in this class by other threads are blocked while the handler is invoked. Unless recovery is assured, options are usually limited to logging the error and/or issuing an <a href="flow.subscriber.html#onError(java.lang.Throwable)"><code>onError</code></a> signal to the subscriber. <p>This method returns a status indicator: If negative, it represents the (negative) number of drops (failed attempts to issue the item to a subscriber). Otherwise it is an estimate of the maximum lag (number of items submitted but not yet consumed) among all current subscribers. This value is at least one (accounting for this submitted item) if there are any subscribers, else zero. </p>
+<p>If the Executor for this publisher throws a RejectedExecutionException (or any other RuntimeException or Error) when attempting to asynchronously notify subscribers, or the drop handler throws an exception when processing a dropped item, then this exception is rethrown.</p>
+</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>item</code> - the (non-null) item to publish</dd> <dd>
+<code>timeout</code> - how long to wait for resources for any subscriber before giving up, in units of <code>unit</code>
+</dd> <dd>
+<code>unit</code> - a <code>TimeUnit</code> determining how to interpret the <code>timeout</code> parameter</dd> <dd>
+<code>onDrop</code> - if non-null, the handler invoked upon a drop to a subscriber, with arguments of the subscriber and item; if it returns true, an offer is re-attempted (once)</dd> <dt>Returns:</dt> <dd>if negative, the (negative) number of drops; otherwise an estimate of maximum lag</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../lang/illegalstateexception.html" title="class in java.lang">IllegalStateException</a></code> - if closed</dd> <dd>
+<code><a href="../../lang/nullpointerexception.html" title="class in java.lang">NullPointerException</a></code> - if item is null</dd> <dd>
+<code><a href="rejectedexecutionexception.html" title="class in java.util.concurrent">RejectedExecutionException</a></code> - if thrown by Executor</dd> </dl> </section><section class="detail" id="close()"> <h3>close</h3> <pre class="lang-java" data-language="java">public void close()</pre> <div class="block">Unless already closed, issues <a href="flow.subscriber.html#onComplete()"><code>onComplete</code></a> signals to current subscribers, and disallows subsequent attempts to publish. Upon return, this method does <em>NOT</em> guarantee that all subscribers have yet completed.</div> <dl class="notes"> <dt>Specified by:</dt> <dd>
+<code><a href="../../lang/autocloseable.html#close()">close</a></code> in interface <code><a href="../../lang/autocloseable.html" title="interface in java.lang">AutoCloseable</a></code>
+</dd> </dl> </section><section class="detail" id="closeExceptionally(java.lang.Throwable)"> <h3>closeExceptionally</h3> <pre class="lang-java" data-language="java">public void closeExceptionally(Throwable error)</pre> <div class="block">Unless already closed, issues <a href="flow.subscriber.html#onError(java.lang.Throwable)"><code>onError</code></a> signals to current subscribers with the given error, and disallows subsequent attempts to publish. Future subscribers also receive the given error. Upon return, this method does <em>NOT</em> guarantee that all subscribers have yet completed.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>error</code> - the <code>onError</code> argument sent to subscribers</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../lang/nullpointerexception.html" title="class in java.lang">NullPointerException</a></code> - if error is null</dd> </dl> </section><section class="detail" id="isClosed()"> <h3>isClosed</h3> <pre class="lang-java" data-language="java">public boolean isClosed()</pre> <div class="block">Returns true if this publisher is not accepting submissions.</div> <dl class="notes"> <dt>Returns:</dt> <dd>true if closed</dd> </dl> </section><section class="detail" id="getClosedException()"> <h3>getClosedException</h3> <pre class="lang-java" data-language="java">public Throwable getClosedException()</pre> <div class="block">Returns the exception associated with <a href="#closeExceptionally(java.lang.Throwable)"><code>closeExceptionally</code></a>, or null if not closed or if closed normally.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the exception, or null if none</dd> </dl> </section><section class="detail" id="hasSubscribers()"> <h3>hasSubscribers</h3> <pre class="lang-java" data-language="java">public boolean hasSubscribers()</pre> <div class="block">Returns true if this publisher has any subscribers.</div> <dl class="notes"> <dt>Returns:</dt> <dd>true if this publisher has any subscribers</dd> </dl> </section><section class="detail" id="getNumberOfSubscribers()"> <h3>getNumberOfSubscribers</h3> <pre class="lang-java" data-language="java">public int getNumberOfSubscribers()</pre> <div class="block">Returns the number of current subscribers.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the number of current subscribers</dd> </dl> </section><section class="detail" id="getExecutor()"> <h3>getExecutor</h3> <pre class="lang-java" data-language="java">public Executor getExecutor()</pre> <div class="block">Returns the Executor used for asynchronous delivery.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the Executor used for asynchronous delivery</dd> </dl> </section><section class="detail" id="getMaxBufferCapacity()"> <h3>getMaxBufferCapacity</h3> <pre class="lang-java" data-language="java">public int getMaxBufferCapacity()</pre> <div class="block">Returns the maximum per-subscriber buffer capacity.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the maximum per-subscriber buffer capacity</dd> </dl> </section><section class="detail" id="getSubscribers()"> <h3>getSubscribers</h3> <pre class="lang-java" data-language="java">public List&lt;Flow.Subscriber&lt;? super T&gt;&gt; getSubscribers()</pre> <div class="block">Returns a list of current subscribers for monitoring and tracking purposes, not for invoking <a href="flow.subscriber.html" title="interface in java.util.concurrent"><code>Flow.Subscriber</code></a> methods on the subscribers.</div> <dl class="notes"> <dt>Returns:</dt> <dd>list of current subscribers</dd> </dl> </section><section class="detail" id="isSubscribed(java.util.concurrent.Flow.Subscriber)"> <h3>isSubscribed</h3> <pre class="lang-java" data-language="java">public boolean isSubscribed(Flow.Subscriber&lt;? super T&gt; subscriber)</pre> <div class="block">Returns true if the given Subscriber is currently subscribed.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>subscriber</code> - the subscriber</dd> <dt>Returns:</dt> <dd>true if currently subscribed</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../lang/nullpointerexception.html" title="class in java.lang">NullPointerException</a></code> - if subscriber is null</dd> </dl> </section><section class="detail" id="estimateMinimumDemand()"> <h3>estimateMinimumDemand</h3> <pre class="lang-java" data-language="java">public long estimateMinimumDemand()</pre> <div class="block">Returns an estimate of the minimum number of items requested (via <a href="flow.subscription.html#request(long)"><code>request</code></a>) but not yet produced, among all current subscribers.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the estimate, or zero if no subscribers</dd> </dl> </section><section class="detail" id="estimateMaximumLag()"> <h3>estimateMaximumLag</h3> <pre class="lang-java" data-language="java">public int estimateMaximumLag()</pre> <div class="block">Returns an estimate of the maximum number of items produced but not yet consumed among all current subscribers.</div> <dl class="notes"> <dt>Returns:</dt> <dd>the estimate</dd> </dl> </section><section class="detail" id="consume(java.util.function.Consumer)"> <h3>consume</h3> <pre class="lang-java" data-language="java">public CompletableFuture&lt;Void&gt; consume(Consumer&lt;? super T&gt; consumer)</pre> <div class="block">Processes all published items using the given Consumer function. Returns a CompletableFuture that is completed normally when this publisher signals <a href="flow.subscriber.html#onComplete()"><code>onComplete</code></a>, or completed exceptionally upon any error, or an exception is thrown by the Consumer, or the returned CompletableFuture is cancelled, in which case no further items are processed.</div> <dl class="notes"> <dt>Parameters:</dt> <dd>
+<code>consumer</code> - the function applied to each onNext item</dd> <dt>Returns:</dt> <dd>a CompletableFuture that is completed normally when the publisher signals onComplete, and exceptionally upon any error or cancellation</dd> <dt>Throws:</dt> <dd>
+<code><a href="../../lang/nullpointerexception.html" title="class in java.lang">NullPointerException</a></code> - if consumer is null</dd> </dl> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 1993, 2023, Oracle and/or its affiliates. All rights reserved.<br>Documentation extracted from Debian's OpenJDK Development Kit package.<br>Licensed under the GNU General Public License, version 2, with the Classpath Exception.<br>Various third party code in OpenJDK is licensed under different licenses (see Debian package).<br>Java and OpenJDK are trademarks or registered trademarks of Oracle and/or its affiliates.<br>
+    <a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/SubmissionPublisher.html" class="_attribution-link">https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/SubmissionPublisher.html</a>
+  </p>
+</div>
