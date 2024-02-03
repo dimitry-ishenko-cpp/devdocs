@@ -1,0 +1,90 @@
+<h1>Deferred updates</h1> <p><em>Note: This documentation applies to Knockout 3.4.0 and later. For previous versions, the <a href="https://github.com/mbest/knockout-deferred-updates">Deferred Updates</a> plugin provides similar support.</em></p> <p>In complex applications, with multiple, intertwined dependencies, updating a single <a href="observables.html">observable</a> might trigger a cascade of <a href="computedobservables.html">computed observables</a>, manual subscriptions, and UI binding updates. These updates can be expensive and inefficient if unnecessary intermediate values are pushed to the view or result in extra computed observable evaluations. Even in a simple application, updating related observables or a single observable multiple times (such as filling an <a href="observablearrays.html">observable array</a>) can have a similar effect.</p> <p>Using deferred updates ensures that computed observables and bindings are updated only after their dependencies are stable. Even if an observable might go through multiple intermediate values, only the latest value is used to update its dependencies. To facilitate this, all notifications become asynchronous, scheduled using the <a href="microtasks.html">Knockout microtask queue</a>. This may sound very similar to <a href="ratelimit-observable.html">rate-limiting</a>, which also helps prevent extra notifications, but deferred updates can provide these benefits across an entire application without adding delays. Here’s how notification scheduling differs between the standard, deferred, and rate-limited modes:</p> <ul> <li>
+<em>Standard</em> – Notifications happen immediately and synchronously. Dependencies are often notified of intermediate values.</li> <li>
+<em>Deferred</em> – Notifications happen asynchronously, immediately after the current task and generally before any UI redraws.</li> <li>
+<em>Rate-limited</em> – Notifications happen after the specified period of time (a minimum of 2-10 ms depending on the browser).</li> </ul> <h2 id="enabling-deferred-updates">Enabling deferred updates</h2> <p>Deferred updates are turned off by default to provide compatibility with existing applications. To use deferred updates for your application, you must enable it before initializing your viewmodels by setting the following option:</p> <div class="highlight"><pre class="highlight" data-language="javascript">ko.options.deferUpdates = true;
+</pre></div> <p>When the deferUpdates option is on, all observables, computed observables, and bindings will be set to use deferred updates and notifications. Enabling this feature at the start of creating a Knockout-based application means you do not need to worry about working around the intermediate-value problem, and so can facilitate a cleaner, purely reactive design. But you should take care when enabling deferred updates for an existing application because it will break code that depends on synchronous updates or on notification of intermediate values (although you may be able to <a href="#forcing-deferred-notifications-to-happen-early">work around these issues</a>).</p> <h3 id="example-avoiding-multiple-ui-updates">Example: Avoiding multiple UI updates</h3> <p>The following is a contrived example to demonstrate the ability of deferred updates to eliminate UI updates of intermediate values and how this can improve performance.</p>  <div class="liveExample" id="deferred-example1">Live examples are not available on DevDocs, sorry.</div> <h4>Source code: View</h4> <pre class="brush:html" data-language="html">
+&lt;!--ko foreach: $root--&gt;
+&lt;div class="example"&gt;
+    &lt;table&gt;
+        &lt;tbody data-bind='foreach: data'&gt;
+            &lt;tr&gt;
+                &lt;td data-bind="text: name"&gt;&lt;/td&gt;
+                &lt;td data-bind="text: position"&gt;&lt;/td&gt;
+                &lt;td data-bind="text: location"&gt;&lt;/td&gt;
+            &lt;/tr&gt;
+        &lt;/tbody&gt;
+    &lt;/table&gt;
+    &lt;button data-bind="click: flipData, text: 'Flip ' + type"&gt;&lt;/button&gt;
+    &lt;div class="time" data-bind="text: (data(), timing() + ' ms')"&gt;&lt;/div&gt;
+&lt;/div&gt;
+&lt;!--/ko--&gt;
+
+</pre> <h4>Source code: View model</h4> <pre class="brush:js" data-language="js">
+function AppViewModel(type) {
+    this.type = type;
+    this.data = ko.observableArray([
+        { name: 'Alfred', position: 'Butler', location: 'London' },
+        { name: 'Bruce', position: 'Chairman', location: 'New York' }
+    ]);
+    this.flipData = function () {
+        this.starttime = new Date().getTime();
+        var data = this.data();
+        for (var i = 0; i &lt; 999; i++) {
+            this.data([]);
+            this.data(data.reverse());
+        }
+    }
+    this.timing = function () {
+        return this.starttime ? new Date().getTime() - this.starttime : 0;
+    };
+}
+
+ko.options.deferUpdates = true;
+var vmDeferred = new AppViewModel('deferred');
+
+ko.options.deferUpdates = false;
+var vmStandard = new AppViewModel('standard');
+
+ko.applyBindings([vmStandard, vmDeferred]);
+</pre> <h2 id="using-deferred-updates-for-specific-observables">Using deferred updates for specific observables</h2> <p>Even if you don’t enable deferred updates for your whole application, you can still benefit from this feature by specifically making certain observables deferred. This is done using the deferred extender:</p> <div class="highlight"><pre class="highlight" data-language="javascript">this.data = ko.observableArray().extend({ deferred: true });
+</pre></div> <p>Now we can push a bunch of items into the data array without worrying about causing excessive UI or computed updates. The deferred extender can be applied to any type of observable, including observable arrays and computed observables.</p> <h3 id="example-avoiding-multiple-ajax-requests">Example: Avoiding multiple Ajax requests</h3> <p>The following model represents data that you could render as a paged grid:</p> <div class="highlight"><pre class="highlight" data-language="javascript">function GridViewModel() {
+    this.pageSize = ko.observable(20);
+    this.pageIndex = ko.observable(1);
+    this.currentPageData = ko.observableArray();
+
+    // Query /Some/Json/Service whenever pageIndex or pageSize changes,
+    // and use the results to update currentPageData
+    ko.computed(function() {
+        var params = { page: this.pageIndex(), size: this.pageSize() };
+        $.getJSON('/Some/Json/Service', params, this.currentPageData);
+    }, this);
+}
+</pre></div> <p>Because the computed observable evaluates both pageIndex and pageSize, it becomes dependent on both of them. So, this code will use jQuery’s <a href="http://api.jquery.com/jQuery.getJSON/">$.getJSON function</a> to reload currentPageData when a GridViewModel is first instantiated <em>and</em> whenever the pageIndex or pageSize properties are later changed.</p> <p>This is very simple and elegant (and it’s trivial to add yet more observable query parameters that also trigger a refresh automatically whenever they change), but there is a potential efficiency problem. Suppose you add the following function to GridViewModel that changes both pageIndex and pageSize:</p> <div class="highlight"><pre class="highlight" data-language="javascript">this.setPageSize = function(newPageSize) {
+    // Whenever you change the page size, we always reset the page index to 1
+    this.pageSize(newPageSize);
+    this.pageIndex(1);
+}
+</pre></div> <p>The problem is that this will cause <em>two</em> Ajax requests: the first one will start when you update pageSize, and the second one will start immediately afterwards when you update pageIndex. This is a waste of bandwidth and server resources, and a source of unpredictable race conditions.</p> <p>When applied to a computed observable, the deferred extender will also avoid excess evaluation of the computed function. Using deferred updates ensures that any sequence of changes to dependencies in the current task will trigger just <em>one</em> re-evaluation of the computed observable. For example:</p> <div class="highlight"><pre class="highlight" data-language="javascript">ko.computed(function() {
+    // This evaluation logic is exactly the same as before
+    var params = { page: this.pageIndex(), size: this.pageSize() };
+    $.getJSON('/Some/Json/Service', params, this.currentPageData);
+}, this).extend({ deferred: true });
+</pre></div> <p>Now you can change pageIndex and pageSize as many times as you like, and the Ajax call will only happen once after you release your thread back to the JavaScript runtime.</p> <h2 id="forcing-deferred-notifications-to-happen-early">Forcing deferred notifications to happen early</h2> <p>Although deferred, asynchronous notifications are generally better because of fewer UI updates, it can be a problem if you need to update the UI immediately. Sometimes, for proper functionality, you need an intermediate value pushed to the UI. You can accomplish this using the <a href="microtasks.html#advanced-queue-control">ko.tasks.runEarly method</a>. For example:</p> <div class="highlight"><pre class="highlight" data-language="javascript">// remove an item from an array
+var items = myArray.splice(sourceIndex, 1);
+
+// force updates so the UI will see a delete/add rather than a move
+ko.tasks.runEarly();
+
+// add the item in a new location
+myArray.splice(targetIndex, 0, items[0]);
+</pre></div> <h2 id="forcing-deferred-observables-to-always-notify-subscribers">Forcing deferred observables to always notify subscribers</h2> <p>When the value of any observable is primitive (a number, string, boolean, or null), the dependents of the observable are by default notified only when it is set to a value that is actually different from before. So, primitive-valued deferred observables notify only when their value is actually different at the end of the current task. In other words, if a primitive-valued deferred observable is changed to a new value and then changed back to the original value, no notification will happen.</p> <p>To ensure that the subscribers are always notified of an update, even if the value is the same, you would use the notify extender:</p> <div class="highlight"><pre class="highlight" data-language="javascript">ko.options.deferUpdates = true;
+
+myViewModel.fullName = ko.pureComputed(function() {
+    return myViewModel.firstName() + " " + myViewModel.lastName();
+}).extend({ notify: 'always' });
+</pre></div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Steven Sanderson, the Knockout.js team, and other contributors<br>Licensed under the MIT License.<br>
+    <a href="https://knockoutjs.com/documentation/deferred-updates.html" class="_attribution-link">https://knockoutjs.com/documentation/deferred-updates.html</a>
+  </p>
+</div>
