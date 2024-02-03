@@ -1,0 +1,380 @@
+<h1>Enabling TurboModule on Android</h1>
+caution<p>This documentation is still <strong>experimental</strong> and details are subject to changes as we iterate. Feel free to share your feedback on the <a href="https://github.com/reactwg/react-native-new-architecture/discussions/8" rel="noopener noreferrer">discussion inside the working group</a> for this page.</p>
+<p>Moreover, it contains several <strong>manual steps</strong>. Please note that this won't be representative of the final developer experience once the New Architecture is stable. We're working on tools, templates and libraries to help you get started fast on the New Architecture, without having to go through the whole setup.</p>
+<p>Make sure your application meets all the <a href="new-architecture-app-intro.html">prerequisites</a>.</p>
+<h2 id="1-enable-ndk-and-the-native-build">1. Enable NDK and the native build</h2>
+caution<p>In this iteration of the guide we’re setting up the project to let you build from source. You might notice an increase in your build time because of this. You can mitigate this by following the approach described in <a href="https://reactnative.dev/docs/next/build-speed">Speeding up your Build phase</a> guide.</p>
+<p>The code-gen will output some Java and some C++ code that now we need to build.</p>
+<p>Let’s edit your <strong>module-level</strong> <code>build.gradle</code> to include the <strong>two</strong> <code>externalNativeBuild</code> blocks detailed below inside the <code>android{}</code> block:</p>
+<pre tabindex="0" data-language="jsx">android {
+    defaultConfig {
+        applicationId "com.awesomeproject"
+        // ...
+
+        // Add this block
+        externalNativeBuild {
+            ndkBuild {
+                arguments "APP_PLATFORM=android-21",
+                        "APP_STL=c++_shared",
+                        "NDK_TOOLCHAIN_VERSION=clang",
+                        "GENERATED_SRC_DIR=$buildDir/generated/source",
+                        "PROJECT_BUILD_DIR=$buildDir",
+                        "REACT_ANDROID_DIR=$rootDir/../node_modules/react-native/ReactAndroid",
+                        "REACT_ANDROID_BUILD_DIR=$rootDir/../node_modules/react-native/ReactAndroid/build"
+                cFlags "-Wall", "-Werror", "-fexceptions", "-frtti", "-DWITH_INSPECTOR=1"
+                cppFlags "-std=c++17"
+                targets "myapplication_appmodules"
+            }
+        }
+    }
+
+    // Add this block
+    externalNativeBuild {
+        ndkBuild {
+            path "$projectDir/src/main/jni/Android.mk"
+        }
+    }
+}</pre>
+
+<p>In the same <code>build.gradle</code> file, inside the same <code>android{}</code> let’s add also the following section:</p>
+<pre tabindex="0" data-language="jsx">android {
+    // ...
+
+    def reactAndroidProjectDir = project(':ReactAndroid').projectDir
+    def packageReactNdkLibs = tasks.register("packageReactNdkLibs", Copy) {
+        dependsOn(":ReactAndroid:packageReactNdkLibsForBuck")
+        dependsOn("generateCodegenArtifactsFromSchema")
+        from("$reactAndroidProjectDir/src/main/jni/prebuilt/lib")
+        into("$buildDir/react-ndk/exported")
+    }
+
+    afterEvaluate {
+        preBuild.dependsOn(packageReactNdkLibs)
+        configureNdkBuildDebug.dependsOn(preBuild)
+        configureNdkBuildRelease.dependsOn(preBuild)
+    }
+
+    packagingOptions {
+        pickFirst '**/libhermes.so'
+        pickFirst '**/libjsc.so'
+    }
+}</pre>
+
+<p>Finally, we need to create a Makefile inside the <code>src/main/jni</code> folder called <code>Android.mk</code> with the following content:</p>
+<pre tabindex="0" data-language="jsx">THIS_DIR := $(call my-dir)
+
+include $(REACT_ANDROID_DIR)/Android-prebuilt.mk
+include $(GENERATED_SRC_DIR)/codegen/jni/Android.mk
+
+include $(CLEAR_VARS)
+
+LOCAL_PATH := $(THIS_DIR)
+LOCAL_MODULE := myapplication_appmodules
+
+LOCAL_C_INCLUDES := $(LOCAL_PATH) $(GENERATED_SRC_DIR)/codegen/jni
+LOCAL_SRC_FILES := $(wildcard $(LOCAL_PATH)/*.cpp) $(wildcard $(GENERATED_SRC_DIR)/codegen/jni/*.cpp)
+LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH) $(GENERATED_SRC_DIR)/codegen/jni
+
+# Please note as one of the library listed is libreact_codegen_samplelibrary
+# This name will be generated as libreact_codegen_&lt;library-name&gt;
+# where &lt;library-name&gt; is the one you specified in the Gradle configuration
+LOCAL_SHARED_LIBRARIES := libjsi \
+    libfbjni \
+    libglog \
+    libfolly_json \
+    libyoga \
+    libreact_nativemodule_core \
+    libturbomodulejsijni \
+    librrc_view \
+    libreact_render_core \
+    libreact_render_graphics \
+    libfabricjni \
+    libfolly_futures \
+    libreact_debug \
+    libreact_render_componentregistry \
+    libreact_render_debug \
+    libruntimeexecutor \
+    libreact_codegen_rncore \
+    libreact_codegen_samplelibrary
+
+LOCAL_CFLAGS := \
+    -DLOG_TAG=\"ReactNative\"
+LOCAL_CFLAGS += -fexceptions -frtti -std=c++17 -Wall
+
+include $(BUILD_SHARED_LIBRARY)</pre>
+
+<p>This setup will run a native build on your project and will compile the C++ files that have been generated by the codegen. You will see the native build running with the Gradle task <code>:app:externalNativeBuildDebug</code></p>
+<p>You can now verify that everything works correctly by running your android app:</p>
+<pre tabindex="0" data-language="jsx">yarn react-native run-android</pre>
+
+<h2 id="2-java---provide-a-reactpackageturbomodulemanagerdelegate">2. Java - Provide a <code>ReactPackageTurboModuleManagerDelegate</code>
+</h2>
+<p>Now is time to actually use the TurboModule. First, we will need to create a <code>ReactPackageTurboModuleManagerDelegate</code> subclass, like the following:</p>
+<pre tabindex="0" data-language="jsx">package com.awesomeproject;
+
+import com.facebook.jni.HybridData;
+import com.facebook.react.ReactPackage;
+import com.facebook.react.ReactPackageTurboModuleManagerDelegate;
+import com.facebook.react.bridge.ReactApplicationContext;
+import com.facebook.soloader.SoLoader;
+
+import java.util.List;
+
+public class MyApplicationTurboModuleManagerDelegate extends ReactPackageTurboModuleManagerDelegate {
+
+    private static volatile boolean sIsSoLibraryLoaded;
+
+    protected MyApplicationTurboModuleManagerDelegate(ReactApplicationContext reactApplicationContext, List&lt;ReactPackage&gt; packages) {
+        super(reactApplicationContext, packages);
+    }
+
+    protected native HybridData initHybrid();
+
+    public static class Builder extends ReactPackageTurboModuleManagerDelegate.Builder {
+        protected MyApplicationTurboModuleManagerDelegate build(
+                ReactApplicationContext context, List&lt;ReactPackage&gt; packages) {
+            return new MyApplicationTurboModuleManagerDelegate(context, packages);
+        }
+    }
+
+    @Override
+    protected synchronized void maybeLoadOtherSoLibraries() {
+        // Prevents issues with initializer interruptions.
+        if (!sIsSoLibraryLoaded) {
+            SoLoader.loadLibrary("myapplication_appmodules");
+            sIsSoLibraryLoaded = true;
+        }
+    }
+}</pre>
+
+<p>Please note that the <code>SoLoader.loadLibrary</code> parameter (in this case <code>"myapplication_appmodules")</code> should be the same as the one specified for <code>LOCAL_MODULE :=</code> inside the <code>Android.mk</code> file you created before.</p>
+<p>This class will then be responsible of loading the TurboModules and will take care of loading the native library build with the NDK at runtime.</p>
+<h2 id="3-adapt-your-reactnativehost-to-use-the-reactpackageturbomodulemanagerdelegate">3. Adapt your <code>ReactNativeHost</code> to use the <code>ReactPackageTurboModuleManagerDelegate</code>
+</h2>
+<p>Then, you can provide the class you created to your <code>ReactNativeHost</code>. You can locate your <code>ReactNativeHost</code> by searching for the <code>getReactNativeHost()</code>. The <code>ReactNativeHost</code> is usually located inside your <code>Application</code> class.</p>
+<p>Once you located it, you need to add the <code>getReactPackageTurboModuleManagerDelegateBuilder</code> method as from the snippet below:</p>
+<pre tabindex="0" data-language="jsx">public class MyApplication extends Application implements ReactApplication {
+
+    private final ReactNativeHost mReactNativeHost =
+        new ReactNativeHost(this) {
+            @Override
+            public boolean getUseDeveloperSupport() { /* ... */ }
+
+            @Override
+            protected List&lt;ReactPackage&gt; getPackages() { /* ... */ }
+
+            @Override
+            protected String getJSMainModuleName() {/* ... */ }
+
+            @NonNull
+            @Override
+            protected ReactPackageTurboModuleManagerDelegate.Builder getReactPackageTurboModuleManagerDelegateBuilder() {
+                return new MyApplicationTurboModuleManagerDelegate.Builder();
+            }
+        };
+}</pre>
+
+<h2 id="4-extend-the-getpackages-from-your-reactnativehost-to-use-the-turbomodule">4. Extend the <code>getPackages()</code> from your <code>ReactNativeHost</code> to use the TurboModule</h2>
+<p>Still on the <code>ReactNativeHost</code> , we need to extend the the <code>getPackages()</code> method to include the newly created TurboModule. Update the method to include the following:</p>
+<pre tabindex="0" data-language="jsx">public class MyApplication extends Application implements ReactApplication {
+
+    private final ReactNativeHost mReactNativeHost =
+        new ReactNativeHost(this) {
+            @Override
+            public boolean getUseDeveloperSupport() { /* ... */ }
+
+            @Override
+            protected List&lt;ReactPackage&gt; getPackages() {
+                List&lt;ReactPackage&gt; packages = new PackageList(this).getPackages();
+
+                // Add those lines
+                packages.add(new TurboReactPackage() {
+                    @Nullable
+                    @Override
+                    public NativeModule getModule(String name, ReactApplicationContext reactContext) {
+                        if (name.equals(NativeAwesomeManager.NAME)) {
+                            return new NativeAwesomeManager(reactContext);
+                        } else {
+                            return null;
+                        }
+                    }
+
+                    @Override
+                    public ReactModuleInfoProvider getReactModuleInfoProvider() {
+                        return () -&gt; {
+                            final Map&lt;String, ReactModuleInfo&gt; moduleInfos = new HashMap&lt;&gt;();
+                            moduleInfos.put(
+                                    NativeAwesomeManager.NAME,
+                                    new ReactModuleInfo(
+                                            NativeAwesomeManager.NAME,
+                                            "NativeAwesomeManager",
+                                            false, // canOverrideExistingModule
+                                            false, // needsEagerInit
+                                            true, // hasConstants
+                                            false, // isCxxModule
+                                            true // isTurboModule
+                                    )
+                            );
+                            return moduleInfos;
+                        };
+                    }
+                });
+                return packages;
+            }
+
+            @Override
+            protected String getJSMainModuleName() {/* ... */ }
+
+            @NonNull
+            @Override
+            protected ReactPackageTurboModuleManagerDelegate.Builder getReactPackageTurboModuleManagerDelegateBuilder() {
+                return new MyApplicationTurboModuleManagerDelegate.Builder();
+            }
+        };</pre>
+
+<h2 id="5-c-provide-a-native-implementation-for-the-methods-in-your-turbomoduledelegate-class">5. C++ Provide a native implementation for the methods in your <code>*TurboModuleDelegate</code> class</h2>
+<p>If you take a closer look at the class <code>MyApplicationTurboModuleManagerDelegate</code> that you created before, you will notice how some of the methods are <code>native</code>.</p>
+<p>Therefore, you need to provide some C++ classes to implement those methods. Specifically you will need those files, to be added inside the <code>src/main/jni</code> folder:</p>
+<ul>
+<li>
+<code>MyApplicationTurboModuleManagerDelegate.h</code> An header file for the TurboModule Delegate.</li>
+<li>
+<code>MyApplicationTurboModuleManagerDelegate.cpp</code> The implementation of the aforementioned header file.</li>
+<li>
+<code>MyApplicationModuleProvider.h</code> A header file for the TurboModule provider, where you can specify which TurboModules you want to load.</li>
+<li>
+<code>MyApplicationModuleProvider.cpp</code> The implementation for the aforementioned header file.</li>
+<li>
+<code>OnLoad.cpp</code> Where the initialisation code will be placed. Specifically TurboModule uses FBJNI so the initialisation for such library lives there.</li>
+</ul>
+<p>The content of those files should be the following:</p>
+<h4 id="myapplicationturbomodulemanagerdelegateh">MyApplicationTurboModuleManagerDelegate.h</h4>
+<p>Please note that the <code>kJavaDescriptor</code> should be adapted to follow the package name you picked for your project.</p>
+<pre tabindex="0" data-language="jsx">#include &lt;memory&gt;
+#include &lt;string&gt;
+
+#include &lt;ReactCommon/TurboModuleManagerDelegate.h&gt;
+#include &lt;fbjni/fbjni.h&gt;
+
+namespace facebook {
+namespace react {
+
+class MyApplicationTurboModuleManagerDelegate : public jni::HybridClass&lt;MyApplicationTurboModuleManagerDelegate, TurboModuleManagerDelegate&gt; {
+public:
+  // Adapt it to the package you used for your Java class.
+  static constexpr auto kJavaDescriptor =
+      "Lcom/awesomeproject/MyApplicationTurboModuleManagerDelegate;";
+
+  static jni::local_ref&lt;jhybriddata&gt; initHybrid(jni::alias_ref&lt;jhybridobject&gt;);
+
+  static void registerNatives();
+
+  std::shared_ptr&lt;TurboModule&gt; getTurboModule(const std::string name, const std::shared_ptr&lt;CallInvoker&gt; jsInvoker) override;
+  std::shared_ptr&lt;TurboModule&gt; getTurboModule(const std::string name, const JavaTurboModule::InitParams &amp;params) override;
+
+private:
+  friend HybridBase;
+  using HybridBase::HybridBase;
+
+};
+
+} // namespace react
+} // namespace facebook</pre>
+
+<h4 id="myapplicationturbomodulemanagerdelegatecpp">MyApplicationTurboModuleManagerDelegate.cpp</h4>
+<pre tabindex="0" data-language="jsx">#include "MyApplicationTurboModuleManagerDelegate.h"
+#include "MyApplicationModuleProvider.h"
+
+namespace facebook {
+namespace react {
+
+jni::local_ref&lt;MyApplicationTurboModuleManagerDelegate::jhybriddata&gt; MyApplicationTurboModuleManagerDelegate::initHybrid(jni::alias_ref&lt;jhybridobject&gt;) {
+  return makeCxxInstance();
+}
+
+void MyApplicationTurboModuleManagerDelegate::registerNatives() {
+  registerHybrid({
+    makeNativeMethod("initHybrid", MyApplicationTurboModuleManagerDelegate::initHybrid),
+  });
+}
+
+std::shared_ptr&lt;TurboModule&gt; MyApplicationTurboModuleManagerDelegate::getTurboModule(const std::string name, const std::shared_ptr&lt;CallInvoker&gt; jsInvoker) {
+  // Not implemented yet: provide pure-C++ NativeModules here.
+  return nullptr;
+}
+
+std::shared_ptr&lt;TurboModule&gt; MyApplicationTurboModuleManagerDelegate::getTurboModule(const std::string name, const JavaTurboModule::InitParams &amp;params) {
+  return MyApplicationModuleProvider(name, params);
+}
+
+} // namespace react
+} // namespace facebook</pre>
+
+<h4 id="myapplicationmoduleproviderh">MyApplicationModuleProvider.h</h4>
+<pre tabindex="0" data-language="jsx">#pragma once
+
+#include &lt;memory&gt;
+#include &lt;string&gt;
+
+#include &lt;ReactCommon/JavaTurboModule.h&gt;
+
+namespace facebook {
+namespace react {
+
+std::shared_ptr&lt;TurboModule&gt; MyApplicationModuleProvider(const std::string moduleName, const JavaTurboModule::InitParams &amp;params);
+
+} // namespace react
+} // namespace facebook</pre>
+
+<h4 id="myapplicationmoduleprovidercpp">MyApplicationModuleProvider.cpp</h4>
+<p>Please adapt the <code>samplelibrary.h</code> import to match the same library name you provided when building the apps. This is the C++ generated file that is created by the codegen.</p>
+<p>Here you can also specify more than one provider, should you have more than one TurboModule. Specifically in this example we look for a TurboModule from <code>samplelibrary</code> (the one we specified) and we fallback to the <code>rncore</code> Module Provider (containing all the Core modules).</p>
+<pre tabindex="0" data-language="jsx">#include "MyApplicationModuleProvider.h"
+
+#include &lt;rncore.h&gt;
+#include &lt;samplelibrary.h&gt;
+
+namespace facebook {
+namespace react {
+
+std::shared_ptr&lt;TurboModule&gt; MyApplicationModuleProvider(const std::string moduleName, const JavaTurboModule::InitParams &amp;params) {
+    auto module = samplelibrary_ModuleProvider(moduleName, params);
+    if (module != nullptr) {
+      return module;
+    }
+
+    return rncore_ModuleProvider(moduleName, params);
+}
+
+} // namespace react
+} // namespace facebook</pre>
+
+<h4 id="onloadcpp">OnLoad.cpp</h4>
+<pre tabindex="0" data-language="jsx">#include &lt;fbjni/fbjni.h&gt;
+#include "MyApplicationTurboModuleManagerDelegate.h"
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
+  return facebook::jni::initialize(vm, [] {
+    facebook::react::MyApplicationTurboModuleManagerDelegate::registerNatives();
+  });
+}</pre>
+
+<h2 id="6-enable-the-useturbomodules-flag-in-your-application-oncreate">6. Enable the <code>useTurboModules</code> flag in your Application <code>onCreate</code>
+</h2>
+<p>Now you can finally enable the <code>TurboModule </code>support in your Application. To do so, you need to turn on the <code>useTurboModule</code> flag inside your Application <code>onCreate</code> method.</p>
+<pre tabindex="0" data-language="jsx">public class MyApplication extends Application implements ReactApplication {
+
+    @Override
+    public void onCreate() {
+        ReactFeatureFlags.useTurboModules = true;
+        //...
+    }</pre>
+
+<p>It’s now time to run again your Android app to verify that everything works correctly:</p>
+<pre tabindex="0" data-language="jsx">yarn react-native run-android</pre>
+<div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2022 Facebook Inc.<br>Licensed under the Creative Commons Attribution 4.0 International Public License.<br>
+    <a href="https://reactnative.dev/docs/new-architecture-app-modules-android" class="_attribution-link">https://reactnative.dev/docs/new-architecture-app-modules-android</a>
+  </p>
+</div>
