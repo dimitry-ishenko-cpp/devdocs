@@ -1,0 +1,310 @@
+<p class="_links"><a href="../../dart-core/dart-core-library.html" class="_links-link">dart:core</a></p> <h1>parse method  </h1> <section class="multi-line-signature"> <a href="../uri-class.html">Uri</a> parse(<wbr><ol class="parameter-list">
+<li>
+<a href="../string-class.html">String</a> uri, </li> <li>[<a href="../int-class.html">int</a> start = 0, </li> <li>
+<a href="../int-class.html">int</a>? end]</li> </ol>) </wbr></section>  <p>Creates a new <code>Uri</code> object by parsing a URI string.</p> <p>If <code>start</code> and <code>end</code> are provided, they must specify a valid substring of <code>uri</code>, and only the substring from <code>start</code> to <code>end</code> is parsed as a URI.</p> <p>If the <code>uri</code> string is not valid as a URI or URI reference, a <a href="../formatexception-class.html">FormatException</a> is thrown.</p> <p>Example:</p> <pre class="language-dart" data-language="dart">final uri =
+    Uri.parse('https://example.com/api/fetch?limit=10,20,30&amp;max=100');
+print(uri); // https://example.com/api/fetch?limit=10,20,30&amp;max=100
+
+Uri.parse('::Not valid URI::'); // Throws FormatException.</pre>   <h2 id="source">Implementation</h2> <pre class="language-dart" data-language="dart">static Uri parse(String uri, [int start = 0, int? end]) {
+  // This parsing will not validate percent-encoding, IPv6, etc.
+  // When done splitting into parts, it will call, e.g., [_makeFragment]
+  // to do the final parsing.
+  //
+  // Important parts of the RFC 3986 used here:
+  // URI           = scheme ":" hier-part [ "?" query ] [ "#" fragment ]
+  //
+  // hier-part     = "//" authority path-abempty
+  //               / path-absolute
+  //               / path-rootless
+  //               / path-empty
+  //
+  // URI-reference = URI / relative-ref
+  //
+  // absolute-URI  = scheme ":" hier-part [ "?" query ]
+  //
+  // relative-ref  = relative-part [ "?" query ] [ "#" fragment ]
+  //
+  // relative-part = "//" authority path-abempty
+  //               / path-absolute
+  //               / path-noscheme
+  //               / path-empty
+  //
+  // scheme        = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+  //
+  // authority     = [ userinfo "@" ] host [ ":" port ]
+  // userinfo      = *( unreserved / pct-encoded / sub-delims / ":" )
+  // host          = IP-literal / IPv4address / reg-name
+  // IP-literal    = "[" ( IPv6address / IPv6addrz / IPvFuture ) "]"
+  // IPv6addrz     = IPv6address "%25" ZoneID
+  // ZoneID        = 1*( unreserved / pct-encoded )
+  // port          = *DIGIT
+  // reg-name      = *( unreserved / pct-encoded / sub-delims )
+  //
+  // path          = path-abempty    ; begins with "/" or is empty
+  //               / path-absolute   ; begins with "/" but not "//"
+  //               / path-noscheme   ; begins with a non-colon segment
+  //               / path-rootless   ; begins with a segment
+  //               / path-empty      ; zero characters
+  //
+  // path-abempty  = *( "/" segment )
+  // path-absolute = "/" [ segment-nz *( "/" segment ) ]
+  // path-noscheme = segment-nz-nc *( "/" segment )
+  // path-rootless = segment-nz *( "/" segment )
+  // path-empty    = 0&lt;pchar&gt;
+  //
+  // segment       = *pchar
+  // segment-nz    = 1*pchar
+  // segment-nz-nc = 1*( unreserved / pct-encoded / sub-delims / "@" )
+  //               ; non-zero-length segment without any colon ":"
+  //
+  // pchar         = unreserved / pct-encoded / sub-delims / ":" / "@"
+  //
+  // query         = *( pchar / "/" / "?" )
+  //
+  // fragment      = *( pchar / "/" / "?" )
+  end ??= uri.length;
+
+  // Special case data:URIs. Ignore case when testing.
+  if (end &gt;= start + 5) {
+    int dataDelta = _startsWithData(uri, start);
+    if (dataDelta == 0) {
+      // The case is right.
+      if (start &gt; 0 || end &lt; uri.length) uri = uri.substring(start, end);
+      return UriData._parse(uri, 5, null).uri;
+    } else if (dataDelta == 0x20) {
+      return UriData._parse(uri.substring(start + 5, end), 0, null).uri;
+    }
+    // Otherwise the URI doesn't start with "data:" or any case variant of it.
+  }
+
+  // The following index-normalization belongs with the scanning, but is
+  // easier to do here because we already have extracted variables from the
+  // indices list.
+  var indices = List&lt;int&gt;.filled(8, 0, growable: false);
+
+  // Set default values for each position.
+  // The value will either be correct in some cases where it isn't set
+  // by the scanner, or it is clearly recognizable as an unset value.
+  indices
+    ..[0] = 0
+    ..[_schemeEndIndex] = start - 1
+    ..[_hostStartIndex] = start - 1
+    ..[_notSimpleIndex] = start - 1
+    ..[_portStartIndex] = start
+    ..[_pathStartIndex] = start
+    ..[_queryStartIndex] = end
+    ..[_fragmentStartIndex] = end;
+  var state = _scan(uri, start, end, _uriStart, indices);
+  // Some states that should be non-simple, but the URI ended early.
+  // Paths that end at a ".." must be normalized to end in "../".
+  if (state &gt;= _nonSimpleEndStates) {
+    indices[_notSimpleIndex] = end;
+  }
+  int schemeEnd = indices[_schemeEndIndex];
+  if (schemeEnd &gt;= start) {
+    // Rescan the scheme part now that we know it's not a path.
+    state = _scan(uri, start, schemeEnd, _schemeStart, indices);
+    if (state == _schemeStart) {
+      // Empty scheme.
+      indices[_notSimpleIndex] = schemeEnd;
+    }
+  }
+  // The returned positions are limited by the scanners ability to write only
+  // one position per character, and only the current position.
+  // Scanning from left to right, we only know whether something is a scheme
+  // or a path when we see a `:` or `/`, and likewise we only know if the first
+  // `/` is part of the path or is leading an authority component when we see
+  // the next character.
+
+  int hostStart = indices[_hostStartIndex] + 1;
+  int portStart = indices[_portStartIndex];
+  int pathStart = indices[_pathStartIndex];
+  int queryStart = indices[_queryStartIndex];
+  int fragmentStart = indices[_fragmentStartIndex];
+
+  // We may discover the scheme while handling special cases.
+  String? scheme;
+
+  // Derive some positions that weren't set to normalize the indices.
+  if (fragmentStart &lt; queryStart) queryStart = fragmentStart;
+  // If pathStart isn't set (it's before scheme end or host start), then
+  // the path is empty, or there is no authority part and the path
+  // starts with a non-simple character.
+  if (pathStart &lt; hostStart) {
+    // There is an authority, but no path. The path would start with `/`
+    // if it was there.
+    pathStart = queryStart;
+  } else if (pathStart &lt;= schemeEnd) {
+    // There is a scheme, but no authority.
+    pathStart = schemeEnd + 1;
+  }
+  // If there is an authority with no port, set the port position
+  // to be at the end of the authority (equal to pathStart).
+  // This also handles a ":" in a user-info component incorrectly setting
+  // the port start position.
+  if (portStart &lt; hostStart) portStart = pathStart;
+
+  assert(hostStart == start || schemeEnd &lt;= hostStart);
+  assert(hostStart &lt;= portStart);
+  assert(schemeEnd &lt;= pathStart);
+  assert(portStart &lt;= pathStart);
+  assert(pathStart &lt;= queryStart);
+  assert(queryStart &lt;= fragmentStart);
+
+  bool isSimple = indices[_notSimpleIndex] &lt; start;
+
+  if (isSimple) {
+    // Check/do normalizations that weren't detected by the scanner.
+    // This includes removal of empty port or userInfo,
+    // or scheme specific port and path normalizations.
+    if (hostStart &gt; schemeEnd + 3) {
+      // Always be non-simple if URI contains user-info.
+      // The scanner doesn't set the not-simple position in this case because
+      // it's setting the host-start position instead.
+      isSimple = false;
+    } else if (portStart &gt; start &amp;&amp; portStart + 1 == pathStart) {
+      // If the port is empty, it should be omitted.
+      // Pathological case, don't bother correcting it.
+      isSimple = false;
+    } else if (uri.startsWith(r"\", pathStart) ||
+        hostStart &gt; start &amp;&amp;
+            (uri.startsWith(r"\", hostStart - 1) ||
+                uri.startsWith(r"\", hostStart - 2))) {
+      // Seeing a `\` anywhere.
+      // The scanner doesn't record when the first path character is a `\`
+      // or when the last slash before the authority is a `\`.
+      isSimple = false;
+    } else if (queryStart &lt; end &amp;&amp;
+            (queryStart == pathStart + 2 &amp;&amp;
+                uri.startsWith("..", pathStart)) ||
+        (queryStart &gt; pathStart + 2 &amp;&amp;
+            uri.startsWith("/..", queryStart - 3))) {
+      // The path ends in a ".." segment. This should be normalized to "../".
+      // We didn't detect this while scanning because a query or fragment was
+      // detected at the same time (which is why we only need to check this
+      // if there is something after the path).
+      isSimple = false;
+    } else {
+      // There are a few scheme-based normalizations that
+      // the scanner couldn't check.
+      // That means that the input is very close to simple, so just do
+      // the normalizations.
+      if (schemeEnd == start + 4) {
+        // Do scheme based normalizations for file, http.
+        if (uri.startsWith("file", start)) {
+          scheme = "file";
+          if (hostStart &lt;= start) {
+            // File URIs should have an authority.
+            // Paths after an authority should be absolute.
+            String schemeAuth = "file://";
+            int delta = 2;
+            if (!uri.startsWith("/", pathStart)) {
+              schemeAuth = "file:///";
+              delta = 3;
+            }
+            uri = schemeAuth + uri.substring(pathStart, end);
+            schemeEnd -= start;
+            hostStart = 7;
+            portStart = 7;
+            pathStart = 7;
+            queryStart += delta - start;
+            fragmentStart += delta - start;
+            start = 0;
+            end = uri.length;
+          } else if (pathStart == queryStart) {
+            // Uri has authority and empty path. Add "/" as path.
+            if (start == 0 &amp;&amp; end == uri.length) {
+              uri = uri.replaceRange(pathStart, queryStart, "/");
+              queryStart += 1;
+              fragmentStart += 1;
+              end += 1;
+            } else {
+              uri = "${uri.substring(start, pathStart)}/"
+                  "${uri.substring(queryStart, end)}";
+              schemeEnd -= start;
+              hostStart -= start;
+              portStart -= start;
+              pathStart -= start;
+              queryStart += 1 - start;
+              fragmentStart += 1 - start;
+              start = 0;
+              end = uri.length;
+            }
+          }
+        } else if (uri.startsWith("http", start)) {
+          scheme = "http";
+          // HTTP URIs should not have an explicit port of 80.
+          if (portStart &gt; start &amp;&amp;
+              portStart + 3 == pathStart &amp;&amp;
+              uri.startsWith("80", portStart + 1)) {
+            if (start == 0 &amp;&amp; end == uri.length) {
+              uri = uri.replaceRange(portStart, pathStart, "");
+              pathStart -= 3;
+              queryStart -= 3;
+              fragmentStart -= 3;
+              end -= 3;
+            } else {
+              uri = uri.substring(start, portStart) +
+                  uri.substring(pathStart, end);
+              schemeEnd -= start;
+              hostStart -= start;
+              portStart -= start;
+              pathStart -= 3 + start;
+              queryStart -= 3 + start;
+              fragmentStart -= 3 + start;
+              start = 0;
+              end = uri.length;
+            }
+          }
+        }
+      } else if (schemeEnd == start + 5 &amp;&amp; uri.startsWith("https", start)) {
+        scheme = "https";
+        // HTTPS URIs should not have an explicit port of 443.
+        if (portStart &gt; start &amp;&amp;
+            portStart + 4 == pathStart &amp;&amp;
+            uri.startsWith("443", portStart + 1)) {
+          if (start == 0 &amp;&amp; end == uri.length) {
+            uri = uri.replaceRange(portStart, pathStart, "");
+            pathStart -= 4;
+            queryStart -= 4;
+            fragmentStart -= 4;
+            end -= 3;
+          } else {
+            uri = uri.substring(start, portStart) +
+                uri.substring(pathStart, end);
+            schemeEnd -= start;
+            hostStart -= start;
+            portStart -= start;
+            pathStart -= 4 + start;
+            queryStart -= 4 + start;
+            fragmentStart -= 4 + start;
+            start = 0;
+            end = uri.length;
+          }
+        }
+      }
+    }
+  }
+
+  if (isSimple) {
+    if (start &gt; 0 || end &lt; uri.length) {
+      uri = uri.substring(start, end);
+      schemeEnd -= start;
+      hostStart -= start;
+      portStart -= start;
+      pathStart -= start;
+      queryStart -= start;
+      fragmentStart -= start;
+    }
+    return _SimpleUri(uri, schemeEnd, hostStart, portStart, pathStart,
+        queryStart, fragmentStart, scheme);
+  }
+
+  return _Uri.notSimple(uri, start, end, schemeEnd, hostStart, portStart,
+      pathStart, queryStart, fragmentStart, scheme);
+}</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012 the Dart project authors<br>Licensed under the BSD 3-Clause "New" or "Revised" License.<br>
+    <a href="https://api.dart.dev/stable/2.18.5/dart-core/Uri/parse.html" class="_attribution-link">https://api.dart.dev/stable/2.18.5/dart-core/Uri/parse.html</a>
+  </p>
+</div>
