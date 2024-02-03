@@ -1,0 +1,478 @@
+<div class="innertube"> <h1 id="The beam_makeops script">12 The beam_makeops script</h1> <p> This document describes the <strong>beam_makeops</strong> script. </p> <h2 id="introduction" class="title-link"> <div class="title-name">12.1 Introduction</div>  </h2> <p> The <strong>beam_makeops</strong> Perl script is used at build-time by both the compiler and runtime system. Given a number of input files (all with the extension <code>.tab</code>), it will generate source files used by the Erlang compiler and by the runtime system to load and execute BEAM instructions. </p> <p> Essentially those <code>.tab</code> files define: </p> <ul> <li> <p>External generic BEAM instructions. They are the instructions that are known to both the compiler and the runtime system. Generic instructions are stable between releases. New generic instructions with high numbers than previous instructions can be added in major releases. The OTP 20 release has 159 external generic instructions. </p> </li> <li> <p>Internal generic instructions. They are known only to the runtime system and can be changed at any time without compatibility issues. They are created by transformation rules (described next). </p> </li> <li> <p>Rules for transforming one or more generic instructions to other generic instructions. The transformation rules allow combining, splitting, and removal of instructions, as well as shuffling operands. Because of the transformation rules, the runtime can have many internal generic instructions that are only known to runtime system. </p> </li> <li> <p>Specific BEAM instructions. The specific instructions are the instructions that are actually executed by the runtime system. They can be changed at any time without causing compatibility issues. The loader translates generic instructions to specific instructions. In general, for each generic instruction, there exists a family of specific instructions. The OTP 20 release has 389 specific instructions. </p> </li> <li> <p>The implementation of specific instructions for the traditional BEAM interpreter. For the <code><a href="beamasm.html">BeamAsm JIT</a></code> introduced in OTP 24, the implementation of instructions are defined in emitter functions written in C++. </p> </li> </ul> <p> Generic instructions have typed operands. Here are a few examples of operands for <code>move/2</code>: </p> <pre data-language="erlang">{move,{atom,id},{x,5}}.
+{move,{x,3},{x,0}}.
+{move,{x,2},{y,1}}.</pre> <p> When those instructions are loaded, the loader rewrites them to specific instructions: </p> <pre data-language="erlang">move_cx id 5
+move_xx 3 0
+move_xy 2 1</pre> <p> Corresponding to each generic instruction, there is a family of specific instructions. The types that an instance of a specific instruction can handle are encoded in the instruction names. For example, <code>move_xy</code> takes an X register number as the first operand and a Y register number as the second operand. <code>move_cx</code> takes a tagged Erlang term as the first operand and an X register number as the second operand. </p> <h2 id="an-example--the-move-instruction" class="title-link"> <div class="title-name">12.2 An example: the move instruction</div>  </h2> <p> Using the <code>move</code> instruction as an example, we will give a quick tour to show the main features of <strong>beam_makeops</strong>. </p> <p> In the <code>compiler</code> application, in the file <code>genop.tab</code>, there is the following line: </p> <pre data-language="erlang">64: move/2</pre> <p> This is a definition of an external generic BEAM instruction. Most importantly it specifies that the opcode is 64. It also defines that it has two operands. The BEAM assembler will use the opcode when creating <code>.beam</code> files. The compiler does not really need the arity, but it will use it as an internal sanity check when assembling the BEAM code. </p> <p> Let's have a look at <code>ops.tab</code> in <code>erts/emulator/beam/emu</code>, where the specific <code>move</code> instructions are defined. Here are a few of them: </p> <pre data-language="erlang">move x x
+move x y
+move c x</pre> <p> Each specific instructions is defined by following the name of the instruction with the types for each operand. An operand type is a single letter. For example, <code>x</code> means an X register, <code>y</code> means a Y register, and <code>c</code> is a "constant" (a tagged term such as an integer, an atom, or a literal). </p> <p> Now let's look at the implementation of the <code>move</code> instruction. There are multiple files containing implementations of instructions in the <code>erts/emulator/beam/emu</code> directory. The <code>move</code> instruction is defined in <code>instrs.tab</code>. It looks like this: </p> <pre data-language="erlang">move(Src, Dst) {
+    $Dst = $Src;
+}</pre> <p> The implementation for an instruction largely follows the C syntax, except that the variables in the function head don't have any types. The <code>$</code> before an identifier denotes a macro expansion. Thus, <code>$Src</code> will expand to the code to pick up the source operand for the instruction and <code>$Dst</code> to the code for the destination register. </p> <p> We will look at the code for each specific instruction in turn. To make the code easier to understand, let's first look at the memory layout for the instruction <code>{move,{atom,id},{x,5}}</code>: </p> <pre data-language="erlang">     +--------------------+--------------------+
+I -&gt; |                 40 |       &amp;&amp;lb_move_cx |
+     +--------------------+--------------------+
+     |                        Tagged atom 'id' |
+     +--------------------+--------------------+</pre> <p> This example and all other examples in the document assumes a 64-bit architecture, and furthermore that pointers to C code fit in 32 bits. </p> <p> <code>I</code> in the BEAM virtual machine is the instruction pointer. When BEAM executes an instruction, <code>I</code> points to the first word of the instruction. </p> <p> <code>&amp;&amp;lb_move_cx</code> is the address to C code that implements <code>move_cx</code>. It is stored in the lower 32 bits of the word. In the upper 32 bits is the byte offset to the X register; the register number 5 has been multiplied by the word size size 8. </p> <p> In the next word the tagged atom <code>id</code> is stored. </p> <p> With that background, we can look at the generated code for <code>move_cx</code> in <code>beam_hot.h</code>: </p> <pre data-language="erlang">OpCase(move_cx):
+{
+  BeamInstr next_pf = BeamCodeAddr(I[2]);
+  xb(BeamExtraData(I[0])) = I[1];
+  I += 2;
+  ASSERT(VALID_INSTR(next_pf));
+  GotoPF(next_pf);
+}</pre> <p> We will go through each line in turn. </p> <ul> <li> <p><code>OpCase(move_cx):</code> defines a label for the instruction. The <code>OpCase()</code> macro is defined in <code>beam_emu.c</code>. It will expand this line to <code>lb_move_cx:</code>. </p> </li> <li> <p><code>BeamInstr next_pf = BeamCodeAddr(I[2]);</code> fetches the pointer to code for the next instruction to be executed. The <code>BeamCodeAddr()</code> macro extracts the pointer from the lower 32 bits of the instruction word. </p> </li> <li> <p><code>xb(BeamExtraData(I[0])) = I[1];</code> is the expansion of <code>$Dst = $Src</code>. <code>BeamExtraData()</code> is a macro that will extract the upper 32 bits from the instruction word. In this example, it will return 40 which is the byte offset for X register 5. The <code>xb()</code> macro will cast a byte pointer to an <code>Eterm</code> pointer and dereference it. The <code>I[1]</code> on the right-hand side of the <code>=</code> fetches an Erlang term (the atom <code>id</code> in this case). </p> </li> <li> <p><code>I += 2</code> advances the instruction pointer to the next instruction. </p> </li> <li> <p>In a debug-compiled emulator, <code>ASSERT(VALID_INSTR(next_pf));</code> makes sure that <code>next_pf</code> is a valid instruction (that is, that it points within the <code>process_main()</code> function in <code>beam_emu.c</code>). </p> </li> <li> <p><code>GotoPF(next_pf);</code> transfers control to the next instruction. </p> </li> </ul> <p> Now let's look at the implementation of <code>move_xx</code>: </p> <pre data-language="erlang">OpCase(move_xx):
+{
+  Eterm tmp_packed1 = BeamExtraData(I[0]);
+  BeamInstr next_pf = BeamCodeAddr(I[1]);
+  xb((tmp_packed1&gt;&gt;BEAM_TIGHT_SHIFT)) = xb(tmp_packed1&amp;BEAM_TIGHT_MASK);
+  I += 1;
+  ASSERT(VALID_INSTR(next_pf));
+  GotoPF(next_pf);
+}</pre> <p> We will go through the lines that are new or have changed compared to <code>move_cx</code>. </p> <ul> <li> <p><code>Eterm tmp_packed1 = BeamExtraData(I[0]);</code> picks up both X register numbers packed into the upper 32 bits of the instruction word. </p> </li> <li> <p><code>BeamInstr next_pf = BeamCodeAddr(I[1]);</code> pre-fetches the address of the next instruction. Note that because both X registers operands fits into the instruction word, the next instruction is in the very next word. </p> </li> <li> <p><code>xb((tmp_packed1&gt;&gt;BEAM_TIGHT_SHIFT)) = xb(tmp_packed1&amp;BEAM_TIGHT_MASK);</code> copies the source to the destination. (For a 64-bit architecture, <code>BEAM_TIGHT_SHIFT</code> is 16 and <code>BEAM_TIGHT_MASK</code> is <code>0xFFFF</code>.) </p> </li> <li> <p><code>I += 1;</code> advances the instruction pointer to the next instruction. </p> </li> </ul> <p> <code>move_xy</code> is almost identical to <code>move_xx</code>. The only difference is the use of the <code>yb()</code> macro instead of <code>xb()</code> to reference the destination register: </p> <pre data-language="erlang">OpCase(move_xy):
+{
+  Eterm tmp_packed1 = BeamExtraData(I[0]);
+  BeamInstr next_pf = BeamCodeAddr(I[1]);
+  yb((tmp_packed1&gt;&gt;BEAM_TIGHT_SHIFT)) = xb(tmp_packed1&amp;BEAM_TIGHT_MASK);
+  I += 1;
+  ASSERT(VALID_INSTR(next_pf));
+  GotoPF(next_pf);
+}</pre> <h3 id="transformation-rules" class="title-link"> <div class="title-name">Transformation rules</div>  </h3> <p> Next let's look at how we can do some optimizations using transformation rules. For simple instructions such as <code>move/2</code>, the instruction dispatch overhead can be substantial. A simple optimization is to combine common instructions sequences to a single instruction. One such common sequence is multiple <code>move</code> instructions moving X registers to Y registers. </p> <p> Using the following rule we can combine two <code>move</code> instructions to a <code>move2</code> instruction: </p> <pre data-language="erlang">move X1=x Y1=y | move X2=x Y2=y =&gt; move2 X1 Y1 X2 Y2</pre> <p> The left-hand side of the arrow (<code>=&gt;</code>) is a pattern. If the pattern matches, the matching instructions will be replaced by the instructions on the right-hand side. Variables in a pattern must start with an uppercase letter just as in Erlang. A pattern variable may be followed <code>=</code> and one or more type letters to constrain the match to one of those types. The variables that are bound on the left-hand side can be used on the right-hand side. </p> <p> We will also need to define a specific instruction and an implementation: </p> <pre data-language="erlang"># In ops.tab
+move2 x y x y
+
+// In instrs.tab
+move2(S1, D1, S2, D2) {
+    Eterm V1, V2;
+    V1 = $S1;
+    V2 = $S2;
+    $D1 = V1;
+    $D2 = V2;
+}</pre> <p> When the loader has found a match and replaced the matched instructions, it will match the new instructions against the transformation rules. Because of that, we can define the rule for a <code>move3/6</code> instruction as follows: </p> <pre data-language="erlang">move2 X1=x Y1=y X2=x Y2=y | move X3=x Y3=y =&gt;
+      move3 X1 Y1 X2 Y2 X3 Y3</pre> <p> (For readability, a long transformation line can be broken after <code>|</code> and <code>=&gt;</code> operators.) </p> <p> It would also be possible to define it like this: </p> <pre data-language="erlang">move X1=x Y1=y | move X2=x Y2=y | move X3=x Y3=y =&gt;
+     move3 X1 Y1 X2 Y2 X3 Y3</pre> <p> but in that case it must be defined before the rule for <code>move2/4</code> because the first matching rule will be applied. </p> <p> One must be careful not to create infinite loops. For example, if we for some reason would want to reverse the operand order for the <code>move</code> instruction, we must not do like this: </p> <pre data-language="erlang">move Src Dst =&gt; move Dst Src</pre> <p> The loader would swap the operands forever. To avoid the loop, we must rename the instruction. For example: </p> <pre data-language="erlang">move Src Dst =&gt; assign Dst Src</pre> <p> This concludes the quick tour of the features of <strong>beam_makeops</strong>. </p> <h2 id="short-overview-of-instruction-loading-for-the-interpreter" class="title-link"> <div class="title-name">12.3 Short overview of instruction loading for the interpreter</div>  </h2> <p> To give some background to the rest of this document, here follows a quick overview of how instructions are loaded. </p> <ul> <li> <p>The loader reads and decodes one instruction at a time from the BEAM code and creates a generic instruction. Many transformation rules must look at multiple instructions, so the loader will keep multiple generic instructions in a linked list. </p> </li> <li> <p>The loader tries to apply transformation rules against the generic instructions in the linked list. If a rule matches, the matched instructions will be removed and replaced with new generic instructions constructed from the right-hand side of the transformation. </p> </li> <li> <p>If a transformation rule matched, the loader applies the transformation rules again. </p> </li> <li> <p>If no transformation rule match, the loader will begin rewriting the first of generic instructions to a specific instruction. </p> </li> <li> <p>First the loader will search for a specific operation where the types for all operands match the type for the generic instruction. The first matching instruction will be selected. <strong>beam_makeops</strong> has ordered the specific instructions so that instructions with more specific operands comes before instructions with less specific operands. For example, <code>move_nx</code> is more specific than <code>move_cx</code>. If the first operand is <code>[]</code> (NIL), <code>move_nx</code> will be selected. </p> </li> <li> <p>Given the opcode for the selected specific instruction, the loader looks up the pointer to the C code for the instruction and stores in the code area for the module being loaded. </p> </li> <li> <p>The loader translates each operand to a machine word and stores it in the code area. The operand type for the selected specific instruction guides the translation. For example, if the type is <code>e</code>, the value of the operand is an index into an array of external functions and will be translated to a pointer to the export entry for the function to call. If the type is <code>x</code>, the number of the X register will be multiplied by the word size to produce a byte offset. </p> </li> <li> <p>The loader runs the packing engine to pack multiple operands into a single word. The packing engine is controlled by a small program, which is a string where each character is an instruction. For example, the code to pack the operands for <code>move_xy</code> is <code>"22#"</code> (on a 64-bit machine). That program will pack the byte offsets for both registers into the same word as the pointer to C code. </p> </li> </ul> <h2 id="short-overview-of-instruction-loading-for-beamasm" class="title-link"> <div class="title-name">12.4 Short overview of instruction loading for BeamAsm</div>  </h2> <ul> <li> <p>The first steps up to selection of a specific instruction is done as described for the interpreter. The selection of a specific instruction is simpler, because in BeamAsm most generic instructions only have a single corresponding specific instruction. </p> </li> <li> <p>The loader calls the <strong>emitter function</strong> for the selected specific instruction. The emitter function translates the instruction to machine code. </p> </li> </ul> <h2 id="running-beam_makeops" class="title-link"> <div class="title-name">12.5 Running beam_makeops</div>  </h2> <p> <strong>beam_makeops</strong> is found in <code>$ERL_TOP/erts/emulator/utils</code>. Options start with a hyphen (<code>-</code>). The options are followed by the name of the input files. By convention, all input files have the extension <code>.tab</code>, but is not enforced by <strong>beam_makeops</strong>. </p> <h3 id="the--outdir-option" class="title-link"> <div class="title-name">The -outdir option</div>  </h3> <p> The option <code>-outdir Directory</code> specifies the output directory for the generated files. Default is the current working directory. </p> <h3 id="running-beam_makeops-for-the-compiler" class="title-link"> <div class="title-name">Running beam_makeops for the compiler</div>  </h3> <p> Give the option <code>-compiler</code> to produce output files for the compiler. The following files will be written to the output directory: </p> <ul> <li> <p><code>beam_opcodes.erl</code> - Used primarily by <code>beam_asm</code> and <code>beam_diasm</code>. </p> </li> <li> <p><code>beam_opcode.hrl</code> - Used by <code>beam_asm</code>. It contains tag definitions used for encoding instruction operands. </p> </li> </ul> <p> The input file should only contain the definition of BEAM_FORMAT_NUMBER and external generic instructions. (Everything else would be ignored.) </p> <h3 id="running-beam_makeops-for-the-emulator" class="title-link"> <div class="title-name">Running beam_makeops for the emulator</div>  </h3> <p> Give the option <code>-emulator</code> to produce output files for the emulator. The following output files will be generated in the output directory. </p> <ul> <li> <p><code>beam_opcodes.c</code> - Defines static data used by the loader (<code>beam_load.c</code>). Data about generic instructions, specific instructions (including how to pack their operands), and transformation rules are all part of this file. </p> </li> <li> <p><code>beam_opcodes.h</code> - Miscellaneous preprocessor definitions, mainly used by <code>beam_load.c</code> but also by <code>beam_{hot,warm,cold}.h</code>. </p> </li> <li> <p><code>beam_transform.c</code> - Implementation of guard constraints and generators called from transformation rules. </p> </li> </ul> <p> For the traditional BEAM interpreter, the following files are also generated: </p> <ul><li> <code>beam_hot.h</code>, <code>beam_warm.h</code>, <code>beam_cold.</code>h - Implementation of instructions. Included inside the <code>process_main()</code> function in <code>beam_emu.c</code>. </li></ul> <p> For BeamAsm, the following files are also generated: </p> <ul> <li> <p><code>beamasm_emit.h</code> - Glue code to call emitter functions. </p> </li> <li> <p><code>beamasm_protos.h</code> - Prototypes for all emitter functions. </p> </li> </ul> <p> The following options can be given: </p> <ul> <li> <p><code>wordsize 32|64</code> - Defines the word size. Default is 32. </p> </li> <li> <p><code>code-model Model</code> - The code model as given to <code>-mcmodel</code> option for GCC. Default is <code>unknown</code>. If the code model is <code>small</code> (and the word size is 64 bits), <strong>beam_makeops</strong> will pack operands into the upper 32 bits of the instruction word. </p> </li> <li> <p><code>DSymbol=0|1</code> - Defines the value for a symbol. The symbol can be used in <code>%if</code> and <code>%unless</code> directives. </p> </li> </ul> <h2 id="syntax-of-.tab-files" class="title-link"> <div class="title-name">12.6 Syntax of .tab files</div>  </h2> <h3 id="comments" class="title-link"> <div class="title-name">Comments</div>  </h3> <p> Any line starting with <code>#</code> is a comment and is ignored. </p> <p> A line with <code>//</code> is also a comment. It is recommended to only use this style of comments in files that define implementations of instructions. </p> <p> A long transformation line can be broken after the <code>=&gt;</code> operator and after <code>|</code> operators. Since OTP 25, this is the only way to break transformation lines. When reading older source you may see that <code>\</code> was used for this purpose, but we removed it since it was only seen together with <code>=&gt;</code> and <code>|</code>. </p> <h3 id="variable-definitions" class="title-link"> <div class="title-name">Variable definitions</div>  </h3> <p> A variable definition binds a variable to a Perl variable. It is only meaningful to add a new definition if <strong>beam_makeops</strong> is updated at the same time to use the variable. A variable definition looks this: </p> <p> <strong>name</strong>=<strong>value</strong>[;] </p> <p> where <strong>name</strong> is the name of a Perl variable in <strong>beam_makeops</strong>, and <strong>value</strong> is the value to be given to the variable. The line can optionally end with a <code>;</code> (to avoid messing up the C indentation mode in Emacs). </p> <p> Here follows a description of the variables that are defined. </p> <h4 id="Syntax-of-tab-files_Variable-definitions_BEAMFORMATNUMBER"> BEAM_FORMAT_NUMBER</h4> <p> <code>genop.tab</code> has the following definition: </p> <pre data-language="erlang">BEAM_FORMAT_NUMBER=0</pre> <p> It defines the version of the instruction set (which will be included in the code header in the BEAM code). Theoretically, the version could be bumped, and all instructions changed. In practice, we would have two support two instruction sets in the runtime system for at least two releases, so it will probably never happen in practice. </p> <h4 id="Syntax-of-tab-files_Variable-definitions_GCREGEXP"> GC_REGEXP</h4> <p> In <code>macros.tab</code>, there is a definition of <code>GC_REGEXP</code>. It will be described in <code><a href="#Syntax-of-tab-files_Defining-the-implementation_Macros-in-the-macrostab-file_The-GCREGEXP-definition">a later section</a></code>. </p> <h4 id="Syntax-of-tab-files_Variable-definitions_FORBIDDENTYPES"> FORBIDDEN_TYPES</h4> <p> In <code>asm/ops.tab</code>, there is a directive to forbid certain types in specific instructions: </p> <pre data-language="erlang">FORBIDDEN_TYPES=hQ</pre> <p> Especially for BeamAsm, all built-in types may not make sense, so <code>FORBIDDEN_TYPES</code> makes it possible to enforce that some types should not be used. </p> <p> Specific instructions will be described in <code><a href="#Syntax-of-tab-files_Defining-specific-instructions">a later section</a></code>. </p> <h3 id="directives" class="title-link"> <div class="title-name">Directives</div>  </h3> <p> There are directives to classify specific instructions depending on how frequently used they are: </p> <ul> <li> <p><code>%hot</code> - Implementation will be placed in <code>beam_hot.h</code>. Frequently executed instructions. </p> </li> <li> <p><code>%warm</code> - Implementation will be placed in <code>beam_warm.h</code>. Binary syntax instructions. </p> </li> <li> <p><code>%cold</code> - Implementation will be placed in <code>beam_cold.h</code>. Trace instructions and infrequently used instructions. </p> </li> </ul> <p> Default is <code>%hot</code>. The directives will be applied to declarations of the specific instruction that follow. Here is an example: </p> <pre data-language="erlang">%cold
+is_number f? xy
+%hot</pre> <h4 id="Syntax-of-tab-files_Directives_Conditional-compilation-directives"> Conditional compilation directives</h4> <p> The <code>%if</code> directive includes a range of lines if a condition is true. For example: </p> <pre data-language="erlang">%if ARCH_64
+i_bs_get_integer_32 x f? x
+%endif</pre> <p> The specific instruction <code>i_bs_get_integer_32</code> will only be defined on a 64-bit machine. </p> <p> The condition can be inverted by using <code>%unless</code> instead of <code>%if</code>: </p> <pre data-language="erlang">%unless NO_FPE_SIGNALS
+fcheckerror p =&gt; i_fcheckerror
+i_fcheckerror
+fclearerror
+%endif</pre> <p> It is also possible to add an <code>%else</code> clause: </p> <pre data-language="erlang">%if ARCH_64
+BS_SAFE_MUL(A, B, Fail, Dst) {
+    Uint64 res = ($A) * ($B);
+    if (res / $B != $A) {
+        $Fail;
+    }
+    $Dst = res;
+}
+%else
+BS_SAFE_MUL(A, B, Fail, Dst) {
+    Uint64 res = (Uint64)($A) * (Uint64)($B);
+    if ((res &gt;&gt; (8*sizeof(Uint))) != 0) {
+        $Fail;
+    }
+    $Dst = res;
+}
+%endif</pre> <h4 id="Syntax-of-tab-files_Directives_Symbols-that-are-defined-in-directives"> Symbols that are defined in directives</h4> <p> The following symbols are always defined. </p> <ul> <li> <code>ARCH_64</code> - is 1 for a 64-bit machine, and 0 otherwise. </li> <li> <code>ARCH_32</code> - is 1 for 32-bit machine, and 0 otherwise. </li> </ul> <p> The <code>Makefile</code> for building the emulator currently defines the following symbols by using the <code>-D</code> option on the command line for <strong>beam_makeops</strong>. </p> <ul><li> <code>USE_VM_PROBES</code> - 1 if the runtime system is compiled to use VM probes (support for dtrace or systemtap), 0 otherwise. </li></ul> <h3 id="defining-external-generic-instructions" class="title-link"> <div class="title-name">Defining external generic instructions</div>  </h3> <p> External generic BEAM instructions are known to both the compiler and the runtime system. They remain stable between releases. A new major release may add more external generic instructions, but must not change the semantics for a previously defined instruction. </p> <p> The syntax for an external generic instruction is as follows: </p> <p> <strong>opcode</strong>: [-]<strong>name</strong>/<strong>arity</strong> </p> <p> <strong>opcode</strong> is an integer greater than or equal to 1. </p> <p> <strong>name</strong> is an identifier starting with a lowercase letter. <strong>arity</strong> is an integer denoting the number of operands. </p> <p> <strong>name</strong> can optionally be preceded by <code>-</code> to indicate that it has been obsoleted. The compiler is not allowed to generate BEAM files that use obsolete instructions and the loader will refuse to load BEAM files that use obsolete instructions. </p> <p> It only makes sense to define external generic instructions in the file <code>genop.tab</code> in <code>lib/compiler/src</code>, because the compiler must know about them in order to use them. </p> <p> New instructions must be added at the end of the file, with higher numbers than the previous instructions. </p> <h3 id="defining-internal-generic-instructions" class="title-link"> <div class="title-name">Defining internal generic instructions</div>  </h3> <p> Internal generic instructions are known only to the runtime system and can be changed at any time without compatibility issues. </p> <p> There are two ways to define internal generic instructions: </p> <ul> <li> <p>Implicitly when a specific instruction is defined. This is by far the most common way. Whenever a specific instruction is created, <strong>beam_makeops</strong> automatically creates an internal generic instruction if it does not previously exist. </p> </li> <li> <p>Explicitly. This is necessary only when a generic instruction is used in transformations, but does not have any corresponding specific instruction. </p> </li> </ul> <p> The syntax for an internal generic instruction is as follows: </p> <p> <strong>name</strong>/<strong>arity</strong> </p> <p> <strong>name</strong> is an identifier starting with a lowercase letter. <strong>arity</strong> is an integer denoting the number of operands. </p> <h3 id="about-generic-instructions-in-general" class="title-link"> <div class="title-name">About generic instructions in general</div>  </h3> <p> Each generic instruction has an opcode. The opcode is an integer, greater than or equal to 1. For an external generic instruction, it must be explicitly given <code>genop.tab</code>, while internal generic instructions are automatically numbered by <strong>beam_makeops</strong>. </p> <p> The identity of a generic instruction is its name combined with its arity. That means that it is allowed to define two distinct generic instructions having the same name but with different arities. For example: </p> <pre data-language="erlang">move_window/5
+move_window/6</pre> <p> Each operand of a generic instruction is tagged with its type. A generic instruction can have one of the following types: </p> <ul> <li> <p><code>x</code> - X register. </p> </li> <li> <p><code>y</code> - Y register. </p> </li> <li> <p><code>l</code> - Floating point register number. </p> </li> <li> <p><code>i</code> - Tagged literal integer. </p> </li> <li> <p><code>a</code> - Tagged literal atom. </p> </li> <li> <p><code>n</code> - NIL (<code>[]</code>, the empty list). </p> </li> <li> <p><code>q</code> - Literal that don't fit in a word, that is an object stored on the heap such as a list or tuple. Any heap object type is supported, even types that don't have real literals such as external references. </p> </li> <li> <p><code>f</code> - Non-zero failure label. </p> </li> <li> <p><code>p</code> - Zero failure label. </p> </li> <li> <p><code>u</code> - Untagged integer that fits in a machine word. It is used for many different purposes, such as the number of live registers in <code>test_heap/2</code>, as a reference to the export for <code>call_ext/2</code>, and as the flags operand for binary syntax instructions. When the generic instruction is translated to a specific instruction, the type for the operand in the specific operation will tell the loader how to treat the operand. </p> </li> <li> <p><code>o</code> - Overflow. If the value for an <code>u</code> operand does not fit in a machine word, the type of the operand will be changed to <code>o</code> (with no associated value). Currently only used internally in the loader in the guard constraint function <code>binary_too_big()</code>. </p> </li> <li> <p><code>v</code> - Arity value. Only used internally in the loader. </p> </li> </ul> <h3 id="defining-specific-instructions" class="title-link"> <div class="title-name">Defining specific instructions</div>  </h3> <p> The specific instructions are known only to the runtime system and are the instructions that are actually executed. They can be changed at any time without causing compatibility issues. </p> <p> A specific instruction can have at most 6 operands if the family of instructions it belongs to has more than one member. The number of operands is unlimited if there is only a single specific instruction in a family. </p> <p> A specific instruction is defined by first giving its name followed by the types for each operand. For example: </p> <pre data-language="erlang">move x y</pre> <p> Internally, for example in the generated code and in the output from the BEAM disassembler, the instruction <code>move x y</code> will be called <code>move_xy</code>. </p> <p> The name for a specific instruction is an identifier starting with a lowercase letter. A type is a lowercase or uppercase letter. </p> <p> All specific instructions with a given name must have the same number of operands. That is, the following is <strong>not</strong> allowed: </p> <pre data-language="erlang">move x x
+move x y x y</pre> <p> Here follows the type letters that more or less directly corresponds to the types for generic instructions. </p> <ul> <li> <p><code>x</code> - X register. Will be loaded as a byte offset to the X register relative to the base of X register array. (Can be packed with other operands.) </p> </li> <li> <p><code>y</code> - Y register. Will be loaded as a byte offset to the Y register relative to the stack frame. (Can be packed with other operands.) </p> </li> <li> <p><code>r</code> - X register 0. An implicit operand that will not be stored in the loaded code. (Not used in BeamAsm.) </p> </li> <li> <p><code>l</code> - Floating point register number. (Can be packed with other operands.) </p> </li> <li> <p><code>a</code> - Tagged atom. </p> </li> <li> <p><code>n</code> - NIL or the empty list. (Will not be stored in the loaded code.) </p> </li> <li> <p><code>q</code> - Tagged CONS or BOXED pointer. That is, a term such as a list or tuple. Any heap object type is supported, even types that don't have real literals such as external references. </p> </li> <li> <p><code>f</code> - Failure label (non-zero). The target for a branch or call instruction. </p> </li> <li> <p><code>p</code> - The 0 failure label, meaning that an exception should be raised if the instruction fails. (Will not be stored in the loaded code.) </p> </li> <li> <p><code>c</code> - Any literal term; that is, immediate literals such as SMALL, and CONS or BOXED pointers to literals. (Can be used where the operand in the generic instruction has one of the types <code>i</code>, <code>a</code>, <code>n</code>, or <code>q</code>.) </p> </li> </ul> <p> The types that follow do a type test of the operand at runtime; thus, they are generally more expensive in terms of runtime than the types described earlier. However, those operand types are needed to avoid a combinatorial explosion in the number of specific instructions and overall code size of <code>process_main()</code>. </p> <ul> <li> <p><code>s</code> - Tagged source: X register, Y register, or a literal term. The tag will be tested at runtime to retrieve the value from an X register, a Y register, or simply use the value as a tagged Erlang term. (Implementation note: An X register is tagged as a pid, and a Y register as a port. Therefore the literal term must not contain a port or pid.) </p> </li> <li> <p><code>S</code> - Tagged source register (X or Y). The tag will be tested at runtime to retrieve the value from an X register or a Y register. Slightly cheaper than <code>s</code>. </p> </li> <li> <p><code>d</code> - Tagged destination register (X or Y). The tag will be tested at runtime to set up a pointer to the destination register. If the instruction performs a garbage collection, it must use the <code>$REFRESH_GEN_DEST()</code> macro to refresh the pointer before storing to it (there are more details about that in a later section). </p> </li> <li> <p><code>j</code> - A failure label (combination of <code>f</code> and <code>p</code>). If the branch target 0, an exception will be raised if instruction fails, otherwise control will be transferred to the target address. </p> </li> </ul> <p> The types that follows are all applied to an operand that has the <code>u</code> type. </p> <ul> <li> <p><code>t</code> - An untagged integer that will fit in 12 bits (0-4096). It can be packed with other operands in a word. Most often used as the number of live registers in instructions such as <code>test_heap</code>. </p> </li> <li> <p><code>I</code> - An untagged integer that will fit in 32 bits. It can be packed with other operands in a word on a 64-bit system. </p> </li> <li> <p><code>W</code> - Untagged integer or pointer. Not possible to pack with other operands. </p> </li> <li> <p><code>e</code> - Pointer to an export entry. Use by call instructions that call other modules, such as <code>call_ext</code>. </p> </li> <li> <p><code>L</code> - A label. Only used by the <code>label/1</code> instruction. </p> </li> <li> <p><code>b</code> - Pointer to BIF. Used in BIF instructions such as <code>call_bif</code>. </p> </li> <li> <p><code>F</code> - Pointer to a fun entry. Used in <code>make_fun2</code> and friends. </p> </li> <li> <p><code>A</code> - A tagged arityvalue. Used in instructions that test the arity of a tuple. </p> </li> <li> <p><code>P</code> - A byte offset into a tuple. </p> </li> <li> <p><code>Q</code> - A byte offset into the stack. Used for updating the frame pointer register. Can be packed with other operands. </p> </li> <li> <p><code>*</code> - This operand must be the last operand. It indicates that a variable number of operands follow. Its use is mandatory for BeamAsm when an instruction has a variable number of operands; see [handling a variable number of operands](#handling-a-variable-number-of-operands). It can be used for the interpreter as documentation, but it will have no effect on the code generation. </p> </li> </ul> <p> When the loader translates a generic instruction a specific instruction, it will choose the most specific instruction that will fit the types. Consider the following two instructions: </p> <pre data-language="erlang">move c x
+move n x</pre> <p> The <code>c</code> operand can encode any literal value, including NIL. The <code>n</code> operand only works for NIL. If we have the generic instruction <code>{move,nil,{x,1}}</code>, the loader will translate it to <code>move_nx 1</code> because <code>move n x</code> is more specific. <code>move_nx</code> could be slightly faster or smaller (depending on the architecture), because the <code>[]</code> is not stored explicitly as an operand. </p> <h4 id="Syntax-of-tab-files_Defining-specific-instructions_Syntactic-sugar-for-specific-instructions"> Syntactic sugar for specific instructions</h4> <p> It is possible to specify more than one type letter for each operand. Here is an example: </p> <pre data-language="erlang">move cxy xy</pre> <p> This is syntactic sugar for: </p> <pre data-language="erlang">move c x
+move c y
+move x x
+move x y
+move y x
+move y y</pre> <p> Note the difference between <code>move c xy</code> and <code>move c d</code>. Note that <code>move c xy</code> is equivalent to the following two definitions: </p> <pre data-language="erlang">move c x
+move c y</pre> <p> On the other hand, <code>move c d</code> is a single instruction. At runtime, the <code>d</code> operand will be tested to see whether it refers to an X register or a Y register, and a pointer to the register will be set up. </p> <h4 id="Syntax-of-tab-files_Defining-specific-instructions_The--type-modifier"> The '?' type modifier</h4> <p> The character <code>?</code> can be added to the end of an operand to indicate that the operand will not be used every time the instruction is executed. For example: </p> <pre data-language="erlang">allocate_heap t I t?
+is_eq_exact f? x xy</pre> <p> In <code>allocate_heap</code>, the last operand is the number of live registers. It will only be used if there is not enough heap space and a garbage collection must be performed. </p> <p> In <code>is_eq_exact</code>, the failure address (the first operand) will only be used if the two register operands are not equal. </p> <p> Knowing that an operand is not always used can improve how packing is done for some instructions. </p> <p> For the <code>allocate_heap</code> instruction, without the <code>?</code> the packing would be done like this: </p> <pre data-language="erlang">     +--------------------+--------------------+
+I -&gt; |       Stack needed | &amp;&amp;lb_allocate_heap +
+     +--------------------+--------------------+
+     |        Heap needed | Live registers     +
+     +--------------------+--------------------+</pre> <p> "Stack needed" and "Heap needed" are always used, but they are in different words. Thus, at runtime the <code>allocate_heap</code> instruction must read both words from memory even though it will not always use "Live registers". </p> <p> With the <code>?</code>, the operands will be packed like this: </p> <pre data-language="erlang">     +--------------------+--------------------+
+I -&gt; |     Live registers | &amp;&amp;lb_allocate_heap +
+     +--------------------+--------------------+
+     |        Heap needed |       Stack needed +
+     +--------------------+--------------------+</pre> <p> Now "Stack needed" and "Heap needed" are in the same word. </p> <h3 id="defining-transformation-rules" class="title-link"> <div class="title-name">Defining transformation rules</div>  </h3> <p> Transformation rules are used to rewrite generic instructions to other generic instructions. The transformations rules are applied repeatedly until no rule match. At that point, the first instruction in the resulting instruction sequence will be converted to a specific instruction and added to the code for the module being loaded. Then the transformation rules for the remaining instructions are run in the same way. </p> <p> A rule is recognized by its right-pointer arrow: <code>=&gt;</code>. To the left of the arrow is one or more instruction patterns, separated by <code>|</code>. To the right of the arrow is zero or more instructions, separated by <code>|</code>. If the instructions from the BEAM code matches the instruction patterns on the left-hand side, they will be replaced with instructions on the right-hand side (or removed if there are no instructions on the right). </p> <h4 id="Syntax-of-tab-files_Defining-transformation-rules_Defining-instruction-patterns"> Defining instruction patterns</h4> <p> We will start looking at the patterns on the left-hand side of the arrow. </p> <p> A pattern for an instruction consists of its name, followed by a pattern for each of its operands. The operand patterns are separated by spaces. </p> <p> The simplest possible pattern is a variable. Just like in Erlang, a variable must begin with an uppercase letter. In constrast to Erlang, variables must <strong>not</strong> be repeated. </p> <p> Variables that have been bound on the left-hand side can be used on the right-hand side. For example, this rule will rewrite all <code>move</code> instructions to <code>assign</code> instructions with the operands swapped: </p> <pre data-language="erlang">move Src Dst =&gt; assign Dst Src</pre> <p> If we only want to match operands of a certain type, we can use a type constraint. A type constraint consists of one or more lowercase letters, each specifying a type. For example: </p> <pre data-language="erlang">is_integer Fail an =&gt; jump Fail</pre> <p> The second operand pattern, <code>an</code>, will match if the second operand is either an atom or NIL (the empty list). In case of a match, the <code>is_integer/2</code> instruction will be replaced with a <code>jump/1</code> instruction. </p> <p> An operand pattern can bind a variable and constrain the type at the same time by following the variable with a <code>=</code> and the constraint. For example: </p> <pre data-language="erlang">is_eq_exact Fail=f R=xy C=q =&gt; i_is_eq_exact_literal Fail R C</pre> <p> Here the <code>is_eq_exact</code> instruction is replaced with a specialized instruction that only compares literals, but only if the first operand is a register and the second operand is a literal. </p> <h4 id="Syntax-of-tab-files_Defining-transformation-rules_Removing-instructions"> Removing instructions</h4> <p> The instructions of the left-hand side of the pattern can be removed by using the <code>_</code> symbol on the right-hand side of the transformation. For example, a <code>line</code> instruction without any actual line-number information can be removed like this: </p> <pre data-language="erlang">line n =&gt; _</pre> <p> (Before OTP 25, this was instead achieved by leaving the right-hand side blank.) </p> <h4 id="Syntax-of-tab-files_Defining-transformation-rules_Further-constraining-patterns"> Further constraining patterns</h4> <p> In addition to specifying a type letter, the actual value for the type can be specified. For example: </p> <pre data-language="erlang">move C=c x==1 =&gt; move_x1 C</pre> <p> Here the second operand of <code>move</code> is constrained to be X register 1. </p> <p> When specifying an atom constraint, the atom is written as it would be in the C source code. That is, it needs an <code>am_</code> prefix, and it must be listed in <code>atom.names</code>. For example, redundant <code>is_boolean</code> instructions can be removed like this: </p> <pre data-language="erlang">is_boolean Fail=f a==am_true =&gt; _
+is_boolean Fail=f a==am_false =&gt; _</pre> <p> There are several constraints available for testing whether a call is to a BIF or a function. </p> <p> The constraint <code>u$is_bif</code> will test whether the given operand refers to a BIF. For example: </p> <pre data-language="erlang">call_ext u Bif=u$is_bif =&gt; call_bif Bif
+call_ext u Func         =&gt; i_call_ext Func</pre> <p> The <code>call_ext</code> instruction can be used to call functions written in Erlang as well as BIFs (or more properly called SNIFs). The <code>u$is_bif</code> constraint will match if the operand refers to a BIF (that is, if it is listed in the file <code>bif.tab</code>). Note that <code>u$is_bif</code> should only be applied to operands that are known to contain an index to the import table chunk in the BEAM file (such operands have the type <code>b</code> or <code>e</code> in the corresponding specific instruction). If applied to other <code>u</code> operands, it will at best return a nonsense result. </p> <p> The <code>u$is_not_bif</code> constraint matches if the operand does not refer to a BIF (not listed in <code>bif.tab</code>). For example: </p> <pre data-language="erlang">move S X0=x==0 | line Loc | call_ext_last Ar Func=u$is_not_bif D =&gt;
+     move S X0 | call_ext_last Ar Func D</pre> <p> The <code>u$bif:Module:Name/Arity</code> constraint tests whether the given operand refers to a specific BIF. Note that <code>Module:Name/Arity</code> <strong>must</strong> be an existing BIF defined in <code>bif.tab</code>, or there will be a compilation error. It is useful when a call to a specific BIF should be replaced with an instruction as in this example: </p> <pre data-language="erlang">gc_bif2 Fail Live u$bif:erlang:splus/2 S1 S2 Dst =&gt;
+     gen_plus Fail Live S1 S2 Dst</pre> <p> Here the call to the GC BIF <code>'+'/2</code> will be replaced with the instruction <code>gen_plus/5</code>. Note that the same name as used in the C source code must be used for the BIF, which in this case is <code>splus</code>. It is defined like this in <code>bit.tab</code>: </p> <pre data-language="erlang">ubif erlang:'+'/2 splus_2</pre> <p> The <code>u$func:Module:Name/Arity</code> will test whether the given operand is a a specific function. Here is an example: </p> <pre data-language="erlang">bif1 Fail u$func:erlang:is_constant/1 Src Dst =&gt; too_old_compiler</pre> <p> <code>is_constant/1</code> used to be a BIF a long time ago. The transformation replaces the call with the <code>too_old_compiler</code> instruction, which is specially handled in the loader to produce a nicer error message than the default error would be for a missing guard BIF. </p> <h4 id="Syntax-of-tab-files_Defining-transformation-rules_Type-constraints-allowed-in-patterns"> Type constraints allowed in patterns</h4> <p> Here are all type letters that are allowed on the left-hand side of a transformation rule. </p> <ul> <li> <p><code>u</code> - An untagged integer that fits in a machine word. </p> </li> <li> <p><code>x</code> - X register. </p> </li> <li> <p><code>y</code> - Y register. </p> </li> <li> <p><code>l</code> - Floating point register number. </p> </li> <li> <p><code>i</code> - Tagged literal integer. </p> </li> <li> <p><code>a</code> - Tagged literal atom. </p> </li> <li> <p><code>n</code> - NIL (<code>[]</code>, the empty list). </p> </li> <li> <p><code>q</code> - Literals that don't fit in a word, such as list or tuples. </p> </li> <li> <p><code>f</code> - Non-zero failure label. </p> </li> <li> <p><code>p</code> - The zero failure label. </p> </li> <li> <p><code>j</code> - Any label. Equivalent to <code>fp</code>. </p> </li> <li> <p><code>c</code> - Any literal term. Equivalent to <code>ainq</code>. </p> </li> <li> <p><code>s</code> - X register, Y register, or any literal term. Equivalent to <code>xyc</code>. </p> </li> <li> <p><code>d</code> - X or Y register. Equivalent to <code>xy</code>. (In a pattern <code>d</code> will match both source and destination registers. As an operand in a specific instruction, it must only be used for a destination register.) </p> </li> <li> <p><code>o</code> - Overflow. An untagged integer that does not fit in a machine word. </p> </li> </ul> <h4 id="Syntax-of-tab-files_Defining-transformation-rules_Predicates"> Predicates</h4> <p> If the constraints described so far is not enough, additional constraints can be implemented in C and be called as a guard function on the left-hand side of the transformation. If the guard function returns a non-zero value, the matching of the rule will continue, otherwise the match will fail. Such guard functions are hereafter called <strong>predicates</strong>. </p> <p> The most commonly used guard constraints is <code>equal()</code>. It can be used to remove a redundant <code>move</code> instructio like this: </p> <pre data-language="erlang">move R1 R2 | equal(R1, R2) =&gt; _</pre> <p> or remove a redundant <code>is_eq_exact</code> instruction like this: </p> <pre data-language="erlang">is_eq_exact Lbl Src1 Src2 | equal(Src1, Src2) =&gt; _</pre> <p> At the time of writing, all predicates are defined in files named <code>predicates.tab</code> in several directories. In <code>predicates.tab</code> directly in <code>$ERL_TOP/erts/emulator/beam</code>, predicates that are used by both the traditinal emulator and the JIT implementations are contained. Predicates only used by the emulator can be found in <code>emu/predicates.tab</code>. </p> <h3 id="a-very-brief-note-on-implementation-of-predicates" class="title-link"> <div class="title-name">A very brief note on implementation of predicates</div>  </h3> <p> It is outside the scope for this document to describe in detail how predicates are implemented because it requires knowledge of the internal loader data structures, but here is quick look at the implementation of a simple predicate called <code>literal_is_map()</code>. </p> <p> Here is first an example how it is used: </p> <p> is<strong>map Fail Lit=q | literal</strong>is<strong>map(Lit) =&gt; </strong> </p> <p> If the <code>Lit</code> operand is a literal, then the <code>literal_is_map()</code> predicate is called to determine wheter is is a map literal. It it is, the instruction is not needed and can be removed. </p> <p> <code>literal_is_map()</code> is implemented like this (in <code>emu/predicates.tab</code>): </p> <pre data-language="erlang">pred.literal_is_map(Lit) {
+    Eterm term;
+
+    ASSERT(Lit.type == TAG_q);
+    term = beamfile_get_literal(&amp;S-&gt;beam, Lit.val);
+    return is_map(term);
+}</pre> <p> The <code>pred.</code> prefix tells <strong>beam_makeops</strong> that this function is a predicate. Without the prefix, it would have been interpreted as the implementation of an instruction (described in <strong>Defining the implementation</strong>). </p> <p> Predicate functions have a magic variabled called <code>S</code>, which is a pointer to a state struct. In the example, <code>beamfile_get_literal(&amp;S-&gt;beam, Lit.val);</code> is used to retrieve the actual term for the literal. </p> <p> At the time of writing, the expanded C code generated by <strong>beam_makeops</strong> looks like this: </p> <pre data-language="erlang">static int literal_is_map(LoaderState* S, BeamOpArg Lit) {
+  Eterm term;
+
+  ASSERT(Lit.type == TAG_q);
+  term = S-&gt;literals[Lit.val].term;
+  return is_map(term);;
+}</pre> <h4 id="Syntax-of-tab-files_A-very-brief-note-on-implementation-of-predicates_Handling-instructions-with-variable-number-of-operands"> Handling instructions with variable number of operands</h4> <p> Some instructions, such as <code>select_val/3</code>, essentially has a variable number of operands. Such instructions have a <code>{list,[...]}</code> operand as their last operand in the BEAM assembly code. For example: </p> <pre data-language="erlang">{select_val,{x,0},
+            {f,1},
+            {list,[{atom,b},{f,4},{atom,a},{f,5}]}}.</pre> <p> The loader will convert a <code>{list,[...]}</code> operand to an <code>u</code> operand whose value is the number of elements in the list, followed by each element in the list. The instruction above would be translated to the following generic instruction: </p> <pre data-language="erlang">{select_val,{x,0},{f,1},{u,4},{atom,b},{f,4},{atom,a},{f,5}}</pre> <p> To match a variable number of arguments we need to use the special operand type <code>*</code> like this: </p> <pre data-language="erlang">select_val Src=aiq Fail=f Size=u List=* =&gt;
+    i_const_select_val Src Fail Size List</pre> <p> This transformation renames a <code>select_val/3</code> instruction with a constant source operand to <code>i_const_select_val/3</code>. </p> <h4 id="Syntax-of-tab-files_A-very-brief-note-on-implementation-of-predicates_Constructing-new-instructions-on-the-righthand-side"> Constructing new instructions on the right-hand side</h4> <p> The most common operand on the right-hand side is a variable that was bound while matching the pattern on the left-hand side. For example: </p> <pre data-language="erlang">trim N Remaining =&gt; i_trim N</pre> <p> An operand can also be a type letter to construct an operand of that type. Each type has a default value. For example, the type <code>x</code> has the default value 1023, which is the highest X register. That makes <code>x</code> on the right-hand side a convenient shortcut for a temporary X register. For example: </p> <pre data-language="erlang">is_number Fail Literal=q =&gt; move Literal x | is_number Fail x</pre> <p> If the second operand for <code>is_number/2</code> is a literal, it will be moved to X register 1023. Then <code>is_number/2</code> will test whether the value stored in X register 1023 is a number. </p> <p> This kind of transformation is useful when it is rare that an operand can be anything else but a register. In the case of <code>is_number/2</code>, the second operand is always a register unless the compiler optimizations have been disabled. </p> <p> If the default value is not suitable, the type letter can be followed by <code>=</code> and a value. Most types take an integer value. The value for an atom is written the same way as in the C source code. For example, the atom <code>false</code> is written as <code>am_false</code>. The atom must be listed in <code>atom.names</code>. </p> <p> Here is an example showing how values can be specified: </p> <pre data-language="erlang">bs_put_utf32 Fail=j Flags=u Src=s =&gt;
+    i_bs_validate_unicode Fail Src |
+    bs_put_integer Fail i=32 u=1 Flags Src</pre> <h4 id="Syntax-of-tab-files_A-very-brief-note-on-implementation-of-predicates_Type-letters-on-the-righthand-side"> Type letters on the right-hand side</h4> <p> Here follows all types that are allowed to be used in operands for instructions being constructed on the right-hand side of a transformation rule. </p> <ul> <li> <p><code>u</code> - Construct an untagged integer. The default value is 0. </p> </li> <li> <p><code>x</code> - X register. The default value is 1023. That makes <code>x</code> convenient to use as a temporary X register. </p> </li> <li> <p><code>y</code> - Y register. The default value is 0. </p> </li> <li> <p><code>l</code> - Floating point register number. The default value is 0. </p> </li> <li> <p><code>i</code> - Tagged literal integer. The default value is 0. </p> </li> <li> <p><code>a</code> - Tagged atom. The default value is the empty atom (<code>am_Empty</code>). </p> </li> <li> <p><code>p</code> - Zero failure label. </p> </li> <li> <p><code>n</code> - NIL (<code>[]</code>, the empty list). </p> </li> </ul> <h4 id="Syntax-of-tab-files_A-very-brief-note-on-implementation-of-predicates_Function-call-on-the-righthand-side"> Function call on the right-hand side</h4> <p> Transformations that are not possible to describe with the rule language as described here can be implemented as a generator function in C and called from the right-hand side of a transformation. The left-hand side of the transformation will perform the match and bind operands to variables. The variables can then be passed to a generator function on the right-hand side. For example: </p> <pre data-language="erlang">bif2 Fail=j u$bif:erlang:element/2 Index=s Tuple=xy Dst=d =&gt;
+    element(Jump, Index, Tuple, Dst)</pre> <p> This transformation rule matches a call to the BIF <code>element/2</code>. The operands will be captured and the generator function <code>element()</code> will be called. </p> <p> The <code>element()</code> generator will produce one of two instructions depending on <code>Index</code>. If <code>Index</code> is an integer in the range from 1 up to the maximum tuple size, the instruction <code>i_fast_element/2</code> will be produced, otherwise the instruction <code>i_element/4</code> will be produced. The corresponding specific instructions are: </p> <pre data-language="erlang">i_fast_element xy j? I d
+i_element xy j? s d</pre> <p> The <code>i_fast_element/2</code> instruction is faster because the tuple is already an untagged integer. It also knows that the index is at least 1, so it does not have to test for that. The <code>i_element/4</code> instruction will have to fetch the index from a register, test that it is an integer, and untag the integer. </p> <p> At the time of writing, all generators functions were defined in files named <code>generators.tab</code> in several directories (in the same directories as the <code>predicates.tab</code> files). </p> <p> It is outside the scope of this document to describe in detail how generator functions are written, but here is the implementation of <code>element()</code>: </p> <pre data-language="erlang">gen.element(Fail, Index, Tuple, Dst) {
+    BeamOp* op;
+
+    $NewBeamOp(S, op);
+
+    if (Index.type == TAG_i &amp;&amp; Index.val &gt; 0 &amp;&amp;
+        Index.val &lt;= ERTS_MAX_TUPLE_SIZE &amp;&amp;
+        (Tuple.type == TAG_x || Tuple.type == TAG_y)) {
+        $BeamOpNameArity(op, i_fast_element, 4);
+        op-&gt;a[0] = Tuple;
+        op-&gt;a[1] = Fail;
+        op-&gt;a[2].type = TAG_u;
+        op-&gt;a[2].val = Index.val;
+        op-&gt;a[3] = Dst;
+    } else {
+        $BeamOpNameArity(op, i_element, 4);
+        op-&gt;a[0] = Tuple;
+        op-&gt;a[1] = Fail;
+        op-&gt;a[2] = Index;
+        op-&gt;a[3] = Dst;
+    }
+
+    return op;
+}</pre> <p> The <code>gen.</code> prefix tells <strong>beam_makeops</strong> that this function is a generator. Without the prefix, it would have been interpreted as the implementation of an instruction (described in <strong>Defining the implementation</strong>). </p> <p> Generator functions have a magic variabled called <code>S</code>, which is a pointer to a state struct. In the example, <code>S</code> is used in the invocation of the <code>NewBeamOp</code> macro. </p> <h3 id="defining-the-implementation" class="title-link"> <div class="title-name">Defining the implementation</div>  </h3> <p> For the traditional BEAM interpreter, the actual implementation of instructions are also defined in <code>.tab</code> files processed by <strong>beam_makeops</strong>. See [Code generation for BeamAsm](#code-generation-for-beamasm) for a brief introduction to how code generation is done for BeamAsm. </p> <p> For practical reasons, instruction definitions are stored in several files, at the time of writing in the following files (in the <code>beam/emu</code> directory): </p> <pre data-language="erlang">bif_instrs.tab
+arith_instrs.tab
+bs_instrs.tab
+float_instrs.tab
+instrs.tab
+map_instrs.tab
+msg_instrs.tab
+select_instrs.tab
+trace_instrs.tab</pre> <p> There is also a file that only contains macro definitions: </p> <pre data-language="erlang">macros.tab</pre> <p> The syntax of each file is similar to C code. In fact, most of the contents <strong>is</strong> C code, interspersed with macro invocations. </p> <p> To allow Emacs to auto-indent the code, each file starts with the following line: </p> <pre data-language="erlang">// -*- c -*-</pre> <p> To avoid messing up the indentation, all comments are written as C++ style comments (<code>//</code>) instead of <code>#</code>. Note that a comment must start at the beginning of a line. </p> <p> The meat of an instruction definition file are macro definitions. We have seen this macro definition before: </p> <pre data-language="erlang">move(Src, Dst) {
+    $Dst = $Src;
+}</pre> <p> A macro definitions must start at the beginning of the line (no spaces allowed), the opening curly bracket must be on the same line, and the finishing curly bracket must be at the beginning of a line. It is recommended that the macro body is properly indented. </p> <p> As a convention, the macro arguments in the head all start with an uppercase letter. In the body, the macro arguments can be expanded by preceding them with <code>$</code>. </p> <p> A macro definition whose name and arity matches a family of specific instructions is assumed to be the implementation of that instruction. </p> <p> A macro can also be invoked from within another macro. For example, <code>move_deallocate_return/2</code> avoids repeating code by invoking <code>$deallocate_return()</code> as a macro: </p> <pre data-language="erlang">move_deallocate_return(Src, Deallocate) {
+    x(0) = $Src;
+    $deallocate_return($Deallocate);
+}</pre> <p> Here is the definition of <code>deallocate_return/1</code>: </p> <pre data-language="erlang">deallocate_return(Deallocate) {
+    //| -no_next
+    int words_to_pop = $Deallocate;
+    SET_I((BeamInstr *) cp_val(*E));
+    E = ADD_BYTE_OFFSET(E, words_to_pop);
+    CHECK_TERM(x(0));
+    DispatchReturn;
+}</pre> <p> The expanded code for <code>move_deallocate_return</code> will look this: </p> <pre data-language="erlang">OpCase(move_deallocate_return_cQ):
+{
+  x(0) = I[1];
+  do {
+    int words_to_pop = Qb(BeamExtraData(I[0]));
+    SET_I((BeamInstr *) cp_val(*E));
+    E = ADD_BYTE_OFFSET(E, words_to_pop);
+    CHECK_TERM(x(0));
+    DispatchReturn;
+  } while (0);
+}</pre> <p> When expanding macros, <strong>beam_makeops</strong> wraps the expansion in a <code>do</code>/<code>while</code> wrapper unless <strong>beam_makeops</strong> can clearly see that no wrapper is needed. In this case, the wrapper is needed. </p> <p> Note that arguments for macros cannot be complex expressions, because the arguments are split on <code>,</code>. For example, the following would not work because <strong>beam_makeops</strong> would split the expression into two arguments: </p> <pre data-language="erlang">$deallocate_return(get_deallocation(y, $Deallocate));</pre> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Code-generation-directives"> Code generation directives</h4> <p> Within macro definitions, <code>//</code> comments are in general not treated specially. They will be copied to the file with the generated code along with the rest of code in the body. </p> <p> However, there is an exception. Within a macro definition, a line that starts with whitespace followed by <code>//|</code> is treated specially. The rest of the line is assumed to contain directives to control code generation. </p> <p> Currently, two code generation directives are recognized: </p> <ul> <li> <code>-no_prefetch</code> </li> <li> <code>-no_next</code> </li> </ul> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Code-generation-directives_The-noprefetch-directive"> The -no_prefetch directive</h4> <p> To see what <code>-no_prefetch</code> does, let's first look at the default code generation. Here is the code generated for <code>move_cx</code>: </p> <pre data-language="erlang">OpCase(move_cx):
+{
+  BeamInstr next_pf = BeamCodeAddr(I[2]);
+  xb(BeamExtraData(I[0])) = I[1];
+  I += 2;
+  ASSERT(VALID_INSTR(next_pf));
+  GotoPF(next_pf);
+}</pre> <p> Note that the very first thing done is to fetch the address to the next instruction. The reason is that it usually improves performance. </p> <p> Just as a demonstration, we can add a <code>-no_prefetch</code> directive to the <code>move/2</code> instruction: </p> <pre data-language="erlang">move(Src, Dst) {
+    //| -no_prefetch
+    $Dst = $Src;
+}</pre> <p> We can see that the prefetch is no longer done: </p> <pre data-language="erlang">OpCase(move_cx):
+{
+  xb(BeamExtraData(I[0])) = I[1];
+  I += 2;
+  ASSERT(VALID_INSTR(*I));
+  Goto(*I);
+}</pre> <p> When would we want to turn off the prefetch in practice? </p> <p> In instructions that will not always execute the next instruction. For example: </p> <pre data-language="erlang">is_atom(Fail, Src) {
+    if (is_not_atom($Src)) {
+        $FAIL($Fail);
+    }
+}
+
+// From macros.tab
+FAIL(Fail) {
+    //| -no_prefetch
+    $SET_I_REL($Fail);
+    Goto(*I);
+}</pre> <p> <code>is_atom/2</code> may either execute the next instruction (if the second operand is an atom) or branch to the failure label. </p> <p> The generated code looks like this: </p> <pre data-language="erlang">OpCase(is_atom_fx):
+{
+  if (is_not_atom(xb(I[1]))) {
+    ASSERT(VALID_INSTR(*(I + (fb(BeamExtraData(I[0]))) + 0)));
+    I += fb(BeamExtraData(I[0])) + 0;;
+    Goto(*I);;
+  }
+  I += 2;
+  ASSERT(VALID_INSTR(*I));
+  Goto(*I);
+}</pre> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Code-generation-directives_The-nonext-directive"> The -no_next directive</h4> <p> Next we will look at when the <code>-no_next</code> directive can be used. Here is the <code>jump/1</code> instruction: </p> <pre data-language="erlang">jump(Fail) {
+    $JUMP($Fail);
+}
+
+// From macros.tab
+JUMP(Fail) {
+    //| -no_next
+    $SET_I_REL($Fail);
+    Goto(*I);
+}</pre> <p> The generated code looks like this: </p> <pre data-language="erlang">OpCase(jump_f):
+{
+  ASSERT(VALID_INSTR(*(I + (fb(BeamExtraData(I[0]))) + 0)));
+  I += fb(BeamExtraData(I[0])) + 0;;
+  Goto(*I);;
+}</pre> <p> If we remove the <code>-no_next</code> directive, the code would look like this: </p> <pre data-language="erlang">OpCase(jump_f):
+{
+  BeamInstr next_pf = BeamCodeAddr(I[1]);
+  ASSERT(VALID_INSTR(*(I + (fb(BeamExtraData(I[0]))) + 0)));
+  I += fb(BeamExtraData(I[0])) + 0;;
+  Goto(*I);;
+  I += 1;
+  ASSERT(VALID_INSTR(next_pf));
+  GotoPF(next_pf);
+}</pre> <p> In the end, the C compiler will probably optimize this code to the same native code as the first version, but the first version is certainly much easier to read for human readers. </p> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Macros-in-the-macrostab-file"> Macros in the macros.tab file</h4> <p> The file <code>macros.tab</code> contains many useful macros. When implementing new instructions it is good practice to look through <code>macros.tab</code> to see if any of existing macros can be used rather than re-inventing the wheel. </p> <p> We will describe a few of the most useful macros here. </p> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Macros-in-the-macrostab-file_The-GCREGEXP-definition"> The GC_REGEXP definition</h4> <p> The following line defines a regular expression that will recognize a call to a function that does a garbage collection: </p> <pre data-language="erlang">GC_REGEXP=erts_garbage_collect|erts_gc|GcBifFunction;</pre> <p> The purpose is that <strong>beam_makeops</strong> can verify that an instruction that does a garbage collection and has an <code>d</code> operand uses the <code>$REFRESH_GEN_DEST()</code> macro. </p> <p> If you need to define a new function that does garbage collection, you should give it the prefix <code>erts_gc_</code>. If that is not possible you should update the regular expression so that it will match your new function. </p> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Macros-in-the-macrostab-file_FAILFail"> FAIL(Fail)</h4> <p> Branch to <code>$Fail</code>. Will suppress prefetch (<code>-no_prefetch</code>). Typical use: </p> <pre data-language="erlang">is_nonempty_list(Fail, Src) {
+    if (is_not_list($Src)) {
+        $FAIL($Fail);
+    }
+}</pre> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Macros-in-the-macrostab-file_JUMPFail"> JUMP(Fail)</h4> <p> Branch to <code>$Fail</code>. Suppresses generation of dispatch of the next instruction (<code>-no_next</code>). Typical use: </p> <pre data-language="erlang">jump(Fail) {
+    $JUMP($Fail);
+}</pre> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Macros-in-the-macrostab-file_GCTESTNeedStack-NeedHeap-Live"> GC_TEST(NeedStack, NeedHeap, Live)</h4> <p> <code>$GC_TEST(NeedStack, NeedHeap, Live)</code> tests that given amount of stack space and heap space is available. If not it will do a garbage collection. Typical use: </p> <pre data-language="erlang">test_heap(Nh, Live) {
+    $GC_TEST(0, $Nh, $Live);
+}</pre> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Macros-in-the-macrostab-file_AHNeedStack-NeedHeap-Live"> AH(NeedStack, NeedHeap, Live)</h4> <p> <code>AH(NeedStack, NeedHeap, Live)</code> allocates a stack frame and optionally additional heap space. </p> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Predefined-macros-and-variables"> Pre-defined macros and variables</h4> <p> <strong>beam_makeops</strong> defines several built-in macros and pre-bound variables. </p> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Predefined-macros-and-variables_The-NEXTINSTRUCTION-prebound-variable"> The NEXT_INSTRUCTION pre-bound variable</h4> <p> The NEXT_INSTRUCTION is a pre-bound variable that is available in all instructions. It expands to the address of the next instruction. </p> <p> Here is an example: </p> <pre data-language="erlang">i_call(CallDest) {
+    //| -no_next
+    $SAVE_CONTINUATION_POINTER($NEXT_INSTRUCTION);
+    $DISPATCH_REL($CallDest);
+}</pre> <p> When calling a function, the return address is first stored in <code>E[0]</code> (using the <code>$SAVE_CONTINUATION_POINTER()</code> macro), and then control is transferred to the callee. Here is the generated code: </p> <pre data-language="erlang">OpCase(i_call_f):
+{
+    ASSERT(VALID_INSTR(*(I+2)));
+    *E = (BeamInstr) (I+2);;
+
+    /* ... dispatch code intentionally left out ... */
+}</pre> <p> We can see that that <code>$NEXT_INSTRUCTION</code> has been expanded to <code>I+2</code>. That makes sense since the size of the <code>i_call_f/1</code> instruction is two words. </p> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Predefined-macros-and-variables_The-IPADJUSTMENT-prebound-variable"> The IP_ADJUSTMENT pre-bound variable</h4> <p> <code>$IP_ADJUSTMENT</code> is usually 0. In a few combined instructions (described below) it can be non-zero. It is used like this in <code>macros.tab</code>: </p> <pre data-language="erlang">SET_I_REL(Offset) {
+    ASSERT(VALID_INSTR(*(I + ($Offset) + $IP_ADJUSTMENT)));
+    I += $Offset + $IP_ADJUSTMENT;
+}</pre> <p> Avoid using <code>IP_ADJUSTMENT</code> directly. Use <code>SET_I_REL()</code> or one of the macros that invoke such as <code>FAIL()</code> or <code>JUMP()</code> defined in <code>macros.tab</code>. </p> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Predefined-macro-functions"> Pre-defined macro functions</h4> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Predefined-macro-functions_The-IF-macro"> The IF() macro</h4> <p> <code>$IF(Expr, IfTrue, IfFalse)</code> evaluates <code>Expr</code>, which must be a valid Perl expression (which for simple numeric expressions have the same syntax as C). If <code>Expr</code> evaluates to 0, the entire <code>IF()</code> expression will be replaced with <code>IfFalse</code>, otherwise it will be replaced with <code>IfTrue</code>. </p> <p> See the description of <code>OPERAND_POSITION()</code> for an example. </p> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Predefined-macro-functions_The-OPERANDPOSITION-macro"> The OPERAND_POSITION() macro</h4> <p> <code>$OPERAND_POSITION(Expr)</code> returns the position for <code>Expr</code>, if <code>Expr</code> is an operand that is not packed. The first operand is at position 1. </p> <p> Returns 0 otherwise. </p> <p> This macro could be used like this in order to share code: </p> <pre data-language="erlang">FAIL(Fail) {
+    //| -no_prefetch
+    $IF($OPERAND_POSITION($Fail) == 1 &amp;&amp; $IP_ADJUSTMENT == 0,
+        goto common_jump,
+        $DO_JUMP($Fail));
+}
+
+DO_JUMP(Fail) {
+    $SET_I_REL($Fail);
+    Goto(*I));
+}
+
+// In beam_emu.c:
+common_jump:
+   I += I[1];
+   Goto(*I));</pre> <h4 id="Syntax-of-tab-files_Defining-the-implementation_The-REFRESHGENDEST-macro"> The $REFRESH_GEN_DEST() macro</h4> <p> When a specific instruction has a <code>d</code> operand, early during execution of the instruction, a pointer will be initialized to point to the X or Y register in question. </p> <p> If there is a garbage collection before the result is stored, the stack will move and if the <code>d</code> operand referred to a Y register, the pointer will no longer be valid. (Y registers are stored on the stack.) </p> <p> In those circumstances, <code>$REFRESH_GEN_DEST()</code> must be invoked to set up the pointer again. <strong>beam_makeops</strong> will notice if there is a call to a function that does a garbage collection and <code>$REFRESH_GEN_DEST()</code> is not called. </p> <p> Here is a complete example. The <code>new_map</code> instruction is defined like this: </p> <pre data-language="erlang">new_map d t I</pre> <p> It is implemented like this: </p> <pre data-language="erlang">new_map(Dst, Live, N) {
+    Eterm res;
+
+    HEAVY_SWAPOUT;
+    res = erts_gc_new_map(c_p, reg, $Live, $N, $NEXT_INSTRUCTION);
+    HEAVY_SWAPIN;
+    $REFRESH_GEN_DEST();
+    $Dst = res;
+    $NEXT($NEXT_INSTRUCTION+$N);
+}</pre> <p> If we have forgotten the <code>$REFRESH_GEN_DEST()</code> there would be a message similar to this: </p> <pre data-language="erlang">pointer to destination register is invalid after GC -- use $REFRESH_GEN_DEST()
+... from the body of new_map at beam/map_instrs.tab(30)</pre> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Variable-number-of-operands"> Variable number of operands</h4> <p> Here follows an example of how to to handle an instruction with a variable number of operands for the interpreter. Here is the instruction definition in <code>emu/ops.tab</code>: </p> <pre data-language="erlang">put_tuple2 xy I *</pre> <p> For the interpreter, the <code>*</code> is optional, because it does not effect code generation in any way. However, it is recommended to include it to make it clear for human readers that there is a variable number of operands. </p> <p> Use the <code>$NEXT_INSTRUCTION</code> macro to obtain a pointer to the first of the variable operands. </p> <p> Here is the implementation: </p> <pre data-language="erlang">put_tuple2(Dst, Arity) {
+Eterm* hp = HTOP;
+Eterm arity = $Arity;
+Eterm* dst_ptr = &amp;($Dst);
+
+//| -no_next
+ASSERT(arity != 0);
+*hp++ = make_arityval(arity);
+
+/*
+ * The $NEXT_INSTRUCTION macro points just beyond the fixed
+ * operands. In this case it points to the descriptor of
+ * the first element to be put into the tuple.
+ */
+I = $NEXT_INSTRUCTION;
+do {
+    Eterm term = *I++;
+    switch (loader_tag(term)) {
+    case LOADER_X_REG:
+	*hp++ = x(loader_x_reg_index(term));
+	break;
+    case LOADER_Y_REG:
+	*hp++ = y(loader_y_reg_index(term));
+	break;
+    default:
+	*hp++ = term;
+	break;
+    }
+} while (--arity != 0);
+*dst_ptr = make_tuple(HTOP);
+HTOP = hp;
+ASSERT(VALID_INSTR(* (Eterm *)I));
+Goto(*I);
+}</pre> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Combined-instructions"> Combined instructions</h4> <p> <strong>Problem</strong>: For frequently executed instructions we want to use "fast" operands types such as <code>x</code> and <code>y</code>, as opposed to <code>s</code> or <code>S</code>. To avoid an explosion in code size, we want to share most of the implementation between the instructions. Here are the specific instructions for <code>i_increment/5</code>: </p> <pre data-language="erlang">i_increment r W t d
+i_increment x W t d
+i_increment y W t d</pre> <p> The <code>i_increment</code> instruction is implemented like this: </p> <pre data-language="erlang">i_increment(Source, IncrementVal, Live, Dst) {
+    Eterm increment_reg_source = $Source;
+    Eterm increment_val = $IncrementVal;
+    Uint live;
+    Eterm result;
+
+    if (ERTS_LIKELY(is_small(increment_reg_val))) {
+        Sint i = signed_val(increment_reg_val) + increment_val;
+        if (ERTS_LIKELY(IS_SSMALL(i))) {
+            $Dst = make_small(i);
+            $NEXT0();
+        }
+    }
+    live = $Live;
+    HEAVY_SWAPOUT;
+    reg[live] = increment_reg_val;
+    reg[live+1] = make_small(increment_val);
+    result = erts_gc_mixed_plus(c_p, reg, live);
+    HEAVY_SWAPIN;
+    ERTS_HOLE_CHECK(c_p);
+    if (ERTS_LIKELY(is_value(result))) {
+        $REFRESH_GEN_DEST();
+        $Dst = result;
+        $NEXT0();
+    }
+    ASSERT(c_p-&gt;freason != BADMATCH || is_value(c_p-&gt;fvalue));
+    goto find_func_info;
+}</pre> <p> There will be three almost identical copies of the code. Given the size of the code, that could be too high cost to pay. </p> <p> To avoid the three copies of the code, we could use only one specific instruction: </p> <pre data-language="erlang">i_increment S W t d</pre> <p> (The same implementation as above will work.) </p> <p> That reduces the code size, but is slower because <code>S</code> means that there will be extra code to test whether the operand refers to an X register or a Y register. </p> <p> <strong>Solution</strong>: We can use "combined instructions". Combined instructions are combined from instruction fragments. The bulk of the code can be shared. </p> <p> Here we will show how <code>i_increment</code> can be implemented as a combined instruction. We will show each individual fragment first, and then show how to connect them together. First we will need a variable that we can store the value fetched from the register in: </p> <pre data-language="erlang">increment.head() {
+    Eterm increment_reg_val;
+}</pre> <p> The name <code>increment</code> is the name of the group that the fragment belongs to. Note that it does not need to have the same name as the instruction. The group name is followed by <code>.</code> and the name of the fragment. The name <code>head</code> is pre-defined. The code in it will be placed at the beginning of a block, so that all fragments in the group can access it. </p> <p> Next we define the fragment that will pick up the value from the register from the first operand: </p> <pre data-language="erlang">increment.fetch(Src) {
+    increment_reg_val = $Src;
+}</pre> <p> We call this fragment <code>fetch</code>. This fragment will be duplicated three times, one for each value of the first operand (<code>r</code>, <code>x</code>, and <code>y</code>). </p> <p> Next we define the main part of the code that do the actual incrementing. </p> <pre data-language="erlang">increment.execute(IncrementVal, Live, Dst) {
+    Eterm increment_val = $IncrementVal;
+    Uint live;
+    Eterm result;
+
+    if (ERTS_LIKELY(is_small(increment_reg_val))) {
+        Sint i = signed_val(increment_reg_val) + increment_val;
+        if (ERTS_LIKELY(IS_SSMALL(i))) {
+            $Dst = make_small(i);
+            $NEXT0();
+        }
+    }
+    live = $Live;
+    HEAVY_SWAPOUT;
+    reg[live] = increment_reg_val;
+    reg[live+1] = make_small(increment_val);
+    result = erts_gc_mixed_plus(c_p, reg, live);
+    HEAVY_SWAPIN;
+    ERTS_HOLE_CHECK(c_p);
+    if (ERTS_LIKELY(is_value(result))) {
+        $REFRESH_GEN_DEST();
+        $Dst = result;
+        $NEXT0();
+    }
+    ASSERT(c_p-&gt;freason != BADMATCH || is_value(c_p-&gt;fvalue));
+    goto find_func_info;
+}</pre> <p> We call this fragment <code>execute</code>. It will handle the three remaining operands (<code>W t d</code>). There will only be one copy of this fragment. </p> <p> Now that we have defined the fragments, we need to inform <strong>beam_makeops</strong> how they should be connected: </p> <pre data-language="erlang">i_increment := increment.fetch.execute;</pre> <p> To the left of the <code>:=</code> is the name of the specific instruction that should be implemented by the fragments, in this case <code>i_increment</code>. To the right of <code>:=</code> is the name of the group with the fragments, followed by a <code>.</code>. Then the name of the fragments in the group are listed in the order they should be executed. Note that the <code>head</code> fragment is not listed. </p> <p> The line ends in <code>;</code> (to avoid messing up the indentation in Emacs). </p> <p> (Note that in practice the <code>:=</code> line is usually placed before the fragments.) </p> <p> The generated code looks like this: </p> <pre data-language="erlang">{
+  Eterm increment_reg_val;
+  OpCase(i_increment_rWtd):
+  {
+    increment_reg_val = r(0);
+  }
+  goto increment__execute;
+
+  OpCase(i_increment_xWtd):
+  {
+    increment_reg_val = xb(BeamExtraData(I[0]));
+  }
+  goto increment__execute;
+
+  OpCase(i_increment_yWtd):
+  {
+    increment_reg_val = yb(BeamExtraData(I[0]));
+  }
+  goto increment__execute;
+
+  increment__execute:
+  {
+    // Here follows the code from increment.execute()
+    .
+    .
+    .
+}</pre> <h4 id="Syntax-of-tab-files_Defining-the-implementation_Combined-instructions_Some-notes-about-combined-instructions"> Some notes about combined instructions</h4> <p> The operands that are different must be at the beginning of the instruction. All operands in the last fragment must have the same operands in all variants of the specific instruction. </p> <p> As an example, the following specific instructions cannot be implemented as a combined instruction: </p> <pre data-language="erlang">i_times j? t x x d
+i_times j? t x y d
+i_times j? t s s d</pre> <p> We would have to change the order of the operands so that the two operands that are different are placed first: </p> <pre data-language="erlang">i_times x x j? t d
+i_times x y j? t d
+i_times s s j? t d</pre> <p> We can then define: </p> <pre data-language="erlang">i_times := times.fetch.execute;
+
+times.head {
+    Eterm op1, op2;
+}
+
+times.fetch(Src1, Src2) {
+    op1 = $Src1;
+    op2 = $Src2;
+}
+
+times.execute(Fail, Live, Dst) {
+    // Multiply op1 and op2.
+    .
+    .
+    .
+}</pre> <p> Several instructions can share a group. As an example, the following instructions have different names, but in the end they all create a binary. The last two operands are common for all of them: </p> <pre data-language="erlang">i_bs_init_fail       xy j? t? x
+i_bs_init_fail_heap s I j? t? x
+i_bs_init                W t? x
+i_bs_init_heap         W I t? x</pre> <p> The instructions are defined like this (formatted with extra spaces for clarity): </p> <pre data-language="erlang">i_bs_init_fail_heap := bs_init . fail_heap . verify . execute;
+i_bs_init_fail      := bs_init . fail      . verify . execute;
+i_bs_init           := bs_init .           .  plain . execute;
+i_bs_init_heap      := bs_init .               heap . execute;</pre> <p> Note that the first two instruction have three fragments, while the other two only have two fragments. Here are the fragments: </p> <pre data-language="erlang">bs_init_bits.head() {
+    Eterm num_bits_term;
+    Uint num_bits;
+    Uint alloc;
+}
+
+bs_init_bits.plain(NumBits) {
+    num_bits = $NumBits;
+    alloc = 0;
+}
+
+bs_init_bits.heap(NumBits, Alloc) {
+    num_bits = $NumBits;
+    alloc = $Alloc;
+}
+
+bs_init_bits.fail(NumBitsTerm) {
+    num_bits_term = $NumBitsTerm;
+    alloc = 0;
+}
+
+bs_init_bits.fail_heap(NumBitsTerm, Alloc) {
+    num_bits_term = $NumBitsTerm;
+    alloc = $Alloc;
+}
+
+bs_init_bits.verify(Fail) {
+    // Verify the num_bits_term, fail using $FAIL
+    // if there is a problem.
+.
+.
+.
+}
+
+bs_init_bits.execute(Live, Dst) {
+   // Long complicated code to a create a binary.
+   .
+   .
+   .
+}</pre> <p> The full definitions of those instructions can be found in <code>bs_instrs.tab</code>. The generated code can be found in <code>beam_warm.h</code>. </p> <h3 id="code-generation-for-beamasm" class="title-link"> <div class="title-name">Code generation for BeamAsm</div>  </h3> <p> For the BeamAsm runtime system, the implementation of each instruction is defined by emitter functions written in C++ that emit the assembly code for each instruction. There is one emitter function for each family of specific instructions. </p> <p> Take for example the <code>move</code> instruction. In <code>beam/asm/ops.tab</code> there is a single specific instruction for <code>move</code> defined like this: </p> <pre data-language="erlang">move s d</pre> <p> The implementation is found in <code>beam/asm/instr_common.cpp</code>: </p> <pre data-language="erlang">void BeamModuleAssembler::emit_move(const ArgVal &amp;Src, const ArgVal &amp;Dst) {
+    mov_arg(Dst, Src);
+}</pre> <p> The <code>mov_arg()</code> helper function will handle all combinations of source and destination operands. For example, the instruction <code>{move,{x,1},{y,1}}</code> will be translated like this: </p> <pre data-language="erlang">mov rdi, qword [rbx+8]
+mov qword [rsp+8], rdi</pre> <p> while <code>{move,{integer,42},{x,0}}</code> will be translated like this: </p> <pre data-language="erlang">mov qword [rbx], 687</pre> <p> It is possible to define more than one specific instruction, but there will still be only one emitter function. For example: </p> <pre data-language="erlang">fload S l
+fload q l</pre> <p> By defining <code>fload</code> like this, the source operand must be a X register, Y register, or a literal. If not, the loading will be aborted. If the instruction instead had been defined like this: </p> <pre data-language="erlang">fload s l</pre> <p> attempting to load an invalid instruction such as <code>{fload,{atom,clearly_bad},{fr,0}}</code> would cause a crash (either at load time or when the instruction was executed). </p> <p> Regardless on how many specific instructions there are in the family, only a single <code>emit_fload()</code> function is allowed: </p> <pre data-language="erlang">void BeamModuleAssembler::emit_fload(const ArgVal &amp;Src, const ArgVal &amp;Dst) {
+    .
+    .
+    .
+}</pre> <h4 id="Syntax-of-tab-files_Code-generation-for-BeamAsm_Handling-a-variable-number-of-operands"> Handling a variable number of operands</h4> <p> Here follows an example of how an instruction with a variable number of operands could be handled. One such instructions is <code>select_val/3</code>. Here is an example how it can look like in BEAM code: </p> <pre data-language="erlang">{select_val,{x,0},
+            {f,1},
+            {list,[{atom,b},{f,4},{atom,a},{f,5}]}}.</pre> <p> The loader will convert a <code>{list,[...]}</code> operand to an <code>u</code> operand whose value is the number of elements in the list, followed by each element in the list. The instruction above would be translated to the following instruction: </p> <pre data-language="erlang">{select_val,{x,0},{f,1},{u,4},{atom,b},{f,4},{atom,a},{f,5}}</pre> <p> A definition of a specific instruction for that instruction would look like this: </p> <pre data-language="erlang">select_val s f I *</pre> <p> The <code>*</code> as the last operand will make sure that the variable operands are passed in as a <code>Span</code> of <code>ArgVal</code> (will be <code>std::span</code> in C++20 onwards). Here is the emitter function: </p> <pre data-language="erlang">void BeamModuleAssembler::emit_select_val(const ArgVal &amp;Src,
+                                          const ArgVal &amp;Fail,
+                                          const ArgVal &amp;Size,
+                                          const Span&lt;ArgVal&gt; &amp;args) {
+    ASSERT(Size.getValue() == args.size());
+       .
+       .
+       .
+}</pre> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2023 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

@@ -1,0 +1,240 @@
+<div class="innertube"> <h1 id="Erl_Interface">5 Erl_Interface</h1> <p>This section outlines an example of how to solve the example problem in <code><a href="example.html">Problem Example</a></code> by using a port and Erl_Interface. It is necessary to read the port example in <code><a href="c_port.html">Ports</a></code> before reading this section.</p> <h2 id="erlang-program" class="title-link"> <div class="title-name">5.1 Erlang Program</div>  </h2> <p>The following example shows an Erlang program communicating with a C program over a plain port with home made encoding:</p> <pre data-language="erlang">-module(complex1).
+-export([start/1, stop/0, init/1]).
+-export([foo/1, bar/1]).
+
+start(ExtPrg) -&gt;
+    spawn(?MODULE, init, [ExtPrg]).
+stop() -&gt;
+    complex ! stop.
+
+foo(X) -&gt;
+    call_port({foo, X}).
+bar(Y) -&gt;
+    call_port({bar, Y}).
+
+call_port(Msg) -&gt;
+    complex ! {call, self(), Msg},
+    receive
+	{complex, Result} -&gt;
+	    Result
+    end.
+
+init(ExtPrg) -&gt;
+    register(complex, self()),
+    process_flag(trap_exit, true),
+    Port = open_port({spawn, ExtPrg}, [{packet, 2}]),
+    loop(Port).
+
+loop(Port) -&gt;
+    receive
+	{call, Caller, Msg} -&gt;
+	    Port ! {self(), {command, encode(Msg)}},
+	    receive
+		{Port, {data, Data}} -&gt;
+		    Caller ! {complex, decode(Data)}
+	    end,
+	    loop(Port);
+	stop -&gt;
+	    Port ! {self(), close},
+	    receive
+		{Port, closed} -&gt;
+		    exit(normal)
+	    end;
+	{'EXIT', Port, Reason} -&gt;
+	    exit(port_terminated)
+    end.
+
+encode({foo, X}) -&gt; [1, X];
+encode({bar, Y}) -&gt; [2, Y].
+
+decode([Int]) -&gt; Int.</pre> <p>There are two differences when using Erl_Interface on the C side compared to the example in <code><a href="c_port.html"> Ports</a></code>, using only the plain port:</p> <ul> <li>As Erl_Interface operates on the Erlang external term format, the port must be set to use binaries.</li> <li>Instead of inventing an encoding/decoding scheme, the <code>term_to_binary/1</code> and <code>binary_to_term/1</code> BIFs are to be used.</li> </ul> <p>That is:</p> <pre data-language="erlang">
+open_port({spawn, ExtPrg}, [{packet, 2}])</pre> <p>is replaced with:</p> <pre data-language="erlang">
+open_port({spawn, ExtPrg}, [{packet, 2}, binary])</pre> <p>And:</p> <pre data-language="erlang">
+Port ! {self(), {command, encode(Msg)}},
+receive
+  {Port, {data, Data}} -&gt;
+    Caller ! {complex, decode(Data)}
+end</pre> <p>is replaced with:</p> <pre data-language="erlang">
+Port ! {self(), {command, term_to_binary(Msg)}},
+receive
+  {Port, {data, Data}} -&gt;
+    Caller ! {complex, binary_to_term(Data)}
+end</pre> <p>The resulting Erlang program is as follows:</p> <pre data-language="erlang">-module(complex2).
+-export([start/1, stop/0, init/1]).
+-export([foo/1, bar/1]).
+
+start(ExtPrg) -&gt;
+    spawn(?MODULE, init, [ExtPrg]).
+stop() -&gt;
+    complex ! stop.
+
+foo(X) -&gt;
+    call_port({foo, X}).
+bar(Y) -&gt;
+    call_port({bar, Y}).
+
+call_port(Msg) -&gt;
+    complex ! {call, self(), Msg},
+    receive
+	{complex, Result} -&gt;
+	    Result
+    end.
+
+init(ExtPrg) -&gt;
+    register(complex, self()),
+    process_flag(trap_exit, true),
+    Port = open_port({spawn, ExtPrg}, [{packet, 2}, binary]),
+    loop(Port).
+
+loop(Port) -&gt;
+    receive
+	{call, Caller, Msg} -&gt;
+	    Port ! {self(), {command, term_to_binary(Msg)}},
+	    receive
+		{Port, {data, Data}} -&gt;
+		    Caller ! {complex, binary_to_term(Data)}
+	    end,
+	    loop(Port);
+	stop -&gt;
+	    Port ! {self(), close},
+	    receive
+		{Port, closed} -&gt;
+		    exit(normal)
+	    end;
+	{'EXIT', Port, Reason} -&gt;
+	    exit(port_terminated)
+    end.</pre> <p>Notice that calling <code>complex2:foo/1</code> and <code>complex2:bar/1</code> results in the tuple <code>{foo,X}</code> or <code>{bar,Y}</code> being sent to the <code>complex</code> process, which codes them as binaries and sends them to the port. This means that the C program must be able to handle these two tuples.</p> <h2 id="c-program" class="title-link"> <div class="title-name">5.2 C Program</div>  </h2> <p>The following example shows a C program communicating with an Erlang program over a plain port with the Erlang external term format encoding:</p> <pre data-language="erlang">/* ei.c */
+
+#include "ei.h"
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdlib.h&gt;
+
+typedef unsigned char byte;
+
+int read_cmd(byte *buf);
+int write_cmd(byte *buf, int len);
+int foo(int x);
+int bar(int y);
+
+static void fail(int place) {
+    fprintf(stderr, "Something went wrong %d\n", place);
+    exit(1);
+}
+
+int main() {
+    byte buf[100];
+    int index = 0;
+    int version = 0;
+    int arity = 0;
+    char atom[128];
+    long in = 0;
+    int res = 0;
+    ei_x_buff res_buf;
+    ei_init();
+    while (read_cmd(buf) &gt; 0) {
+        if (ei_decode_version(buf, &amp;index, &amp;version) != 0)
+            fail(1);
+        if (ei_decode_tuple_header(buf, &amp;index, &amp;arity) != 0)
+            fail(2);
+        if (arity != 2)
+            fail(3);
+        if (ei_decode_atom(buf, &amp;index, atom) != 0)
+            fail(4);
+        if (ei_decode_long(buf, &amp;index, &amp;in) != 0)
+            fail(5);
+        if (strncmp(atom, "foo", 3) == 0) {
+            res = foo((int)in);
+        } else if (strncmp(atom, "bar", 3) == 0) {
+            res = bar((int)in);
+        }
+        if (ei_x_new_with_version(&amp;res_buf) != 0)
+            fail(6);
+        if (ei_x_encode_long(&amp;res_buf, res) != 0)
+            fail(7);
+        write_cmd(res_buf.buff, res_buf.index);
+
+        if (ei_x_free(&amp;res_buf) != 0)
+            fail(8);
+        index = 0;
+    }
+}</pre> <p>The following functions, <code>read_cmd()</code> and <code>write_cmd()</code>, from the <code>erl_comm.c</code> example in <code><a href="c_port.html">Ports</a></code> can still be used for reading from and writing to the port: </p> <pre data-language="erlang">/* erl_comm.c */
+
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+
+typedef unsigned char byte;
+
+int read_exact(byte *buf, int len)
+{
+  int i, got=0;
+
+  do {
+      if ((i = read(0, buf+got, len-got)) &lt;= 0){
+          return(i);
+      }
+    got += i;
+  } while (got&lt;len);
+
+  return(len);
+}
+
+int write_exact(byte *buf, int len)
+{
+  int i, wrote = 0;
+
+  do {
+    if ((i = write(1, buf+wrote, len-wrote)) &lt;= 0)
+      return (i);
+    wrote += i;
+  } while (wrote&lt;len);
+
+  return (len);
+}
+
+int read_cmd(byte *buf)
+{
+  int len;
+
+  if (read_exact(buf, 2) != 2)
+    return(-1);
+  len = (buf[0] &lt;&lt; 8) | buf[1];
+  return read_exact(buf, len);
+}
+
+int write_cmd(byte *buf, int len)
+{
+  byte li;
+
+  li = (len &gt;&gt; 8) &amp; 0xff;
+  write_exact(&amp;li, 1);
+  
+  li = len &amp; 0xff;
+  write_exact(&amp;li, 1);
+
+  return write_exact(buf, len);
+}</pre> <h2 id="running-the-example" class="title-link"> <div class="title-name">5.3 Running the Example</div>  </h2> <p><strong>Step 1.</strong> Compile the C code. This provides the paths to the include file <code>ei.h</code>, and also to the library <code>ei</code>:</p> <pre data-language="erlang">
+unix&gt; <code>gcc -o extprg -I/usr/local/otp/lib/erl_interface-3.9.2/include \</code>
+<code>-L/usr/local/otp/lib/erl_interface-3.9.2/lib \</code>
+<code>complex.c erl_comm.c ei.c -lei -lpthread</code></pre> <p>In Erlang/OTP R5B and later versions of OTP, the <code>include</code> and <code>lib</code> directories are situated under <code>OTPROOT/lib/erl_interface-VSN</code>, where <code>OTPROOT</code> is the root directory of the OTP installation (<code>/usr/local/otp</code> in the recent example) and <code>VSN</code> is the version of the Erl_interface application (3.2.1 in the recent example).</p> <p>In R4B and earlier versions of OTP, <code>include</code> and <code>lib</code> are situated under <code>OTPROOT/usr</code>.</p> <p><strong>Step 2.</strong> Start Erlang and compile the Erlang code:</p> <pre data-language="erlang">
+unix&gt; <code>erl</code>
+Erlang (BEAM) emulator version 4.9.1.2
+
+Eshell V4.9.1.2 (abort with ^G)
+1&gt; <code>c(complex2).</code>
+{ok,complex2}</pre> <p><strong>Step 3.</strong> Run the example:</p> <pre data-language="erlang">
+2&gt; <code>complex2:start("./extprg").</code>
+&lt;0.34.0&gt;
+3&gt; <code>complex2:foo(3).</code>
+4
+4&gt; <code>complex2:bar(5).</code>
+10
+5&gt; <code>complex2:bar(352).</code>
+704
+6&gt; <code>complex2:stop().</code>
+stop</pre> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2023 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>
