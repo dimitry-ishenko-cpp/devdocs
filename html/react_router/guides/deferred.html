@@ -1,0 +1,163 @@
+<h1 id="deferred-data-guide">
+Deferred Data Guide</h1>
+<h2 id="the-problem">
+The problem</h2>
+<p>Imagine a scenario where one of your routes' loaders needs to retrieve some data that for one reason or another is quite slow. For example, let's say you're showing the user the location of a package that's being delivered to their home:</p>
+<div><pre data-line-numbers="true" data-lang="jsx" style="color: var(--base05);background-color: var(--base00)" data-language="javascript">import { json, useLoaderData } from "react-router-dom";
+import { getPackageLocation } from "./api/packages";
+
+async function loader({ params }) {
+  const packageLocation = await getPackageLocation(
+    params.packageId
+  );
+
+  return json({ packageLocation });
+}
+
+function PackageRoute() {
+  const data = useLoaderData();
+  const { packageLocation } = data;
+
+  return (
+    &lt;main&gt;
+      &lt;h1&gt;Let's locate your package&lt;/h1&gt;
+      &lt;p&gt;
+        Your package is at {packageLocation.latitude} lat
+        and {packageLocation.longitude} long.
+      &lt;/p&gt;
+    &lt;/main&gt;
+  );
+}
+</pre></div>
+<p>We'll assume that <code>getPackageLocation</code> is slow. This will lead to initial page load times and transitions to that route to take as long as the slowest bit of data. There are a few things you can do to optimize this and improve the user experience:</p>
+<ul> <li>Speed up the slow thing (😅).</li> <li>Parallelize data loading with <code>Promise.all</code> (we have nothing to parallelize in our example, but it might help a bit in other situations).</li> <li>Add a global transition spinner (helps a bit with UX).</li> <li>Add a localized skeleton UI (helps a bit with UX).</li> </ul>
+<p>If these approaches don't work well, then you may feel forced to move the slow data out of the <code>loader</code> into a component fetch (and show a skeleton fallback UI while loading). In this case you'd render the fallback UI on mount and fire off the fetch for the data. This is actually not so terrible from a DX standpoint thanks to <a href="../hooks/use-fetcher.html"><code>useFetcher</code></a>. And from a UX standpoint this improves the loading experience for both client-side transitions as well as initial page load. So it does seem to solve the problem.</p>
+<p>But it's still sub optimal in most cases (especially if you're code-splitting route components) for two reasons:</p>
+<ol> <li>Client-side fetching puts your data request on a waterfall: document -&gt; JavaScript -&gt; Lazy Loaded Route -&gt; data fetch</li> <li>Your code can't easily switch between component fetching and route fetching (more on this later).</li> </ol>
+<h2 id="the-solution">
+The solution</h2>
+<p>React Router takes advantage of React 18's Suspense for data fetching using the <a href="../fetch/defer.html"><code>defer</code> Response</a> utility and <a href="../components/await.html"><code>&lt;Await /&gt;</code></a> component / <a href="../hooks/use-async-data.html"><code>useAsyncValue</code></a> hook. By using these APIs, you can solve both of these problems:</p>
+<ol> <li>Your data is no longer on a waterfall: document -&gt; JavaScript -&gt; Lazy Loaded Route &amp; data (in parallel)</li> <li>Your can easily switch between rendering the fallback and waiting for the data</li> </ol>
+<p>Let's take a dive into how to accomplish this.</p>
+<h3 id="using-defer">
+Using <code>defer</code>
+</h3>
+<p>Start by adding <code>&lt;Await /&gt;</code> for your slow data requests where you'd rather render a fallback UI. Let's do that for our example above:</p>
+<div><pre data-line-numbers="true" data-lang="jsx" style="color: var(--base05);background-color: var(--base00)" data-language="javascript">import { defer, useLoaderData } from "react-router-dom";
+import { getPackageLocation } from "./api/packages";
+
+async function loader({ params }) {
+  const packageLocationPromise = getPackageLocation(
+    params.packageId
+  );
+
+  return defer({
+    packageLocation: packageLocationPromise,
+  });
+}
+
+export default function PackageRoute() {
+  const data = useLoaderData();
+
+  return (
+    &lt;main&gt;
+      &lt;h1&gt;Let's locate your package&lt;/h1&gt;
+      &lt;React.Suspense
+        fallback={&lt;p&gt;Loading package location...&lt;/p&gt;}
+      &gt;
+        &lt;Await
+          resolve={data.packageLocation}
+          errorElement={
+            &lt;p&gt;Error loading package location!&lt;/p&gt;
+          }
+        &gt;
+          {(packageLocation) =&gt; (
+            &lt;p&gt;
+              Your package is at {packageLocation.latitude}{" "}
+              lat and {packageLocation.longitude} long.
+            &lt;/p&gt;
+          )}
+        &lt;/Await&gt;
+      &lt;/React.Suspense&gt;
+    &lt;/main&gt;
+  );
+}
+</pre></div>
+<details> <summary>Alternatively, you can use the `useAsyncValue` hook:</summary><p>If you're not jazzed about bringing back render props, you can use a hook, but you'll have to break things out into another component:</p>
+<div><pre data-line-numbers="true" data-lang="jsx" style="color: var(--base05);background-color: var(--base00)" data-language="javascript">export default function PackageRoute() {
+  const data = useLoaderData();
+
+  return (
+    &lt;main&gt;
+      &lt;h1&gt;Let's locate your package&lt;/h1&gt;
+      &lt;React.Suspense
+        fallback={&lt;p&gt;Loading package location...&lt;/p&gt;}
+      &gt;
+        &lt;Await
+          resolve={data.packageLocation}
+          errorElement={
+            &lt;p&gt;Error loading package location!&lt;/p&gt;
+          }
+        &gt;
+          &lt;PackageLocation /&gt;
+        &lt;/Await&gt;
+      &lt;/React.Suspense&gt;
+    &lt;/main&gt;
+  );
+}
+
+function PackageLocation() {
+  const packageLocation = useAsyncValue();
+  return (
+    &lt;p&gt;
+      Your package is at {packageLocation.latitude} lat and{" "}
+      {packageLocation.longitude} long.
+    &lt;/p&gt;
+  );
+}
+</pre></div></details><h2 id="evaluating-the-solution">
+Evaluating the solution</h2>
+<p>So rather than waiting for the component before we can trigger the fetch request, we start the request for the slow data as soon as the user starts the transition to the new route. This can significantly speed up the user experience for slower networks.</p>
+<p>Additionally, the API that React Router exposes for this is extremely ergonomic. You can literally switch between whether something is going to be deferred or not based on whether you include the <code>await</code> keyword:</p>
+<div><pre data-line-numbers="true" data-lang="tsx" style="color: var(--base05);background-color: var(--base00)" data-language="javascript">return defer({
+  // not deferred:
+  packageLocation: await packageLocationPromise,
+  // deferred:
+  packageLocation: packageLocationPromise,
+});
+</pre></div>
+<p>Because of this, you can A/B test deferring, or even determine whether to defer based on the user or data being requested:</p>
+<div><pre data-line-numbers="true" data-lang="tsx" style="color: var(--base05);background-color: var(--base00)" data-language="javascript">async function loader({ request, params }) {
+  const packageLocationPromise = getPackageLocation(
+    params.packageId
+  );
+  const shouldDefer = shouldDeferPackageLocation(
+    request,
+    params.packageId
+  );
+
+  return defer({
+    packageLocation: shouldDefer
+      ? packageLocationPromise
+      : await packageLocationPromise,
+  });
+}
+</pre></div>
+<p>That <code>shouldDeferPackageLocation</code> could be implemented to check the user making the request, whether the package location data is in a cache, the status of an A/B test, or whatever else you want. This is pretty sweet 🍭</p>
+<h2 id="faq">
+FAQ</h2>
+<h3 id="why-not-defer-everything-by-default">
+Why not defer everything by default?</h3>
+<p>The React Router defer API is another lever React Router offers to give you a nice way to choose between trade-offs. Do you want the page to render more quickly? Defer stuff. Do you want a lower CLS (Content Layout Shift)? Don't defer stuff. You want a faster render, but also want a lower CLS? Defer just the slow and unimportant stuff.</p>
+<p>It's all trade-offs, and what's neat about the API design is that it's well suited for you to do easy experimentation to see which trade-offs lead to better results for your real-world key indicators.</p>
+<h3 id="when-does-the-suspense-fallback-render">
+When does the <code>&lt;Suspense/&gt;</code> fallback render?</h3>
+<p>The <code>&lt;Await /&gt;</code> component will only throw the promise up the <code>&lt;Suspense&gt;</code> boundary on the initial render of the <code>&lt;Await /&gt;</code> component with an unsettled promise. It will not re-render the fallback if props change. Effectively, this means that you <em>will not</em> get a fallback rendered when a user submits a form and loader data is revalidated. You <em>will</em> get a fallback rendered when the user navigates to the same route with different params (in the context of our above example, if the user selects from a list of packages on the left to find their location on the right).</p>
+<p>This may feel counter-intuitive at first, but stay with us, we really thought this through and it's important that it works this way. Let's imagine a world without the deferred API. For those scenarios you're probably going to want to implement Optimistic UI for form submissions/revalidation.</p>
+<p>When you decide you'd like to try the trade-offs of <code>defer</code>, we don't want you to have to change or remove those optimizations because we want you to be able to easily switch between deferring some data and not deferring it. So, we ensure that your existing optimistic states work the same way. If we didn't do this, then you could experience what we call "Popcorn UI" where submissions of data trigger the fallback loading state instead of the optimistic UI you'd worked hard on.</p>
+<p>So just keep this in mind: <strong>Deferred is 100% only about the initial load of a route and it's params.</strong></p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; React Training 2015-2019<br>&copy; Remix Software 2020-2022<br>Licensed under the MIT License (MIT).<br>
+    <a href="https://reactrouterdotcom.fly.dev/docs/en/v6/guides/deferred" class="_attribution-link">https://reactrouterdotcom.fly.dev/docs/en/v6/guides/deferred</a>
+  </p>
+</div>
