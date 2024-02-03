@@ -1,0 +1,48 @@
+<h1 id="users-guide-esi">Content composition with Edge Side Includes</h1> <p>Varnish can create web pages by assembling different pages, called <code>fragments</code>, together into one page. These <code>fragments</code> can have individual cache policies. If you have a web site with a list showing the five most popular articles on your site, this list can probably be cached as a <code>fragment</code> and included in all the other pages.</p> <p>Used properly this strategy can dramatically increase your hit rate and reduce the load on your servers.</p> <p>In Varnish we’ve only implemented a small subset of ESI, because most of the rest of the ESI specifications facilities are easier and better done with VCL:</p> <pre data-language="python">esi:include
+esi:remove
+&lt;!--esi ...--&gt;
+</pre> <p>Content substitution based on variables and cookies is not implemented.</p> <p>Varnish will not process ESI instructions in HTML comments.</p> <section id="example-esi-include"> <h2>Example: esi:include</h2> <p>Lets see an example how this could be used. This simple cgi script outputs the date:</p> <pre data-language="python">#!/bin/sh
+
+echo 'Content-type: text/html'
+echo ''
+date "+%Y-%m-%d %H:%M"
+</pre> <p>Now, lets have an HTML file that has an ESI include statement:</p> <pre data-language="python">&lt;HTML&gt;
+&lt;BODY&gt;
+The time is: &lt;esi:include src="/cgi-bin/date.cgi"/&gt;
+at this very moment.
+&lt;/BODY&gt;
+&lt;/HTML&gt;
+</pre> <p>For ESI to work you need to activate ESI processing in VCL, like this:</p> <pre data-language="python">sub vcl_backend_response {
+    if (bereq.url == "/test.html") {
+       set beresp.do_esi = true; // Do ESI processing
+       set beresp.ttl = 24 h;    // Sets the TTL on the HTML above
+    } elseif (bereq.url == "/cgi-bin/date.cgi") {
+       set beresp.ttl = 1m;      // Sets a one minute TTL on
+                                 // the included object
+    }
+}
+</pre> <p>Note that <code>set beresp.do_esi = true;</code> is not required, and should be avoided, for the included fragments, unless they also contains <code>&lt;ESI::include …/&gt;</code> instructions.</p> </section> <section id="example-esi-remove-and-esi"> <h2>Example: esi:remove and &lt;!–esi … –&gt;</h2> <p>The <code>&lt;esi:remove&gt;</code> and <code>&lt;!–esi … –&gt;</code> constructs can be used to present appropriate content whether or not ESI is available, for example you can include content when ESI is available or link to it when it is not. ESI processors will remove the start (“&lt;!–esi”) and the end (”–&gt;”) when the page is processed, while still processing the contents. If the page is not processed, it will remain intact, becoming a HTML/XML comment tag. ESI processors will remove <code>&lt;esi:remove&gt;</code> tags and all content contained in them, allowing you to only render the content when the page is not being ESI-processed. For example:</p> <pre data-language="python">&lt;esi:remove&gt;
+  &lt;a href="http://www.example.com/LICENSE"&gt;The license&lt;/a&gt;
+&lt;/esi:remove&gt;
+&lt;!--esi
+&lt;p&gt;The full text of the license:&lt;/p&gt;
+&lt;esi:include src="http://example.com/LICENSE" /&gt;
+--&gt;
+</pre> </section> <section id="what-happens-when-it-fails"> <h2>What happens when it fails ?</h2> <p>By default, the fragments must have <code>resp.status</code> 200 or 206 or their inclusion will cause the parent request to abort.</p> <p>Likewise, if the fragment is a streaming fetch, and that fetch fails, the parent request aborts.</p> <p>If you include synthetic fragments, that is fragments created in <code>vcl_backend_error{}</code> or <code>vcl_synth{}</code>, you must set <code>(be)resp.status</code> to 200 before <code>return(deliver);</code></p> <p>We say “abort” rather than “fail”, because by the time Varnish starts inserting the fragments, the HTTP response header has long since been sent, and it is no longer possible to change the parent requests’s <code>resp.status</code> to a 5xx, so the only way to signal that something is amiss, is to close the connection.</p> <p>However, it is possible to allow individual <code>&lt;ESI:include…</code> to continue in case of failures, by setting:</p> <pre data-language="python">param.set feature +esi_include_onerror
+</pre> <p>and tagging those specific includes:</p> <pre data-language="python">&lt;ESI:include src="…" onerror="continue"/&gt;
+</pre> </section> <section id="can-an-esi-fragment-also-use-esi-includes"> <h2>Can an ESI fragment also use ESI-includes ?</h2> <p>Yes, but the depth is limited by the <code>max_esi_depth</code> parameter in order to prevent infinite recursion.</p> </section> <section id="doing-esi-on-json-and-other-non-xml-ish-content"> <h2>Doing ESI on JSON and other non-XML’ish content</h2> <p>Varnish will peek at the first byte of an object and if it is not a “&lt;” Varnish assumes you didn’t really mean to ESI process it. You can disable this check by:</p> <pre data-language="python">param.set feature +esi_disable_xml_check
+</pre> </section> <section id="ignoring-bom-in-esi-objects"> <h2>Ignoring BOM in ESI objects</h2> <p>If you backend spits out a Unicode Byte-Order-Mark as the first bytes of the response, the “&lt;” check will fail unless you set:</p> <pre data-language="python">param.set feature +esi_remove_bom
+</pre> </section> <section id="esi-on-invalid-xml"> <h2>ESI on invalid XML</h2> <p>The ESI parser expects the XML to be reasonably well formed, but this may fail if you are ESI including non-XML files. You can make the ESI parser disregard anything but ESI tags by setting:</p> <pre data-language="python">param.set feature +esi_ignore_other_elements
+</pre> </section> <section id="esi-includes-with-https-protocol"> <h2>ESI includes with HTTPS protocol</h2> <p>If ESI:include tags specify HTTPS protocol, it will be ignored by default, because Varnish has no way to fetch it with encryption. If you want Varnish to fetch them like it does anything else, set:</p> <pre data-language="python">param.set feature +esi_ignore_https
+</pre> </section> <section id="esi-on-partial-responses-206"> <h2>ESI on partial responses (206)</h2> <p>Varnish supports range requests, but in general partial responses make no sense in an ESI context.</p> <p>If you really know what you are doing, change the 206 to a 200:</p> <pre data-language="python">sub vcl_backend_response {
+    if (beresp.status == 206 &amp;&amp; beresp.http.secret == "swordfish") {
+        set beresp.do_esi = True;
+        set beresp.status = 200;
+    }
+}
+</pre> </section> <section id="esi-and-return-vcl"> <h2>ESI and return(vcl(…))</h2> <p>If the original client request switched to a different VCL using <code>return(vcl(...))</code> in <code>vcl_recv</code>, any esi:include-requests will still start out in the same VCL as the original did, <em>not</em> in the one it switched to.</p> </section> <section id="esi-and-gzip-compression"> <h2>ESI and gzip compression</h2> <p>Varnish’s ESI implementation handles gzip compression automatically, no matter how it is mixed: The parent request can be compressed or uncompressed and the fragments can be compressed or uncompressed, it all works out.</p> <p>Varnish does this compressing all parts of ESI responses separately, and stitching them together on the fly during delivery, which has a negative impact on compression ratio.</p> <p>When you <code>set beresp.do_esi = True;</code> on a gzip’ed response, it will be uncompressed and recompressed part-wise during the fetch.</p> <p>The part-wise compression reduces the opportunities for removing redundancy, because back-references in the gzip data stream cannot point outside it’s own part.</p> <p>The other case where compression ratio is impacted, is if an uncompressed fragment is inserted into a compressed response.</p> </section><div class="_attribution">
+  <p class="_attribution-p">
+    Copyright &copy; 2006 Verdens Gang AS<br>Copyright &copy; 2006&ndash;2020 Varnish Software AS<br>Licensed under the BSD-2-Clause License.<br>
+    <a href="https://varnish-cache.org/docs/7.4/users-guide/esi.html" class="_attribution-link">https://varnish-cache.org/docs/7.4/users-guide/esi.html</a>
+  </p>
+</div>

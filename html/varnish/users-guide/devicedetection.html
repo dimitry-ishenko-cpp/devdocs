@@ -1,0 +1,148 @@
+<h1 id="users-guide-devicedetect">Device detection</h1> <p>Device detection is figuring out what kind of content to serve to a client based on the User-Agent string supplied in a request.</p> <p>Use cases for this are for example to send size reduced files to mobile clients with small screens and on high latency networks, or to provide a streaming video codec that the client understands.</p> <p>There are a couple of typical strategies to use for this type of scenario: 1) Redirect to another URL. 2) Use a different backend for the special client. 3) Change the backend request so that the backend sends tailored content.</p> <p>To perhaps make the strategies easier to understand, we, in this context, assume that the <code>req.http.X-UA-Device</code> header is present and unique per client class.</p> <p>Setting this header can be as simple as:</p> <pre data-language="python">sub vcl_recv {
+    if (req.http.User-Agent ~ "(?i)iphone" {
+        set req.http.X-UA-Device = "mobile-iphone";
+    }
+}
+</pre> <p>There are different commercial and free offerings in doing grouping and identifying clients in further detail. For a basic and community based regular expression set, see <a class="reference external" href="https://github.com/varnishcache/varnish-devicedetect/">https://github.com/varnishcache/varnish-devicedetect/</a>.</p> <section id="serve-the-different-content-on-the-same-url"> <h2>Serve the different content on the same URL</h2> <p>The tricks involved are: 1. Detect the client (pretty simple, just include <code>devicedetect.vcl</code> and call it). 2. Figure out how to signal the backend the client class. This includes for example setting a header, changing a header or even changing the backend request URL. 3. Modify any response from the backend to add missing ‘Vary’ headers, so Varnish’ internal handling of this kicks in. 4. Modify output sent to the client so any caches outside our control don’t serve the wrong content.</p> <p>All this needs to be done while still making sure that we only get one cached object per URL per device class.</p> <section id="example-1-send-http-header-to-backend"> <h3>Example 1: Send HTTP header to backend</h3> <p>The basic case is that Varnish adds the ‘X-UA-Device’ HTTP header on the backend requests, and the backend mentions in the response ‘Vary’ header that the content is dependent on this header.</p> <p>Everything works out of the box from Varnish’ perspective.</p> <p>VCL:</p> <pre data-language="python">sub vcl_recv {
+    # call some detection engine that set req.http.X-UA-Device
+}
+# req.http.X-UA-Device is copied by Varnish into bereq.http.X-UA-Device
+
+# so, this is a bit counterintuitive. The backend creates content based on
+# the normalized User-Agent, but we use Vary on X-UA-Device so Varnish will
+# use the same cached object for all U-As that map to the same X-UA-Device.
+#
+# If the backend does not mention in Vary that it has crafted special
+# content based on the User-Agent (==X-UA-Device), add it.
+# If your backend does set Vary: User-Agent, you may have to remove that here.
+sub vcl_backend_response {
+    if (bereq.http.X-UA-Device) {
+        if (!beresp.http.Vary) { # no Vary at all
+            set beresp.http.Vary = "X-UA-Device";
+        } elseif (beresp.http.Vary !~ "X-UA-Device") { # add to existing Vary
+            set beresp.http.Vary = beresp.http.Vary + ", X-UA-Device";
+        }
+    }
+    # comment this out if you don't want the client to know your
+    # classification
+    set beresp.http.X-UA-Device = bereq.http.X-UA-Device;
+}
+
+# to keep any caches in the wild from serving wrong content to client #2
+# behind them, we need to transform the Vary on the way out.
+sub vcl_deliver {
+    if ((req.http.X-UA-Device) &amp;&amp; (resp.http.Vary)) {
+        set resp.http.Vary = regsub(resp.http.Vary, "X-UA-Device", "User-Agent");
+    }
+}
+</pre> </section> <section id="example-2-normalize-the-user-agent-string"> <h3>Example 2: Normalize the User-Agent string</h3> <p>Another way of signalling the device type is to override or normalize the ‘User-Agent’ header sent to the backend.</p> <p>For example:</p> <pre data-language="python">User-Agent: Mozilla/5.0 (Linux; U; Android 2.2; nb-no; HTC Desire Build/FRF91) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1
+</pre> <p>becomes:</p> <pre data-language="python">User-Agent: mobile-android
+</pre> <p>when seen by the backend.</p> <p>This works if you don’t need the original header for anything on the backend. A possible use for this is for CGI scripts where only a small set of predefined headers are (by default) available for the script.</p> <p>VCL:</p> <pre data-language="python">sub vcl_recv {
+    # call some detection engine that set req.http.X-UA-Device
+}
+
+# override the header before it is sent to the backend
+sub vcl_miss { if (req.http.X-UA-Device) { set req.http.User-Agent = req.http.X-UA-Device; } }
+sub vcl_pass { if (req.http.X-UA-Device) { set req.http.User-Agent = req.http.X-UA-Device; } }
+
+# standard Vary handling code from previous examples.
+sub vcl_backend_response {
+    if (bereq.http.X-UA-Device) {
+        if (!beresp.http.Vary) { # no Vary at all
+            set beresp.http.Vary = "X-UA-Device";
+        } elseif (beresp.http.Vary !~ "X-UA-Device") { # add to existing Vary
+            set beresp.http.Vary = beresp.http.Vary + ", X-UA-Device";
+        }
+    }
+    set beresp.http.X-UA-Device = bereq.http.X-UA-Device;
+}
+sub vcl_deliver {
+    if ((req.http.X-UA-Device) &amp;&amp; (resp.http.Vary)) {
+        set resp.http.Vary = regsub(resp.http.Vary, "X-UA-Device", "User-Agent");
+    }
+}
+</pre> </section> <section id="example-3-add-the-device-class-as-a-get-query-parameter"> <h3>Example 3: Add the device class as a GET query parameter</h3> <p>If everything else fails, you can add the device type as a GET argument.</p>  <p><a class="reference external" href="http://example.com/article/1234.html">http://example.com/article/1234.html</a> –&gt; <a class="reference external" href="http://example.com/article/1234.html?devicetype=mobile-iphone">http://example.com/article/1234.html?devicetype=mobile-iphone</a></p>  <p>The client itself does not see this classification, only the backend request is changed.</p> <p>VCL:</p> <pre data-language="python">sub vcl_recv {
+    # call some detection engine that set req.http.X-UA-Device
+}
+
+sub append_ua {
+    if ((req.http.X-UA-Device) &amp;&amp; (req.method == "GET")) {
+        # if there are existing GET arguments;
+        if (req.url ~ "\?") {
+            set req.http.X-get-devicetype = "&amp;devicetype=" + req.http.X-UA-Device;
+        } else {
+            set req.http.X-get-devicetype = "?devicetype=" + req.http.X-UA-Device;
+        }
+        set req.url = req.url + req.http.X-get-devicetype;
+        unset req.http.X-get-devicetype;
+    }
+}
+
+# do this after vcl_hash, so all Vary-ants can be purged in one go. (avoid ban()ing)
+sub vcl_miss { call append_ua; }
+sub vcl_pass { call append_ua; }
+
+# Handle redirects, otherwise standard Vary handling code from previous
+# examples.
+sub vcl_backend_response {
+    if (bereq.http.X-UA-Device) {
+        if (!beresp.http.Vary) { # no Vary at all
+            set beresp.http.Vary = "X-UA-Device";
+        } elseif (beresp.http.Vary !~ "X-UA-Device") { # add to existing Vary
+            set beresp.http.Vary = beresp.http.Vary + ", X-UA-Device";
+        }
+
+        # if the backend returns a redirect (think missing trailing slash),
+        # we will potentially show the extra address to the client. we
+        # don't want that.  if the backend reorders the get parameters, you
+        # may need to be smarter here. (? and &amp; ordering)
+
+        if (beresp.status == 301 || beresp.status == 302 || beresp.status == 303) {
+            set beresp.http.location = regsub(beresp.http.location, "[?&amp;]devicetype=.*$", "");
+        }
+    }
+    set beresp.http.X-UA-Device = bereq.http.X-UA-Device;
+}
+sub vcl_deliver {
+    if ((req.http.X-UA-Device) &amp;&amp; (resp.http.Vary)) {
+        set resp.http.Vary = regsub(resp.http.Vary, "X-UA-Device", "User-Agent");
+    }
+}
+</pre> </section> </section> <section id="different-backend-for-mobile-clients"> <h2>Different backend for mobile clients</h2> <p>If you have a different backend that serves pages for mobile clients, or any special needs in VCL, you can use the ‘X-UA-Device’ header like this:</p> <pre data-language="python">backend mobile {
+    .host = "10.0.0.1";
+    .port = "80";
+}
+
+sub vcl_recv {
+    # call some detection engine
+
+    if (req.http.X-UA-Device ~ "^mobile" || req.http.X-UA-device ~ "^tablet") {
+        set req.backend_hint = mobile;
+    }
+}
+sub vcl_hash {
+    if (req.http.X-UA-Device) {
+        hash_data(req.http.X-UA-Device);
+    }
+}
+</pre> </section> <section id="redirecting-mobile-clients"> <h2>Redirecting mobile clients</h2> <p>If you want to redirect mobile clients you can use the following snippet.</p> <p>VCL:</p> <pre data-language="python">sub vcl_recv {
+    # call some detection engine
+
+    if (req.http.X-UA-Device ~ "^mobile" || req.http.X-UA-device ~ "^tablet") {
+        return(synth(750, "Moved Temporarily"));
+    }
+}
+
+sub vcl_synth {
+    if (obj.status == 750) {
+        set obj.http.Location = "http://m.example.com" + req.url;
+        set obj.status = 302;
+        return(deliver);
+    }
+}
+</pre> </section><div class="_attribution">
+  <p class="_attribution-p">
+    Copyright &copy; 2006 Verdens Gang AS<br>Copyright &copy; 2006&ndash;2020 Varnish Software AS<br>Licensed under the BSD-2-Clause License.<br>
+    <a href="https://varnish-cache.org/docs/7.4/users-guide/devicedetection.html" class="_attribution-link">https://varnish-cache.org/docs/7.4/users-guide/devicedetection.html</a>
+  </p>
+</div>

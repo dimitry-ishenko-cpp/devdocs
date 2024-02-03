@@ -1,0 +1,227 @@
+<h1 id="ref-vmod">VMOD - Varnish Modules</h1> <p>For all you can do in VCL, there are things you can not do. Look an IP number up in a database file for instance. VCL provides for inline C code, and there you can do everything, but it is not a convenient or even readable way to solve such problems.</p> <p>This is where VMODs come into the picture: A VMOD is a shared library with some C functions which can be called from VCL code.</p> <p>For instance:</p> <pre data-language="python">import std;
+
+sub vcl_deliver {
+        set resp.http.foo = std.toupper(req.url);
+}
+</pre> <p>The “std” vmod is one you get with Varnish, it will always be there and we will put “boutique” functions in it, such as the “toupper” function shown above. The full contents of the “std” module is documented in vmod_std(3).</p> <p>This part of the manual is about how you go about writing your own VMOD, how the language interface between C and VCC works, where you can find contributed VMODs etc. This explanation will use the “std” VMOD as example, having a Varnish source tree handy may be a good idea.</p> <section id="vmod-directory"> <h2>VMOD Directory</h2> <p>The VMOD directory is an up-to-date compilation of maintained extensions written for Varnish Cache:</p>  <p><a class="reference external" href="https://www.varnish-cache.org/vmods">https://www.varnish-cache.org/vmods</a></p>  </section> <section id="the-vmod-vcc-file"> <h2>The vmod.vcc file</h2> <p>The interface between your VMOD and the VCL compiler (“VCC”) and the VCL runtime (“VRT”) is defined in the vmod.vcc file which a python script called “vmodtool.py” turns into thaumaturgically challenged C data structures that do all the hard work.</p> <p>The std VMODs vmod.vcc file looks somewhat like this:</p> <pre data-language="python">$ABI strict
+$Module std 3 "Varnish Standard Module"
+$Event event_function
+$Function STRING toupper(STRANDS s)
+$Function STRING tolower(STRANDS s)
+$Function VOID set_ip_tos(INT)
+</pre> <p>The <code>$ABI</code> line is optional. Possible values are <code>strict</code> (default) and <code>vrt</code>. It allows to specify that a vmod is integrating with the blessed <code>vrt</code> interface provided by <code>varnishd</code> or go deeper in the stack.</p> <p>As a rule of thumb you, if the VMOD uses more than the VRT (Varnish RunTime), in which case it needs to be built for the exact Varnish version, use <code>strict</code>. If it complies to the VRT and only needs to be rebuilt when breaking changes are introduced to the VRT API, use <code>vrt</code>.</p> <p>The <code>$Module</code> line gives the name of the module, the manual section where the documentation will reside, and the description.</p> <p>The <code>$Event</code> line specifies an optional “Event” function, which will be called whenever a VCL program which imports this VMOD is loaded or transitions to any of the warm, active, cold or discarded states. More on this below.</p> <p>The <code>$Function</code> lines define three functions in the VMOD, along with the types of the arguments, and that is probably where the hardest bit of writing a VMOD is to be found, so we will talk about that at length in a moment.</p> <p>Notice that the third function returns VOID, that makes it a “procedure” in VCL lingo, meaning that it cannot be used in expressions, right side of assignments and such. Instead it can be used as a primary action, something functions which return a value can not:</p> <pre data-language="python">sub vcl_recv {
+        std.set_ip_tos(32);
+}
+</pre> <p>Running vmodtool.py on the vmod.vcc file, produces a “vcc_if.c” and “vcc_if.h” files, which you must use to build your shared library file.</p> <p>Forget about vcc_if.c everywhere but your Makefile, you will never need to care about its contents, and you should certainly never modify it, that voids your warranty instantly.</p> <p>But vcc_if.h is important for you, it contains the prototypes for the functions you want to export to VCL.</p> <p>For the std VMOD, the compiled vcc_if.h file looks like this:</p> <pre data-language="python">VCL_STRING vmod_toupper(VRT_CTX, VCL_STRANDS);
+VCL_STRING vmod_tolower(VRT_CTX, VCL_STRANDS);
+VCL_VOID vmod_set_ip_tos(VRT_CTX, VCL_INT);
+
+vmod_event_f event_function;
+</pre> <p>Those are your C prototypes. Notice the <code>vmod_</code> prefix on the function names.</p> <section id="named-arguments-and-default-values"> <h3>Named arguments and default values</h3> <p>The basic vmod.vcc function declaration syntax introduced above makes all arguments mandatory for calls from vcl - which implies that they need to be given in order.</p> <p>Naming the arguments as in:</p> <pre data-language="python">$Function BOOL match_acl(ACL acl, IP ip)
+</pre> <p>allows calls from VCL with named arguments in any order, for example:</p> <pre data-language="python">if (debug.match_acl(ip=client.ip, acl=local)) { # ...
+</pre> <p>Named arguments also take default values, so for this example from the debug vmod:</p> <pre data-language="python">$Function STRING argtest(STRING one, REAL two=2, STRING three="3",
+                         STRING comma=",", INT four=4)
+</pre> <p>only argument <code>one</code> is required, so that all of the following are valid invocations from vcl:</p> <pre data-language="python">debug.argtest("1", 2.1, "3a")
+debug.argtest("1", two=2.2, three="3b")
+debug.argtest("1", three="3c", two=2.3)
+debug.argtest("1", 2.4, three="3d")
+debug.argtest("1", 2.5)
+debug.argtest("1", four=6);
+</pre> <p>The C interface does not change with named arguments and default values, arguments remain positional and default values appear no different to user specified values.</p> <p><code>Note</code> that default values have to be given in the native C-type syntax, see below. As a special case, <code>NULL</code> has to be given as <code>0</code>.</p> </section> <section id="optional-arguments"> <h3>Optional arguments</h3> <p>The vmod.vcc declaration also allows for optional arguments in square brackets like so:</p> <pre data-language="python">$Function VOID opt(PRIV_TASK priv, INT four = 4, [STRING opt])
+</pre> <p>With any optional argument present, the C function prototype looks completely different:</p>  <ul class="simple"> <li>Only the <code>VRT_CTX</code> and object pointer arguments (only for methods) remain positional</li> <li>All other arguments get passed in a struct as the last argument of the C function.</li> </ul>  <p>The argument struct is simple, vmod authors should check the <code>vmodtool</code>-generated <code>vcc_if.c</code> file for the function and struct declarations:</p>  <ul> <li>
+<p>for each optional argument, a <code>valid_</code><code>argument</code> member is used to signal the presence of the respective optional argument.</p> <p><code>valid_</code> argstruct members should only be used as truth values, irrespective of their actual data type.</p> </li> <li>named arguments are passed in argument struct members by the same name and with the same data type.</li> <li>unnamed (positional) arguments are passed as <code>arg</code><code>n</code> with <code>n</code> starting at 1 and incrementing with the argument’s position.</li> </ul>  </section> <section id="objects-and-methods"> <h3 id="ref-vmod-vcl-c-objects">Objects and methods</h3> <p>Varnish also supports a simple object model for vmods. Objects and methods are declared in the vcc file as:</p> <pre data-language="python">$Object class(...)
+$Method .method(...)
+</pre> <p>For declared object classes of a vmod, object instances can then be created in <code>vcl_init { }</code> using the <code>new</code> statement:</p> <pre data-language="python">sub vcl_init {
+        new foo = vmod.class(...);
+}
+</pre> <p>and have their methods called anywhere (including in <code>vcl_init {}</code> after the instantiation):</p> <pre data-language="python">sub somewhere {
+        foo.method(...);
+}
+</pre> <p>Nothing prevents a method to be named like the constructor and the meaning of such a method is up to the vmod author:</p> <pre data-language="python">$Object foo(...)
+$Method .bar(...)
+$Method .foo(...)
+</pre> <p>Object instances are represented as pointers to vmod-implemented C structs. Varnish only provides space to store the address of object instances and ensures that the right object address gets passed to C functions implementing methods.</p>  <ul class="simple"> <li>Objects’ scope and lifetime are the vcl</li> <li>Objects can only be created in <code>vcl_init {}</code> and have their destructors called by varnish after <code>vcl_fini {}</code> has completed.</li> </ul>  <p>vmod authors are advised to understand the prototypes in the <code>vmodtool</code>-generated <code>vcc_if.c</code> file:</p>  <ul class="simple"> <li>For <code>$Object</code> declarations, a constructor and destructor function must be implemented</li> <li>
+<p>The constructor is named by the suffix <code>__init</code>, always is of <code>VOID</code> return type and has the following arguments before the vcc-declared parameters:</p> <ul> <li>
+<code>VRT_CTX</code> as usual</li> <li>a pointer-pointer to return the address of the created oject</li> <li>a string containing the vcl name of the object instance</li> </ul> </li> <li>The destructor is named by the suffix <code>__fini</code>, always is of <code>VOID</code> return type and has a single argument, the pointer-pointer to the address of the object. The destructor is expected clear the address of the object stored in that pointer-pointer.</li> <li>
+<dl class="simple"> <dt>Methods gain the pointer to the object as an argument after</dt>
+<dd>
+<p>the <code>VRT_CTX</code>.</p> </dd> </dl> </li> </ul>  <p>As varnish is in no way involved in managing object instances other than passing their addresses, vmods need to implement all aspects of managing instances, in particular their memory management. As the lifetime of object instances is the vcl, they will usually be allocated from the heap.</p> </section> <section id="functions-and-methods-scope-restriction"> <h3>Functions and Methods scope restriction</h3> <p>The <code>$Restrict</code> stanza offers a way to limit the scope of the preceding vmod function or method, so that they can only be called from restricted vcl call sites. It must only appear after a <code>$Method</code> or <code>$Function</code> and has the following syntax:</p> <pre data-language="python">$Restrict scope1 [scope2 ...]
+</pre> <p>Possible scope values are: <code>backend, client, housekeeping, vcl_recv, vcl_pipe, vcl_pass, vcl_hash, vcl_purge, vcl_miss, vcl_hit,
+vcl_deliver, vcl_synth, vcl_backend_fetch, vcl_backend_response, vcl_backend_error, vcl_init, vcl_fini</code></p> </section> <section id="deprecated-aliases"> <h3>Deprecated Aliases</h3> <p>The <code>$Alias</code> stanza offers a mechanism to rename a function or an object’s method without removing the previous name. This allows name changes to maintain compatibility until the alias is dropped.</p> <p>The syntax for a function is:</p> <pre data-language="python">$Alias deprecated_function original_function
+
+[description]
+</pre> <p>The syntax for a method is:</p> <pre data-language="python">$Alias .deprecated_method object.original_method
+
+[description]
+</pre> <p>The <code>$Alias</code> stanza can appear anywhere, this allows grouping them in a dedicated “deprecated” section of their manual. The optional description can be used to explain why a function was renamed.</p> </section> </section> <section id="vcl-and-c-data-types"> <h2 id="ref-vmod-vcl-c-types">VCL and C data types</h2> <p>VCL data types are targeted at the job, so for instance, we have data types like “DURATION” and “HEADER”, but they all have some kind of C language representation. Here is a description of them.</p> <p>All but the PRIV types have typedefs: VCL_INT, VCL_REAL, etc.</p> <p>Notice that most of the non-native (C pointer) types are <code>const</code>, which, if returned by a vmod function/method, are assumed to be immutable. In other words, a vmod <code>must not</code> modify any data which was previously returned.</p> <p>When returning non-native values, the producing function is responsible for arranging memory management. Either by freeing the structure later by whatever means available or by using storage allocated from the client or backend workspaces.</p> <dl> <dt>ACL</dt>
+<dd>
+<p>C-type: <code>const struct vrt_acl *</code></p> <p>A type for named ACLs declared in VCL.</p> </dd> <dt>BACKEND</dt>
+<dd>
+<p>C-type: <code>const struct director *</code></p> <p>A type for backend and director implementations. See <a class="reference internal" href="directors.html#ref-writing-a-director"><span class="std std-ref">Writing a Director</span></a>.</p> </dd> <dt>BLOB</dt>
+<dd>
+<p>C-type: <code>const struct vmod_priv *</code></p> <p>An opaque type to pass random bits of memory between VMOD functions.</p> </dd> <dt>BODY</dt>
+<dd>
+<p>C-type: <code>const void *</code></p> <p>A type only used on the LHS of an assignment that can take either a blob or an expression that can be converted to a string.</p> </dd> <dt>BOOL</dt>
+<dd>
+<p>C-type: <code>unsigned</code></p> <p>Zero means false, anything else means true.</p> </dd> <dt>BYTES</dt>
+<dd>
+<p>C-type: <code>double</code></p> <p>Unit: bytes.</p> <p>A storage space, as in 1024 bytes.</p> </dd> <dt>DURATION</dt>
+<dd>
+<p>C-type: <code>double</code></p> <p>Unit: seconds.</p> <p>A time interval, as in 25 seconds.</p> </dd> <dt>ENUM</dt>
+<dd>
+<p>vcc syntax: ENUM { val1, val2, … }</p> <p>vcc example: <code>ENUM { one, two, three } number="one"</code></p> <p>C-type: <code>const char *</code></p> <p>Allows values from a set of constant strings. <code>Note</code> that the C-type is a string, not a C enum.</p> <p>Enums will be passed as fixed pointers, so instead of string comparisons, also pointer comparisons with <code>VENUM(name)</code> are possible.</p> </dd> <dt>HEADER</dt>
+<dd>
+<p>C-type: <code>const struct gethdr_s *</code></p> <p>These are VCL compiler generated constants referencing a particular header in a particular HTTP entity, for instance <code>req.http.cookie</code> or <code>beresp.http.last-modified</code>. By passing a reference to the header, the VMOD code can both read and write the header in question.</p> <p>If the header was passed as STRING, the VMOD code only sees the value, but not where it came from.</p> </dd> <dt>HTTP</dt>
+<dd>
+<p>C-type: <code>struct http *</code></p> <p>A reference to a header object as <code>req.http</code> or <code>bereq.http</code>.</p> </dd> <dt>INT</dt>
+<dd>
+<p>C-type: <code>long</code></p> <p>A (long) integer as we know and love them.</p> </dd> <dt>IP</dt>
+<dd>
+<p>C-type: <code>const struct suckaddr *</code></p> <p>This is an opaque type, see the <code>include/vsa.h</code> file for which primitives we support on this type.</p> </dd> <dt>PRIV_CALL</dt>
+<dd>
+<p>See <a class="reference internal" href="#ref-vmod-private-pointers"><span class="std std-ref">Private Pointers</span></a> below.</p> </dd> <dt>PRIV_TASK</dt>
+<dd>
+<p>See <a class="reference internal" href="#ref-vmod-private-pointers"><span class="std std-ref">Private Pointers</span></a> below.</p> </dd> <dt>PRIV_TOP</dt>
+<dd>
+<p>See <a class="reference internal" href="#ref-vmod-private-pointers"><span class="std std-ref">Private Pointers</span></a> below.</p> </dd> <dt>PRIV_VCL</dt>
+<dd>
+<p>See <a class="reference internal" href="#ref-vmod-private-pointers"><span class="std std-ref">Private Pointers</span></a> below.</p> </dd> <dt>PROBE</dt>
+<dd>
+<p>C-type: <code>const struct vrt_backend_probe *</code></p> <p>A named standalone backend probe definition.</p> </dd> <dt>REAL</dt>
+<dd>
+<p>C-type: <code>double</code></p> <p>A floating point value.</p> </dd> <dt>REGEX</dt>
+<dd>
+<p>C-type: <code>const struct vre *</code></p> <p>This is an opaque type for regular expressions with a VCL scope. The REGEX type is only meant for regular expression literals managed by the VCL compiler. For dynamic regular expressions or complex usage see the API from the <code>include/vre.h</code> file.</p> </dd> <dt>STRING</dt>
+<dd>
+<p>C-type: <code>const char *</code></p> <p>A NUL-terminated text-string.</p> <p>Can be NULL to indicate a nonexistent string, for instance in:</p> <pre data-language="python">mymod.foo(req.http.foobar);
+</pre> <p>If there were no “foobar” HTTP header, the vmod_foo() function would be passed a NULL pointer as argument.</p> </dd> <dt>STEVEDORE</dt>
+<dd>
+<p>C-type: <code>const struct stevedore *</code></p> <p>A storage backend.</p> </dd> <dt>STRANDS</dt>
+<dd>
+<p>C-Type: <code>const struct strands *</code></p> <p>Strands are a list of strings that gets passed in a struct with the following members:</p> <ul class="simple"> <li>
+<code>int n</code>: the number of strings</li> <li>
+<code>const char **p</code>: the array of strings with <code>n</code> elements</li> </ul> <p>A VMOD should never hold onto strands beyond a function or method execution. See <code>include/vrt.h</code> for the details.</p> </dd> <dt>TIME</dt>
+<dd>
+<p>C-type: <code>double</code></p> <p>Unit: seconds since UNIX epoch.</p> <p>An absolute time, as in 1284401161.</p> </dd> <dt>VCL_SUB</dt>
+<dd>
+<p>C-type: <code>const struct vcl_sub *</code></p> <p>Opaque handle on a VCL subroutine.</p> <p>References to subroutines can be passed into VMODs as arguments and called later through <code>VRT_call()</code>. The scope strictly is the VCL: vmods must ensure that <code>VCL_SUB</code> references never be called from a different VCL.</p> <p><code>VRT_call()</code> fails the VCL for recursive calls and when the <code>VCL_SUB</code> can not be called from the current context (e.g. calling a subroutine accessing <code>req</code> from the backend side).</p> <p>For more than one invocation of <code>VRT_call()</code>, VMODs <em>must</em> check if <code>VRT_handled()</code> returns non-zero inbetween calls: The called SUB may have returned with an action (any <code>return(x)</code> other than plain <code>return</code>) or may have failed the VCL, and in both cases the calling VMOD <em>must</em> return also, possibly after having conducted some cleanup. Note that undoing the handling through <code>VRT_handling()</code> is a bug.</p> <p><code>VRT_check_call()</code> can be used to check if a <code>VRT_call()</code> would succeed in order to avoid the potential VCL failure. It returns <code>NULL</code> if <code>VRT_call()</code> would make the call or an error string why not.</p> </dd> <dt>VOID</dt>
+<dd>
+<p>C-type: <code>void</code></p> <p>Can only be used for return-value, which makes the function a VCL procedure.</p> </dd> </dl> </section> <section id="private-pointers"> <h2 id="ref-vmod-private-pointers">Private Pointers</h2> <p>It is often useful for library functions to maintain local state, this can be anything from a precompiled regexp to open file descriptors and vast data structures.</p> <p>The VCL compiler supports the following private pointers:</p> <ul> <li>
+<code>PRIV_CALL</code> “per call” private pointers are useful to cache/store state relative to the specific call or its arguments, for instance a compiled regular expression specific to a regsub() statement or simply caching the most recent output of some expensive operation. These private pointers live for the duration of the loaded VCL.</li> <li>
+<code>PRIV_TASK</code> “per task” private pointers are useful for state that applies to calls for either a specific request or a backend request. For instance this can be the result of a parsed cookie specific to a client. Note that <code>PRIV_TASK</code> contexts are separate for the client side and the backend side, so use in <code>vcl_backend_*</code> will yield a different private pointer from the one used on the client side. These private pointers live only for the duration of their task.</li> <li>
+<code>PRIV_TOP</code> “per top-request” private pointers live for the duration of one request and all its ESI-includes. They are only defined for the client side. When used from backend VCL subs, a NULL pointer will potentially be passed and a VCL failure triggered. These private pointers live only for the duration of their top level request </li> <li>
+<p><code>PRIV_VCL</code> “per vcl” private pointers are useful for such global state that applies to all calls in this VCL, for instance flags that determine if regular expressions are case-sensitive in this vmod or similar. The <code>PRIV_VCL</code> object is the same object that is passed to the VMOD’s event function. This private pointer lives for the duration of the loaded VCL.</p> <p>The <code>PRIV_CALL</code> vmod_privs are finalized before <code>PRIV_VCL</code>.</p> </li> </ul> <p>The way it works in the vmod code, is that a <code>struct vmod_priv *</code> is passed to the functions where one of the <code>PRIV_*</code> argument types is specified.</p> <p>This structure contains three members:</p> <pre data-language="python">struct vmod_priv {
+        void                            *priv;
+        long                            len;
+        const struct vmod_priv_methods  *methods;
+};
+</pre> <p>The <code>.priv</code> and <code>.len</code> elements can be used for whatever the vmod code wants to use them for.</p> <p><code>.methods</code> can be an optional pointer to a struct of callbacks:</p> <pre data-language="python">typedef void vmod_priv_fini_f(VRT_CTX, void *);
+
+struct vmod_priv_methods {
+        unsigned                        magic;
+        const char                      *type;
+        vmod_priv_fini_f                *fini;
+};
+</pre> <p><code>.magic</code> has to be initialized to <code>VMOD_PRIV_METHODS_MAGIC</code>. <code>.type</code> should be a descriptive name to help debugging.</p> <p><code>.fini</code> will be called for a non-NULL <code>.priv</code> of the <code>struct
+vmod_priv</code> when the scope ends with that <code>.priv</code> pointer as its second argument besides a <code>VRT_CTX</code>.</p> <p>The common case where a private data structure is allocated with malloc(3) would look like this:</p> <pre data-language="python">static void
+myfree(VRT_CTX, void *p)
+{
+        CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+        free (p);
+}
+
+static const struct vmod_priv_methods mymethods[1] = {{
+        .magic = VMOD_PRIV_METHODS_MAGIC,
+        .type = "mystate",
+        .fini = myfree
+}};
+
+// ....
+
+if (priv-&gt;priv == NULL) {
+        priv-&gt;priv = calloc(1, sizeof(struct myfoo));
+        AN(priv-&gt;priv);
+        priv-&gt;methods = mymethods;
+        mystate = priv-&gt;priv;
+        mystate-&gt;foo = 21;
+        ...
+} else {
+        mystate = priv-&gt;priv;
+}
+if (foo &gt; 25) {
+        ...
+}
+</pre> <section id="private-pointers-memory-management"> <h3>Private Pointers Memory Management</h3> <p>The generic malloc(3) / free(3) approach documented above works for all private pointers. It is the simplest and less error prone (as long as allocated memory is properly freed though the fini callback), but comes at the cost of calling into the heap memory allocator.</p> <p>Per-vmod constant data structures can be assigned to any private pointer type, but, obviously, free(3) must not be used on them.</p> <p>Dynamic data stored in <code>PRIV_TASK</code> and <code>PRIV_TOP</code> pointers can also come from the workspace:</p> <ul> <li>
+<p>For <code>PRIV_TASK</code>, any allocation from <code>ctx-&gt;ws</code> works, like so:</p> <pre data-language="python">if (priv-&gt;priv == NULL) {
+        priv-&gt;priv = WS_Alloc(ctx-&gt;ws, sizeof(struct myfoo));
+        if (priv-&gt;priv == NULL) {
+                VRT_fail(ctx, "WS_Alloc failed");
+                return (...);
+        }
+        priv-&gt;methods = mymethods;
+        mystate = priv-&gt;priv;
+        mystate-&gt;foo = 21;
+        ...
+</pre> </li> <li>
+<p>For <code>PRIV_TOP</code>, first of all keep in mind that it must only be used from the client context, so vmod code should error out for <code>ctx-&gt;req == NULL</code>.</p> <p>For dynamic data, the <em>top request’s</em> workspace must be used, which complicates things a bit:</p> <pre data-language="python">if (priv-&gt;priv == NULL) {
+        struct ws *ws;
+
+        CHECK_OBJ_NOTNULL(ctx-&gt;req, REQ_MAGIC);
+        CHECK_OBJ_NOTNULL(ctx-&gt;req-&gt;top, REQTOP_MAGIC);
+        CHECK_OBJ_NOTNULL(ctx-&gt;req-&gt;top-&gt;topreq, REQ_MAGIC);
+        ws = ctx-&gt;req-&gt;top-&gt;topreq-&gt;ws;
+
+        priv-&gt;priv = WS_Alloc(ws, sizeof(struct myfoo));
+        // ... same as above for PRIV_TASK
+</pre> </li> </ul> <p>Notice that allocations on the workspace do not need to be freed, their lifetime is the respective task.</p> </section> <section id="private-pointers-and-objects"> <h3>Private Pointers and Objects</h3> <p><code>PRIV_TASK</code> and <code>PRIV_TOP</code> arguments to methods are not per object instance, but per vmod as for ordinary vmod functions. Thus, vmods requiring per-task / per top-request state for object instances need to implement other means to associate storage with object instances.</p> <p>This is what <code>VRT_priv_task()</code> / <code>VRT_priv_task_get()</code> and <code>VRT_priv_top()</code> / <code>VRT_priv_top_get()</code> are for:</p> <p>The non-get functions either return an existing <code>PRIV_TASK</code> / <code>PRIV_TOP</code> for a given <code>void *</code> argument or create one. They return <code>NULL</code> in case of an allocation failure.</p> <p>The <code>_get()</code> functions do not create a <code>PRIV_*</code>, but return either an existing one or <code>NULL</code>.</p> <p>By convention, private pointers for object instance are created on the address of the object, as in this example for a <code>PRIV_TASK</code>:</p> <pre data-language="python">VCL_VOID
+myvmod_obj_method(VRT_CTX, struct myvmod_obj *o)
+{
+    struct vmod_priv *p;
+
+    p = VRT_priv_task(ctx, o);
+
+    // ... see above
+</pre> <p>The <code>PRIV_TOP</code> case looks identical except for calling <code>VRT_priv_top(ctx, o)</code> in place of <code>VRT_priv_task(ctx, o)</code>, but be reminded that the <code>VRT_priv_top*()</code> functions must only be called from client context (if <code>ctx-&gt;req != NULL</code>).</p> </section> </section> <section id="event-functions"> <h2 id="ref-vmod-event-functions">Event functions</h2> <p>VMODs can have an “event” function which is called when a VCL which imports the VMOD is loaded or discarded. This corresponds to the <code>VCL_EVENT_LOAD</code> and <code>VCL_EVENT_DISCARD</code> events, respectively. In addition, this function will be called when the VCL temperature is changed to cold or warm, corresponding to the <code>VCL_EVENT_COLD</code> and <code>VCL_EVENT_WARM</code> events.</p> <p>The first argument to the event function is a VRT context.</p> <p>The second argument is the vmod_priv specific to this particular VCL, and if necessary, a VCL specific VMOD “fini” function can be attached to its “free” hook.</p> <p>The third argument is the event.</p> <p>If the VMOD has private global state, which includes any sockets or files opened, any memory allocated to global or private variables in the C-code etc, it is the VMODs own responsibility to track how many VCLs were loaded or discarded and free this global state when the count reaches zero.</p> <p>VMOD writers are <em>strongly</em> encouraged to release all per-VCL resources for a given VCL when it emits a <code>VCL_EVENT_COLD</code> event. You will get a chance to reacquire the resources before the VCL becomes active again and be notified first with a <code>VCL_EVENT_WARM</code> event. Unless a user decides that a given VCL should always be warm, an inactive VMOD will eventually become cold and should manage resources accordingly.</p> <p>An event function must return zero upon success. It is only possible to fail an initialization with the <code>VCL_EVENT_LOAD</code> or <code>VCL_EVENT_WARM</code> events. Should such a failure happen, a <code>VCL_EVENT_DISCARD</code> or <code>VCL_EVENT_COLD</code> event will be sent to the VMODs that succeeded to put them back in a cold state. The VMOD that failed will not receive this event, and therefore must not be left half-initialized should a failure occur.</p> <p>If your VMOD is running an asynchronous background job you can hold a reference to the VCL to prevent it from going cold too soon and get the same guarantees as backends with ongoing requests for instance. For that, you must acquire the reference by calling <code>VRT_VCL_Prevent_Discard</code> when you receive a <code>VCL_EVENT_WARM</code> and later calling <code>VRT_VCL_Allow_Discard</code> once the background job is over. Receiving a <code>VCL_EVENT_COLD</code> is your cue to terminate any background job bound to a VCL.</p> <p>You can find an example of VCL references in vmod-debug:</p> <pre data-language="python">priv_vcl-&gt;vclref = VRT_VCL_Prevent_Discard(ctx, "vmod-debug");
+...
+VRT_VCL_Allow_Discard(&amp;ctx, &amp;priv_vcl-&gt;vclref);
+</pre> <p>In this simplified version, you can see that you need at least a VCL-bound data structure like a <code>PRIV_VCL</code> or a VMOD object to keep track of the reference and later release it. You also have to provide a description, it will be printed to the user if they try to warm up a cooling VCL:</p> <pre data-language="python">$ varnishadm vcl.list
+available  auto/cooling       0 vcl1
+active     auto/warm          0 vcl2
+
+$ varnishadm vcl.state vcl1 warm
+Command failed with error code 300
+Failed &lt;vcl.state vcl1 auto&gt;
+Message:
+        VCL vcl1 is waiting for:
+        - vmod-debug
+</pre> <p>In the case where properly releasing resources may take some time, you can opt for an asynchronous worker, either by spawning a thread and tracking it, or by using Varnish’s worker pools.</p> </section> <section id="when-to-lock-and-when-not-to-lock"> <h2>When to lock, and when not to lock</h2> <p>Varnish is heavily multithreaded, so by default VMODs must implement their own locking to protect shared resources.</p> <p>When a VCL is loaded or unloaded, the event and priv-&gt;free are run sequentially all in a single thread, and there is guaranteed to be no other activity related to this particular VCL, nor are there init/fini activity in any other VCL or VMOD at this time.</p> <p>That means that the VMOD init, and any object init/fini functions are already serialized in sensible order, and won’t need any locking, unless they access VMOD specific global state, shared with other VCLs.</p> <p>Traffic in other VCLs which also import this VMOD, will be happening while housekeeping is going on.</p> </section> <section id="statistics-counters"> <h2>Statistics Counters</h2> <p>Starting in Varnish 6.0, VMODs can define their own counters that appear in <em>varnishstat</em>.</p> <p>If you’re using autotools, see the <code>VARNISH_COUNTERS</code> macro in varnish.m4 for documentation on getting your build set up.</p> <p>Counters are defined in a .vsc file. The <code>VARNISH_COUNTERS</code> macro calls <em>vsctool.py</em> to turn a <em>foo.vsc</em> file into <em>VSC_foo.c</em> and <em>VSC_foo.h</em> files, just like <em>vmodtool.py</em> turns <em>foo.vcc</em> into <em>vcc_foo_if.c</em> and <em>vcc_foo_if.h</em> files. Similarly to the VCC files, the generated VSC files give you a structure and functions that you can use in your VMOD’s code to create and destroy the counters your defined. The <em>vsctool.py</em> tool also generates a <em>VSC_foo.rst</em> file that you can include in your documentation to describe the counters your VMOD has.</p> <p>The .vsc file looks like this:</p> <pre data-language="none">.. varnish_vsc_begin:: xkey
+        :oneliner:      xkey Counters
+        :order:         70
+
+        Metrics from vmod_xkey
+
+.. varnish_vsc:: g_keys
+        :type:          gauge
+        :oneliner:      Number of surrogate keys
+
+        Number of surrogate keys in use. Increases after a request that includes a new key in the xkey header. Decreases when a key is purged or when all cache objects associated with a key expire.
+
+.. varnish_vsc_end:: xkey
+</pre> <p>Counters can have the following parameters:</p> <dl class="simple"> <dt>type</dt>
+<dd>
+<p>The type of metric this is. Can be one of <code>counter</code>, <code>gauge</code>, or <code>bitmap</code>.</p> </dd> <dt>ctype</dt>
+<dd>
+<p>The type that this counter will have in the C code. This can only be <code>uint64_t</code> and does not need to be specified.</p> </dd> <dt>level</dt>
+<dd>
+<p>The verbosity level of this counter. <em>varnishstat</em> will only show counters with a higher verbosity level than the one currently configured. Can be one of <code>info</code>, <code>diag</code>, or <code>debug</code>.</p> </dd> <dt>oneliner</dt>
+<dd>
+<p>A short, one line description of the counter.</p> </dd> <dt>group</dt>
+<dd>
+<p>I don’t know what this does.</p> </dd> <dt>format</dt>
+<dd>
+<p>Can be one of <code>integer</code>, <code>bytes</code>, <code>bitmap</code>, or <code>duration</code>.</p> </dd> </dl> <p>After these parameters, a counter can have a longer description, though this description has to be all on one line in the .vsc file.</p> <p>You should call <code>VSC_*_New()</code> when your VMOD is loaded and <code>VSC_*_Destroy()</code> when it is unloaded. See the generated <code>VSC_*.h</code> file for the full details about the structure that contains your counters.</p> </section><div class="_attribution">
+  <p class="_attribution-p">
+    Copyright &copy; 2006 Verdens Gang AS<br>Copyright &copy; 2006&ndash;2020 Varnish Software AS<br>Licensed under the BSD-2-Clause License.<br>
+    <a href="https://varnish-cache.org/docs/7.4/reference/vmod.html" class="_attribution-link">https://varnish-cache.org/docs/7.4/reference/vmod.html</a>
+  </p>
+</div>

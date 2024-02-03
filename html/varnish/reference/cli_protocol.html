@@ -1,0 +1,50 @@
+<h1 id="ref-cli-api">VCLI protocol - Scripting the CLI interface</h1> <p>The Varnish CLI has a few bells&amp;whistles when used as an API.</p> <p>First: <code>vcli.h</code> contains magic numbers.</p> <p>Second: If you use <code>varnishadm</code> to connect to <code>varnishd</code> for API purposes, use the <code>-p</code> argument to get “pass” mode.</p> <p>In “pass” mode, or with direct CLI connections (more below), the first line of responses is always exactly 13 bytes long, including the NL, and it contains two numbers: The status code and the count of bytes in the “body” of the response:</p> <pre data-language="python">200␣19␣␣␣␣␣␣␤
+PONG␣1613397488␣1.0
+</pre> <p>This makes parsing the response unambiguous, even in cases like this where the response does not end with a NL.</p> <p>The varnishapi library contains functions to implement the basics of the CLI protocol, for more, see the <code>vcli.h</code> include file.</p> <section id="local-and-remote-cli-connections"> <h2 id="ref-remote-cli">Local and remote CLI connections</h2> <p>The <code>varnishd</code> process receives the CLI commands via TCP connections which require PSK authentication (see below), but which provide no secrecy.</p> <p>“No secrecy” means that if you configure these TCP connections to run across a network, anybody who can sniff packets can see your CLI commands. If you need secrecy, use <code>ssh</code> to run <code>varnishadm</code> or to tunnel the TCP connection.</p> <p>By default <code>varnishd</code> binds to <code>localhost</code> and ask the kernel to assign a random port number. The resulting listen address is stored in the shared memory, where the <code>varnishadm</code> program finds it.</p> <p>You can configure <code>varnishd</code> to listen to a specific address with the <code>-T</code> argument, this will also be written to shared memory, so <code>varnishadm</code> keeps working:</p> <pre data-language="python"># Bind to internal network
+varnishd -T 192.168.10.21:3245
+</pre> <p>You can also configure <code>varnishd</code> to actively open a TCP connection to another “controller” program, with the <code>-M</code> argument.</p> <p>Finally, when run in “debug mode” with the <code>-d</code> argument, <code>varnishd</code> will stay in the foreground and turn stdin/stdout into a CLI connection.</p> </section> <section id="authentication-cli-connections"> <h2 id="ref-psk-auth">Authentication CLI connections</h2> <p>CLI connections to <code>varnishd</code> are authenticated with a “pre-shared-key” authentication scheme, where the other end must prove they know <em>the contents of</em> the secret file <code>varnishd</code> uses.</p> <p>They do not have to read the precise same file on that specific computer, they could read an entirely different file on a different computer or fetch the secret from a server.</p> <p>The name of the file can be configured with the <code>-S</code> option, and <code>varnishd</code> records the name in shared memory, so <code>varnishadm</code> can find it.</p> <p>As a bare minimum <code>varnishd</code> needs to be able to read the file, but other than that, it can be restricted any way you want.</p> <p>Since it is not the file, but only the content of it that matter, you can make the file unreadable by everybody, and instead place a copy of the file in the home directories of the authorized users.</p> <p>The file is read only at the moment when the <code>auth</code> CLI command is issued and the contents is not cached in <code>varnishd</code>, so you can change it as often as you want.</p> <p>An authenticated session looks like this:</p> <pre data-language="text">critter phk&gt; telnet localhost 1234
+Trying ::1...
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+107 59
+ixslvvxrgkjptxmcgnnsdxsvdmvfympg
+
+Authentication required.
+
+auth 455ce847f0073c7ab3b1465f74507b75d3dc064c1e7de3b71e00de9092fdc89a
+200 279
+-----------------------------
+Varnish Cache CLI 1.0
+-----------------------------
+FreeBSD,13.0-CURRENT,amd64,-jnone,-sdefault,-sdefault,-hcritbit
+varnish-trunk revision 89a558e56390d425c52732a6c94087eec9083115
+
+Type 'help' for command list.
+Type 'quit' to close CLI session.
+Type 'start' to launch worker process.
+</pre> <p>The CLI status of 107 indicates that authentication is necessary. The first 32 characters of the response text is the challenge “ixsl…mpg”. The challenge is randomly generated for each CLI connection, and changes each time a 107 is emitted.</p> <p>The most recently emitted challenge must be used for calculating the authenticator “455c…c89a”.</p> <p>The authenticator is calculated by applying the SHA256 function to the following byte sequence:</p> <ul class="simple"> <li>Challenge string</li> <li>Newline (0x0a) character.</li> <li>Contents of the secret file</li> <li>Challenge string</li> <li>Newline (0x0a) character.</li> </ul> <p>and dumping the resulting digest in lower-case hex.</p> <p>In the above example, the secret file contains <code>foo\n</code> and thus:</p> <pre data-language="text">critter phk&gt; hexdump secret
+00000000  66 6f 6f 0a                                       |foo.|
+00000004
+critter phk&gt; cat &gt; tmpfile
+ixslvvxrgkjptxmcgnnsdxsvdmvfympg
+foo
+ixslvvxrgkjptxmcgnnsdxsvdmvfympg
+^D
+critter phk&gt; hexdump -C tmpfile
+00000000  69 78 73 6c 76 76 78 72  67 6b 6a 70 74 78 6d 63  |ixslvvxrgkjptxmc|
+00000010  67 6e 6e 73 64 78 73 76  64 6d 76 66 79 6d 70 67  |gnnsdxsvdmvfympg|
+00000020  0a 66 6f 6f 0a 69 78 73  6c 76 76 78 72 67 6b 6a  |.foo.ixslvvxrgkj|
+00000030  70 74 78 6d 63 67 6e 6e  73 64 78 73 76 64 6d 76  |ptxmcgnnsdxsvdmv|
+00000040  66 79 6d 70 67 0a                                 |fympg.|
+00000046
+critter phk&gt; sha256 tmpfile
+SHA256 (tmpfile) = 455ce847f0073c7ab3b1465f74507b75d3dc064c1e7de3b71e00de9092fdc89a
+critter phk&gt; openssl dgst -sha256 &lt; tmpfile
+455ce847f0073c7ab3b1465f74507b75d3dc064c1e7de3b71e00de9092fdc89a
+</pre> <p>The sourcefile <code>lib/libvarnish/cli_auth.c</code> contains a useful function which calculates the response, given an open filedescriptor to the secret file, and the challenge string.</p> </section> <section id="see-also"> <h2>See also:</h2> <ul class="simple"> <li><a class="reference internal" href="varnishadm.html#varnishadm-1"><span class="std std-ref">varnishadm</span></a></li> <li><a class="reference internal" href="varnishd.html#varnishd-1"><span class="std std-ref">varnishd</span></a></li> <li><a class="reference internal" href="vcl.html#vcl-7"><span class="std std-ref">VCL</span></a></li> </ul> </section><div class="_attribution">
+  <p class="_attribution-p">
+    Copyright &copy; 2006 Verdens Gang AS<br>Copyright &copy; 2006&ndash;2020 Varnish Software AS<br>Licensed under the BSD-2-Clause License.<br>
+    <a href="https://varnish-cache.org/docs/7.4/reference/cli_protocol.html" class="_attribution-link">https://varnish-cache.org/docs/7.4/reference/cli_protocol.html</a>
+  </p>
+</div>
