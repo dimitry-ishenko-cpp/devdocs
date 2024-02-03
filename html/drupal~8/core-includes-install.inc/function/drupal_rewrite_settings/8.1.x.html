@@ -1,0 +1,157 @@
+<h1 id="page-subtitle">function drupal_rewrite_settings</h1>     <pre class="signature">drupal_rewrite_settings($settings = array(), <del>$settings_file</del> = NULL)</pre> <p>Replaces values in settings.php with values in the submitted array.</p> <p>This function replaces values in place if possible, even for multidimensional arrays. This way the old settings do not linger, overridden and also the doxygen on a value remains where it should be.</p> <h3>Parameters</h3> <p> <strong>$settings</strong>: An array of settings that need to be updated. Multidimensional arrays are dumped up to a stdClass object. The object can have value, required and comment properties.</p> <pre class="php" data-language="php">  $settings['config_directories'] = array(
+    CONFIG_SYNC_DIRECTORY =&gt; (object) array(
+      'value' =&gt; 'config_hash/sync',
+      'required' =&gt; TRUE,
+    ),
+  );
+  </pre>
+<p> gets dumped as:</p> <pre class="php" data-language="php">  $config_directories['sync'] = 'config_hash/sync'
+  </pre>  <h3>File</h3> 
+<dl> <dt>core/includes/<a href="../../8.1.x.html">install.inc</a>, line 216</dt> <dd>API functions for installing modules and themes.</dd> </dl> <h3>Code</h3> <pre class="php" data-language="php">function drupal_rewrite_settings($settings = array(), $settings_file = NULL) {
+  if (!isset($settings_file)) {
+    $settings_file = \Drupal::service('site.path') . '/settings.php';
+  }
+  // Build list of setting names and insert the values into the global namespace.
+  $variable_names = array();
+  $settings_settings = array();
+  foreach ($settings as $setting =&gt; $data) {
+    if ($setting != 'settings') {
+      _drupal_rewrite_settings_global($GLOBALS[$setting], $data);
+    }
+    else {
+      _drupal_rewrite_settings_global($settings_settings, $data);
+    }
+    $variable_names['$' . $setting] = $setting;
+  }
+  $contents = file_get_contents($settings_file);
+  if ($contents !== FALSE) {
+    // Initialize the contents for the settings.php file if it is empty.
+    if (trim($contents) === '') {
+      $contents = "&lt;?php\n";
+    }
+    // Step through each token in settings.php and replace any variables that
+    // are in the passed-in array.
+    $buffer = '';
+    $state = 'default';
+    foreach (token_get_all($contents) as $token) {
+      if (is_array($token)) {
+        list($type, $value) = $token;
+      }
+      else {
+        $type = -1;
+        $value = $token;
+      }
+      // Do not operate on whitespace.
+      if (!in_array($type, array(T_WHITESPACE, T_COMMENT, T_DOC_COMMENT))) {
+        switch ($state) {
+          case 'default':
+            if ($type === T_VARIABLE &amp;&amp; isset($variable_names[$value])) {
+              // This will be necessary to unset the dumped variable.
+              $parent = &amp;$settings;
+              // This is the current index in parent.
+              $index = $variable_names[$value];
+              // This will be necessary for descending into the array.
+              $current = &amp;$parent[$index];
+              $state = 'candidate_left';
+            }
+            break;
+          case 'candidate_left':
+            if ($value == '[') {
+              $state = 'array_index';
+            }
+            if ($value == '=') {
+              $state = 'candidate_right';
+            }
+            break;
+          case 'array_index':
+            if (_drupal_rewrite_settings_is_array_index($type, $value)) {
+              $index = trim($value, '\'"');
+              $state = 'right_bracket';
+            }
+            else {
+              // $a[foo()] or $a[$bar] or something like that.
+              throw new Exception('invalid array index');
+            }
+            break;
+          case 'right_bracket':
+            if ($value == ']') {
+              if (isset($current[$index])) {
+                // If the new settings has this index, descend into it.
+                $parent = &amp;$current;
+                $current = &amp;$parent[$index];
+                $state = 'candidate_left';
+              }
+              else {
+                // Otherwise, jump back to the default state.
+                $state = 'wait_for_semicolon';
+              }
+            }
+            else {
+              // $a[1 + 2].
+              throw new Exception('] expected');
+            }
+            break;
+          case 'candidate_right':
+            if (_drupal_rewrite_settings_is_simple($type, $value)) {
+              $value = _drupal_rewrite_settings_dump_one($current);
+              // Unsetting $current would not affect $settings at all.
+              unset($parent[$index]);
+              // Skip the semicolon because _drupal_rewrite_settings_dump_one() added one.
+              $state = 'semicolon_skip';
+            }
+            else {
+              $state = 'wait_for_semicolon';
+            }
+            break;
+          case 'wait_for_semicolon':
+            if ($value == ';') {
+              $state = 'default';
+            }
+            break;
+          case 'semicolon_skip':
+            if ($value == ';') {
+              $value = '';
+              $state = 'default';
+            }
+            else {
+              // If the expression was $a = 1 + 2; then we replaced 1 and
+              // the + is unexpected.
+              throw new Exception('Unexpected token after replacing value.');
+            }
+            break;
+        }
+      }
+      $buffer .= $value;
+    }
+    foreach ($settings as $name =&gt; $setting) {
+      $buffer .= _drupal_rewrite_settings_dump($setting, '$' . $name);
+    }
+
+    // Write the new settings file.
+    if (file_put_contents($settings_file, $buffer) === FALSE) {
+      throw new Exception(t('Failed to modify %settings. Verify the file permissions.', array('%settings' =&gt; $settings_file)));
+    }
+    else {
+      // In case any $settings variables were written, import them into the
+      // Settings singleton.
+      if (!empty($settings_settings)) {
+        $old_settings = Settings::getAll();
+        new Settings($settings_settings + $old_settings);
+      }
+      // The existing settings.php file might have been included already. In
+      // case an opcode cache is enabled, the rewritten contents of the file
+      // will not be reflected in this process. Ensure to invalidate the file
+      // in case an opcode cache is enabled.
+      OpCodeCache::invalidate(DRUPAL_ROOT . '/' . $settings_file);
+    }
+  }
+  else {
+    throw new Exception(t('Failed to open %settings. Verify the file permissions.', array('%settings' =&gt; $settings_file)));
+  }
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!includes!install.inc/function/drupal_rewrite_settings/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!includes!install.inc/function/drupal_rewrite_settings/8.1.x</a>
+  </p>
+</div>

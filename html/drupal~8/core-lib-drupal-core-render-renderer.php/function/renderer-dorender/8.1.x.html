@@ -1,0 +1,361 @@
+<h1 id="page-subtitle">protected function Renderer::doRender</h1>     <pre class="signature">protected <a href="../../class/renderer/8.1.x.html">Renderer</a>::doRender(&amp;$elements, $is_root_call = FALSE)</pre> <p>See the docs for ::render().</p>  <h3>File</h3> 
+<dl> <dt>core/lib/Drupal/Core/Render/<a href="https://api.drupal.org/api/drupal/core%21lib%21Drupal%21Core%21Render%21Renderer.php/8.1.x">Renderer.php</a>, line 207</dt>  </dl> <h3>Class</h3> 
+<dl> <dt>
+<a href="../../class/renderer/8.1.x.html">Renderer</a> </dt> <dd>Turns a render array into a HTML string.</dd> </dl> <h3>Namespace</h3> <a href="https://api.drupal.org/api/drupal/namespace/Drupal%21Core%21Render/8.1.x">Drupal\Core\Render</a> <h3>Code</h3> <pre class="php" data-language="php">protected function doRender(&amp;$elements, $is_root_call = FALSE) {
+  if (empty($elements)) {
+    return '';
+  }
+
+  if (!isset($elements['#access']) &amp;&amp; isset($elements['#access_callback'])) {
+    if (is_string($elements['#access_callback']) &amp;&amp; strpos($elements['#access_callback'], '::') === FALSE) {
+      $elements['#access_callback'] = $this-&gt;controllerResolver-&gt;getControllerFromDefinition($elements['#access_callback']);
+    }
+    $elements['#access'] = call_user_func($elements['#access_callback'], $elements);
+  }
+
+  // Early-return nothing if user does not have access.
+  if (isset($elements['#access'])) {
+    // If #access is an AccessResultInterface object, we must apply it's
+    // cacheability metadata to the render array.
+    if ($elements['#access'] instanceof AccessResultInterface) {
+      $this-&gt;addCacheableDependency($elements, $elements['#access']);
+      if (!$elements['#access']-&gt;isAllowed()) {
+        return '';
+      }
+    }
+    elseif ($elements['#access'] === FALSE) {
+      return '';
+    }
+  }
+
+  // Do not print elements twice.
+  if (!empty($elements['#printed'])) {
+    return '';
+  }
+
+  $context = $this-&gt;getCurrentRenderContext();
+  if (!isset($context)) {
+    throw new \LogicException("Render context is empty, because render() was called outside of a renderRoot() or renderPlain() call. Use renderPlain()/renderRoot() or #lazy_builder/#pre_render instead.");
+  }
+  $context-&gt;push(new BubbleableMetadata());
+
+  // Set the bubbleable rendering metadata that has configurable defaults, if:
+  // - this is the root call, to ensure that the final render array definitely
+  //   has these configurable defaults, even when no subtree is render cached.
+  // - this is a render cacheable subtree, to ensure that the cached data has
+  //   the configurable defaults (which may affect the ID and invalidation).
+  if ($is_root_call || isset($elements['#cache']['keys'])) {
+    $required_cache_contexts = $this-&gt;rendererConfig['required_cache_contexts'];
+    if (isset($elements['#cache']['contexts'])) {
+      $elements['#cache']['contexts'] = Cache::mergeContexts($elements['#cache']['contexts'], $required_cache_contexts);
+    }
+    else {
+      $elements['#cache']['contexts'] = $required_cache_contexts;
+    }
+  }
+
+  // Try to fetch the prerendered element from cache, replace any placeholders
+  // and return the final markup.
+  if (isset($elements['#cache']['keys'])) {
+    $cached_element = $this-&gt;renderCache-&gt;get($elements);
+    if ($cached_element !== FALSE) {
+      $elements = $cached_element;
+      // Only when we're in a root (non-recursive) Renderer::render() call,
+      // placeholders must be processed, to prevent breaking the render cache
+      // in case of nested elements with #cache set.
+      if ($is_root_call) {
+        $this-&gt;replacePlaceholders($elements);
+      }
+      // Mark the element markup as safe if is it a string.
+      if (is_string($elements['#markup'])) {
+        $elements['#markup'] = Markup::create($elements['#markup']);
+      }
+      // The render cache item contains all the bubbleable rendering metadata
+      // for the subtree.
+      $context-&gt;update($elements);
+      // Render cache hit, so rendering is finished, all necessary info
+      // collected!
+      $context-&gt;bubble();
+      return $elements['#markup'];
+    }
+  }
+  // Two-tier caching: track pre-bubbling elements' #cache, #lazy_builder and
+  // #create_placeholder for later comparison.
+  // @see \Drupal\Core\Render\RenderCacheInterface::get()
+  // @see \Drupal\Core\Render\RenderCacheInterface::set()
+  $pre_bubbling_elements = array_intersect_key($elements, [
+    '#cache' =&gt; TRUE,
+    '#lazy_builder' =&gt; TRUE,
+    '#create_placeholder' =&gt; TRUE,
+  ]);
+
+  // If the default values for this element have not been loaded yet, populate
+  // them.
+  if (isset($elements['#type']) &amp;&amp; empty($elements['#defaults_loaded'])) {
+    $elements += $this-&gt;elementInfo-&gt;getInfo($elements['#type']);
+  }
+
+  // First validate the usage of #lazy_builder; both of the next if-statements
+  // use it if available.
+  if (isset($elements['#lazy_builder'])) {
+    // @todo Convert to assertions once https://www.drupal.org/node/2408013
+    //   lands.
+    if (!is_array($elements['#lazy_builder'])) {
+      throw new \DomainException('The #lazy_builder property must have an array as a value.');
+    }
+    if (count($elements['#lazy_builder']) !== 2) {
+      throw new \DomainException('The #lazy_builder property must have an array as a value, containing two values: the callback, and the arguments for the callback.');
+    }
+    if (count($elements['#lazy_builder'][1]) !== count(array_filter($elements['#lazy_builder'][1], function($v) {
+      return is_null($v) || is_scalar($v);
+    }))) {
+      throw new \DomainException("A #lazy_builder callback's context may only contain scalar values or NULL.");
+    }
+    $children = Element::children($elements);
+    if ($children) {
+      throw new \DomainException(sprintf('When a #lazy_builder callback is specified, no children can exist; all children must be generated by the #lazy_builder callback. You specified the following children: %s.', implode(', ', $children)));
+    }
+    $supported_keys = [
+      '#lazy_builder',
+      '#cache',
+      '#create_placeholder',
+      // These keys are not actually supported, but they are added automatically
+      // by the Renderer, so we don't crash on them; them being missing when
+      // their #lazy_builder callback is invoked won't surprise the developer.
+      '#weight',
+      '#printed'
+    ];
+    $unsupported_keys = array_diff(array_keys($elements), $supported_keys);
+    if (count($unsupported_keys)) {
+      throw new \DomainException(sprintf('When a #lazy_builder callback is specified, no properties can exist; all properties must be generated by the #lazy_builder callback. You specified the following properties: %s.', implode(', ', $unsupported_keys)));
+    }
+  }
+  // Determine whether to do auto-placeholdering.
+  if ($this-&gt;placeholderGenerator-&gt;canCreatePlaceholder($elements) &amp;&amp; $this-&gt;placeholderGenerator-&gt;shouldAutomaticallyPlaceholder($elements)) {
+    $elements['#create_placeholder'] = TRUE;
+  }
+  // If instructed to create a placeholder, and a #lazy_builder callback is
+  // present (without such a callback, it would be impossible to replace the
+  // placeholder), replace the current element with a placeholder.
+  // @todo remove the isMethodSafe() check when
+  //       https://www.drupal.org/node/2367555 lands.
+  if (isset($elements['#create_placeholder']) &amp;&amp; $elements['#create_placeholder'] === TRUE &amp;&amp; $this-&gt;requestStack-&gt;getCurrentRequest()-&gt;isMethodSafe()) {
+    if (!isset($elements['#lazy_builder'])) {
+      throw new \LogicException('When #create_placeholder is set, a #lazy_builder callback must be present as well.');
+    }
+    $elements = $this-&gt;placeholderGenerator-&gt;createPlaceholder($elements);
+  }
+  // Build the element if it is still empty.
+  if (isset($elements['#lazy_builder'])) {
+    $callable = $elements['#lazy_builder'][0];
+    $args = $elements['#lazy_builder'][1];
+    if (is_string($callable) &amp;&amp; strpos($callable, '::') === FALSE) {
+      $callable = $this-&gt;controllerResolver-&gt;getControllerFromDefinition($callable);
+    }
+    $new_elements = call_user_func_array($callable, $args);
+    // Retain the original cacheability metadata, plus cache keys.
+    CacheableMetadata::createFromRenderArray($elements)
+      -&gt;merge(CacheableMetadata::createFromRenderArray($new_elements))
+      -&gt;applyTo($new_elements);
+    if (isset($elements['#cache']['keys'])) {
+      $new_elements['#cache']['keys'] = $elements['#cache']['keys'];
+    }
+    $elements = $new_elements;
+    $elements['#lazy_builder_built'] = TRUE;
+  }
+
+  // All render elements support #markup and #plain_text.
+  if (!empty($elements['#markup']) || !empty($elements['#plain_text'])) {
+    $elements = $this-&gt;ensureMarkupIsSafe($elements);
+  }
+
+  // Make any final changes to the element before it is rendered. This means
+  // that the $element or the children can be altered or corrected before the
+  // element is rendered into the final text.
+  if (isset($elements['#pre_render'])) {
+    foreach ($elements['#pre_render'] as $callable) {
+      if (is_string($callable) &amp;&amp; strpos($callable, '::') === FALSE) {
+        $callable = $this-&gt;controllerResolver-&gt;getControllerFromDefinition($callable);
+      }
+      $elements = call_user_func($callable, $elements);
+    }
+  }
+
+  // Defaults for bubbleable rendering metadata.
+  $elements['#cache']['tags'] = isset($elements['#cache']['tags']) ? $elements['#cache']['tags'] : array();
+  $elements['#cache']['max-age'] = isset($elements['#cache']['max-age']) ? $elements['#cache']['max-age'] : Cache::PERMANENT;
+  $elements['#attached'] = isset($elements['#attached']) ? $elements['#attached'] : array();
+
+  // Allow #pre_render to abort rendering.
+  if (!empty($elements['#printed'])) {
+    // The #printed element contains all the bubbleable rendering metadata for
+    // the subtree.
+    $context-&gt;update($elements);
+    // #printed, so rendering is finished, all necessary info collected!
+    $context-&gt;bubble();
+    return '';
+  }
+
+  // Add any JavaScript state information associated with the element.
+  if (!empty($elements['#states'])) {
+    drupal_process_states($elements);
+  }
+
+  // Get the children of the element, sorted by weight.
+  $children = Element::children($elements, TRUE);
+
+  // Initialize this element's #children, unless a #pre_render callback
+  // already preset #children.
+  if (!isset($elements['#children'])) {
+    $elements['#children'] = '';
+  }
+
+  // Assume that if #theme is set it represents an implemented hook.
+  $theme_is_implemented = isset($elements['#theme']);
+  // Check the elements for insecure HTML and pass through sanitization.
+  if (isset($elements)) {
+    $markup_keys = array(
+      '#description',
+      '#field_prefix',
+      '#field_suffix',
+    );
+    foreach ($markup_keys as $key) {
+      if (!empty($elements[$key]) &amp;&amp; is_scalar($elements[$key])) {
+        $elements[$key] = $this-&gt;xssFilterAdminIfUnsafe($elements[$key]);
+      }
+    }
+  }
+
+  // Call the element's #theme function if it is set. Then any children of the
+  // element have to be rendered there. If the internal #render_children
+  // property is set, do not call the #theme function to prevent infinite
+  // recursion.
+  if ($theme_is_implemented &amp;&amp; !isset($elements['#render_children'])) {
+    $elements['#children'] = $this-&gt;theme-&gt;render($elements['#theme'], $elements);
+
+    // If ThemeManagerInterface::render() returns FALSE this means that the
+    // hook in #theme was not found in the registry and so we need to update
+    // our flag accordingly. This is common for theme suggestions.
+    $theme_is_implemented = ($elements['#children'] !== FALSE);
+  }
+
+  // If #theme is not implemented or #render_children is set and the element
+  // has an empty #children attribute, render the children now. This is the
+  // same process as Renderer::render() but is inlined for speed.
+  if ((!$theme_is_implemented || isset($elements['#render_children'])) &amp;&amp; empty($elements['#children'])) {
+    foreach ($children as $key) {
+      $elements['#children'] .= $this-&gt;doRender($elements[$key]);
+    }
+    $elements['#children'] = Markup::create($elements['#children']);
+  }
+
+  // If #theme is not implemented and the element has raw #markup as a
+  // fallback, prepend the content in #markup to #children. In this case
+  // #children will contain whatever is provided by #pre_render prepended to
+  // what is rendered recursively above. If #theme is implemented then it is
+  // the responsibility of that theme implementation to render #markup if
+  // required. Eventually #theme_wrappers will expect both #markup and
+  // #children to be a single string as #children.
+  if (!$theme_is_implemented &amp;&amp; isset($elements['#markup'])) {
+    $elements['#children'] = Markup::create($elements['#markup'] . $elements['#children']);
+  }
+
+  // Let the theme functions in #theme_wrappers add markup around the rendered
+  // children.
+  // #states and #attached have to be processed before #theme_wrappers,
+  // because the #type 'page' render array from drupal_prepare_page() would
+  // render the $page and wrap it into the html.html.twig template without the
+  // attached assets otherwise.
+  // If the internal #render_children property is set, do not call the
+  // #theme_wrappers function(s) to prevent infinite recursion.
+  if (isset($elements['#theme_wrappers']) &amp;&amp; !isset($elements['#render_children'])) {
+    foreach ($elements['#theme_wrappers'] as $key =&gt; $value) {
+      // If the value of a #theme_wrappers item is an array then the theme
+      // hook is found in the key of the item and the value contains attribute
+      // overrides. Attribute overrides replace key/value pairs in $elements
+      // for only this ThemeManagerInterface::render() call. This allows
+      // #theme hooks and #theme_wrappers hooks to share variable names
+      // without conflict or ambiguity.
+      $wrapper_elements = $elements;
+      if (is_string($key)) {
+        $wrapper_hook = $key;
+        foreach ($value as $attribute =&gt; $override) {
+          $wrapper_elements[$attribute] = $override;
+        }
+      }
+      else {
+        $wrapper_hook = $value;
+      }
+
+      $elements['#children'] = $this-&gt;theme-&gt;render($wrapper_hook, $wrapper_elements);
+    }
+  }
+
+  // Filter the outputted content and make any last changes before the content
+  // is sent to the browser. The changes are made on $content which allows the
+  // outputted text to be filtered.
+  if (isset($elements['#post_render'])) {
+    foreach ($elements['#post_render'] as $callable) {
+      if (is_string($callable) &amp;&amp; strpos($callable, '::') === FALSE) {
+        $callable = $this-&gt;controllerResolver-&gt;getControllerFromDefinition($callable);
+      }
+      $elements['#children'] = call_user_func($callable, $elements['#children'], $elements);
+    }
+  }
+
+  // We store the resulting output in $elements['#markup'], to be consistent
+  // with how render cached output gets stored. This ensures that placeholder
+  // replacement logic gets the same data to work with, no matter if #cache is
+  // disabled, #cache is enabled, there is a cache hit or miss.
+  $prefix = isset($elements['#prefix']) ? $this-&gt;xssFilterAdminIfUnsafe($elements['#prefix']) : '';
+  $suffix = isset($elements['#suffix']) ? $this-&gt;xssFilterAdminIfUnsafe($elements['#suffix']) : '';
+
+  $elements['#markup'] = Markup::create($prefix . $elements['#children'] . $suffix);
+
+  // We've rendered this element (and its subtree!), now update the context.
+  $context-&gt;update($elements);
+
+  // Cache the processed element if both $pre_bubbling_elements and $elements
+  // have the metadata necessary to generate a cache ID.
+  if (isset($pre_bubbling_elements['#cache']['keys']) &amp;&amp; isset($elements['#cache']['keys'])) {
+    if ($pre_bubbling_elements['#cache']['keys'] !== $elements['#cache']['keys']) {
+      throw new \LogicException('Cache keys may not be changed after initial setup. Use the contexts property instead to bubble additional metadata.');
+    }
+    $this-&gt;renderCache-&gt;set($elements, $pre_bubbling_elements);
+    // Update the render context; the render cache implementation may update
+    // the element, and it may have different bubbleable metadata now.
+    // @see \Drupal\Core\Render\PlaceholderingRenderCache::set()
+    $context-&gt;pop();
+    $context-&gt;push(new BubbleableMetadata());
+    $context-&gt;update($elements);
+  }
+
+  // Only when we're in a root (non-recursive) Renderer::render() call,
+  // placeholders must be processed, to prevent breaking the render cache in
+  // case of nested elements with #cache set.
+  //
+  // By running them here, we ensure that:
+  // - they run when #cache is disabled,
+  // - they run when #cache is enabled and there is a cache miss.
+  // Only the case of a cache hit when #cache is enabled, is not handled here,
+  // that is handled earlier in Renderer::render().
+  if ($is_root_call) {
+    $this-&gt;replacePlaceholders($elements);
+    // @todo remove as part of https://www.drupal.org/node/2511330.
+    if ($context-&gt;count() !== 1) {
+      throw new \LogicException('A stray drupal_render() invocation with $is_root_call = TRUE is causing bubbling of attached assets to break.');
+    }
+  }
+
+  // Rendering is finished, all necessary info collected!
+  $context-&gt;bubble();
+
+  $elements['#printed'] = TRUE;
+  return $elements['#markup'];
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!lib!Drupal!Core!Render!Renderer.php/function/Renderer::doRender/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!lib!Drupal!Core!Render!Renderer.php/function/Renderer::doRender/8.1.x</a>
+  </p>
+</div>

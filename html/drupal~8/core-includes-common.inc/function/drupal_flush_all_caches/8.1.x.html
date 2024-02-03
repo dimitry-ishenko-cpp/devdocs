@@ -1,0 +1,77 @@
+<h1 id="page-subtitle">function drupal_flush_all_caches</h1>     <pre class="signature">drupal_flush_all_caches()</pre> <p>Flushes all persistent caches, resets all variables, and rebuilds all data structures.</p> <p>At times, it is necessary to re-initialize the entire system to account for changed or new code. This function:</p> <ul> <li>Clears all persistent caches: <ul> <li>The bootstrap cache bin containing base system, module system, and theme system information.</li> <li>The common 'default' cache bin containing arbitrary caches.</li> <li>The page cache.</li> <li>The URL alias path cache.</li> </ul> </li> <li>Resets all static variables that have been defined via <a href="../../../core-includes-bootstrap.inc/function/drupal_static/8.1.x.html" title="Provides central static variable storage." class="local">drupal_static</a>().</li> <li>Clears asset (JS/CSS) file caches.</li> <li>Updates the system with latest information about extensions (modules and themes).</li> <li>Updates the bootstrap flag for modules implementing bootstrap_hooks().</li> <li>Rebuilds the full database schema information (invoking <a href="../../../core-lib-drupal-core-database-database.api.php/function/hook_schema/8.1.x.html" title="Define the current version of the database schema." class="local">hook_schema</a>()).</li> <li>Rebuilds data structures of all modules (invoking <a href="../../../core-core.api.php/function/hook_rebuild/8.1.x.html" title="Rebuild data based upon refreshed caches." class="local">hook_rebuild</a>()). In core this means <ul> <li>blocks, node types, date formats and actions are synchronized with the database</li> <li>The 'active' status of fields is refreshed.</li> </ul> </li> <li>Rebuilds the menu router.</li> </ul> <p>This means the entire system is reset so all caches and static variables are effectively empty. After that is guaranteed, information about the currently active code is updated, and rebuild operations are successively called in order to synchronize the active system according to the current information defined in code.</p> <p>All modules need to ensure that all of their caches are flushed when <a href="../../../core-core.api.php/function/hook_cache_flush/8.1.x.html" title="Flush all persistent and static caches." class="local">hook_cache_flush</a>() is invoked; any previously known information must no longer exist. All following <a href="../../../core-core.api.php/function/hook_rebuild/8.1.x.html" title="Rebuild data based upon refreshed caches." class="local">hook_rebuild</a>() operations must be based on fresh and current system data. All modules must be able to rely on this contract.</p> <p>This function also resets the theme, which means it is not initialized anymore and all previously added JavaScript and CSS is gone. Normally, this function is called as an end-of-POST-request operation that is followed by a redirect, so this effect is not visible. Since the full reset is the whole point of this function, callers need to take care for backing up all needed variables and properly restoring or re-initializing them on their own. For convenience, this function automatically re-initializes the maintenance theme if it was initialized before.</p> <p>@todo Try to clear page/JS/CSS caches last, so cached pages can still be served during this possibly long-running operation. (Conflict on bootstrap cache though.) @todo Add a global lock to ensure that caches are not primed in concurrent requests.</p> <h3>See also</h3> <p> \Drupal\Core\Cache\CacheHelper::getBins()</p> <p><a href="../../../core-core.api.php/function/hook_cache_flush/8.1.x.html" title="Flush all persistent and static caches." class="local">hook_cache_flush</a>()</p> <p><a href="../../../core-core.api.php/function/hook_rebuild/8.1.x.html" title="Rebuild data based upon refreshed caches." class="local">hook_rebuild</a>()</p>  <h3>File</h3> 
+<dl> <dt>core/includes/<a href="../../8.1.x.html">common.inc</a>, line 1081</dt> <dd>Common functions that many Drupal modules will need to reference.</dd> </dl> <h3>Code</h3> <pre class="php" data-language="php">function drupal_flush_all_caches() {
+  $module_handler = \Drupal::moduleHandler();
+  // Flush all persistent caches.
+  // This is executed based on old/previously known information, which is
+  // sufficient, since new extensions cannot have any primed caches yet.
+  $module_handler-&gt;invokeAll('cache_flush');
+  foreach (Cache::getBins() as $service_id =&gt; $cache_backend) {
+    $cache_backend-&gt;deleteAll();
+  }
+
+  // Flush asset file caches.
+  \Drupal::service('asset.css.collection_optimizer')-&gt;deleteAll();
+  \Drupal::service('asset.js.collection_optimizer')-&gt;deleteAll();
+  _drupal_flush_css_js();
+
+  // Reset all static caches.
+  drupal_static_reset();
+
+  // Invalidate the container.
+  \Drupal::service('kernel')-&gt;invalidateContainer();
+
+  // Wipe the Twig PHP Storage cache.
+  PhpStorageFactory::get('twig')-&gt;deleteAll();
+
+  // Rebuild module and theme data.
+  $module_data = system_rebuild_module_data();
+  /** @var \Drupal\Core\Extension\ThemeHandlerInterface $theme_handler */
+  $theme_handler = \Drupal::service('theme_handler');
+  $theme_handler-&gt;refreshInfo();
+  // In case the active theme gets requested later in the same request we need
+  // to reset the theme manager.
+  \Drupal::theme()-&gt;resetActiveTheme();
+
+
+  // Rebuild and reboot a new kernel. A simple DrupalKernel reboot is not
+  // sufficient, since the list of enabled modules might have been adjusted
+  // above due to changed code.
+  $files = array();
+  foreach ($module_data as $name =&gt; $extension) {
+    if ($extension-&gt;status) {
+      $files[$name] = $extension;
+    }
+  }
+  \Drupal::service('kernel')-&gt;updateModules($module_handler-&gt;getModuleList(), $files);
+  // New container, new module handler.
+  $module_handler = \Drupal::moduleHandler();
+
+  // Ensure that all modules that are currently supposed to be enabled are
+  // actually loaded.
+  $module_handler-&gt;loadAll();
+
+  // Rebuild all information based on new module data.
+  $module_handler-&gt;invokeAll('rebuild');
+
+  // Clear all plugin caches.
+  \Drupal::service('plugin.cache_clearer')-&gt;clearCachedDefinitions();
+
+  // Rebuild the menu router based on all rebuilt data.
+  // Important: This rebuild must happen last, so the menu router is guaranteed
+  // to be based on up to date information.
+  \Drupal::service('router.builder')-&gt;rebuild();
+
+  // Re-initialize the maintenance theme, if the current request attempted to
+  // use it. Unlike regular usages of this function, the installer and update
+  // scripts need to flush all caches during GET requests/page building.
+  if (function_exists('_drupal_maintenance_theme')) {
+    \Drupal::theme()-&gt;resetActiveTheme();
+    drupal_maintenance_theme();
+  }
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!includes!common.inc/function/drupal_flush_all_caches/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!includes!common.inc/function/drupal_flush_all_caches/8.1.x</a>
+  </p>
+</div>

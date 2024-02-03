@@ -1,0 +1,229 @@
+<h1 id="page-subtitle">function install_begin_request</h1>     <pre class="signature">install_begin_request(<del>$class_loader</del>, &amp;$install_state)</pre> <p>Begins an installation request, modifying the installation state as needed.</p> <p>This function performs commands that must run at the beginning of every page request. It throws an exception if the installation should not proceed.</p> <h3>Parameters</h3> <p> <strong>$class_loader</strong>: The class loader. Normally Composer's ClassLoader, as included by the front controller, but may also be decorated; e.g., <a href="https://api.drupal.org/api/drupal/vendor%21symfony%21class-loader%21ApcClassLoader.php/class/ApcClassLoader/8.1.x" title="ApcClassLoader implements a wrapping autoloader cached in APC for PHP 5.3." class="local">\Symfony\Component\ClassLoader\ApcClassLoader</a>.</p> <p><strong>$install_state</strong>: An array of information about the current installation state. This is modified with information gleaned from the beginning of the page request.</p>  <h3>File</h3> 
+<dl> <dt>core/includes/<a href="../../8.1.x.html">install.core.inc</a>, line 284</dt> <dd>API functions for installing Drupal.</dd> </dl> <h3>Code</h3> <pre class="php" data-language="php">function install_begin_request($class_loader, &amp;$install_state) {
+  $request = Request::createFromGlobals();
+
+  // Add any installation parameters passed in via the URL.
+  if ($install_state['interactive']) {
+    $install_state['parameters'] += $request-&gt;query-&gt;all();
+  }
+
+  // Validate certain core settings that are used throughout the installation.
+  if (!empty($install_state['parameters']['profile'])) {
+    $install_state['parameters']['profile'] = preg_replace('/[^a-zA-Z_0-9]/', '', $install_state['parameters']['profile']);
+  }
+  if (!empty($install_state['parameters']['langcode'])) {
+    $install_state['parameters']['langcode'] = preg_replace('/[^a-zA-Z_0-9\-]/', '', $install_state['parameters']['langcode']);
+  }
+
+  // Allow command line scripts to override server variables used by Drupal.
+  require_once __DIR__ . '/bootstrap.inc';
+
+  // Before having installed the system module and being able to do a module
+  // rebuild, prime the drupal_get_filename() static cache with the module's
+  // exact location.
+  // @todo Remove as part of https://www.drupal.org/node/2186491
+  drupal_get_filename('module', 'system', 'core/modules/system/system.info.yml');
+
+  // If the hash salt leaks, it becomes possible to forge a valid testing user
+  // agent, install a new copy of Drupal, and take over the original site.
+  // The user agent header is used to pass a database prefix in the request when
+  // running tests. However, for security reasons, it is imperative that no
+  // installation be permitted using such a prefix.
+  $user_agent = $request-&gt;cookies-&gt;get('SIMPLETEST_USER_AGENT') ? : $request-&gt;server-&gt;get('HTTP_USER_AGENT');
+  if ($install_state['interactive'] &amp;&amp; strpos($user_agent, 'simpletest') !== FALSE &amp;&amp; !drupal_valid_test_ua()) {
+    header($request-&gt;server-&gt;get('SERVER_PROTOCOL') . ' 403 Forbidden');
+    exit;
+  }
+
+  $site_path = DrupalKernel::findSitePath($request, FALSE);
+  Settings::initialize(dirname(dirname(__DIR__)), $site_path, $class_loader);
+
+  // Ensure that procedural dependencies are loaded as early as possible,
+  // since the error/exception handlers depend on them.
+  require_once __DIR__ . '/../modules/system/system.install';
+  require_once __DIR__ . '/common.inc';
+  require_once __DIR__ . '/file.inc';
+  require_once __DIR__ . '/install.inc';
+  require_once __DIR__ . '/schema.inc';
+  require_once __DIR__ . '/database.inc';
+  require_once __DIR__ . '/form.inc';
+  require_once __DIR__ . '/batch.inc';
+
+  // Load module basics (needed for hook invokes).
+  include_once __DIR__ . '/module.inc';
+  require_once __DIR__ . '/entity.inc';
+
+  // Create a minimal mocked container to support calls to t() in the pre-kernel
+  // base system verification code paths below. The strings are not actually
+  // used or output for these calls.
+  // @todo Separate API level checks from UI-facing error messages.
+  $container = new ContainerBuilder();
+  $container-&gt;setParameter('language.default_values', Language::$defaultValues);
+  $container
+  -&gt;register('language.default', 'Drupal\Core\Language\LanguageDefault')
+    -&gt;addArgument('%language.default_values%');
+  $container
+  -&gt;register('string_translation', 'Drupal\Core\StringTranslation\TranslationManager')
+    -&gt;addArgument(new Reference('language.default'));
+
+  // Register the stream wrapper manager.
+  $container
+  -&gt;register('stream_wrapper_manager', 'Drupal\Core\StreamWrapper\StreamWrapperManager')
+    -&gt;addMethodCall('setContainer', array(new Reference('service_container')));
+  $container
+  -&gt;register('file_system', 'Drupal\Core\File\FileSystem')
+    -&gt;addArgument(new Reference('stream_wrapper_manager'))
+    -&gt;addArgument(Settings::getInstance())
+    -&gt;addArgument((new LoggerChannelFactory())-&gt;get('file'));
+
+  \Drupal::setContainer($container);
+
+  // Determine whether base system services are ready to operate.
+  try {
+    $sync_directory = config_get_config_directory(CONFIG_SYNC_DIRECTORY);
+    $install_state['config_verified'] = file_exists($sync_directory);
+  }
+  catch (Exception $e) {
+    $install_state['config_verified'] = FALSE;
+  }
+  $install_state['database_verified'] = install_verify_database_settings($site_path);
+  $install_state['settings_verified'] = $install_state['config_verified'] &amp;&amp; $install_state['database_verified'];
+
+  // Install factory tables only after checking the database.
+  if ($install_state['database_verified'] &amp;&amp; $install_state['database_ready']) {
+    $container
+    -&gt;register('path.matcher', 'Drupal\Core\Path\PathMatcher')
+      -&gt;addArgument(new Reference('config.factory'));
+  }
+
+  if ($install_state['settings_verified']) {
+    try {
+      $system_schema = system_schema();
+      end($system_schema);
+      $table = key($system_schema);
+      $install_state['base_system_verified'] = Database::getConnection()-&gt;schema()-&gt;tableExists($table);
+    }
+    catch (DatabaseExceptionWrapper $e) {
+      // The last defined table of the base system_schema() does not exist yet.
+      // $install_state['base_system_verified'] defaults to FALSE, so the code
+      // following below will use the minimal installer service container.
+      // As soon as the base system is verified here, the installer operates in
+      // a full and regular Drupal environment, without any kind of exceptions.
+    }
+  }
+
+  // Replace services with in-memory and null implementations. This kernel is
+  // replaced with a regular one in drupal_install_system().
+  if (!$install_state['base_system_verified']) {
+    $environment = 'install';
+    $GLOBALS['conf']['container_service_providers']['InstallerServiceProvider'] = 'Drupal\Core\Installer\InstallerServiceProvider';
+  }
+  else {
+    $environment = 'prod';
+  }
+
+  // Only allow dumping the container once the hash salt has been created.
+  $kernel = InstallerKernel::createFromRequest($request, $class_loader, $environment, (bool) Settings::get('hash_salt', FALSE));
+  $kernel-&gt;setSitePath($site_path);
+  $kernel-&gt;boot();
+  $container = $kernel-&gt;getContainer();
+  // If Drupal is being installed behind a proxy, configure the request.
+  ReverseProxyMiddleware::setSettingsOnRequest($request, Settings::getInstance());
+
+  // Register the file translation service.
+  if (isset($GLOBALS['config']['locale.settings']['translation']['path'])) {
+    $directory = $GLOBALS['config']['locale.settings']['translation']['path'];
+  }
+  else {
+    $directory = $site_path . '/files/translations';
+  }
+  $container-&gt;set('string_translator.file_translation', new FileTranslation($directory));
+  $container-&gt;get('string_translation')
+    -&gt;addTranslator($container-&gt;get('string_translator.file_translation'));
+
+  // Add list of all available profiles to the installation state.
+  $listing = new ExtensionDiscovery($container-&gt;get('app.root'));
+  $listing-&gt;setProfileDirectories(array());
+  $install_state['profiles'] += $listing-&gt;scan('profile');
+
+  // Prime drupal_get_filename()'s static cache.
+  foreach ($install_state['profiles'] as $name =&gt; $profile) {
+    drupal_get_filename('profile', $name, $profile-&gt;getPathname());
+  }
+
+  if ($profile = _install_select_profile($install_state)) {
+    $install_state['parameters']['profile'] = $profile;
+    install_load_profile($install_state);
+    if (isset($install_state['profile_info']['distribution']['install']['theme'])) {
+      $install_state['theme'] = $install_state['profile_info']['distribution']['install']['theme'];
+    }
+  }
+
+  // Use the language from the profile configuration, if available, to override
+  // the language previously set in the parameters.
+  if (isset($install_state['profile_info']['distribution']['langcode'])) {
+    $install_state['parameters']['langcode'] = $install_state['profile_info']['distribution']['langcode'];
+  }
+
+  // Set the default language to the selected language, if any.
+  if (isset($install_state['parameters']['langcode'])) {
+    $default_language = new Language(array('id' =&gt; $install_state['parameters']['langcode']));
+    $container-&gt;get('language.default')-&gt;set($default_language);
+    \Drupal::translation()-&gt;setDefaultLangcode($install_state['parameters']['langcode']);
+  }
+
+  // Override the module list with a minimal set of modules.
+  $module_handler = \Drupal::moduleHandler();
+  if (!$module_handler-&gt;moduleExists('system')) {
+    $module_handler-&gt;addModule('system', 'core/modules/system');
+  }
+  if ($profile &amp;&amp; !$module_handler-&gt;moduleExists($profile)) {
+    $module_handler-&gt;addProfile($profile, $install_state['profiles'][$profile]-&gt;getPath());
+  }
+
+  // Load all modules and perform request related initialization.
+  $kernel-&gt;preHandle($request);
+
+  // Initialize a route on this legacy request similar to
+  // \Drupal\Core\DrupalKernel::prepareLegacyRequest() since normal routing
+  // will not happen.
+  $request-&gt;attributes-&gt;set(RouteObjectInterface::ROUTE_OBJECT, new Route('&lt;none&gt;'));
+  $request-&gt;attributes-&gt;set(RouteObjectInterface::ROUTE_NAME, '&lt;none&gt;');
+
+  // Prepare for themed output. We need to run this at the beginning of the
+  // page request to avoid a different theme accidentally getting set. (We also
+  // need to run it even in the case of command-line installations, to prevent
+  // any code in the installer that happens to initialize the theme system from
+  // accessing the database before it is set up yet.)
+  drupal_maintenance_theme();
+
+  if ($install_state['database_verified']) {
+    // Verify the last completed task in the database, if there is one.
+    $task = install_verify_completed_task();
+  }
+  else {
+    $task = NULL;
+
+    // Do not install over a configured settings.php.
+    if (Database::getConnectionInfo()) {
+      throw new AlreadyInstalledException($container-&gt;get('string_translation'));
+    }
+  }
+
+  // Ensure that the active configuration is empty before installation starts.
+  if ($install_state['config_verified'] &amp;&amp; empty($task)) {
+    if (count($kernel-&gt;getConfigStorage()-&gt;listAll())) {
+      $task = NULL;
+      throw new AlreadyInstalledException($container-&gt;get('string_translation'));
+    }
+  }
+
+  // Modify the installation state as appropriate.
+  $install_state['completed_task'] = $task;
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!includes!install.core.inc/function/install_begin_request/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!includes!install.core.inc/function/install_begin_request/8.1.x</a>
+  </p>
+</div>

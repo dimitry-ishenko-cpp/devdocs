@@ -1,0 +1,97 @@
+<h1 id="page-subtitle">protected function HtmlRenderer::prepare</h1>     <pre class="signature">protected <a href="../../class/htmlrenderer/8.1.x.html">HtmlRenderer</a>::prepare(array $main_content, Request $request, RouteMatchInterface $route_match)</pre> <p>Prepares the HTML body: wraps the main content in #type 'page'.</p> <h3>Parameters</h3> <p> <strong>array $main_content</strong>: The render array representing the main content.</p> <p><strong><a href="https://api.drupal.org/api/drupal/vendor%21symfony%21http-foundation%21Request.php/class/Request/8.1.x" title="Request represents an HTTP request." class="local">\Symfony\Component\HttpFoundation\Request</a> $request</strong>: The request object, for context.</p> <p><strong><a href="../../../core-lib-drupal-core-routing-routematchinterface.php/interface/routematchinterface/8.1.x.html" title="Provides an interface for classes representing the result of routing." class="local">\Drupal\Core\Routing\RouteMatchInterface</a> $route_match</strong>: The route match, for context.</p> <h3>Return value</h3> <p> array An array with two values: 0. A #type 'page' render array. 1. The page title.</p> <h3>Throws</h3> <p> \LogicException If the selected display variant does not implement <a href="../../../core-lib-drupal-core-display-pagevariantinterface.php/interface/pagevariantinterface/8.1.x.html" title="Provides an interface for PageDisplayVariant plugins." class="local">PageVariantInterface</a>.</p>  <h3>File</h3> 
+<dl> <dt>core/lib/Drupal/Core/Render/MainContent/<a href="https://api.drupal.org/api/drupal/core%21lib%21Drupal%21Core%21Render%21MainContent%21HtmlRenderer.php/8.1.x">HtmlRenderer.php</a>, line 189</dt>  </dl> <h3>Class</h3> 
+<dl> <dt>
+<a href="../../class/htmlrenderer/8.1.x.html">HtmlRenderer</a> </dt> <dd>Default main content renderer for HTML requests.</dd> </dl> <h3>Namespace</h3> <a href="https://api.drupal.org/api/drupal/namespace/Drupal%21Core%21Render%21MainContent/8.1.x">Drupal\Core\Render\MainContent</a> <h3>Code</h3> <pre class="php" data-language="php">protected function prepare(array $main_content, Request $request, RouteMatchInterface $route_match) {
+  // Determine the title: use the title provided by the main content if any,
+  // otherwise get it from the routing information.
+  $get_title = function(array $main_content) use ($request, $route_match) {
+    return isset($main_content['#title']) ? $main_content['#title'] : $this-&gt;titleResolver-&gt;getTitle($request, $route_match-&gt;getRouteObject());
+  };
+
+  // If the _controller result already is #type =&gt; page,
+  // we have no work to do: The "main content" already is an entire "page"
+  // (see html.html.twig).
+  if (isset($main_content['#type']) &amp;&amp; $main_content['#type'] === 'page') {
+    $page = $main_content;
+    $title = $get_title($page);
+  }
+  // Otherwise, render it as the main content of a #type =&gt; page, by selecting
+  // page display variant to do that and building that page display variant.
+  else {
+    // Select the page display variant to be used to render this main content,
+    // default to the built-in "simple page".
+    $event = new PageDisplayVariantSelectionEvent('simple_page', $route_match);
+    $this-&gt;eventDispatcher-&gt;dispatch(RenderEvents::SELECT_PAGE_DISPLAY_VARIANT, $event);
+    $variant_id = $event-&gt;getPluginId();
+
+    // We must render the main content now already, because it might provide a
+    // title. We set its $is_root_call parameter to FALSE, to ensure
+    // placeholders are not yet replaced. This is essentially "pre-rendering"
+    // the main content, the "full rendering" will happen in
+    // ::renderResponse().
+    // @todo Remove this once https://www.drupal.org/node/2359901 lands.
+    if (!empty($main_content)) {
+      $this-&gt;renderer-&gt;executeInRenderContext(new RenderContext(), function() use (&amp;$main_content) {
+        if (isset($main_content['#cache']['keys'])) {
+          // Retain #title, otherwise, dynamically generated titles would be
+          // missing for controllers whose entire returned render array is
+          // render cached.
+          $main_content['#cache_properties'][] = '#title';
+        }
+        return $this-&gt;renderer-&gt;render($main_content, FALSE);
+      });
+      $main_content = $this-&gt;renderCache-&gt;getCacheableRenderArray($main_content) + [
+        '#title' =&gt; isset($main_content['#title']) ? $main_content['#title'] : NULL
+      ];
+    }
+
+    $title = $get_title($main_content);
+
+    // Instantiate the page display, and give it the main content.
+    $page_display = $this-&gt;displayVariantManager-&gt;createInstance($variant_id);
+    if (!$page_display instanceof PageVariantInterface) {
+      throw new \LogicException('Cannot render the main content for this page because the provided display variant does not implement PageVariantInterface.');
+    }
+    $page_display
+    -&gt;setMainContent($main_content)
+      -&gt;setTitle($title)
+      -&gt;addCacheableDependency($event)
+      -&gt;setConfiguration($event-&gt;getPluginConfiguration());
+    // Some display variants need to be passed an array of contexts with
+    // values because they can't get all their contexts globally. For example,
+    // in Page Manager, you can create a Page which has a specific static
+    // context (e.g. a context that refers to the Node with nid 6), if any
+    // such contexts were added to the $event, pass them to the $page_display.
+    if ($page_display instanceof ContextAwareVariantInterface) {
+      $page_display-&gt;setContexts($event-&gt;getContexts());
+    }
+
+    // Generate a #type =&gt; page render array using the page display variant,
+    // the page display will build the content for the various page regions.
+    $page = array(
+      '#type' =&gt; 'page',
+    );
+    $page += $page_display-&gt;build();
+  }
+
+  // $page is now fully built. Find all non-empty page regions, and add a
+  // theme wrapper function that allows them to be consistently themed.
+  $regions = \Drupal::theme()-&gt;getActiveTheme()-&gt;getRegions();
+  foreach ($regions as $region) {
+    if (!empty($page[$region])) {
+      $page[$region]['#theme_wrappers'][] = 'region';
+      $page[$region]['#region'] = $region;
+    }
+  }
+
+  // Allow hooks to add attachments to $page['#attached'].
+  $this-&gt;invokePageAttachmentHooks($page);
+
+  return [$page, $title];
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!lib!Drupal!Core!Render!MainContent!HtmlRenderer.php/function/HtmlRenderer::prepare/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!lib!Drupal!Core!Render!MainContent!HtmlRenderer.php/function/HtmlRenderer::prepare/8.1.x</a>
+  </p>
+</div>

@@ -1,0 +1,142 @@
+<h1 id="page-subtitle">function color_scheme_form_submit</h1>     <pre class="signature">color_scheme_form_submit(<del>$form</del>, FormStateInterface <del>$form_state</del>)</pre> <p>Form submission handler for <a href="../color_scheme_form/8.1.x.html" title="Form constructor for the color configuration form for a particular theme." class="local">color_scheme_form</a>().</p> <h3>See also</h3> <p> <a href="../color_scheme_form_validate/8.1.x.html" title="Form validation handler for color_scheme_form()." class="local">color_scheme_form_validate</a>()</p>  <h3>File</h3> 
+<dl> <dt>core/modules/color/<a href="../../8.1.x.html">color.module</a>, line 372</dt> <dd>Allows users to change the color scheme of themes.</dd> </dl> <h3>Code</h3> <pre class="php" data-language="php">function color_scheme_form_submit($form, FormStateInterface $form_state) {
+
+  // Avoid color settings spilling over to theme settings.
+  $color_settings = array('theme', 'palette', 'scheme');
+  if ($form_state-&gt;hasValue('info')) {
+    $color_settings[] = 'info';
+  }
+  foreach ($color_settings as $setting_name) {
+    ${$setting_name}= $form_state-&gt;getValue($setting_name);
+    $form_state-&gt;unsetValue($setting_name);
+  }
+  if (!isset($info)) {
+    return;
+  }
+
+  $config = \Drupal::configFactory()-&gt;getEditable('color.theme.' . $theme);
+
+  // Resolve palette.
+  if ($scheme != '') {
+    foreach ($palette as $key =&gt; $color) {
+      if (isset($info['schemes'][$scheme]['colors'][$key])) {
+        $palette[$key] = $info['schemes'][$scheme]['colors'][$key];
+      }
+    }
+    $palette += $info['schemes']['default']['colors'];
+  }
+
+  // Make sure enough memory is available.
+  if (isset($info['base_image'])) {
+    // Fetch source image dimensions.
+    $source = drupal_get_path('theme', $theme) . '/' . $info['base_image'];
+    list($width, $height) = getimagesize($source);
+
+    // We need at least a copy of the source and a target buffer of the same
+    // size (both at 32bpp).
+    $required = $width * $height * 8;
+    // We intend to prevent color scheme changes if there isn't enough memory
+    // available.  memory_get_usage(TRUE) returns a more accurate number than
+    // memory_get_usage(), therefore we won't inadvertently reject a color
+    // scheme change based on a faulty memory calculation.
+    $usage = memory_get_usage(TRUE);
+    $memory_limit = ini_get('memory_limit');
+    $size = Bytes::toInt($memory_limit);
+    if (!Environment::checkMemoryLimit($usage + $required, $memory_limit)) {
+      drupal_set_message(t('There is not enough memory available to PHP to change this theme\'s color scheme. You need at least %size more. Check the &lt;a href="http://php.net/manual/ini.core.php#ini.sect.resource-limits"&gt;PHP documentation&lt;/a&gt; for more information.', array('%size' =&gt; format_size($usage + $required - $size))), 'error');
+      return;
+    }
+  }
+
+  // Delete old files.
+  $files = $config-&gt;get('files');
+  if (isset($files)) {
+    foreach ($files as $file) {
+      @drupal_unlink($file);
+    }
+  }
+  if (isset($file) &amp;&amp; $file = dirname($file)) {
+    @drupal_rmdir($file);
+  }
+
+  // No change in color config, use the standard theme from color.inc.
+  if (implode(',', color_get_palette($theme, TRUE)) == implode(',', $palette)) {
+    $config-&gt;delete();
+    return;
+  }
+
+  // Prepare target locations for generated files.
+  $id = $theme . '-' . substr(hash('sha256', serialize($palette) . microtime()), 0, 8);
+  $paths['color'] = 'public://color';
+  $paths['target'] = $paths['color'] . '/' . $id;
+  foreach ($paths as $path) {
+    file_prepare_directory($path, FILE_CREATE_DIRECTORY);
+  }
+  $paths['target'] = $paths['target'] . '/';
+  $paths['id'] = $id;
+  $paths['source'] = drupal_get_path('theme', $theme) . '/';
+  $paths['files'] = $paths['map'] = array();
+
+  // Save palette and logo location.
+  $config
+  -&gt;set('palette', $palette)
+    -&gt;set('logo', $paths['target'] . 'logo.svg')
+    -&gt;save();
+
+  // Copy over neutral images.
+  foreach ($info['copy'] as $file) {
+    $base = drupal_basename($file);
+    $source = $paths['source'] . $file;
+    $filepath = file_unmanaged_copy($source, $paths['target'] . $base);
+    $paths['map'][$file] = $base;
+    $paths['files'][] = $filepath;
+  }
+
+  // Render new images, if image has been provided.
+  if (isset($info['base_image'])) {
+    _color_render_images($theme, $info, $paths, $palette);
+  }
+
+  // Rewrite theme stylesheets.
+  $css = array();
+  foreach ($info['css'] as $stylesheet) {
+    // Build a temporary array with CSS files.
+    $files = array();
+    if (file_exists($paths['source'] . $stylesheet)) {
+      $files[] = $stylesheet;
+    }
+
+    foreach ($files as $file) {
+      $css_optimizer = new CssOptimizer();
+      // Aggregate @imports recursively for each configured top level CSS file
+      // without optimization. Aggregation and optimization will be
+      // handled by drupal_build_css_cache() only.
+      $style = $css_optimizer-&gt;loadFile($paths['source'] . $file, FALSE);
+
+      // Return the path to where this CSS file originated from, stripping
+      // off the name of the file at the end of the path.
+      $css_optimizer-&gt;rewriteFileURIBasePath = base_path() . dirname($paths['source'] . $file) . '/';
+
+      // Prefix all paths within this CSS file, ignoring absolute paths.
+      $style = preg_replace_callback('/url\([\'"]?(?![a-z]+:|\/+)([^\'")]+)[\'"]?\)/i', array($css_optimizer, 'rewriteFileURI'), $style);
+
+      // Rewrite stylesheet with new colors.
+      $style = _color_rewrite_stylesheet($theme, $info, $paths, $palette, $style);
+      $base_file = drupal_basename($file);
+      $css[] = $paths['target'] . $base_file;
+      _color_save_stylesheet($paths['target'] . $base_file, $style, $paths);
+    }
+  }
+
+  // Maintain list of files.
+  $config
+  -&gt;set('stylesheets', $css)
+    -&gt;set('files', $paths['files'])
+    -&gt;save();
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!modules!color!color.module/function/color_scheme_form_submit/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!modules!color!color.module/function/color_scheme_form_submit/8.1.x</a>
+  </p>
+</div>

@@ -1,0 +1,130 @@
+<h1 id="page-subtitle">function search_index</h1>     <pre class="signature">search_index($type, $sid, <del>$langcode</del>, $text)</pre> <p>Updates the full-text search index for a particular item.</p> <h3>Parameters</h3> <p> <strong>string $type</strong>: The plugin ID or other machine-readable type of this item, which should be less than 64 bytes.</p> <p><strong>int $sid</strong>: An ID number identifying this particular item (e.g., node ID).</p> <p><strong>string $langcode</strong>: Language code for the language of the text being indexed.</p> <p><strong>string $text</strong>: The content of this item. Must be a piece of HTML or plain text.</p> <h3>Related topics</h3>   <dl api-related-topics> <dt><a href="../../group/search/8.1.x.html">Search interface</a></dt> <dd>The Drupal search interface manages a global search mechanism.</dd> </dl>    <h3>File</h3> 
+<dl> <dt>core/modules/search/<a href="../../8.1.x.html">search.module</a>, line 430</dt> <dd>Enables site-wide keyword searching.</dd> </dl> <h3>Code</h3> <pre class="php" data-language="php">function search_index($type, $sid, $langcode, $text) {
+  $minimum_word_size = \Drupal::config('search.settings')-&gt;get('index.minimum_word_size');
+
+  // Multipliers for scores of words inside certain HTML tags. The weights are
+  // stored in config so that modules can overwrite the default weights.
+  // Note: 'a' must be included for link ranking to work.
+  $tags = \Drupal::config('search.settings')-&gt;get('index.tag_weights');
+
+  // Strip off all ignored tags to speed up processing, but insert space before
+  // and after them to keep word boundaries.
+  $text = str_replace(array('&lt;', '&gt;'), array(' &lt;', '&gt; '), $text);
+  $text = strip_tags($text, '&lt;' . implode('&gt;&lt;', array_keys($tags)) . '&gt;');
+
+  // Split HTML tags from plain text.
+  $split = preg_split('/\s*&lt;([^&gt;]+?)&gt;\s*/', $text, -1, PREG_SPLIT_DELIM_CAPTURE);
+  // Note: PHP ensures the array consists of alternating delimiters and literals
+  // and begins and ends with a literal (inserting $null as required).
+
+  $tag = FALSE; // Odd/even counter. Tag or no tag.
+  $score = 1; // Starting score per word
+  $accum = ' '; // Accumulator for cleaned up data
+  $tagstack = array(); // Stack with open tags
+  $tagwords = 0; // Counter for consecutive words
+  $focus = 1; // Focus state
+
+  $scored_words = array(); // Accumulator for words for index
+
+  foreach ($split as $value) {
+    if ($tag) {
+      // Increase or decrease score per word based on tag
+      list($tagname) = explode(' ', $value, 2);
+      $tagname = Unicode::strtolower($tagname);
+      // Closing or opening tag?
+      if ($tagname[0] == '/') {
+        $tagname = substr($tagname, 1);
+        // If we encounter unexpected tags, reset score to avoid incorrect boosting.
+        if (!count($tagstack) || $tagstack[0] != $tagname) {
+          $tagstack = array();
+          $score = 1;
+        }
+        else {
+          // Remove from tag stack and decrement score
+          $score = max(1, $score - $tags[array_shift($tagstack)]);
+        }
+      }
+      else {
+        if (isset($tagstack[0]) &amp;&amp; $tagstack[0] == $tagname) {
+          // None of the tags we look for make sense when nested identically.
+          // If they are, it's probably broken HTML.
+          $tagstack = array();
+          $score = 1;
+        }
+        else {
+          // Add to open tag stack and increment score
+          array_unshift($tagstack, $tagname);
+          $score += $tags[$tagname];
+        }
+      }
+      // A tag change occurred, reset counter.
+      $tagwords = 0;
+    }
+    else {
+      // Note: use of PREG_SPLIT_DELIM_CAPTURE above will introduce empty values
+      if ($value != '') {
+        $words = search_index_split($value, $langcode);
+        foreach ($words as $word) {
+          // Add word to accumulator
+          $accum .= $word . ' ';
+          // Check wordlength
+          if (is_numeric($word) || Unicode::strlen($word) &gt;= $minimum_word_size) {
+            if (!isset($scored_words[$word])) {
+              $scored_words[$word] = 0;
+            }
+            $scored_words[$word] += $score * $focus;
+            // Focus is a decaying value in terms of the amount of unique words up to this point.
+            // From 100 words and more, it decays, to e.g. 0.5 at 500 words and 0.3 at 1000 words.
+            $focus = min(1, .01 + 3.5 / (2 + count($scored_words) * .015));
+          }
+          $tagwords++;
+          // Too many words inside a single tag probably mean a tag was accidentally left open.
+          if (count($tagstack) &amp;&amp; $tagwords &gt;= 15) {
+            $tagstack = array();
+            $score = 1;
+          }
+        }
+      }
+    }
+    $tag = !$tag;
+  }
+
+  // Remove the item $sid from the search index, and invalidate the relevant
+  // cache tags.
+  search_index_clear($type, $sid, $langcode);
+
+  // Insert cleaned up data into dataset
+  db_insert('search_dataset')
+    -&gt;fields(array(
+      'sid' =&gt; $sid,
+      'langcode' =&gt; $langcode,
+      'type' =&gt; $type,
+      'data' =&gt; $accum,
+      'reindex' =&gt; 0,
+    ))
+    -&gt;execute();
+
+  // Insert results into search index
+  foreach ($scored_words as $word =&gt; $score) {
+    // If a word already exists in the database, its score gets increased
+    // appropriately. If not, we create a new record with the appropriate
+    // starting score.
+    db_merge('search_index')
+      -&gt;keys(array(
+        'word' =&gt; $word,
+        'sid' =&gt; $sid,
+        'langcode' =&gt; $langcode,
+        'type' =&gt; $type,
+      ))
+      -&gt;fields(array('score' =&gt; $score))
+      -&gt;expression('score', 'score + :score', array(':score' =&gt; $score))
+      -&gt;execute();
+    search_dirty($word);
+  }
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!modules!search!search.module/function/search_index/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!modules!search!search.module/function/search_index/8.1.x</a>
+  </p>
+</div>

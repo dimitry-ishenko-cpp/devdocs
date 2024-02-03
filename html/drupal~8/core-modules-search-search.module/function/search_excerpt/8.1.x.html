@@ -1,0 +1,153 @@
+<h1 id="page-subtitle">function search_excerpt</h1>     <pre class="signature">search_excerpt($keys, $text, <del>$langcode</del> = NULL)</pre> <p>Returns snippets from a piece of text, with search keywords highlighted.</p> <p>Used for formatting search results. All HTML tags will be stripped from $text.</p> <h3>Parameters</h3> <p> <strong>string $keys</strong>: A string containing a search query.</p> <p><strong>string $text</strong>: The text to extract fragments from.</p> <p><strong>string|null $langcode</strong>: Language code for the language of $text, if known.</p> <h3>Return value</h3> <p> array A render array containing HTML for the excerpt.</p> <h3>Related topics</h3>   <dl api-related-topics> <dt><a href="../../group/search/8.1.x.html">Search interface</a></dt> <dd>The Drupal search interface manages a global search mechanism.</dd> </dl>    <h3>File</h3> 
+<dl> <dt>core/modules/search/<a href="../../8.1.x.html">search.module</a>, line 642</dt> <dd>Enables site-wide keyword searching.</dd> </dl> <h3>Code</h3> <pre class="php" data-language="php">function search_excerpt($keys, $text, $langcode = NULL) {
+  // We highlight around non-indexable or CJK characters.
+  $boundary_character = '[' . Unicode::PREG_CLASS_WORD_BOUNDARY . PREG_CLASS_CJK . ']';
+  $preceded_by_boundary = '(?&lt;=' . $boundary_character . ')';
+  $followed_by_boundary = '(?=' . $boundary_character . ')';
+
+  // Extract positive keywords and phrases.
+  preg_match_all('/ ("([^"]+)"|(?!OR)([^" ]+))/', ' ' . $keys, $matches);
+  $keys = array_merge($matches[2], $matches[3]);
+
+  // Prepare text by stripping HTML tags and decoding HTML entities.
+  $text = strip_tags(str_replace(array('&lt;', '&gt;'), array(' &lt;', '&gt; '), $text));
+  $text = Html::decodeEntities($text);
+  $text_length = strlen($text);
+
+  // Make a list of unique keywords that are actually found in the text,
+  // which could be items in $keys or replacements that are equivalent through
+  // search_simplify().
+  $temp_keys = array();
+  foreach ($keys as $key) {
+    $key = _search_find_match_with_simplify($key, $text, $boundary_character, $langcode);
+    if (isset($key)) {
+      // Quote slashes so they can be used in regular expressions.
+      $temp_keys[] = preg_quote($key, '/');
+    }
+  }
+  // Several keywords could have simplified down to the same thing, so pick
+  // out the unique ones.
+  $keys = array_unique($temp_keys);
+
+  // Extract fragments of about 60 characters around keywords, bounded by word
+  // boundary characters. Try to reach 256 characters, using second occurrences
+  // if necessary.
+  $ranges = array();
+  $length = 0;
+  $look_start = array();
+  $remaining_keys = $keys;
+
+  while ($length &lt; 256 &amp;&amp; !empty($remaining_keys)) {
+    $found_keys = array();
+    foreach ($remaining_keys as $key) {
+      if ($length &gt;= 256) {
+        break;
+      }
+
+      // Remember where we last found $key, in case we are coming through a
+      // second time.
+      if (!isset($look_start[$key])) {
+        $look_start[$key] = 0;
+      }
+
+      // See if we can find $key after where we found it the last time. Since
+      // we are requiring a match on a word boundary, make sure $text starts
+      // and ends with a space.
+      $matches = array();
+      if (preg_match('/' . $preceded_by_boundary . $key . $followed_by_boundary . '/iu', ' ' . $text . ' ', $matches, PREG_OFFSET_CAPTURE, $look_start[$key])) {
+        $found_position = $matches[0][1];
+        $look_start[$key] = $found_position + 1;
+        // Keep track of which keys we found this time, in case we need to
+        // pass through again to find more text.
+        $found_keys[] = $key;
+
+        // Locate a space before and after this match, leaving about 60
+        // characters of context on each end.
+        $before = strpos(' ' . $text, ' ', max(0, $found_position - 61));
+        if ($before !== FALSE &amp;&amp; $before &lt;= $found_position) {
+          if ($text_length &gt; $found_position + 60) {
+            $after = strrpos(substr($text, 0, $found_position + 60), ' ', $found_position);
+          }
+          else {
+            $after = $text_length;
+          }
+          if ($after !== FALSE &amp;&amp; $after &gt; $found_position) {
+            // Account for the spaces we added.
+            $before = max($before - 1, 0);
+            if ($before &lt; $after) {
+              // Save this range.
+              $ranges[$before] = $after;
+              $length += $after - $before;
+            }
+          }
+        }
+      }
+    }
+    // Next time through this loop, only look for keys we found this time,
+    // if any.
+    $remaining_keys = $found_keys;
+  }
+
+  if (empty($ranges)) {
+    // We didn't find any keyword matches, so just return the first part of the
+    // text. We also need to re-encode any HTML special characters that we
+    // entity-decoded above.
+    return [
+      '#plain_text' =&gt; Unicode::truncate($text, 256, TRUE, TRUE),
+    ];
+  }
+
+  // Sort the text ranges by starting position.
+  ksort($ranges);
+
+  // Collapse overlapping text ranges into one. The sorting makes it O(n).
+  $new_ranges = array();
+  $max_end = 0;
+  foreach ($ranges as $this_from =&gt; $this_to) {
+    $max_end = max($max_end, $this_to);
+    if (!isset($working_from)) {
+      // This is the first time through this loop: initialize.
+      $working_from = $this_from;
+      $working_to = $this_to;
+      continue;
+    }
+    if ($this_from &lt;= $working_to) {
+      // The ranges overlap: combine them.
+      $working_to = max($working_to, $this_to);
+    }
+    else {
+      // The ranges do not overlap: save the working range and start a new one.
+      $new_ranges[$working_from] = $working_to;
+      $working_from = $this_from;
+      $working_to = $this_to;
+    }
+  }
+  // Save the remaining working range.
+  $new_ranges[$working_from] = $working_to;
+
+  // Fetch text within the combined ranges we found.
+  $out = array();
+  foreach ($new_ranges as $from =&gt; $to) {
+    $out[] = substr($text, $from, $to - $from);
+  }
+
+  // Combine the text chunks with "…" separators. The "…" needs to be
+  // translated. Let translators have the … separator text as one chunk.
+  $ellipses = explode('@excerpt', t('… @excerpt … @excerpt …'));
+  $text = (isset($new_ranges[0]) ? '' : $ellipses[0]) . implode($ellipses[1], $out) . (($max_end &lt; strlen($text) - 1) ? $ellipses[2] : '');
+  $text = Html::escape($text);
+
+  // Highlight keywords. Must be done at once to prevent conflicts ('strong'
+  // and '&lt;strong&gt;').
+  $text = trim(preg_replace('/' . $preceded_by_boundary . '(?:' . implode('|', $keys) . ')' . $followed_by_boundary . '/iu', '&lt;strong&gt;\0&lt;/strong&gt;', ' ' . $text . ' '));
+  return [
+    '#markup' =&gt; $text,
+    '#allowed_tags' =&gt; ['strong']
+  ];
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!modules!search!search.module/function/search_excerpt/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!modules!search!search.module/function/search_excerpt/8.1.x</a>
+  </p>
+</div>

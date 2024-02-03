@@ -1,0 +1,117 @@
+<h1 id="page-subtitle">protected function SqlContentEntityStorage::saveToDedicatedTables</h1>     <pre class="signature">protected <a href="../../class/sqlcontententitystorage/8.1.x.html">SqlContentEntityStorage</a>::saveToDedicatedTables(ContentEntityInterface $entity, $update = TRUE, $names = array())</pre> <p>Saves values of fields that use dedicated tables.</p> <h3>Parameters</h3> <p> <strong><a href="../../../core-lib-drupal-core-entity-contententityinterface.php/interface/contententityinterface/8.1.x.html" title="Defines a common interface for all content entity objects." class="local">\Drupal\Core\Entity\ContentEntityInterface</a> $entity</strong>: The entity.</p> <p><strong>bool $update</strong>: TRUE if the entity is being updated, FALSE if it is being inserted.</p> <p><strong>string[] $names</strong>: (optional) The names of the fields to be stored. Defaults to all the available fields.</p>  <h3>File</h3> 
+<dl> <dt>core/lib/Drupal/Core/Entity/Sql/<a href="https://api.drupal.org/api/drupal/core%21lib%21Drupal%21Core%21Entity%21Sql%21SqlContentEntityStorage.php/8.1.x">SqlContentEntityStorage.php</a>, line 1164</dt>  </dl> <h3>Class</h3> 
+<dl> <dt>
+<a href="../../class/sqlcontententitystorage/8.1.x.html">SqlContentEntityStorage</a> </dt> <dd>A content entity database storage implementation.</dd> </dl> <h3>Namespace</h3> <a href="https://api.drupal.org/api/drupal/namespace/Drupal%21Core%21Entity%21Sql/8.1.x">Drupal\Core\Entity\Sql</a> <h3>Code</h3> <pre class="php" data-language="php">protected function saveToDedicatedTables(ContentEntityInterface $entity, $update = TRUE, $names = array()) {
+  $vid = $entity-&gt;getRevisionId();
+  $id = $entity-&gt;id();
+  $bundle = $entity-&gt;bundle();
+  $entity_type = $entity-&gt;getEntityTypeId();
+  $default_langcode = $entity-&gt;getUntranslated()-&gt;language()-&gt;getId();
+  $translation_langcodes = array_keys($entity-&gt;getTranslationLanguages());
+  $table_mapping = $this-&gt;getTableMapping();
+
+  if (!isset($vid)) {
+    $vid = $id;
+  }
+
+  $original = !empty($entity-&gt;original) ? $entity-&gt;original : NULL;
+
+  // Determine which fields should be actually stored.
+  $definitions = $this-&gt;entityManager-&gt;getFieldDefinitions($entity_type, $bundle);
+  if ($names) {
+    $definitions = array_intersect_key($definitions, array_flip($names));
+  }
+
+  foreach ($definitions as $field_name =&gt; $field_definition) {
+    $storage_definition = $field_definition-&gt;getFieldStorageDefinition();
+    if (!$table_mapping-&gt;requiresDedicatedTableStorage($storage_definition)) {
+      continue;
+    }
+
+    // When updating an existing revision, keep the existing records if the
+    // field values did not change.
+    if (!$entity-&gt;isNewRevision() &amp;&amp; $original &amp;&amp; !$this-&gt;hasFieldValueChanged($field_definition, $entity, $original)) {
+      continue;
+    }
+
+    $table_name = $table_mapping-&gt;getDedicatedDataTableName($storage_definition);
+    $revision_name = $table_mapping-&gt;getDedicatedRevisionTableName($storage_definition);
+
+    // Delete and insert, rather than update, in case a value was added.
+    if ($update) {
+      // Only overwrite the field's base table if saving the default revision
+      // of an entity.
+      if ($entity-&gt;isDefaultRevision()) {
+        $this-&gt;database-&gt;delete($table_name)
+          -&gt;condition('entity_id', $id)
+          -&gt;execute();
+      }
+      if ($this-&gt;entityType-&gt;isRevisionable()) {
+        $this-&gt;database-&gt;delete($revision_name)
+          -&gt;condition('entity_id', $id)
+          -&gt;condition('revision_id', $vid)
+          -&gt;execute();
+      }
+    }
+
+    // Prepare the multi-insert query.
+    $do_insert = FALSE;
+    $columns = array('entity_id', 'revision_id', 'bundle', 'delta', 'langcode');
+    foreach ($storage_definition-&gt;getColumns() as $column =&gt; $attributes) {
+      $columns[] = $table_mapping-&gt;getFieldColumnName($storage_definition, $column);
+    }
+    $query = $this-&gt;database-&gt;insert($table_name)-&gt;fields($columns);
+    if ($this-&gt;entityType-&gt;isRevisionable()) {
+      $revision_query = $this-&gt;database-&gt;insert($revision_name)-&gt;fields($columns);
+    }
+
+    $langcodes = $field_definition-&gt;isTranslatable() ? $translation_langcodes : array($default_langcode);
+    foreach ($langcodes as $langcode) {
+      $delta_count = 0;
+      $items = $entity-&gt;getTranslation($langcode)-&gt;get($field_name);
+      $items-&gt;filterEmptyItems();
+      foreach ($items as $delta =&gt; $item) {
+        // We now know we have something to insert.
+        $do_insert = TRUE;
+        $record = array(
+          'entity_id' =&gt; $id,
+          'revision_id' =&gt; $vid,
+          'bundle' =&gt; $bundle,
+          'delta' =&gt; $delta,
+          'langcode' =&gt; $langcode,
+        );
+        foreach ($storage_definition-&gt;getColumns() as $column =&gt; $attributes) {
+          $column_name = $table_mapping-&gt;getFieldColumnName($storage_definition, $column);
+          // Serialize the value if specified in the column schema.
+          $record[$column_name] = !empty($attributes['serialize']) ? serialize($item-&gt;$column) : $item-&gt;$column;
+        }
+        $query-&gt;values($record);
+        if ($this-&gt;entityType-&gt;isRevisionable()) {
+          $revision_query-&gt;values($record);
+        }
+
+        if ($storage_definition-&gt;getCardinality() != FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED &amp;&amp; ++$delta_count == $storage_definition-&gt;getCardinality()) {
+          break;
+        }
+      }
+    }
+
+    // Execute the query if we have values to insert.
+    if ($do_insert) {
+      // Only overwrite the field's base table if saving the default revision
+      // of an entity.
+      if ($entity-&gt;isDefaultRevision()) {
+        $query-&gt;execute();
+      }
+      if ($this-&gt;entityType-&gt;isRevisionable()) {
+        $revision_query-&gt;execute();
+      }
+    }
+  }
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!lib!Drupal!Core!Entity!Sql!SqlContentEntityStorage.php/function/SqlContentEntityStorage::saveToDedicatedTables/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!lib!Drupal!Core!Entity!Sql!SqlContentEntityStorage.php/function/SqlContentEntityStorage::saveToDedicatedTables/8.1.x</a>
+  </p>
+</div>

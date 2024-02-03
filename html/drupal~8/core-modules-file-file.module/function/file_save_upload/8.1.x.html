@@ -1,0 +1,210 @@
+<h1 id="page-subtitle">function file_save_upload</h1>     <pre class="signature">file_save_upload(<del>$form_field_name</del>, <del>$validators</del> = array(), <del>$destination</del> = FALSE, <del>$delta</del> = NULL, $replace = FILE_EXISTS_RENAME)</pre> <p>Saves file uploads to a new location.</p> <p>The files will be added to the {file_managed} table as temporary files. Temporary files are periodically cleaned. Use the 'file.usage' service to register the usage of the file which will automatically mark it as permanent.</p> <h3>Parameters</h3> <p> <strong>string $form_field_name</strong>: A string that is the associative array key of the upload form element in the form array.</p> <p><strong>array $validators</strong>: (optional) An associative array of callback functions used to validate the file. See <a href="../file_validate/8.1.x.html" title="Checks that a file meets the criteria specified by the validators." class="local">file_validate</a>() for a full discussion of the array format. If the array is empty, it will be set up to call <a href="../file_validate_extensions/8.1.x.html" title="Checks that the filename ends with an allowed extension." class="local">file_validate_extensions</a>() with a safe list of extensions, as follows: "jpg jpeg gif png txt doc xls pdf ppt pps odt ods odp". To allow all extensions, you must explicitly set this array to ['file_validate_extensions' =&gt; '']. (Beware: this is not safe and should only be allowed for trusted users, if at all.)</p> <p><strong>string|false $destination</strong>: (optional) A string containing the URI that the file should be copied to. This must be a stream wrapper URI. If this value is omitted or set to FALSE, Drupal's temporary files scheme will be used ("temporary://").</p> <p><strong>null|int $delta</strong>: (optional) The delta of the file to return the file entity. Defaults to NULL.</p> <p><strong>int $replace</strong>: (optional) The replace behavior when the destination file already exists. Possible values include:</p> <ul> <li>
+<strong><a href="../../../core-includes-file.inc/constant/file_exists_replace/8.1.x.html" title="Flag for dealing with existing files: Replace the existing file." class="local">FILE_EXISTS_REPLACE</a></strong>: Replace the existing file.</li> <li>
+<strong><a href="../../../core-includes-file.inc/constant/file_exists_rename/8.1.x.html" title="Flag for dealing with existing files: Appends number until name is unique." class="local">FILE_EXISTS_RENAME</a></strong>: (default) Append _{incrementing number} until the filename is unique.</li> <li>
+<strong><a href="../../../core-includes-file.inc/constant/file_exists_error/8.1.x.html" title="Flag for dealing with existing files: Do nothing and return FALSE." class="local">FILE_EXISTS_ERROR</a></strong>: Do nothing and return FALSE.</li> </ul> <h3>Return value</h3> <p> array|\Drupal\file\FileInterface|null|false An array of file entities or a single file entity if $delta != NULL. Each array element contains the file entity if the upload succeeded or FALSE if there was an error. Function returns NULL if no file was uploaded.</p>  <h3>File</h3> 
+<dl> <dt>core/modules/file/<a href="../../8.1.x.html">file.module</a>, line 706</dt> <dd>Defines a "managed_file" Form API field and a "file" field for Field module.</dd> </dl> <h3>Code</h3> <pre class="php" data-language="php">function file_save_upload($form_field_name, $validators = array(), $destination = FALSE, $delta = NULL, $replace = FILE_EXISTS_RENAME) {
+  $user = \Drupal::currentUser();
+  static $upload_cache;
+
+  $all_files = \Drupal::request()-&gt;files-&gt;get('files', array());
+  // Make sure there's an upload to process.
+  if (empty($all_files[$form_field_name])) {
+    return NULL;
+  }
+  $file_upload = $all_files[$form_field_name];
+
+  // Return cached objects without processing since the file will have
+  // already been processed and the paths in $_FILES will be invalid.
+  if (isset($upload_cache[$form_field_name])) {
+    if (isset($delta)) {
+      return $upload_cache[$form_field_name][$delta];
+    }
+    return $upload_cache[$form_field_name];
+  }
+
+  // Prepare uploaded files info. Representation is slightly different
+  // for multiple uploads and we fix that here.
+  $uploaded_files = $file_upload;
+  if (!is_array($file_upload)) {
+    $uploaded_files = array($file_upload);
+  }
+
+  $files = array();
+  foreach ($uploaded_files as $i =&gt; $file_info) {
+    // Check for file upload errors and return FALSE for this file if a lower
+    // level system error occurred. For a complete list of errors:
+    // See http://php.net/manual/features.file-upload.errors.php.
+    switch ($file_info-&gt;getError()) {
+      case UPLOAD_ERR_INI_SIZE:
+      case UPLOAD_ERR_FORM_SIZE:
+        drupal_set_message(t('The file %file could not be saved because it exceeds %maxsize, the maximum allowed size for uploads.', array('%file' =&gt; $file_info-&gt;getFilename(), '%maxsize' =&gt; format_size(file_upload_max_size()))), 'error');
+        $files[$i] = FALSE;
+        continue;
+
+      case UPLOAD_ERR_PARTIAL:
+      case UPLOAD_ERR_NO_FILE:
+        drupal_set_message(t('The file %file could not be saved because the upload did not complete.', array('%file' =&gt; $file_info-&gt;getFilename())), 'error');
+        $files[$i] = FALSE;
+        continue;
+
+      case UPLOAD_ERR_OK:
+        // Final check that this is a valid upload, if it isn't, use the
+        // default error handler.
+        if (is_uploaded_file($file_info-&gt;getRealPath())) {
+          break;
+        }
+
+        // Unknown error
+      default:
+        drupal_set_message(t('The file %file could not be saved. An unknown error has occurred.', array('%file' =&gt; $file_info-&gt;getFilename())), 'error');
+        $files[$i] = FALSE;
+        continue;
+
+    }
+    // Begin building file entity.
+    $values = array(
+      'uid' =&gt; $user-&gt;id(),
+      'status' =&gt; 0,
+      'filename' =&gt; $file_info-&gt;getClientOriginalName(),
+      'uri' =&gt; $file_info-&gt;getRealPath(),
+      'filesize' =&gt; $file_info-&gt;getSize(),
+    );
+    $values['filemime'] = \Drupal::service('file.mime_type.guesser')-&gt;guess($values['filename']);
+    $file = File::create($values);
+
+    $extensions = '';
+    if (isset($validators['file_validate_extensions'])) {
+      if (isset($validators['file_validate_extensions'][0])) {
+        // Build the list of non-munged extensions if the caller provided them.
+        $extensions = $validators['file_validate_extensions'][0];
+      }
+      else {
+        // If 'file_validate_extensions' is set and the list is empty then the
+        // caller wants to allow any extension. In this case we have to remove the
+        // validator or else it will reject all extensions.
+        unset($validators['file_validate_extensions']);
+      }
+    }
+    else {
+      // No validator was provided, so add one using the default list.
+      // Build a default non-munged safe list for file_munge_filename().
+      $extensions = 'jpg jpeg gif png txt doc xls pdf ppt pps odt ods odp';
+      $validators['file_validate_extensions'] = array();
+      $validators['file_validate_extensions'][0] = $extensions;
+    }
+
+    if (!empty($extensions)) {
+      // Munge the filename to protect against possible malicious extension
+      // hiding within an unknown file type (ie: filename.html.foo).
+      $file-&gt;setFilename(file_munge_filename($file-&gt;getFilename(), $extensions));
+    }
+
+    // Rename potentially executable files, to help prevent exploits (i.e. will
+    // rename filename.php.foo and filename.php to filename.php.foo.txt and
+    // filename.php.txt, respectively). Don't rename if 'allow_insecure_uploads'
+    // evaluates to TRUE.
+    if (!\Drupal::config('system.file')-&gt;get('allow_insecure_uploads') &amp;&amp; preg_match('/\.(php|pl|py|cgi|asp|js)(\.|$)/i', $file-&gt;getFilename()) &amp;&amp; (substr($file-&gt;getFilename(), -4) != '.txt')) {
+      $file-&gt;setMimeType('text/plain');
+      // The destination filename will also later be used to create the URI.
+      $file-&gt;setFilename($file-&gt;getFilename() . '.txt');
+      // The .txt extension may not be in the allowed list of extensions. We have
+      // to add it here or else the file upload will fail.
+      if (!empty($extensions)) {
+        $validators['file_validate_extensions'][0] .= ' txt';
+        drupal_set_message(t('For security reasons, your upload has been renamed to %filename.', array('%filename' =&gt; $file-&gt;getFilename())));
+      }
+    }
+
+    // If the destination is not provided, use the temporary directory.
+    if (empty($destination)) {
+      $destination = 'temporary://';
+    }
+
+    // Assert that the destination contains a valid stream.
+    $destination_scheme = file_uri_scheme($destination);
+    if (!file_stream_wrapper_valid_scheme($destination_scheme)) {
+      drupal_set_message(t('The file could not be uploaded because the destination %destination is invalid.', array('%destination' =&gt; $destination)), 'error');
+      $files[$i] = FALSE;
+      continue;
+    }
+
+    $file-&gt;source = $form_field_name;
+    // A file URI may already have a trailing slash or look like "public://".
+    if (substr($destination, -1) != '/') {
+      $destination .= '/';
+    }
+    $file-&gt;destination = file_destination($destination . $file-&gt;getFilename(), $replace);
+    // If file_destination() returns FALSE then $replace === FILE_EXISTS_ERROR and
+    // there's an existing file so we need to bail.
+    if ($file-&gt;destination === FALSE) {
+      drupal_set_message(t('The file %source could not be uploaded because a file by that name already exists in the destination %directory.', array('%source' =&gt; $form_field_name, '%directory' =&gt; $destination)), 'error');
+      $files[$i] = FALSE;
+      continue;
+    }
+
+    // Add in our check of the file name length.
+    $validators['file_validate_name_length'] = array();
+
+    // Call the validation functions specified by this function's caller.
+    $errors = file_validate($file, $validators);
+
+    // Check for errors.
+    if (!empty($errors)) {
+      $message = array(
+        'error' =&gt; array(
+          '#markup' =&gt; t('The specified file %name could not be uploaded.', array('%name' =&gt; $file-&gt;getFilename())),
+        ),
+        'item_list' =&gt; array(
+          '#theme' =&gt; 'item_list',
+          '#items' =&gt; $errors,
+        ),
+      );
+      // @todo Add support for render arrays in drupal_set_message()? See
+      //  https://www.drupal.org/node/2505497.
+      drupal_set_message(\Drupal::service('renderer')-&gt;renderPlain($message), 'error');
+      $files[$i] = FALSE;
+      continue;
+    }
+
+    // Move uploaded files from PHP's upload_tmp_dir to Drupal's temporary
+    // directory. This overcomes open_basedir restrictions for future file
+    // operations.
+    $file-&gt;setFileUri($file-&gt;destination);
+    if (!drupal_move_uploaded_file($file_info-&gt;getRealPath(), $file-&gt;getFileUri())) {
+      drupal_set_message(t('File upload error. Could not move uploaded file.'), 'error');
+      \Drupal::logger('file')-&gt;notice('Upload error. Could not move uploaded file %file to destination %destination.', array('%file' =&gt; $file-&gt;getFilename(), '%destination' =&gt; $file-&gt;getFileUri()));
+      $files[$i] = FALSE;
+      continue;
+    }
+
+    // Set the permissions on the new file.
+    drupal_chmod($file-&gt;getFileUri());
+
+    // If we are replacing an existing file re-use its database record.
+    // @todo Do not create a new entity in order to update it. See
+    //   https://www.drupal.org/node/2241865.
+    if ($replace == FILE_EXISTS_REPLACE) {
+      $existing_files = entity_load_multiple_by_properties('file', array('uri' =&gt; $file-&gt;getFileUri()));
+      if (count($existing_files)) {
+        $existing = reset($existing_files);
+        $file-&gt;fid = $existing-&gt;id();
+        $file-&gt;setOriginalId($existing-&gt;id());
+      }
+    }
+
+    // If we made it this far it's safe to record this file in the database.
+    $file-&gt;save();
+    $files[$i] = $file;
+  }
+
+  // Add files to the cache.
+  $upload_cache[$form_field_name] = $files;
+
+  return isset($delta) ? $files[$delta] : $files;
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2001&ndash;2016 by the original authors<br>Licensed under the GNU General Public License, version 2 and later.<br>Drupal is a registered trademark of Dries Buytaert.<br>
+    <a href="https://api.drupal.org/api/drupal/core!modules!file!file.module/function/file_save_upload/8.1.x" class="_attribution-link">https://api.drupal.org/api/drupal/core!modules!file!file.module/function/file_save_upload/8.1.x</a>
+  </p>
+</div>
