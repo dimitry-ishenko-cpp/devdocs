@@ -1,0 +1,198 @@
+<h1>WP_Customize_Manager::save()</h1>  <section> <p>Handles customize_save WP Ajax request to save/update a changeset.</p> </section>   <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/class-wp-customize-manager.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-customize-manager.php/">View all references</a> </p> <pre class="wp-block-code" data-start="2421" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function save() {
+	if ( ! is_user_logged_in() ) {
+		wp_send_json_error( 'unauthenticated' );
+	}
+
+	if ( ! $this-&gt;is_preview() ) {
+		wp_send_json_error( 'not_preview' );
+	}
+
+	$action = 'save-customize_' . $this-&gt;get_stylesheet();
+	if ( ! check_ajax_referer( $action, 'nonce', false ) ) {
+		wp_send_json_error( 'invalid_nonce' );
+	}
+
+	$changeset_post_id = $this-&gt;changeset_post_id();
+	$is_new_changeset  = empty( $changeset_post_id );
+	if ( $is_new_changeset ) {
+		if ( ! current_user_can( get_post_type_object( 'customize_changeset' )-&gt;cap-&gt;create_posts ) ) {
+			wp_send_json_error( 'cannot_create_changeset_post' );
+		}
+	} else {
+		if ( ! current_user_can( get_post_type_object( 'customize_changeset' )-&gt;cap-&gt;edit_post, $changeset_post_id ) ) {
+			wp_send_json_error( 'cannot_edit_changeset_post' );
+		}
+	}
+
+	if ( ! empty( $_POST['customize_changeset_data'] ) ) {
+		$input_changeset_data = json_decode( wp_unslash( $_POST['customize_changeset_data'] ), true );
+		if ( ! is_array( $input_changeset_data ) ) {
+			wp_send_json_error( 'invalid_customize_changeset_data' );
+		}
+	} else {
+		$input_changeset_data = array();
+	}
+
+	// Validate title.
+	$changeset_title = null;
+	if ( isset( $_POST['customize_changeset_title'] ) ) {
+		$changeset_title = sanitize_text_field( wp_unslash( $_POST['customize_changeset_title'] ) );
+	}
+
+	// Validate changeset status param.
+	$is_publish       = null;
+	$changeset_status = null;
+	if ( isset( $_POST['customize_changeset_status'] ) ) {
+		$changeset_status = wp_unslash( $_POST['customize_changeset_status'] );
+		if ( ! get_post_status_object( $changeset_status ) || ! in_array( $changeset_status, array( 'draft', 'pending', 'publish', 'future' ), true ) ) {
+			wp_send_json_error( 'bad_customize_changeset_status', 400 );
+		}
+		$is_publish = ( 'publish' === $changeset_status || 'future' === $changeset_status );
+		if ( $is_publish &amp;&amp; ! current_user_can( get_post_type_object( 'customize_changeset' )-&gt;cap-&gt;publish_posts ) ) {
+			wp_send_json_error( 'changeset_publish_unauthorized', 403 );
+		}
+	}
+
+	/*
+	 * Validate changeset date param. Date is assumed to be in local time for
+	 * the WP if in MySQL format (YYYY-MM-DD HH:MM:SS). Otherwise, the date
+	 * is parsed with strtotime() so that ISO date format may be supplied
+	 * or a string like "+10 minutes".
+	 */
+	$changeset_date_gmt = null;
+	if ( isset( $_POST['customize_changeset_date'] ) ) {
+		$changeset_date = wp_unslash( $_POST['customize_changeset_date'] );
+		if ( preg_match( '/^\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d$/', $changeset_date ) ) {
+			$mm         = substr( $changeset_date, 5, 2 );
+			$jj         = substr( $changeset_date, 8, 2 );
+			$aa         = substr( $changeset_date, 0, 4 );
+			$valid_date = wp_checkdate( $mm, $jj, $aa, $changeset_date );
+			if ( ! $valid_date ) {
+				wp_send_json_error( 'bad_customize_changeset_date', 400 );
+			}
+			$changeset_date_gmt = get_gmt_from_date( $changeset_date );
+		} else {
+			$timestamp = strtotime( $changeset_date );
+			if ( ! $timestamp ) {
+				wp_send_json_error( 'bad_customize_changeset_date', 400 );
+			}
+			$changeset_date_gmt = gmdate( 'Y-m-d H:i:s', $timestamp );
+		}
+	}
+
+	$lock_user_id = null;
+	$autosave     = ! empty( $_POST['customize_changeset_autosave'] );
+	if ( ! $is_new_changeset ) {
+		$lock_user_id = wp_check_post_lock( $this-&gt;changeset_post_id() );
+	}
+
+	// Force request to autosave when changeset is locked.
+	if ( $lock_user_id &amp;&amp; ! $autosave ) {
+		$autosave           = true;
+		$changeset_status   = null;
+		$changeset_date_gmt = null;
+	}
+
+	if ( $autosave &amp;&amp; ! defined( 'DOING_AUTOSAVE' ) ) { // Back-compat.
+		define( 'DOING_AUTOSAVE', true );
+	}
+
+	$autosaved = false;
+	$r         = $this-&gt;save_changeset_post(
+		array(
+			'status'   =&gt; $changeset_status,
+			'title'    =&gt; $changeset_title,
+			'date_gmt' =&gt; $changeset_date_gmt,
+			'data'     =&gt; $input_changeset_data,
+			'autosave' =&gt; $autosave,
+		)
+	);
+	if ( $autosave &amp;&amp; ! is_wp_error( $r ) ) {
+		$autosaved = true;
+	}
+
+	// If the changeset was locked and an autosave request wasn't itself an error, then now explicitly return with a failure.
+	if ( $lock_user_id &amp;&amp; ! is_wp_error( $r ) ) {
+		$r = new WP_Error(
+			'changeset_locked',
+			__( 'Changeset is being edited by other user.' ),
+			array(
+				'lock_user' =&gt; $this-&gt;get_lock_user_data( $lock_user_id ),
+			)
+		);
+	}
+
+	if ( is_wp_error( $r ) ) {
+		$response = array(
+			'message' =&gt; $r-&gt;get_error_message(),
+			'code'    =&gt; $r-&gt;get_error_code(),
+		);
+		if ( is_array( $r-&gt;get_error_data() ) ) {
+			$response = array_merge( $response, $r-&gt;get_error_data() );
+		} else {
+			$response['data'] = $r-&gt;get_error_data();
+		}
+	} else {
+		$response       = $r;
+		$changeset_post = get_post( $this-&gt;changeset_post_id() );
+
+		// Dismiss all other auto-draft changeset posts for this user (they serve like autosave revisions), as there should only be one.
+		if ( $is_new_changeset ) {
+			$this-&gt;dismiss_user_auto_draft_changesets();
+		}
+
+		// Note that if the changeset status was publish, then it will get set to Trash if revisions are not supported.
+		$response['changeset_status'] = $changeset_post-&gt;post_status;
+		if ( $is_publish &amp;&amp; 'trash' === $response['changeset_status'] ) {
+			$response['changeset_status'] = 'publish';
+		}
+
+		if ( 'publish' !== $response['changeset_status'] ) {
+			$this-&gt;set_changeset_lock( $changeset_post-&gt;ID );
+		}
+
+		if ( 'future' === $response['changeset_status'] ) {
+			$response['changeset_date'] = $changeset_post-&gt;post_date;
+		}
+
+		if ( 'publish' === $response['changeset_status'] || 'trash' === $response['changeset_status'] ) {
+			$response['next_changeset_uuid'] = wp_generate_uuid4();
+		}
+	}
+
+	if ( $autosave ) {
+		$response['autosaved'] = $autosaved;
+	}
+
+	if ( isset( $response['setting_validities'] ) ) {
+		$response['setting_validities'] = array_map( array( $this, 'prepare_setting_validity_for_js' ), $response['setting_validities'] );
+	}
+
+	/**
+	 * Filters response data for a successful customize_save Ajax request.
+	 *
+	 * This filter does not apply if there was a nonce or authentication failure.
+	 *
+	 * @since 4.2.0
+	 *
+	 * @param array                $response Additional information passed back to the 'saved'
+	 *                                       event on `wp.customize`.
+	 * @param WP_Customize_Manager $manager  WP_Customize_Manager instance.
+	 */
+	$response = apply_filters( 'customize_save_response', $response, $this );
+
+	if ( is_wp_error( $r ) ) {
+		wp_send_json_error( $response );
+	} else {
+		wp_send_json_success( $response );
+	}
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/customize_save_response.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'customize_save_response', <nobr><span class="arg-type">array</span> <span class="arg-name">$response</span></nobr>, <nobr><span class="arg-type">WP_Customize_Manager</span> <span class="arg-name">$manager</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters response data for a successful customize_save Ajax request.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="get_lock_user_data.html">WP_Customize_Manager::get_lock_user_data()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Gets lock user data.</p> </td> </tr> <tr> <td class="related-title"> <a href="is_preview.html">WP_Customize_Manager::is_preview()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Determines whether it is a theme preview or not.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post_status_object.html">get_post_status_object()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves a post status object by name.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_checkdate.html">wp_checkdate()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Tests if the supplied date is valid for the Gregorian calendar.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_gmt_from_date.html">get_gmt_from_date()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Given a date in the timezone of the site, returns that date in UTC.</p> </td> </tr> <tr> <td class="related-title"> <a href="set_changeset_lock.html">WP_Customize_Manager::set_changeset_lock()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Marks the changeset post as being currently edited by the current user.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_stylesheet.html">WP_Customize_Manager::get_stylesheet()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Retrieves the stylesheet name of the previewed theme.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/sanitize_text_field.html">sanitize_text_field()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Sanitizes a string from user input or from the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="save_changeset_post.html">WP_Customize_Manager::save_changeset_post()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Saves the post for the loaded changeset.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_generate_uuid4.html">wp_generate_uuid4()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Generates a random UUID (version 4).</p> </td> </tr> <tr> <td class="related-title"> <a href="changeset_post_id.html">WP_Customize_Manager::changeset_post_id()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Gets the changeset post ID for the loaded changeset.</p> </td> </tr> <tr> <td class="related-title"> <a href="dismiss_user_auto_draft_changesets.html">WP_Customize_Manager::dismiss_user_auto_draft_changesets()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Dismisses all of the current user’s auto-drafts (other than the present one).</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_check_post_lock.html">wp_check_post_lock()</a> <span>wp-admin/includes/post.php</span> </td> <td class="related-desc"> <p>Determines whether the post is currently being edited by another user.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post.html">get_post()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves post data given a post ID or post object.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post_type_object.html">get_post_type_object()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves a post type object by name.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/current_user_can.html">current_user_can()</a> <span>wp-includes/capabilities.php</span> </td> <td class="related-desc"> <p>Returns whether the current user has the specified capability.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_send_json_success.html">wp_send_json_success()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Sends a JSON response back to an Ajax request, indicating success.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_send_json_error.html">wp_send_json_error()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Sends a JSON response back to an Ajax request, indicating failure.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/check_ajax_referer.html">check_ajax_referer()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Verifies the Ajax request to prevent processing requests external of the blog.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_user_logged_in.html">is_user_logged_in()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Determines whether the current visitor is a logged in user.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_unslash.html">wp_unslash()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Removes slashes from a string or recursively removes slashes from strings within an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_error/__construct.html">WP_Error::__construct()</a> <span>wp-includes/class-wp-error.php</span> </td> <td class="related-desc"> <p>Initializes the error.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.7.0/" alt="WordPress 4.7.0">4.7.0</a></td> <td><span class="since-description">The semantics of this method have changed to update a changeset, optionally to also change the status and other attributes.</span></td> </tr> <tr> <td><a href="https://developer.wordpress.org/reference/since/3.4.0/" alt="WordPress 3.4.0">3.4.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_customize_manager/save" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_customize_manager/save</a>
+  </p>
+</div>

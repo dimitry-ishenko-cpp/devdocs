@@ -1,0 +1,160 @@
+<h1>wp_ajax_replyto_comment( string $action )</h1>  <section> <p>Ajax handler for replying to a comment.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$action</code> <span class="type"><span class="string">string</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Action to perform.</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-admin/includes/ajax-actions.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-admin/includes/ajax-actions.php/">View all references</a> </p> <pre class="wp-block-code" data-start="1286" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">function wp_ajax_replyto_comment( $action ) {
+	if ( empty( $action ) ) {
+		$action = 'replyto-comment';
+	}
+
+	check_ajax_referer( $action, '_ajax_nonce-replyto-comment' );
+
+	$comment_post_id = (int) $_POST['comment_post_ID'];
+	$post            = get_post( $comment_post_id );
+
+	if ( ! $post ) {
+		wp_die( -1 );
+	}
+
+	if ( ! current_user_can( 'edit_post', $comment_post_id ) ) {
+		wp_die( -1 );
+	}
+
+	if ( empty( $post-&gt;post_status ) ) {
+		wp_die( 1 );
+	} elseif ( in_array( $post-&gt;post_status, array( 'draft', 'pending', 'trash' ), true ) ) {
+		wp_die( __( 'You cannot reply to a comment on a draft post.' ) );
+	}
+
+	$user = wp_get_current_user();
+
+	if ( $user-&gt;exists() ) {
+		$comment_author       = wp_slash( $user-&gt;display_name );
+		$comment_author_email = wp_slash( $user-&gt;user_email );
+		$comment_author_url   = wp_slash( $user-&gt;user_url );
+		$user_id              = $user-&gt;ID;
+
+		if ( current_user_can( 'unfiltered_html' ) ) {
+			if ( ! isset( $_POST['_wp_unfiltered_html_comment'] ) ) {
+				$_POST['_wp_unfiltered_html_comment'] = '';
+			}
+
+			if ( wp_create_nonce( 'unfiltered-html-comment' ) != $_POST['_wp_unfiltered_html_comment'] ) {
+				kses_remove_filters(); // Start with a clean slate.
+				kses_init_filters();   // Set up the filters.
+				remove_filter( 'pre_comment_content', 'wp_filter_post_kses' );
+				add_filter( 'pre_comment_content', 'wp_filter_kses' );
+			}
+		}
+	} else {
+		wp_die( __( 'Sorry, you must be logged in to reply to a comment.' ) );
+	}
+
+	$comment_content = trim( $_POST['content'] );
+
+	if ( '' === $comment_content ) {
+		wp_die( __( 'Please type your comment text.' ) );
+	}
+
+	$comment_type = isset( $_POST['comment_type'] ) ? trim( $_POST['comment_type'] ) : 'comment';
+
+	$comment_parent = 0;
+
+	if ( isset( $_POST['comment_ID'] ) ) {
+		$comment_parent = absint( $_POST['comment_ID'] );
+	}
+
+	$comment_auto_approved = false;
+
+	$commentdata = array(
+		'comment_post_ID' =&gt; $comment_post_id,
+	);
+
+	$commentdata += compact(
+		'comment_author',
+		'comment_author_email',
+		'comment_author_url',
+		'comment_content',
+		'comment_type',
+		'comment_parent',
+		'user_id'
+	);
+
+	// Automatically approve parent comment.
+	if ( ! empty( $_POST['approve_parent'] ) ) {
+		$parent = get_comment( $comment_parent );
+
+		if ( $parent &amp;&amp; '0' === $parent-&gt;comment_approved &amp;&amp; $parent-&gt;comment_post_ID == $comment_post_id ) {
+			if ( ! current_user_can( 'edit_comment', $parent-&gt;comment_ID ) ) {
+				wp_die( -1 );
+			}
+
+			if ( wp_set_comment_status( $parent, 'approve' ) ) {
+				$comment_auto_approved = true;
+			}
+		}
+	}
+
+	$comment_id = wp_new_comment( $commentdata );
+
+	if ( is_wp_error( $comment_id ) ) {
+		wp_die( $comment_id-&gt;get_error_message() );
+	}
+
+	$comment = get_comment( $comment_id );
+
+	if ( ! $comment ) {
+		wp_die( 1 );
+	}
+
+	$position = ( isset( $_POST['position'] ) &amp;&amp; (int) $_POST['position'] ) ? (int) $_POST['position'] : '-1';
+
+	ob_start();
+	if ( isset( $_REQUEST['mode'] ) &amp;&amp; 'dashboard' === $_REQUEST['mode'] ) {
+		require_once ABSPATH . 'wp-admin/includes/dashboard.php';
+		_wp_dashboard_recent_comments_row( $comment );
+	} else {
+		if ( isset( $_REQUEST['mode'] ) &amp;&amp; 'single' === $_REQUEST['mode'] ) {
+			$wp_list_table = _get_list_table( 'WP_Post_Comments_List_Table', array( 'screen' =&gt; 'edit-comments' ) );
+		} else {
+			$wp_list_table = _get_list_table( 'WP_Comments_List_Table', array( 'screen' =&gt; 'edit-comments' ) );
+		}
+		$wp_list_table-&gt;single_row( $comment );
+	}
+	$comment_list_item = ob_get_clean();
+
+	$response = array(
+		'what'     =&gt; 'comment',
+		'id'       =&gt; $comment-&gt;comment_ID,
+		'data'     =&gt; $comment_list_item,
+		'position' =&gt; $position,
+	);
+
+	$counts                   = wp_count_comments();
+	$response['supplemental'] = array(
+		'in_moderation'        =&gt; $counts-&gt;moderated,
+		'i18n_comments_text'   =&gt; sprintf(
+			/* translators: %s: Number of comments. */
+			_n( '%s Comment', '%s Comments', $counts-&gt;approved ),
+			number_format_i18n( $counts-&gt;approved )
+		),
+		'i18n_moderation_text' =&gt; sprintf(
+			/* translators: %s: Number of comments. */
+			_n( '%s Comment in moderation', '%s Comments in moderation', $counts-&gt;moderated ),
+			number_format_i18n( $counts-&gt;moderated )
+		),
+	);
+
+	if ( $comment_auto_approved ) {
+		$response['supplemental']['parent_approved'] = $parent-&gt;comment_ID;
+		$response['supplemental']['parent_post_id']  = $parent-&gt;comment_post_ID;
+	}
+
+	$x = new WP_Ajax_Response();
+	$x-&gt;add( $response );
+	$x-&gt;send();
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="../classes/wp_list_table/single_row.html">WP_List_Table::single_row()</a> <span>wp-admin/includes/class-wp-list-table.php</span> </td> <td class="related-desc"> <p>Generates content for a single row of the table.</p> </td> </tr> <tr> <td class="related-title"> <a href="remove_filter.html">remove_filter()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Removes a callback function from a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="_get_list_table.html">_get_list_table()</a> <span>wp-admin/includes/list-table.php</span> </td> <td class="related-desc"> <p>Fetches an instance of a <a href="../classes/wp_list_table.html" rel="class">WP_List_Table</a> class.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_count_comments.html">wp_count_comments()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Retrieves the total comment counts for the whole site or a single post.</p> </td> </tr> <tr> <td class="related-title"> <a href="_n.html">_n()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Translates and retrieves the singular or plural form based on the supplied number.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_new_comment.html">wp_new_comment()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Adds a new comment to the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_create_nonce.html">wp_create_nonce()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Creates a cryptographic token tied to a specific action, user, user session, and window of time.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_set_comment_status.html">wp_set_comment_status()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Sets the status of a comment.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_get_current_user.html">wp_get_current_user()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Retrieves the current user object.</p> </td> </tr> <tr> <td class="related-title"> <a href="kses_remove_filters.html">kses_remove_filters()</a> <span>wp-includes/kses.php</span> </td> <td class="related-desc"> <p>Removes all KSES input form content filters.</p> </td> </tr> <tr> <td class="related-title"> <a href="kses_init_filters.html">kses_init_filters()</a> <span>wp-includes/kses.php</span> </td> <td class="related-desc"> <p>Adds all KSES input form content filters.</p> </td> </tr> <tr> <td class="related-title"> <a href="_wp_dashboard_recent_comments_row.html">_wp_dashboard_recent_comments_row()</a> <span>wp-admin/includes/dashboard.php</span> </td> <td class="related-desc"> <p>Outputs a row for the Recent Comments widget.</p> </td> </tr> <tr> <td class="related-title"> <a href="../classes/wp_ajax_response/__construct.html">WP_Ajax_Response::__construct()</a> <span>wp-includes/class-wp-ajax-response.php</span> </td> <td class="related-desc"> <p>Constructor – Passes args to <a href="../classes/wp_ajax_response/add.html" rel="method">WP_Ajax_Response::add()</a>.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_comment.html">get_comment()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Retrieves comment data given a comment ID or comment object.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_post.html">get_post()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves post data given a post ID or post object.</p> </td> </tr> <tr> <td class="related-title"> <a href="add_filter.html">add_filter()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Adds a callback function to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="absint.html">absint()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Converts a value to non-negative integer.</p> </td> </tr> <tr> <td class="related-title"> <a href="number_format_i18n.html">number_format_i18n()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Converts float number to format based on the locale.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_die.html">wp_die()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Kills WordPress execution and displays HTML page with an error message.</p> </td> </tr> <tr> <td class="related-title"> <a href="check_ajax_referer.html">check_ajax_referer()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Verifies the Ajax request to prevent processing requests external of the blog.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_slash.html">wp_slash()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Adds slashes to a string or recursively adds slashes to strings within an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="current_user_can.html">current_user_can()</a> <span>wp-includes/capabilities.php</span> </td> <td class="related-desc"> <p>Returns whether the current user has the specified capability.</p> </td> </tr> <tr> <td class="related-title"> <a href="is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/3.1.0/" alt="WordPress 3.1.0">3.1.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/functions/wp_ajax_replyto_comment" class="_attribution-link">https://developer.wordpress.org/reference/functions/wp_ajax_replyto_comment</a>
+  </p>
+</div>

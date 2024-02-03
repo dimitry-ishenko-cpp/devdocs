@@ -1,0 +1,258 @@
+<h1>WP_REST_Attachments_Controller::edit_media_item( WP_REST_Request $request ): WP_REST_Response|WP_Error</h1>  <section> <p>Applies edits to a media item and creates a new attachment record.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$request</code> <span class="type"><span class="WP_REST_Request"><a href="../wp_rest_request.html" rel="class">WP_REST_Request</a></span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Full details about the request.</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type"><a href="../wp_rest_response.html" rel="class">WP_REST_Response</a>|<a href="../wp_error.html" rel="class">WP_Error</a></span> Response object on success, <a href="../wp_error.html" rel="class">WP_Error</a> object on failure.</p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/rest-api/endpoints/class-wp-rest-attachments-controller.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/rest-api/endpoints/class-wp-rest-attachments-controller.php/">View all references</a> </p> <pre class="wp-block-code" data-start="428" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function edit_media_item( $request ) {
+	require_once ABSPATH . 'wp-admin/includes/image.php';
+
+	$attachment_id = $request['id'];
+
+	// This also confirms the attachment is an image.
+	$image_file = wp_get_original_image_path( $attachment_id );
+	$image_meta = wp_get_attachment_metadata( $attachment_id );
+
+	if (
+		! $image_meta ||
+		! $image_file ||
+		! wp_image_file_matches_image_meta( $request['src'], $image_meta, $attachment_id )
+	) {
+		return new WP_Error(
+			'rest_unknown_attachment',
+			__( 'Unable to get meta information for file.' ),
+			array( 'status' =&gt; 404 )
+		);
+	}
+
+	$supported_types = array( 'image/jpeg', 'image/png', 'image/gif', 'image/webp' );
+	$mime_type       = get_post_mime_type( $attachment_id );
+	if ( ! in_array( $mime_type, $supported_types, true ) ) {
+		return new WP_Error(
+			'rest_cannot_edit_file_type',
+			__( 'This type of file cannot be edited.' ),
+			array( 'status' =&gt; 400 )
+		);
+	}
+
+	// The `modifiers` param takes precedence over the older format.
+	if ( isset( $request['modifiers'] ) ) {
+		$modifiers = $request['modifiers'];
+	} else {
+		$modifiers = array();
+
+		if ( ! empty( $request['rotation'] ) ) {
+			$modifiers[] = array(
+				'type' =&gt; 'rotate',
+				'args' =&gt; array(
+					'angle' =&gt; $request['rotation'],
+				),
+			);
+		}
+
+		if ( isset( $request['x'], $request['y'], $request['width'], $request['height'] ) ) {
+			$modifiers[] = array(
+				'type' =&gt; 'crop',
+				'args' =&gt; array(
+					'left'   =&gt; $request['x'],
+					'top'    =&gt; $request['y'],
+					'width'  =&gt; $request['width'],
+					'height' =&gt; $request['height'],
+				),
+			);
+		}
+
+		if ( 0 === count( $modifiers ) ) {
+			return new WP_Error(
+				'rest_image_not_edited',
+				__( 'The image was not edited. Edit the image before applying the changes.' ),
+				array( 'status' =&gt; 400 )
+			);
+		}
+	}
+
+	/*
+	 * If the file doesn't exist, attempt a URL fopen on the src link.
+	 * This can occur with certain file replication plugins.
+	 * Keep the original file path to get a modified name later.
+	 */
+	$image_file_to_edit = $image_file;
+	if ( ! file_exists( $image_file_to_edit ) ) {
+		$image_file_to_edit = _load_image_to_edit_path( $attachment_id );
+	}
+
+	$image_editor = wp_get_image_editor( $image_file_to_edit );
+
+	if ( is_wp_error( $image_editor ) ) {
+		return new WP_Error(
+			'rest_unknown_image_file_type',
+			__( 'Unable to edit this image.' ),
+			array( 'status' =&gt; 500 )
+		);
+	}
+
+	foreach ( $modifiers as $modifier ) {
+		$args = $modifier['args'];
+		switch ( $modifier['type'] ) {
+			case 'rotate':
+				// Rotation direction: clockwise vs. counter clockwise.
+				$rotate = 0 - $args['angle'];
+
+				if ( 0 !== $rotate ) {
+					$result = $image_editor-&gt;rotate( $rotate );
+
+					if ( is_wp_error( $result ) ) {
+						return new WP_Error(
+							'rest_image_rotation_failed',
+							__( 'Unable to rotate this image.' ),
+							array( 'status' =&gt; 500 )
+						);
+					}
+				}
+
+				break;
+
+			case 'crop':
+				$size = $image_editor-&gt;get_size();
+
+				$crop_x = round( ( $size['width'] * $args['left'] ) / 100.0 );
+				$crop_y = round( ( $size['height'] * $args['top'] ) / 100.0 );
+				$width  = round( ( $size['width'] * $args['width'] ) / 100.0 );
+				$height = round( ( $size['height'] * $args['height'] ) / 100.0 );
+
+				if ( $size['width'] !== $width &amp;&amp; $size['height'] !== $height ) {
+					$result = $image_editor-&gt;crop( $crop_x, $crop_y, $width, $height );
+
+					if ( is_wp_error( $result ) ) {
+						return new WP_Error(
+							'rest_image_crop_failed',
+							__( 'Unable to crop this image.' ),
+							array( 'status' =&gt; 500 )
+						);
+					}
+				}
+
+				break;
+
+		}
+	}
+
+	// Calculate the file name.
+	$image_ext  = pathinfo( $image_file, PATHINFO_EXTENSION );
+	$image_name = wp_basename( $image_file, ".{$image_ext}" );
+
+	// Do not append multiple `-edited` to the file name.
+	// The user may be editing a previously edited image.
+	if ( preg_match( '/-edited(-\d+)?$/', $image_name ) ) {
+		// Remove any `-1`, `-2`, etc. `wp_unique_filename()` will add the proper number.
+		$image_name = preg_replace( '/-edited(-\d+)?$/', '-edited', $image_name );
+	} else {
+		// Append `-edited` before the extension.
+		$image_name .= '-edited';
+	}
+
+	$filename = "{$image_name}.{$image_ext}";
+
+	// Create the uploads sub-directory if needed.
+	$uploads = wp_upload_dir();
+
+	// Make the file name unique in the (new) upload directory.
+	$filename = wp_unique_filename( $uploads['path'], $filename );
+
+	// Save to disk.
+	$saved = $image_editor-&gt;save( $uploads['path'] . "/$filename" );
+
+	if ( is_wp_error( $saved ) ) {
+		return $saved;
+	}
+
+	// Create new attachment post.
+	$new_attachment_post = array(
+		'post_mime_type' =&gt; $saved['mime-type'],
+		'guid'           =&gt; $uploads['url'] . "/$filename",
+		'post_title'     =&gt; $image_name,
+		'post_content'   =&gt; '',
+	);
+
+	// Copy post_content, post_excerpt, and post_title from the edited image's attachment post.
+	$attachment_post = get_post( $attachment_id );
+
+	if ( $attachment_post ) {
+		$new_attachment_post['post_content'] = $attachment_post-&gt;post_content;
+		$new_attachment_post['post_excerpt'] = $attachment_post-&gt;post_excerpt;
+		$new_attachment_post['post_title']   = $attachment_post-&gt;post_title;
+	}
+
+	$new_attachment_id = wp_insert_attachment( wp_slash( $new_attachment_post ), $saved['path'], 0, true );
+
+	if ( is_wp_error( $new_attachment_id ) ) {
+		if ( 'db_update_error' === $new_attachment_id-&gt;get_error_code() ) {
+			$new_attachment_id-&gt;add_data( array( 'status' =&gt; 500 ) );
+		} else {
+			$new_attachment_id-&gt;add_data( array( 'status' =&gt; 400 ) );
+		}
+
+		return $new_attachment_id;
+	}
+
+	// Copy the image alt text from the edited image.
+	$image_alt = get_post_meta( $attachment_id, '_wp_attachment_image_alt', true );
+
+	if ( ! empty( $image_alt ) ) {
+		// update_post_meta() expects slashed.
+		update_post_meta( $new_attachment_id, '_wp_attachment_image_alt', wp_slash( $image_alt ) );
+	}
+
+	if ( defined( 'REST_REQUEST' ) &amp;&amp; REST_REQUEST ) {
+		// Set a custom header with the attachment_id.
+		// Used by the browser/client to resume creating image sub-sizes after a PHP fatal error.
+		header( 'X-WP-Upload-Attachment-ID: ' . $new_attachment_id );
+	}
+
+	// Generate image sub-sizes and meta.
+	$new_image_meta = wp_generate_attachment_metadata( $new_attachment_id, $saved['path'] );
+
+	// Copy the EXIF metadata from the original attachment if not generated for the edited image.
+	if ( isset( $image_meta['image_meta'] ) &amp;&amp; isset( $new_image_meta['image_meta'] ) &amp;&amp; is_array( $new_image_meta['image_meta'] ) ) {
+		// Merge but skip empty values.
+		foreach ( (array) $image_meta['image_meta'] as $key =&gt; $value ) {
+			if ( empty( $new_image_meta['image_meta'][ $key ] ) &amp;&amp; ! empty( $value ) ) {
+				$new_image_meta['image_meta'][ $key ] = $value;
+			}
+		}
+	}
+
+	// Reset orientation. At this point the image is edited and orientation is correct.
+	if ( ! empty( $new_image_meta['image_meta']['orientation'] ) ) {
+		$new_image_meta['image_meta']['orientation'] = 1;
+	}
+
+	// The attachment_id may change if the site is exported and imported.
+	$new_image_meta['parent_image'] = array(
+		'attachment_id' =&gt; $attachment_id,
+		// Path to the originally uploaded image file relative to the uploads directory.
+		'file'          =&gt; _wp_relative_upload_path( $image_file ),
+	);
+
+	/**
+	 * Filters the meta data for the new image created by editing an existing image.
+	 *
+	 * @since 5.5.0
+	 *
+	 * @param array $new_image_meta    Meta data for the new image.
+	 * @param int   $new_attachment_id Attachment post ID for the new image.
+	 * @param int   $attachment_id     Attachment post ID for the edited (parent) image.
+	 */
+	$new_image_meta = apply_filters( 'wp_edited_image_metadata', $new_image_meta, $new_attachment_id, $attachment_id );
+
+	wp_update_attachment_metadata( $new_attachment_id, $new_image_meta );
+
+	$response = $this-&gt;prepare_item_for_response( get_post( $new_attachment_id ), $request );
+	$response-&gt;set_status( 201 );
+	$response-&gt;header( 'Location', rest_url( sprintf( '%s/%s/%s', $this-&gt;namespace, $this-&gt;rest_base, $new_attachment_id ) ) );
+
+	return $response;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/wp_edited_image_metadata.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'wp_edited_image_metadata', <nobr><span class="arg-type">array</span> <span class="arg-name">$new_image_meta</span></nobr>, <nobr><span class="arg-type">int</span> <span class="arg-name">$new_attachment_id</span></nobr>, <nobr><span class="arg-type">int</span> <span class="arg-name">$attachment_id</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the meta data for the new image created by editing an existing image.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="../../functions/wp_image_file_matches_image_meta.html">wp_image_file_matches_image_meta()</a> <span>wp-includes/media.php</span> </td> <td class="related-desc"> <p>Determines if the image meta data is for the image source file.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/update_post_meta.html">update_post_meta()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Updates a post meta field based on the given post ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="prepare_item_for_response.html">WP_REST_Attachments_Controller::prepare_item_for_response()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-attachments-controller.php</span> </td> <td class="related-desc"> <p>Prepares a single attachment output for response.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/_load_image_to_edit_path.html">_load_image_to_edit_path()</a> <span>wp-admin/includes/image.php</span> </td> <td class="related-desc"> <p>Retrieves the path or URL of an attachment’s attached file.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_generate_attachment_metadata.html">wp_generate_attachment_metadata()</a> <span>wp-admin/includes/image.php</span> </td> <td class="related-desc"> <p>Generates attachment meta data and create image sub-sizes for images.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/_wp_relative_upload_path.html">_wp_relative_upload_path()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Returns relative path to an uploaded file.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post_mime_type.html">get_post_mime_type()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves the mime type of an attachment based on the ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_upload_dir.html">wp_upload_dir()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Returns an array containing the current upload directory’s path and URL.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_unique_filename.html">wp_unique_filename()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Gets a filename that is sanitized and unique for the given directory.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_get_original_image_path.html">wp_get_original_image_path()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves the path to an uploaded image file.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_get_image_editor.html">wp_get_image_editor()</a> <span>wp-includes/media.php</span> </td> <td class="related-desc"> <p>Returns a <a href="../wp_image_editor.html" rel="class">WP_Image_Editor</a> instance and loads file into it.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_get_attachment_metadata.html">wp_get_attachment_metadata()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves attachment metadata for attachment ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_insert_attachment.html">wp_insert_attachment()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Inserts an attachment.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_update_attachment_metadata.html">wp_update_attachment_metadata()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Updates metadata for an attachment.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post.html">get_post()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves post data given a post ID or post object.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post_meta.html">get_post_meta()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves a post meta field for the given post ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_slash.html">wp_slash()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Adds slashes to a string or recursively adds slashes to strings within an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_basename.html">wp_basename()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>i18n-friendly version of basename().</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/rest_url.html">rest_url()</a> <span>wp-includes/rest-api.php</span> </td> <td class="related-desc"> <p>Retrieves the URL to a REST endpoint.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_error/__construct.html">WP_Error::__construct()</a> <span>wp-includes/class-wp-error.php</span> </td> <td class="related-desc"> <p>Initializes the error.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/5.5.0/" alt="WordPress 5.5.0">5.5.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_rest_attachments_controller/edit_media_item" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_rest_attachments_controller/edit_media_item</a>
+  </p>
+</div>

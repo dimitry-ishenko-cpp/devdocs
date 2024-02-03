@@ -1,0 +1,382 @@
+<h1>class MagpieRSS {}</h1>     <section> <header class="toc-header"><h2 id="methods">Methods</h2></header> <ul> <li>
+<a href="magpierss/__construct.html"> __construct</a> — PHP5 constructor. </li> <li>
+<a href="magpierss/append.html"> append</a> </li> <li>
+<a href="magpierss/append_content.html"> append_content</a> </li> <li>
+<a href="magpierss/concat.html"> concat</a> </li> <li>
+<a href="magpierss/error.html"> error</a> </li> <li>
+<a href="magpierss/feed_cdata.html"> feed_cdata</a> </li> <li>
+<a href="magpierss/feed_end_element.html"> feed_end_element</a> </li> <li>
+<a href="magpierss/feed_start_element.html"> feed_start_element</a> </li> <li>
+<a href="magpierss/is_atom.html"> is_atom</a> </li> <li>
+<a href="magpierss/is_rss.html"> is_rss</a> </li> <li>
+<a href="magpierss/magpierss.html"> MagpieRSS</a> — PHP4 constructor. </li> <li>
+<a href="magpierss/map_attrs.html"> map_attrs</a> </li> <li>
+<a href="magpierss/normalize.html"> normalize</a> </li> </ul> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/rss.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/rss.php/">View all references</a> </p> <pre class="wp-block-code" data-start="34" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">class MagpieRSS {
+	var $parser;
+	var $current_item	= array();	// item currently being parsed
+	var $items			= array();	// collection of parsed items
+	var $channel		= array();	// hash of channel fields
+	var $textinput		= array();
+	var $image			= array();
+	var $feed_type;
+	var $feed_version;
+
+	// parser variables
+	var $stack				= array(); // parser stack
+	var $inchannel			= false;
+	var $initem 			= false;
+	var $incontent			= false; // if in Atom &lt;content mode="xml"&gt; field
+	var $intextinput		= false;
+	var $inimage 			= false;
+	var $current_field		= '';
+	var $current_namespace	= false;
+
+	//var $ERROR = "";
+
+	var $_CONTENT_CONSTRUCTS = array('content', 'summary', 'info', 'title', 'tagline', 'copyright');
+
+	/**
+	 * PHP5 constructor.
+	 */
+	function __construct( $source ) {
+
+		# Check if PHP xml isn't compiled
+		#
+		if ( ! function_exists('xml_parser_create') ) {
+			return trigger_error( "PHP's XML extension is not available. Please contact your hosting provider to enable PHP's XML extension." );
+		}
+
+		$parser = xml_parser_create();
+
+		$this-&gt;parser = $parser;
+
+		# pass in parser, and a reference to this object
+		# set up handlers
+		#
+		xml_set_object( $this-&gt;parser, $this );
+		xml_set_element_handler($this-&gt;parser,
+				'feed_start_element', 'feed_end_element' );
+
+		xml_set_character_data_handler( $this-&gt;parser, 'feed_cdata' );
+
+		$status = xml_parse( $this-&gt;parser, $source );
+
+		if (! $status ) {
+			$errorcode = xml_get_error_code( $this-&gt;parser );
+			if ( $errorcode != XML_ERROR_NONE ) {
+				$xml_error = xml_error_string( $errorcode );
+				$error_line = xml_get_current_line_number($this-&gt;parser);
+				$error_col = xml_get_current_column_number($this-&gt;parser);
+				$errormsg = "$xml_error at line $error_line, column $error_col";
+
+				$this-&gt;error( $errormsg );
+			}
+		}
+
+		xml_parser_free( $this-&gt;parser );
+		unset( $this-&gt;parser );
+
+		$this-&gt;normalize();
+	}
+
+	/**
+	 * PHP4 constructor.
+	 */
+	public function MagpieRSS( $source ) {
+		self::__construct( $source );
+	}
+
+	function feed_start_element($p, $element, &amp;$attrs) {
+		$el = $element = strtolower($element);
+		$attrs = array_change_key_case($attrs, CASE_LOWER);
+
+		// check for a namespace, and split if found
+		$ns	= false;
+		if ( strpos( $element, ':' ) ) {
+			list($ns, $el) = explode( ':', $element, 2);
+		}
+		if ( $ns and $ns != 'rdf' ) {
+			$this-&gt;current_namespace = $ns;
+		}
+
+		# if feed type isn't set, then this is first element of feed
+		# identify feed from root element
+		#
+		if (!isset($this-&gt;feed_type) ) {
+			if ( $el == 'rdf' ) {
+				$this-&gt;feed_type = RSS;
+				$this-&gt;feed_version = '1.0';
+			}
+			elseif ( $el == 'rss' ) {
+				$this-&gt;feed_type = RSS;
+				$this-&gt;feed_version = $attrs['version'];
+			}
+			elseif ( $el == 'feed' ) {
+				$this-&gt;feed_type = ATOM;
+				$this-&gt;feed_version = $attrs['version'];
+				$this-&gt;inchannel = true;
+			}
+			return;
+		}
+
+		if ( $el == 'channel' )
+		{
+			$this-&gt;inchannel = true;
+		}
+		elseif ($el == 'item' or $el == 'entry' )
+		{
+			$this-&gt;initem = true;
+			if ( isset($attrs['rdf:about']) ) {
+				$this-&gt;current_item['about'] = $attrs['rdf:about'];
+			}
+		}
+
+		// if we're in the default namespace of an RSS feed,
+		//  record textinput or image fields
+		elseif (
+			$this-&gt;feed_type == RSS and
+			$this-&gt;current_namespace == '' and
+			$el == 'textinput' )
+		{
+			$this-&gt;intextinput = true;
+		}
+
+		elseif (
+			$this-&gt;feed_type == RSS and
+			$this-&gt;current_namespace == '' and
+			$el == 'image' )
+		{
+			$this-&gt;inimage = true;
+		}
+
+		# handle atom content constructs
+		elseif ( $this-&gt;feed_type == ATOM and in_array($el, $this-&gt;_CONTENT_CONSTRUCTS) )
+		{
+			// avoid clashing w/ RSS mod_content
+			if ($el == 'content' ) {
+				$el = 'atom_content';
+			}
+
+			$this-&gt;incontent = $el;
+
+		}
+
+		// if inside an Atom content construct (e.g. content or summary) field treat tags as text
+		elseif ($this-&gt;feed_type == ATOM and $this-&gt;incontent )
+		{
+			// if tags are inlined, then flatten
+			$attrs_str = join(' ',
+					array_map(array('MagpieRSS', 'map_attrs'),
+					array_keys($attrs),
+					array_values($attrs) ) );
+
+			$this-&gt;append_content( "&lt;$element $attrs_str&gt;"  );
+
+			array_unshift( $this-&gt;stack, $el );
+		}
+
+		// Atom support many links per containging element.
+		// Magpie treats link elements of type rel='alternate'
+		// as being equivalent to RSS's simple link element.
+		//
+		elseif ($this-&gt;feed_type == ATOM and $el == 'link' )
+		{
+			if ( isset($attrs['rel']) and $attrs['rel'] == 'alternate' )
+			{
+				$link_el = 'link';
+			}
+			else {
+				$link_el = 'link_' . $attrs['rel'];
+			}
+
+			$this-&gt;append($link_el, $attrs['href']);
+		}
+		// set stack[0] to current element
+		else {
+			array_unshift($this-&gt;stack, $el);
+		}
+	}
+
+	function feed_cdata ($p, $text) {
+
+		if ($this-&gt;feed_type == ATOM and $this-&gt;incontent)
+		{
+			$this-&gt;append_content( $text );
+		}
+		else {
+			$current_el = join('_', array_reverse($this-&gt;stack));
+			$this-&gt;append($current_el, $text);
+		}
+	}
+
+	function feed_end_element ($p, $el) {
+		$el = strtolower($el);
+
+		if ( $el == 'item' or $el == 'entry' )
+		{
+			$this-&gt;items[] = $this-&gt;current_item;
+			$this-&gt;current_item = array();
+			$this-&gt;initem = false;
+		}
+		elseif ($this-&gt;feed_type == RSS and $this-&gt;current_namespace == '' and $el == 'textinput' )
+		{
+			$this-&gt;intextinput = false;
+		}
+		elseif ($this-&gt;feed_type == RSS and $this-&gt;current_namespace == '' and $el == 'image' )
+		{
+			$this-&gt;inimage = false;
+		}
+		elseif ($this-&gt;feed_type == ATOM and in_array($el, $this-&gt;_CONTENT_CONSTRUCTS) )
+		{
+			$this-&gt;incontent = false;
+		}
+		elseif ($el == 'channel' or $el == 'feed' )
+		{
+			$this-&gt;inchannel = false;
+		}
+		elseif ($this-&gt;feed_type == ATOM and $this-&gt;incontent  ) {
+			// balance tags properly
+			// note: This may not actually be necessary
+			if ( $this-&gt;stack[0] == $el )
+			{
+				$this-&gt;append_content("&lt;/$el&gt;");
+			}
+			else {
+				$this-&gt;append_content("&lt;$el /&gt;");
+			}
+
+			array_shift( $this-&gt;stack );
+		}
+		else {
+			array_shift( $this-&gt;stack );
+		}
+
+		$this-&gt;current_namespace = false;
+	}
+
+	function concat (&amp;$str1, $str2="") {
+		if (!isset($str1) ) {
+			$str1="";
+		}
+		$str1 .= $str2;
+	}
+
+	function append_content($text) {
+		if ( $this-&gt;initem ) {
+			$this-&gt;concat( $this-&gt;current_item[ $this-&gt;incontent ], $text );
+		}
+		elseif ( $this-&gt;inchannel ) {
+			$this-&gt;concat( $this-&gt;channel[ $this-&gt;incontent ], $text );
+		}
+	}
+
+	// smart append - field and namespace aware
+	function append($el, $text) {
+		if (!$el) {
+			return;
+		}
+		if ( $this-&gt;current_namespace )
+		{
+			if ( $this-&gt;initem ) {
+				$this-&gt;concat(
+					$this-&gt;current_item[ $this-&gt;current_namespace ][ $el ], $text);
+			}
+			elseif ($this-&gt;inchannel) {
+				$this-&gt;concat(
+					$this-&gt;channel[ $this-&gt;current_namespace][ $el ], $text );
+			}
+			elseif ($this-&gt;intextinput) {
+				$this-&gt;concat(
+					$this-&gt;textinput[ $this-&gt;current_namespace][ $el ], $text );
+			}
+			elseif ($this-&gt;inimage) {
+				$this-&gt;concat(
+					$this-&gt;image[ $this-&gt;current_namespace ][ $el ], $text );
+			}
+		}
+		else {
+			if ( $this-&gt;initem ) {
+				$this-&gt;concat(
+					$this-&gt;current_item[ $el ], $text);
+			}
+			elseif ($this-&gt;intextinput) {
+				$this-&gt;concat(
+					$this-&gt;textinput[ $el ], $text );
+			}
+			elseif ($this-&gt;inimage) {
+				$this-&gt;concat(
+					$this-&gt;image[ $el ], $text );
+			}
+			elseif ($this-&gt;inchannel) {
+				$this-&gt;concat(
+					$this-&gt;channel[ $el ], $text );
+			}
+
+		}
+	}
+
+	function normalize () {
+		// if atom populate rss fields
+		if ( $this-&gt;is_atom() ) {
+			$this-&gt;channel['descripton'] = $this-&gt;channel['tagline'];
+			for ( $i = 0; $i &lt; count($this-&gt;items); $i++) {
+				$item = $this-&gt;items[$i];
+				if ( isset($item['summary']) )
+					$item['description'] = $item['summary'];
+				if ( isset($item['atom_content']))
+					$item['content']['encoded'] = $item['atom_content'];
+
+				$this-&gt;items[$i] = $item;
+			}
+		}
+		elseif ( $this-&gt;is_rss() ) {
+			$this-&gt;channel['tagline'] = $this-&gt;channel['description'];
+			for ( $i = 0; $i &lt; count($this-&gt;items); $i++) {
+				$item = $this-&gt;items[$i];
+				if ( isset($item['description']))
+					$item['summary'] = $item['description'];
+				if ( isset($item['content']['encoded'] ) )
+					$item['atom_content'] = $item['content']['encoded'];
+
+				$this-&gt;items[$i] = $item;
+			}
+		}
+	}
+
+	function is_rss () {
+		if ( $this-&gt;feed_type == RSS ) {
+			return $this-&gt;feed_version;
+		}
+		else {
+			return false;
+		}
+	}
+
+	function is_atom() {
+		if ( $this-&gt;feed_type == ATOM ) {
+			return $this-&gt;feed_version;
+		}
+		else {
+			return false;
+		}
+	}
+
+	function map_attrs($k, $v) {
+		return "$k=\"$v\"";
+	}
+
+	function error( $errormsg, $lvl = E_USER_WARNING ) {
+		if ( MAGPIE_DEBUG ) {
+			trigger_error( $errormsg, $lvl);
+		} else {
+			error_log( $errormsg, 0);
+		}
+	}
+
+}
+</code></pre>  </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/magpierss" class="_attribution-link">https://developer.wordpress.org/reference/classes/magpierss</a>
+  </p>
+</div>

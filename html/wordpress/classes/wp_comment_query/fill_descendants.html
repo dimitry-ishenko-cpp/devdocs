@@ -1,0 +1,117 @@
+<h1>WP_Comment_Query::fill_descendants( WP_Comment[] $comments ): array</h1>  <section> <p>Fetch descendants for located comments.</p> </section>   <section> <header class="toc-header"><h2 id="description">Description</h2></header> <p>Instead of calling <code>get_children()</code> separately on each child comment, we do a single set of queries to fetch the descendant trees for all matched top-level comments.</p> </section>  <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$comments</code> <span class="type"><span class="WP_Comment[]"><a href="../wp_comment.html" rel="class">WP_Comment</a>[]</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Array of top-level comments whose descendants should be filled in.</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">array</span> </p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/class-wp-comment-query.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-comment-query.php/">View all references</a> </p> <pre class="wp-block-code" data-start="1021" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">protected function fill_descendants( $comments ) {
+	global $wpdb;
+
+	$levels = array(
+		0 =&gt; wp_list_pluck( $comments, 'comment_ID' ),
+	);
+
+	$key          = md5( serialize( wp_array_slice_assoc( $this-&gt;query_vars, array_keys( $this-&gt;query_var_defaults ) ) ) );
+	$last_changed = wp_cache_get_last_changed( 'comment' );
+
+	// Fetch an entire level of the descendant tree at a time.
+	$level        = 0;
+	$exclude_keys = array( 'parent', 'parent__in', 'parent__not_in' );
+	do {
+		// Parent-child relationships may be cached. Only query for those that are not.
+		$child_ids           = array();
+		$uncached_parent_ids = array();
+		$_parent_ids         = $levels[ $level ];
+		foreach ( $_parent_ids as $parent_id ) {
+			$cache_key        = "get_comment_child_ids:$parent_id:$key:$last_changed";
+			$parent_child_ids = wp_cache_get( $cache_key, 'comment' );
+			if ( false !== $parent_child_ids ) {
+				$child_ids = array_merge( $child_ids, $parent_child_ids );
+			} else {
+				$uncached_parent_ids[] = $parent_id;
+			}
+		}
+
+		if ( $uncached_parent_ids ) {
+			// Fetch this level of comments.
+			$parent_query_args = $this-&gt;query_vars;
+			foreach ( $exclude_keys as $exclude_key ) {
+				$parent_query_args[ $exclude_key ] = '';
+			}
+			$parent_query_args['parent__in']    = $uncached_parent_ids;
+			$parent_query_args['no_found_rows'] = true;
+			$parent_query_args['hierarchical']  = false;
+			$parent_query_args['offset']        = 0;
+			$parent_query_args['number']        = 0;
+
+			$level_comments = get_comments( $parent_query_args );
+
+			// Cache parent-child relationships.
+			$parent_map = array_fill_keys( $uncached_parent_ids, array() );
+			foreach ( $level_comments as $level_comment ) {
+				$parent_map[ $level_comment-&gt;comment_parent ][] = $level_comment-&gt;comment_ID;
+				$child_ids[]                                    = $level_comment-&gt;comment_ID;
+			}
+
+			$data = array();
+			foreach ( $parent_map as $parent_id =&gt; $children ) {
+				$cache_key          = "get_comment_child_ids:$parent_id:$key:$last_changed";
+				$data[ $cache_key ] = $children;
+			}
+			wp_cache_set_multiple( $data, 'comment' );
+		}
+
+		$level++;
+		$levels[ $level ] = $child_ids;
+	} while ( $child_ids );
+
+	// Prime comment caches for non-top-level comments.
+	$descendant_ids = array();
+	for ( $i = 1, $c = count( $levels ); $i &lt; $c; $i++ ) {
+		$descendant_ids = array_merge( $descendant_ids, $levels[ $i ] );
+	}
+
+	_prime_comment_caches( $descendant_ids, $this-&gt;query_vars['update_comment_meta_cache'] );
+
+	// Assemble a flat array of all comments + descendants.
+	$all_comments = $comments;
+	foreach ( $descendant_ids as $descendant_id ) {
+		$all_comments[] = get_comment( $descendant_id );
+	}
+
+	// If a threaded representation was requested, build the tree.
+	if ( 'threaded' === $this-&gt;query_vars['hierarchical'] ) {
+		$threaded_comments = array();
+		$ref               = array();
+		foreach ( $all_comments as $k =&gt; $c ) {
+			$_c = get_comment( $c-&gt;comment_ID );
+
+			// If the comment isn't in the reference array, it goes in the top level of the thread.
+			if ( ! isset( $ref[ $c-&gt;comment_parent ] ) ) {
+				$threaded_comments[ $_c-&gt;comment_ID ] = $_c;
+				$ref[ $_c-&gt;comment_ID ]               = $threaded_comments[ $_c-&gt;comment_ID ];
+
+				// Otherwise, set it as a child of its parent.
+			} else {
+
+				$ref[ $_c-&gt;comment_parent ]-&gt;add_child( $_c );
+				$ref[ $_c-&gt;comment_ID ] = $ref[ $_c-&gt;comment_parent ]-&gt;get_child( $_c-&gt;comment_ID );
+			}
+		}
+
+		// Set the 'populated_children' flag, to ensure additional database queries aren't run.
+		foreach ( $ref as $_ref ) {
+			$_ref-&gt;populated_children( true );
+		}
+
+		$comments = $threaded_comments;
+	} else {
+		$comments = $all_comments;
+	}
+
+	return $comments;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="../../functions/wp_cache_set_multiple.html">wp_cache_set_multiple()</a> <span>wp-includes/cache.php</span> </td> <td class="related-desc"> <p>Sets multiple values to the cache in one call.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_cache_get_last_changed.html">wp_cache_get_last_changed()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Gets last changed date for the specified cache group.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/_prime_comment_caches.html">_prime_comment_caches()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Adds any comments from the given IDs to the cache that do not already exist in cache.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_list_pluck.html">wp_list_pluck()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Plucks a certain field out of each object or array in an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_array_slice_assoc.html">wp_array_slice_assoc()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Extracts a slice of an array, given a list of keys.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_comments.html">get_comments()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Retrieves a list of comments.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_cache_get.html">wp_cache_get()</a> <span>wp-includes/cache.php</span> </td> <td class="related-desc"> <p>Retrieves the cache contents from the cache by key and group.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_comment.html">get_comment()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Retrieves comment data given a comment ID or comment object.</p> </td> </tr> </tbody>
+
+</table>   </article>  <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="get_comments.html">WP_Comment_Query::get_comments()</a> <span>wp-includes/class-wp-comment-query.php</span> </td> <td class="related-desc"> <p>Get a list of comments matching the query vars.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.4.0/" alt="WordPress 4.4.0">4.4.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_comment_query/fill_descendants" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_comment_query/fill_descendants</a>
+  </p>
+</div>

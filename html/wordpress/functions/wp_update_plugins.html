@@ -1,0 +1,269 @@
+<h1>wp_update_plugins( array $extra_stats = array() )</h1>  <section> <p>Checks for available updates to plugins based on the latest versions hosted on WordPress.org.</p> </section>   <section> <header class="toc-header"><h2 id="description">Description</h2></header> <p>Despite its name this function does not actually perform any updates, it only checks for available updates.</p> <p>A list of all plugins installed is sent to WP, along with the site locale.</p> <p>Checks against the WordPress server at api.wordpress.org. Will only check if WordPress isn’t installing.</p> </section>  <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$extra_stats</code> <span class="type"><span class="array">array</span></span> <span class="required">Optional</span> </dt> <dd> <div class="desc"> <span class="description">Extra statistics to report to the WordPress.org API.</span> </div> <p class="default">Default: <code>array()</code></p> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/update.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/update.php/">View all references</a> </p> <pre class="wp-block-code" data-start="310" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">function wp_update_plugins( $extra_stats = array() ) {
+	if ( wp_installing() ) {
+		return;
+	}
+
+	// Include an unmodified $wp_version.
+	require ABSPATH . WPINC . '/version.php';
+
+	// If running blog-side, bail unless we've not checked in the last 12 hours.
+	if ( ! function_exists( 'get_plugins' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+
+	$plugins      = get_plugins();
+	$translations = wp_get_installed_translations( 'plugins' );
+
+	$active  = get_option( 'active_plugins', array() );
+	$current = get_site_transient( 'update_plugins' );
+
+	if ( ! is_object( $current ) ) {
+		$current = new stdClass;
+	}
+
+	$updates               = new stdClass;
+	$updates-&gt;last_checked = time();
+	$updates-&gt;response     = array();
+	$updates-&gt;translations = array();
+	$updates-&gt;no_update    = array();
+
+	$doing_cron = wp_doing_cron();
+
+	// Check for update on a different schedule, depending on the page.
+	switch ( current_filter() ) {
+		case 'upgrader_process_complete':
+			$timeout = 0;
+			break;
+		case 'load-update-core.php':
+			$timeout = MINUTE_IN_SECONDS;
+			break;
+		case 'load-plugins.php':
+		case 'load-update.php':
+			$timeout = HOUR_IN_SECONDS;
+			break;
+		default:
+			if ( $doing_cron ) {
+				$timeout = 2 * HOUR_IN_SECONDS;
+			} else {
+				$timeout = 12 * HOUR_IN_SECONDS;
+			}
+	}
+
+	$time_not_changed = isset( $current-&gt;last_checked ) &amp;&amp; $timeout &gt; ( time() - $current-&gt;last_checked );
+
+	if ( $time_not_changed &amp;&amp; ! $extra_stats ) {
+		$plugin_changed = false;
+
+		foreach ( $plugins as $file =&gt; $p ) {
+			$updates-&gt;checked[ $file ] = $p['Version'];
+
+			if ( ! isset( $current-&gt;checked[ $file ] ) || (string) $current-&gt;checked[ $file ] !== (string) $p['Version'] ) {
+				$plugin_changed = true;
+			}
+		}
+
+		if ( isset( $current-&gt;response ) &amp;&amp; is_array( $current-&gt;response ) ) {
+			foreach ( $current-&gt;response as $plugin_file =&gt; $update_details ) {
+				if ( ! isset( $plugins[ $plugin_file ] ) ) {
+					$plugin_changed = true;
+					break;
+				}
+			}
+		}
+
+		// Bail if we've checked recently and if nothing has changed.
+		if ( ! $plugin_changed ) {
+			return;
+		}
+	}
+
+	// Update last_checked for current to prevent multiple blocking requests if request hangs.
+	$current-&gt;last_checked = time();
+	set_site_transient( 'update_plugins', $current );
+
+	$to_send = compact( 'plugins', 'active' );
+
+	$locales = array_values( get_available_languages() );
+
+	/**
+	 * Filters the locales requested for plugin translations.
+	 *
+	 * @since 3.7.0
+	 * @since 4.5.0 The default value of the `$locales` parameter changed to include all locales.
+	 *
+	 * @param string[] $locales Plugin locales. Default is all available locales of the site.
+	 */
+	$locales = apply_filters( 'plugins_update_check_locales', $locales );
+	$locales = array_unique( $locales );
+
+	if ( $doing_cron ) {
+		$timeout = 30; // 30 seconds.
+	} else {
+		// Three seconds, plus one extra second for every 10 plugins.
+		$timeout = 3 + (int) ( count( $plugins ) / 10 );
+	}
+
+	$options = array(
+		'timeout'    =&gt; $timeout,
+		'body'       =&gt; array(
+			'plugins'      =&gt; wp_json_encode( $to_send ),
+			'translations' =&gt; wp_json_encode( $translations ),
+			'locale'       =&gt; wp_json_encode( $locales ),
+			'all'          =&gt; wp_json_encode( true ),
+		),
+		'user-agent' =&gt; 'WordPress/' . $wp_version . '; ' . home_url( '/' ),
+	);
+
+	if ( $extra_stats ) {
+		$options['body']['update_stats'] = wp_json_encode( $extra_stats );
+	}
+
+	$url      = 'http://api.wordpress.org/plugins/update-check/1.1/';
+	$http_url = $url;
+	$ssl      = wp_http_supports( array( 'ssl' ) );
+
+	if ( $ssl ) {
+		$url = set_url_scheme( $url, 'https' );
+	}
+
+	$raw_response = wp_remote_post( $url, $options );
+
+	if ( $ssl &amp;&amp; is_wp_error( $raw_response ) ) {
+		trigger_error(
+			sprintf(
+				/* translators: %s: Support forums URL. */
+				__( 'An unexpected error occurred. Something may be wrong with WordPress.org or this server&amp;#8217;s configuration. If you continue to have problems, please try the &lt;a href="%s.html"&gt;support forums&lt;/a&gt;.' ),
+				__( 'https://wordpress.org/support/forums/' )
+			) . ' ' . __( '(WordPress could not establish a secure connection to WordPress.org. Please contact your server administrator.)' ),
+			headers_sent() || WP_DEBUG ? E_USER_WARNING : E_USER_NOTICE
+		);
+		$raw_response = wp_remote_post( $http_url, $options );
+	}
+
+	if ( is_wp_error( $raw_response ) || 200 !== wp_remote_retrieve_response_code( $raw_response ) ) {
+		return;
+	}
+
+	$response = json_decode( wp_remote_retrieve_body( $raw_response ), true );
+
+	if ( $response &amp;&amp; is_array( $response ) ) {
+		$updates-&gt;response     = $response['plugins'];
+		$updates-&gt;translations = $response['translations'];
+		$updates-&gt;no_update    = $response['no_update'];
+	}
+
+	// Support updates for any plugins using the `Update URI` header field.
+	foreach ( $plugins as $plugin_file =&gt; $plugin_data ) {
+		if ( ! $plugin_data['UpdateURI'] || isset( $updates-&gt;response[ $plugin_file ] ) ) {
+			continue;
+		}
+
+		$hostname = wp_parse_url( sanitize_url( $plugin_data['UpdateURI'] ), PHP_URL_HOST );
+
+		/**
+		 * Filters the update response for a given plugin hostname.
+		 *
+		 * The dynamic portion of the hook name, `$hostname`, refers to the hostname
+		 * of the URI specified in the `Update URI` header field.
+		 *
+		 * @since 5.8.0
+		 *
+		 * @param array|false $update {
+		 *     The plugin update data with the latest details. Default false.
+		 *
+		 *     @type string $id           Optional. ID of the plugin for update purposes, should be a URI
+		 *                                specified in the `Update URI` header field.
+		 *     @type string $slug         Slug of the plugin.
+		 *     @type string $version      The version of the plugin.
+		 *     @type string $url          The URL for details of the plugin.
+		 *     @type string $package      Optional. The update ZIP for the plugin.
+		 *     @type string $tested       Optional. The version of WordPress the plugin is tested against.
+		 *     @type string $requires_php Optional. The version of PHP which the plugin requires.
+		 *     @type bool   $autoupdate   Optional. Whether the plugin should automatically update.
+		 *     @type array  $icons        Optional. Array of plugin icons.
+		 *     @type array  $banners      Optional. Array of plugin banners.
+		 *     @type array  $banners_rtl  Optional. Array of plugin RTL banners.
+		 *     @type array  $translations {
+		 *         Optional. List of translation updates for the plugin.
+		 *
+		 *         @type string $language   The language the translation update is for.
+		 *         @type string $version    The version of the plugin this translation is for.
+		 *                                  This is not the version of the language file.
+		 *         @type string $updated    The update timestamp of the translation file.
+		 *                                  Should be a date in the `YYYY-MM-DD HH:MM:SS` format.
+		 *         @type string $package    The ZIP location containing the translation update.
+		 *         @type string $autoupdate Whether the translation should be automatically installed.
+		 *     }
+		 * }
+		 * @param array       $plugin_data      Plugin headers.
+		 * @param string      $plugin_file      Plugin filename.
+		 * @param string[]    $locales          Installed locales to look up translations for.
+		 */
+		$update = apply_filters( "update_plugins_{$hostname}", false, $plugin_data, $plugin_file, $locales );
+
+		if ( ! $update ) {
+			continue;
+		}
+
+		$update = (object) $update;
+
+		// Is it valid? We require at least a version.
+		if ( ! isset( $update-&gt;version ) ) {
+			continue;
+		}
+
+		// These should remain constant.
+		$update-&gt;id     = $plugin_data['UpdateURI'];
+		$update-&gt;plugin = $plugin_file;
+
+		// WordPress needs the version field specified as 'new_version'.
+		if ( ! isset( $update-&gt;new_version ) ) {
+			$update-&gt;new_version = $update-&gt;version;
+		}
+
+		// Handle any translation updates.
+		if ( ! empty( $update-&gt;translations ) ) {
+			foreach ( $update-&gt;translations as $translation ) {
+				if ( isset( $translation['language'], $translation['package'] ) ) {
+					$translation['type'] = 'plugin';
+					$translation['slug'] = isset( $update-&gt;slug ) ? $update-&gt;slug : $update-&gt;id;
+
+					$updates-&gt;translations[] = $translation;
+				}
+			}
+		}
+
+		unset( $updates-&gt;no_update[ $plugin_file ], $updates-&gt;response[ $plugin_file ] );
+
+		if ( version_compare( $update-&gt;new_version, $plugin_data['Version'], '&gt;' ) ) {
+			$updates-&gt;response[ $plugin_file ] = $update;
+		} else {
+			$updates-&gt;no_update[ $plugin_file ] = $update;
+		}
+	}
+
+	$sanitize_plugin_update_payload = static function( &amp;$item ) {
+		$item = (object) $item;
+
+		unset( $item-&gt;translations, $item-&gt;compatibility );
+
+		return $item;
+	};
+
+	array_walk( $updates-&gt;response, $sanitize_plugin_update_payload );
+	array_walk( $updates-&gt;no_update, $sanitize_plugin_update_payload );
+
+	set_site_transient( 'update_plugins', $updates );
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../hooks/plugins_update_check_locales.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'plugins_update_check_locales', <nobr><span class="arg-type">string[]</span> <span class="arg-name">$locales</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the locales requested for plugin translations.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../hooks/update_plugins_hostname.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( "update_plugins_{$hostname}", <nobr><span class="arg-type">array|false</span> <span class="arg-name">$update</span></nobr>, <nobr><span class="arg-type">array</span> <span class="arg-name">$plugin_data</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$plugin_file</span></nobr>, <nobr><span class="arg-type">string[]</span> <span class="arg-name">$locales</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the update response for a given plugin hostname.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="wp_doing_cron.html">wp_doing_cron()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Determines whether the current request is a WordPress cron request.</p> </td> </tr> <tr> <td class="related-title"> <a href="set_site_transient.html">set_site_transient()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Sets/updates the value of a site transient.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_parse_url.html">wp_parse_url()</a> <span>wp-includes/http.php</span> </td> <td class="related-desc"> <p>A wrapper for PHP’s parse_url() function that handles consistency in the return values across PHP versions.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_plugins.html">get_plugins()</a> <span>wp-admin/includes/plugin.php</span> </td> <td class="related-desc"> <p>Checks the plugins directory and retrieve all plugin files with plugin data.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_get_installed_translations.html">wp_get_installed_translations()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Gets installed translations.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_available_languages.html">get_available_languages()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Gets all available languages based on the presence of *.mo files in a given directory.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_site_transient.html">get_site_transient()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Retrieves the value of a site transient.</p> </td> </tr> <tr> <td class="related-title"> <a href="sanitize_url.html">sanitize_url()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Sanitizes a URL for database or redirect usage.</p> </td> </tr> <tr> <td class="related-title"> <a href="set_url_scheme.html">set_url_scheme()</a> <span>wp-includes/link-template.php</span> </td> <td class="related-desc"> <p>Sets the scheme for a URL.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_installing.html">wp_installing()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Check or set whether WordPress is in “installation” mode.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_http_supports.html">wp_http_supports()</a> <span>wp-includes/http.php</span> </td> <td class="related-desc"> <p>Determines if there is an HTTP Transport that can process this request.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_remote_post.html">wp_remote_post()</a> <span>wp-includes/http.php</span> </td> <td class="related-desc"> <p>Performs an HTTP request using the POST method and returns its response.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_remote_retrieve_response_code.html">wp_remote_retrieve_response_code()</a> <span>wp-includes/http.php</span> </td> <td class="related-desc"> <p>Retrieve only the response code from the raw response.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_remote_retrieve_body.html">wp_remote_retrieve_body()</a> <span>wp-includes/http.php</span> </td> <td class="related-desc"> <p>Retrieve only the body from the raw response.</p> </td> </tr> <tr> <td class="related-title"> <a href="current_filter.html">current_filter()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Retrieves the name of the current filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_option.html">get_option()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Retrieves an option value based on an option name.</p> </td> </tr> <tr> <td class="related-title"> <a href="home_url.html">home_url()</a> <span>wp-includes/link-template.php</span> </td> <td class="related-desc"> <p>Retrieves the URL for the current site where the front end is accessible.</p> </td> </tr> <tr> <td class="related-title"> <a href="apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_json_encode.html">wp_json_encode()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Encodes a variable into JSON, with some sanity checks.</p> </td> </tr> <tr> <td class="related-title"> <a href="is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> </tbody>
+
+</table>   </article>  <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="../classes/wp_debug_data/check_for_updates.html">WP_Debug_Data::check_for_updates()</a> <span>wp-admin/includes/class-wp-debug-data.php</span> </td> <td class="related-desc"> <p>Calls all core functions to check for updates.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_ajax_update_plugin.html">wp_ajax_update_plugin()</a> <span>wp-admin/includes/ajax-actions.php</span> </td> <td class="related-desc"> <p>Ajax handler for updating a plugin.</p> </td> </tr> <tr> <td class="related-title"> <a href="../classes/wp_automatic_updater/run.html">WP_Automatic_Updater::run()</a> <span>wp-admin/includes/class-wp-automatic-updater.php</span> </td> <td class="related-desc"> <p>Kicks off the background update process, looping through all pending updates.</p> </td> </tr> <tr> <td class="related-title"> <a href="install_plugin_install_status.html">install_plugin_install_status()</a> <span>wp-admin/includes/plugin-install.php</span> </td> <td class="related-desc"> <p>Determines the status we can perform on a plugin.</p> </td> </tr> <tr> <td class="related-title"> <a href="_maybe_update_plugins.html">_maybe_update_plugins()</a> <span>wp-includes/update.php</span> </td> <td class="related-desc"> <p>Checks the last time plugins were run before checking plugin versions.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/2.3.0/" alt="WordPress 2.3.0">2.3.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/functions/wp_update_plugins" class="_attribution-link">https://developer.wordpress.org/reference/functions/wp_update_plugins</a>
+  </p>
+</div>

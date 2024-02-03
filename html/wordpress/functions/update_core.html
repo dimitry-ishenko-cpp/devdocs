@@ -1,0 +1,530 @@
+<h1>update_core( string $from, string $to ): string|WP_Error</h1>  <section> <p>Upgrades the core of WordPress.</p> </section>   <section> <header class="toc-header"><h2 id="description">Description</h2></header> <p>This will create a .maintenance file at the base of the WordPress directory to ensure that people can not access the web site, when the files are being copied to their locations.</p> <p>The files in the <code>$_old_files</code> list will be removed and the new files copied from the zip file after the database is upgraded.</p> <p>The files in the <code>$_new_bundled_files</code> list will be added to the installation if the version is greater than or equal to the old version being upgraded.</p> <p>The steps for the upgrader for after the new release is downloaded and unzipped is:</p> <ol> <li>Test unzipped location for select files to ensure that unzipped worked.</li> <li>Create the .maintenance file in current WordPress base.</li> <li>Copy new WordPress directory over old WordPress files.</li> <li>Upgrade WordPress to new version.<br>4.1. Copy all files/folders other than wp-content 4.2. Copy any language files to WP_LANG_DIR (which may differ from WP_CONTENT_DIR 4.3. Copy any new bundled themes/plugins to their respective locations</li> <li>Delete new WordPress directory path.</li> <li>Delete .maintenance file.</li> <li>Remove old files.</li> <li>Delete ‘update_core’ option.</li> </ol> <p>There are several areas of failure. For instance if PHP times out before step 6, then you will not be able to access any portion of your site. Also, since the upgrade will not continue where it left off, you will not be able to automatically remove old files and remove the ‘update_core’ option. This isn’t that bad.</p> <p>If the copy of the new WordPress over the old fails, then the worse is that the new WordPress directory will remain.</p> <p>If it is assumed that every file will be copied over, including plugins and themes, then if you edit the default theme, you should rename it, so that your changes remain.</p> </section>  <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$from</code> <span class="type"><span class="string">string</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">New release unzipped path.</span> </div> </dd> <dt> <code>$to</code> <span class="type"><span class="string">string</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Path to old WordPress installation.</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">string|<a href="../classes/wp_error.html" rel="class">WP_Error</a></span> New WordPress version on success, <a href="../classes/wp_error.html" rel="class">WP_Error</a> on failure.</p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-admin/includes/update-core.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-admin/includes/update-core.php/">View all references</a> </p> <pre class="wp-block-code" data-start="963" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">function update_core( $from, $to ) {
+	global $wp_filesystem, $_old_files, $_new_bundled_files, $wpdb;
+
+	set_time_limit( 300 );
+
+	/**
+	 * Filters feedback messages displayed during the core update process.
+	 *
+	 * The filter is first evaluated after the zip file for the latest version
+	 * has been downloaded and unzipped. It is evaluated five more times during
+	 * the process:
+	 *
+	 * 1. Before WordPress begins the core upgrade process.
+	 * 2. Before Maintenance Mode is enabled.
+	 * 3. Before WordPress begins copying over the necessary files.
+	 * 4. Before Maintenance Mode is disabled.
+	 * 5. Before the database is upgraded.
+	 *
+	 * @since 2.5.0
+	 *
+	 * @param string $feedback The core update feedback messages.
+	 */
+	apply_filters( 'update_feedback', __( 'Verifying the unpacked files&amp;#8230;' ) );
+
+	// Sanity check the unzipped distribution.
+	$distro = '';
+	$roots  = array( '/wordpress/', '/wordpress-mu/' );
+
+	foreach ( $roots as $root ) {
+		if ( $wp_filesystem-&gt;exists( $from . $root . 'readme.html' )
+			&amp;&amp; $wp_filesystem-&gt;exists( $from . $root . 'wp-includes/version.php' )
+		) {
+			$distro = $root;
+			break;
+		}
+	}
+
+	if ( ! $distro ) {
+		$wp_filesystem-&gt;delete( $from, true );
+
+		return new WP_Error( 'insane_distro', __( 'The update could not be unpacked' ) );
+	}
+
+	/*
+	 * Import $wp_version, $required_php_version, and $required_mysql_version from the new version.
+	 * DO NOT globalize any variables imported from `version-current.php` in this function.
+	 *
+	 * BC Note: $wp_filesystem-&gt;wp_content_dir() returned unslashed pre-2.8.
+	 */
+	$versions_file = trailingslashit( $wp_filesystem-&gt;wp_content_dir() ) . 'upgrade/version-current.php';
+
+	if ( ! $wp_filesystem-&gt;copy( $from . $distro . 'wp-includes/version.php', $versions_file ) ) {
+		$wp_filesystem-&gt;delete( $from, true );
+
+		return new WP_Error(
+			'copy_failed_for_version_file',
+			__( 'The update cannot be installed because some files could not be copied. This is usually due to inconsistent file permissions.' ),
+			'wp-includes/version.php'
+		);
+	}
+
+	$wp_filesystem-&gt;chmod( $versions_file, FS_CHMOD_FILE );
+
+	/*
+	 * `wp_opcache_invalidate()` only exists in WordPress 5.5 or later,
+	 * so don't run it when upgrading from older versions.
+	 */
+	if ( function_exists( 'wp_opcache_invalidate' ) ) {
+		wp_opcache_invalidate( $versions_file );
+	}
+
+	require WP_CONTENT_DIR . '/upgrade/version-current.php';
+	$wp_filesystem-&gt;delete( $versions_file );
+
+	$php_version       = PHP_VERSION;
+	$mysql_version     = $wpdb-&gt;db_version();
+	$old_wp_version    = $GLOBALS['wp_version']; // The version of WordPress we're updating from.
+	$development_build = ( false !== strpos( $old_wp_version . $wp_version, '-' ) ); // A dash in the version indicates a development release.
+	$php_compat        = version_compare( $php_version, $required_php_version, '&gt;=' );
+
+	if ( file_exists( WP_CONTENT_DIR . '/db.php' ) &amp;&amp; empty( $wpdb-&gt;is_mysql ) ) {
+		$mysql_compat = true;
+	} else {
+		$mysql_compat = version_compare( $mysql_version, $required_mysql_version, '&gt;=' );
+	}
+
+	if ( ! $mysql_compat || ! $php_compat ) {
+		$wp_filesystem-&gt;delete( $from, true );
+	}
+
+	$php_update_message = '';
+
+	if ( function_exists( 'wp_get_update_php_url' ) ) {
+		$php_update_message = '&lt;/p&gt;&lt;p&gt;' . sprintf(
+			/* translators: %s: URL to Update PHP page. */
+			__( '&lt;a href="%s.html"&gt;Learn more about updating PHP&lt;/a&gt;.' ),
+			esc_url( wp_get_update_php_url() )
+		);
+
+		if ( function_exists( 'wp_get_update_php_annotation' ) ) {
+			$annotation = wp_get_update_php_annotation();
+
+			if ( $annotation ) {
+				$php_update_message .= '&lt;/p&gt;&lt;p&gt;&lt;em&gt;' . $annotation . '&lt;/em&gt;';
+			}
+		}
+	}
+
+	if ( ! $mysql_compat &amp;&amp; ! $php_compat ) {
+		return new WP_Error(
+			'php_mysql_not_compatible',
+			sprintf(
+				/* translators: 1: WordPress version number, 2: Minimum required PHP version number, 3: Minimum required MySQL version number, 4: Current PHP version number, 5: Current MySQL version number. */
+				__( 'The update cannot be installed because WordPress %1$s requires PHP version %2$s or higher and MySQL version %3$s or higher. You are running PHP version %4$s and MySQL version %5$s.' ),
+				$wp_version,
+				$required_php_version,
+				$required_mysql_version,
+				$php_version,
+				$mysql_version
+			) . $php_update_message
+		);
+	} elseif ( ! $php_compat ) {
+		return new WP_Error(
+			'php_not_compatible',
+			sprintf(
+				/* translators: 1: WordPress version number, 2: Minimum required PHP version number, 3: Current PHP version number. */
+				__( 'The update cannot be installed because WordPress %1$s requires PHP version %2$s or higher. You are running version %3$s.' ),
+				$wp_version,
+				$required_php_version,
+				$php_version
+			) . $php_update_message
+		);
+	} elseif ( ! $mysql_compat ) {
+		return new WP_Error(
+			'mysql_not_compatible',
+			sprintf(
+				/* translators: 1: WordPress version number, 2: Minimum required MySQL version number, 3: Current MySQL version number. */
+				__( 'The update cannot be installed because WordPress %1$s requires MySQL version %2$s or higher. You are running version %3$s.' ),
+				$wp_version,
+				$required_mysql_version,
+				$mysql_version
+			)
+		);
+	}
+
+	// Add a warning when the JSON PHP extension is missing.
+	if ( ! extension_loaded( 'json' ) ) {
+		return new WP_Error(
+			'php_not_compatible_json',
+			sprintf(
+				/* translators: 1: WordPress version number, 2: The PHP extension name needed. */
+				__( 'The update cannot be installed because WordPress %1$s requires the %2$s PHP extension.' ),
+				$wp_version,
+				'JSON'
+			)
+		);
+	}
+
+	/** This filter is documented in wp-admin/includes/update-core.php */
+	apply_filters( 'update_feedback', __( 'Preparing to install the latest version&amp;#8230;' ) );
+
+	// Don't copy wp-content, we'll deal with that below.
+	// We also copy version.php last so failed updates report their old version.
+	$skip              = array( 'wp-content', 'wp-includes/version.php' );
+	$check_is_writable = array();
+
+	// Check to see which files don't really need updating - only available for 3.7 and higher.
+	if ( function_exists( 'get_core_checksums' ) ) {
+		// Find the local version of the working directory.
+		$working_dir_local = WP_CONTENT_DIR . '/upgrade/' . basename( $from ) . $distro;
+
+		$checksums = get_core_checksums( $wp_version, isset( $wp_local_package ) ? $wp_local_package : 'en_US' );
+
+		if ( is_array( $checksums ) &amp;&amp; isset( $checksums[ $wp_version ] ) ) {
+			$checksums = $checksums[ $wp_version ]; // Compat code for 3.7-beta2.
+		}
+
+		if ( is_array( $checksums ) ) {
+			foreach ( $checksums as $file =&gt; $checksum ) {
+				if ( 'wp-content' === substr( $file, 0, 10 ) ) {
+					continue;
+				}
+
+				if ( ! file_exists( ABSPATH . $file ) ) {
+					continue;
+				}
+
+				if ( ! file_exists( $working_dir_local . $file ) ) {
+					continue;
+				}
+
+				if ( '.' === dirname( $file )
+					&amp;&amp; in_array( pathinfo( $file, PATHINFO_EXTENSION ), array( 'html', 'txt' ), true )
+				) {
+					continue;
+				}
+
+				if ( md5_file( ABSPATH . $file ) === $checksum ) {
+					$skip[] = $file;
+				} else {
+					$check_is_writable[ $file ] = ABSPATH . $file;
+				}
+			}
+		}
+	}
+
+	// If we're using the direct method, we can predict write failures that are due to permissions.
+	if ( $check_is_writable &amp;&amp; 'direct' === $wp_filesystem-&gt;method ) {
+		$files_writable = array_filter( $check_is_writable, array( $wp_filesystem, 'is_writable' ) );
+
+		if ( $files_writable !== $check_is_writable ) {
+			$files_not_writable = array_diff_key( $check_is_writable, $files_writable );
+
+			foreach ( $files_not_writable as $relative_file_not_writable =&gt; $file_not_writable ) {
+				// If the writable check failed, chmod file to 0644 and try again, same as copy_dir().
+				$wp_filesystem-&gt;chmod( $file_not_writable, FS_CHMOD_FILE );
+
+				if ( $wp_filesystem-&gt;is_writable( $file_not_writable ) ) {
+					unset( $files_not_writable[ $relative_file_not_writable ] );
+				}
+			}
+
+			// Store package-relative paths (the key) of non-writable files in the WP_Error object.
+			$error_data = version_compare( $old_wp_version, '3.7-beta2', '&gt;' ) ? array_keys( $files_not_writable ) : '';
+
+			if ( $files_not_writable ) {
+				return new WP_Error(
+					'files_not_writable',
+					__( 'The update cannot be installed because your site is unable to copy some files. This is usually due to inconsistent file permissions.' ),
+					implode( ', ', $error_data )
+				);
+			}
+		}
+	}
+
+	/** This filter is documented in wp-admin/includes/update-core.php */
+	apply_filters( 'update_feedback', __( 'Enabling Maintenance mode&amp;#8230;' ) );
+
+	// Create maintenance file to signal that we are upgrading.
+	$maintenance_string = '&lt;?php $upgrading = ' . time() . '; ?&gt;';
+	$maintenance_file   = $to . '.maintenance';
+	$wp_filesystem-&gt;delete( $maintenance_file );
+	$wp_filesystem-&gt;put_contents( $maintenance_file, $maintenance_string, FS_CHMOD_FILE );
+
+	/** This filter is documented in wp-admin/includes/update-core.php */
+	apply_filters( 'update_feedback', __( 'Copying the required files&amp;#8230;' ) );
+
+	// Copy new versions of WP files into place.
+	$result = copy_dir( $from . $distro, $to, $skip );
+
+	if ( is_wp_error( $result ) ) {
+		$result = new WP_Error(
+			$result-&gt;get_error_code(),
+			$result-&gt;get_error_message(),
+			substr( $result-&gt;get_error_data(), strlen( $to ) )
+		);
+	}
+
+	// Since we know the core files have copied over, we can now copy the version file.
+	if ( ! is_wp_error( $result ) ) {
+		if ( ! $wp_filesystem-&gt;copy( $from . $distro . 'wp-includes/version.php', $to . 'wp-includes/version.php', true /* overwrite */ ) ) {
+			$wp_filesystem-&gt;delete( $from, true );
+			$result = new WP_Error(
+				'copy_failed_for_version_file',
+				__( 'The update cannot be installed because your site is unable to copy some files. This is usually due to inconsistent file permissions.' ),
+				'wp-includes/version.php'
+			);
+		}
+
+		$wp_filesystem-&gt;chmod( $to . 'wp-includes/version.php', FS_CHMOD_FILE );
+
+		/*
+		 * `wp_opcache_invalidate()` only exists in WordPress 5.5 or later,
+		 * so don't run it when upgrading from older versions.
+		 */
+		if ( function_exists( 'wp_opcache_invalidate' ) ) {
+			wp_opcache_invalidate( $to . 'wp-includes/version.php' );
+		}
+	}
+
+	// Check to make sure everything copied correctly, ignoring the contents of wp-content.
+	$skip   = array( 'wp-content' );
+	$failed = array();
+
+	if ( isset( $checksums ) &amp;&amp; is_array( $checksums ) ) {
+		foreach ( $checksums as $file =&gt; $checksum ) {
+			if ( 'wp-content' === substr( $file, 0, 10 ) ) {
+				continue;
+			}
+
+			if ( ! file_exists( $working_dir_local . $file ) ) {
+				continue;
+			}
+
+			if ( '.' === dirname( $file )
+				&amp;&amp; in_array( pathinfo( $file, PATHINFO_EXTENSION ), array( 'html', 'txt' ), true )
+			) {
+				$skip[] = $file;
+				continue;
+			}
+
+			if ( file_exists( ABSPATH . $file ) &amp;&amp; md5_file( ABSPATH . $file ) === $checksum ) {
+				$skip[] = $file;
+			} else {
+				$failed[] = $file;
+			}
+		}
+	}
+
+	// Some files didn't copy properly.
+	if ( ! empty( $failed ) ) {
+		$total_size = 0;
+
+		foreach ( $failed as $file ) {
+			if ( file_exists( $working_dir_local . $file ) ) {
+				$total_size += filesize( $working_dir_local . $file );
+			}
+		}
+
+		// If we don't have enough free space, it isn't worth trying again.
+		// Unlikely to be hit due to the check in unzip_file().
+		$available_space = function_exists( 'disk_free_space' ) ? @disk_free_space( ABSPATH ) : false;
+
+		if ( $available_space &amp;&amp; $total_size &gt;= $available_space ) {
+			$result = new WP_Error( 'disk_full', __( 'There is not enough free disk space to complete the update.' ) );
+		} else {
+			$result = copy_dir( $from . $distro, $to, $skip );
+
+			if ( is_wp_error( $result ) ) {
+				$result = new WP_Error(
+					$result-&gt;get_error_code() . '_retry',
+					$result-&gt;get_error_message(),
+					substr( $result-&gt;get_error_data(), strlen( $to ) )
+				);
+			}
+		}
+	}
+
+	// Custom content directory needs updating now.
+	// Copy languages.
+	if ( ! is_wp_error( $result ) &amp;&amp; $wp_filesystem-&gt;is_dir( $from . $distro . 'wp-content/languages' ) ) {
+		if ( WP_LANG_DIR !== ABSPATH . WPINC . '/languages' || @is_dir( WP_LANG_DIR ) ) {
+			$lang_dir = WP_LANG_DIR;
+		} else {
+			$lang_dir = WP_CONTENT_DIR . '/languages';
+		}
+
+		// Check if the language directory exists first.
+		if ( ! @is_dir( $lang_dir ) &amp;&amp; 0 === strpos( $lang_dir, ABSPATH ) ) {
+			// If it's within the ABSPATH we can handle it here, otherwise they're out of luck.
+			$wp_filesystem-&gt;mkdir( $to . str_replace( ABSPATH, '', $lang_dir ), FS_CHMOD_DIR );
+			clearstatcache(); // For FTP, need to clear the stat cache.
+		}
+
+		if ( @is_dir( $lang_dir ) ) {
+			$wp_lang_dir = $wp_filesystem-&gt;find_folder( $lang_dir );
+
+			if ( $wp_lang_dir ) {
+				$result = copy_dir( $from . $distro . 'wp-content/languages/', $wp_lang_dir );
+
+				if ( is_wp_error( $result ) ) {
+					$result = new WP_Error(
+						$result-&gt;get_error_code() . '_languages',
+						$result-&gt;get_error_message(),
+						substr( $result-&gt;get_error_data(), strlen( $wp_lang_dir ) )
+					);
+				}
+			}
+		}
+	}
+
+	/** This filter is documented in wp-admin/includes/update-core.php */
+	apply_filters( 'update_feedback', __( 'Disabling Maintenance mode&amp;#8230;' ) );
+
+	// Remove maintenance file, we're done with potential site-breaking changes.
+	$wp_filesystem-&gt;delete( $maintenance_file );
+
+	// 3.5 -&gt; 3.5+ - an empty twentytwelve directory was created upon upgrade to 3.5 for some users,
+	// preventing installation of Twenty Twelve.
+	if ( '3.5' === $old_wp_version ) {
+		if ( is_dir( WP_CONTENT_DIR . '/themes/twentytwelve' )
+			&amp;&amp; ! file_exists( WP_CONTENT_DIR . '/themes/twentytwelve/style.css' )
+		) {
+			$wp_filesystem-&gt;delete( $wp_filesystem-&gt;wp_themes_dir() . 'twentytwelve/' );
+		}
+	}
+
+	/*
+	 * Copy new bundled plugins &amp; themes.
+	 * This gives us the ability to install new plugins &amp; themes bundled with
+	 * future versions of WordPress whilst avoiding the re-install upon upgrade issue.
+	 * $development_build controls us overwriting bundled themes and plugins when a non-stable release is being updated.
+	 */
+	if ( ! is_wp_error( $result )
+		&amp;&amp; ( ! defined( 'CORE_UPGRADE_SKIP_NEW_BUNDLED' ) || ! CORE_UPGRADE_SKIP_NEW_BUNDLED )
+	) {
+		foreach ( (array) $_new_bundled_files as $file =&gt; $introduced_version ) {
+			// If a $development_build or if $introduced version is greater than what the site was previously running.
+			if ( $development_build || version_compare( $introduced_version, $old_wp_version, '&gt;' ) ) {
+				$directory = ( '/' === $file[ strlen( $file ) - 1 ] );
+
+				list( $type, $filename ) = explode( '/', $file, 2 );
+
+				// Check to see if the bundled items exist before attempting to copy them.
+				if ( ! $wp_filesystem-&gt;exists( $from . $distro . 'wp-content/' . $file ) ) {
+					continue;
+				}
+
+				if ( 'plugins' === $type ) {
+					$dest = $wp_filesystem-&gt;wp_plugins_dir();
+				} elseif ( 'themes' === $type ) {
+					// Back-compat, ::wp_themes_dir() did not return trailingslash'd pre-3.2.
+					$dest = trailingslashit( $wp_filesystem-&gt;wp_themes_dir() );
+				} else {
+					continue;
+				}
+
+				if ( ! $directory ) {
+					if ( ! $development_build &amp;&amp; $wp_filesystem-&gt;exists( $dest . $filename ) ) {
+						continue;
+					}
+
+					if ( ! $wp_filesystem-&gt;copy( $from . $distro . 'wp-content/' . $file, $dest . $filename, FS_CHMOD_FILE ) ) {
+						$result = new WP_Error( "copy_failed_for_new_bundled_$type", __( 'Could not copy file.' ), $dest . $filename );
+					}
+				} else {
+					if ( ! $development_build &amp;&amp; $wp_filesystem-&gt;is_dir( $dest . $filename ) ) {
+						continue;
+					}
+
+					$wp_filesystem-&gt;mkdir( $dest . $filename, FS_CHMOD_DIR );
+					$_result = copy_dir( $from . $distro . 'wp-content/' . $file, $dest . $filename );
+
+					// If a error occurs partway through this final step, keep the error flowing through, but keep process going.
+					if ( is_wp_error( $_result ) ) {
+						if ( ! is_wp_error( $result ) ) {
+							$result = new WP_Error;
+						}
+
+						$result-&gt;add(
+							$_result-&gt;get_error_code() . "_$type",
+							$_result-&gt;get_error_message(),
+							substr( $_result-&gt;get_error_data(), strlen( $dest ) )
+						);
+					}
+				}
+			}
+		} // End foreach.
+	}
+
+	// Handle $result error from the above blocks.
+	if ( is_wp_error( $result ) ) {
+		$wp_filesystem-&gt;delete( $from, true );
+
+		return $result;
+	}
+
+	// Remove old files.
+	foreach ( $_old_files as $old_file ) {
+		$old_file = $to . $old_file;
+
+		if ( ! $wp_filesystem-&gt;exists( $old_file ) ) {
+			continue;
+		}
+
+		// If the file isn't deleted, try writing an empty string to the file instead.
+		if ( ! $wp_filesystem-&gt;delete( $old_file, true ) &amp;&amp; $wp_filesystem-&gt;is_file( $old_file ) ) {
+			$wp_filesystem-&gt;put_contents( $old_file, '' );
+		}
+	}
+
+	// Remove any Genericons example.html's from the filesystem.
+	_upgrade_422_remove_genericons();
+
+	// Deactivate the REST API plugin if its version is 2.0 Beta 4 or lower.
+	_upgrade_440_force_deactivate_incompatible_plugins();
+
+	// Deactivate the Gutenberg plugin if its version is 11.8 or lower.
+	_upgrade_590_force_deactivate_incompatible_plugins();
+
+	// Upgrade DB with separate request.
+	/** This filter is documented in wp-admin/includes/update-core.php */
+	apply_filters( 'update_feedback', __( 'Upgrading database&amp;#8230;' ) );
+
+	$db_upgrade_url = admin_url( 'upgrade.php?step=upgrade_db' );
+	wp_remote_post( $db_upgrade_url, array( 'timeout' =&gt; 60 ) );
+
+	// Clear the cache to prevent an update_option() from saving a stale db_version to the cache.
+	wp_cache_flush();
+	// Not all cache back ends listen to 'flush'.
+	wp_cache_delete( 'alloptions', 'options' );
+
+	// Remove working directory.
+	$wp_filesystem-&gt;delete( $from, true );
+
+	// Force refresh of update information.
+	if ( function_exists( 'delete_site_transient' ) ) {
+		delete_site_transient( 'update_core' );
+	} else {
+		delete_option( 'update_core' );
+	}
+
+	/**
+	 * Fires after WordPress core has been successfully updated.
+	 *
+	 * @since 3.3.0
+	 *
+	 * @param string $wp_version The current WordPress version.
+	 */
+	do_action( '_core_updated_successfully', $wp_version );
+
+	// Clear the option that blocks auto-updates after failures, now that we've been successful.
+	if ( function_exists( 'delete_site_option' ) ) {
+		delete_site_option( 'auto_core_update_failed' );
+	}
+
+	return $wp_version;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../hooks/update_feedback.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'update_feedback', <nobr><span class="arg-type">string</span> <span class="arg-name">$feedback</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters feedback messages displayed during the core update process.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../hooks/_core_updated_successfully.html" style="text-decoration: none"> <span class="hook-func">do_action</span>( '_core_updated_successfully', <nobr><span class="arg-type">string</span> <span class="arg-name">$wp_version</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Fires after WordPress core has been successfully updated.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="wp_opcache_invalidate.html">wp_opcache_invalidate()</a> <span>wp-admin/includes/file.php</span> </td> <td class="related-desc"> <p>Attempts to clear the opcode cache for an individual PHP file.</p> </td> </tr> <tr> <td class="related-title"> <a href="delete_site_transient.html">delete_site_transient()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Deletes a site transient.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_get_update_php_url.html">wp_get_update_php_url()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Gets the URL to learn more about updating the PHP version the site is running on.</p> </td> </tr> <tr> <td class="related-title"> <a href="_upgrade_422_remove_genericons.html">_upgrade_422_remove_genericons()</a> <span>wp-admin/includes/update-core.php</span> </td> <td class="related-desc"> <p>Cleans up Genericons example files.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_core_checksums.html">get_core_checksums()</a> <span>wp-admin/includes/update.php</span> </td> <td class="related-desc"> <p>Gets and caches the checksums for the given version of WordPress.</p> </td> </tr> <tr> <td class="related-title"> <a href="copy_dir.html">copy_dir()</a> <span>wp-admin/includes/file.php</span> </td> <td class="related-desc"> <p>Copies a directory from one location to another via the WordPress Filesystem Abstraction.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_cache_flush.html">wp_cache_flush()</a> <span>wp-includes/cache.php</span> </td> <td class="related-desc"> <p>Removes all cache items.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_cache_delete.html">wp_cache_delete()</a> <span>wp-includes/cache.php</span> </td> <td class="related-desc"> <p>Removes the cache contents matching key and group.</p> </td> </tr> <tr> <td class="related-title"> <a href="../classes/wpdb/db_version.html">wpdb::db_version()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Retrieves the database server version.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_get_update_php_annotation.html">wp_get_update_php_annotation()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Returns the default annotation for the web hosting altering the “Update PHP” page URL.</p> </td> </tr> <tr> <td class="related-title"> <a href="delete_option.html">delete_option()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Removes option by name. Prevents removal of protected WordPress options.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_remote_post.html">wp_remote_post()</a> <span>wp-includes/http.php</span> </td> <td class="related-desc"> <p>Performs an HTTP request using the POST method and returns its response.</p> </td> </tr> <tr> <td class="related-title"> <a href="delete_site_option.html">delete_site_option()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Removes a option by name for the current network.</p> </td> </tr> <tr> <td class="related-title"> <a href="is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> <tr> <td class="related-title"> <a href="trailingslashit.html">trailingslashit()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Appends a trailing slash.</p> </td> </tr> <tr> <td class="related-title"> <a href="do_action.html">do_action()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to an action hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="admin_url.html">admin_url()</a> <span>wp-includes/link-template.php</span> </td> <td class="related-desc"> <p>Retrieves the URL to the admin area for the current site.</p> </td> </tr> <tr> <td class="related-title"> <a href="esc_url.html">esc_url()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Checks and cleans a URL.</p> </td> </tr> <tr> <td class="related-title"> <a href="__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="../classes/wp_error/__construct.html">WP_Error::__construct()</a> <span>wp-includes/class-wp-error.php</span> </td> <td class="related-desc"> <p>Initializes the error.</p> </td> </tr> </tbody>
+
+</table>   </article>  <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="../classes/core_upgrader/upgrade.html">Core_Upgrader::upgrade()</a> <span>wp-admin/includes/class-core-upgrader.php</span> </td> <td class="related-desc"> <p>Upgrade WordPress core.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/2.7.0/" alt="WordPress 2.7.0">2.7.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/functions/update_core" class="_attribution-link">https://developer.wordpress.org/reference/functions/update_core</a>
+  </p>
+</div>

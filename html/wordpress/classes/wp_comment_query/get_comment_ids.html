@@ -1,0 +1,452 @@
+<h1>WP_Comment_Query::get_comment_ids(): int|array</h1>  <section> <p>Used internally to get a list of comment IDs matching the query vars.</p> </section>   <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">int|array</span> A single count of comment IDs if a count query. An array of comment IDs if a full query.</p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/class-wp-comment-query.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-comment-query.php/">View all references</a> </p> <pre class="wp-block-code" data-start="540" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">protected function get_comment_ids() {
+	global $wpdb;
+
+	// Assemble clauses related to 'comment_approved'.
+	$approved_clauses = array();
+
+	// 'status' accepts an array or a comma-separated string.
+	$status_clauses = array();
+	$statuses       = wp_parse_list( $this-&gt;query_vars['status'] );
+
+	// Empty 'status' should be interpreted as 'all'.
+	if ( empty( $statuses ) ) {
+		$statuses = array( 'all' );
+	}
+
+	// 'any' overrides other statuses.
+	if ( ! in_array( 'any', $statuses, true ) ) {
+		foreach ( $statuses as $status ) {
+			switch ( $status ) {
+				case 'hold':
+					$status_clauses[] = "comment_approved = '0'";
+					break;
+
+				case 'approve':
+					$status_clauses[] = "comment_approved = '1'";
+					break;
+
+				case 'all':
+				case '':
+					$status_clauses[] = "( comment_approved = '0' OR comment_approved = '1' )";
+					break;
+
+				default:
+					$status_clauses[] = $wpdb-&gt;prepare( 'comment_approved = %s', $status );
+					break;
+			}
+		}
+
+		if ( ! empty( $status_clauses ) ) {
+			$approved_clauses[] = '( ' . implode( ' OR ', $status_clauses ) . ' )';
+		}
+	}
+
+	// User IDs or emails whose unapproved comments are included, regardless of $status.
+	if ( ! empty( $this-&gt;query_vars['include_unapproved'] ) ) {
+		$include_unapproved = wp_parse_list( $this-&gt;query_vars['include_unapproved'] );
+
+		$unapproved_ids    = array();
+		$unapproved_emails = array();
+		foreach ( $include_unapproved as $unapproved_identifier ) {
+			// Numeric values are assumed to be user IDs.
+			if ( is_numeric( $unapproved_identifier ) ) {
+				$approved_clauses[] = $wpdb-&gt;prepare( "( user_id = %d AND comment_approved = '0' )", $unapproved_identifier );
+			} else {
+				// Otherwise we match against email addresses.
+				if ( ! empty( $_GET['unapproved'] ) &amp;&amp; ! empty( $_GET['moderation-hash'] ) ) {
+					// Only include requested comment.
+					$approved_clauses[] = $wpdb-&gt;prepare( "( comment_author_email = %s AND comment_approved = '0' AND {$wpdb-&gt;comments}.comment_ID = %d )", $unapproved_identifier, (int) $_GET['unapproved'] );
+				} else {
+					// Include all of the author's unapproved comments.
+					$approved_clauses[] = $wpdb-&gt;prepare( "( comment_author_email = %s AND comment_approved = '0' )", $unapproved_identifier );
+				}
+			}
+		}
+	}
+
+	// Collapse comment_approved clauses into a single OR-separated clause.
+	if ( ! empty( $approved_clauses ) ) {
+		if ( 1 === count( $approved_clauses ) ) {
+			$this-&gt;sql_clauses['where']['approved'] = $approved_clauses[0];
+		} else {
+			$this-&gt;sql_clauses['where']['approved'] = '( ' . implode( ' OR ', $approved_clauses ) . ' )';
+		}
+	}
+
+	$order = ( 'ASC' === strtoupper( $this-&gt;query_vars['order'] ) ) ? 'ASC' : 'DESC';
+
+	// Disable ORDER BY with 'none', an empty array, or boolean false.
+	if ( in_array( $this-&gt;query_vars['orderby'], array( 'none', array(), false ), true ) ) {
+		$orderby = '';
+	} elseif ( ! empty( $this-&gt;query_vars['orderby'] ) ) {
+		$ordersby = is_array( $this-&gt;query_vars['orderby'] ) ?
+			$this-&gt;query_vars['orderby'] :
+			preg_split( '/[,\s]/', $this-&gt;query_vars['orderby'] );
+
+		$orderby_array            = array();
+		$found_orderby_comment_id = false;
+		foreach ( $ordersby as $_key =&gt; $_value ) {
+			if ( ! $_value ) {
+				continue;
+			}
+
+			if ( is_int( $_key ) ) {
+				$_orderby = $_value;
+				$_order   = $order;
+			} else {
+				$_orderby = $_key;
+				$_order   = $_value;
+			}
+
+			if ( ! $found_orderby_comment_id &amp;&amp; in_array( $_orderby, array( 'comment_ID', 'comment__in' ), true ) ) {
+				$found_orderby_comment_id = true;
+			}
+
+			$parsed = $this-&gt;parse_orderby( $_orderby );
+
+			if ( ! $parsed ) {
+				continue;
+			}
+
+			if ( 'comment__in' === $_orderby ) {
+				$orderby_array[] = $parsed;
+				continue;
+			}
+
+			$orderby_array[] = $parsed . ' ' . $this-&gt;parse_order( $_order );
+		}
+
+		// If no valid clauses were found, order by comment_date_gmt.
+		if ( empty( $orderby_array ) ) {
+			$orderby_array[] = "$wpdb-&gt;comments.comment_date_gmt $order";
+		}
+
+		// To ensure determinate sorting, always include a comment_ID clause.
+		if ( ! $found_orderby_comment_id ) {
+			$comment_id_order = '';
+
+			// Inherit order from comment_date or comment_date_gmt, if available.
+			foreach ( $orderby_array as $orderby_clause ) {
+				if ( preg_match( '/comment_date(?:_gmt)*\ (ASC|DESC)/', $orderby_clause, $match ) ) {
+					$comment_id_order = $match[1];
+					break;
+				}
+			}
+
+			// If no date-related order is available, use the date from the first available clause.
+			if ( ! $comment_id_order ) {
+				foreach ( $orderby_array as $orderby_clause ) {
+					if ( false !== strpos( 'ASC', $orderby_clause ) ) {
+						$comment_id_order = 'ASC';
+					} else {
+						$comment_id_order = 'DESC';
+					}
+
+					break;
+				}
+			}
+
+			// Default to DESC.
+			if ( ! $comment_id_order ) {
+				$comment_id_order = 'DESC';
+			}
+
+			$orderby_array[] = "$wpdb-&gt;comments.comment_ID $comment_id_order";
+		}
+
+		$orderby = implode( ', ', $orderby_array );
+	} else {
+		$orderby = "$wpdb-&gt;comments.comment_date_gmt $order";
+	}
+
+	$number = absint( $this-&gt;query_vars['number'] );
+	$offset = absint( $this-&gt;query_vars['offset'] );
+	$paged  = absint( $this-&gt;query_vars['paged'] );
+	$limits = '';
+
+	if ( ! empty( $number ) ) {
+		if ( $offset ) {
+			$limits = 'LIMIT ' . $offset . ',' . $number;
+		} else {
+			$limits = 'LIMIT ' . ( $number * ( $paged - 1 ) ) . ',' . $number;
+		}
+	}
+
+	if ( $this-&gt;query_vars['count'] ) {
+		$fields = 'COUNT(*)';
+	} else {
+		$fields = "$wpdb-&gt;comments.comment_ID";
+	}
+
+	$post_id = absint( $this-&gt;query_vars['post_id'] );
+	if ( ! empty( $post_id ) ) {
+		$this-&gt;sql_clauses['where']['post_id'] = $wpdb-&gt;prepare( 'comment_post_ID = %d', $post_id );
+	}
+
+	// Parse comment IDs for an IN clause.
+	if ( ! empty( $this-&gt;query_vars['comment__in'] ) ) {
+		$this-&gt;sql_clauses['where']['comment__in'] = "$wpdb-&gt;comments.comment_ID IN ( " . implode( ',', wp_parse_id_list( $this-&gt;query_vars['comment__in'] ) ) . ' )';
+	}
+
+	// Parse comment IDs for a NOT IN clause.
+	if ( ! empty( $this-&gt;query_vars['comment__not_in'] ) ) {
+		$this-&gt;sql_clauses['where']['comment__not_in'] = "$wpdb-&gt;comments.comment_ID NOT IN ( " . implode( ',', wp_parse_id_list( $this-&gt;query_vars['comment__not_in'] ) ) . ' )';
+	}
+
+	// Parse comment parent IDs for an IN clause.
+	if ( ! empty( $this-&gt;query_vars['parent__in'] ) ) {
+		$this-&gt;sql_clauses['where']['parent__in'] = 'comment_parent IN ( ' . implode( ',', wp_parse_id_list( $this-&gt;query_vars['parent__in'] ) ) . ' )';
+	}
+
+	// Parse comment parent IDs for a NOT IN clause.
+	if ( ! empty( $this-&gt;query_vars['parent__not_in'] ) ) {
+		$this-&gt;sql_clauses['where']['parent__not_in'] = 'comment_parent NOT IN ( ' . implode( ',', wp_parse_id_list( $this-&gt;query_vars['parent__not_in'] ) ) . ' )';
+	}
+
+	// Parse comment post IDs for an IN clause.
+	if ( ! empty( $this-&gt;query_vars['post__in'] ) ) {
+		$this-&gt;sql_clauses['where']['post__in'] = 'comment_post_ID IN ( ' . implode( ',', wp_parse_id_list( $this-&gt;query_vars['post__in'] ) ) . ' )';
+	}
+
+	// Parse comment post IDs for a NOT IN clause.
+	if ( ! empty( $this-&gt;query_vars['post__not_in'] ) ) {
+		$this-&gt;sql_clauses['where']['post__not_in'] = 'comment_post_ID NOT IN ( ' . implode( ',', wp_parse_id_list( $this-&gt;query_vars['post__not_in'] ) ) . ' )';
+	}
+
+	if ( '' !== $this-&gt;query_vars['author_email'] ) {
+		$this-&gt;sql_clauses['where']['author_email'] = $wpdb-&gt;prepare( 'comment_author_email = %s', $this-&gt;query_vars['author_email'] );
+	}
+
+	if ( '' !== $this-&gt;query_vars['author_url'] ) {
+		$this-&gt;sql_clauses['where']['author_url'] = $wpdb-&gt;prepare( 'comment_author_url = %s', $this-&gt;query_vars['author_url'] );
+	}
+
+	if ( '' !== $this-&gt;query_vars['karma'] ) {
+		$this-&gt;sql_clauses['where']['karma'] = $wpdb-&gt;prepare( 'comment_karma = %d', $this-&gt;query_vars['karma'] );
+	}
+
+	// Filtering by comment_type: 'type', 'type__in', 'type__not_in'.
+	$raw_types = array(
+		'IN'     =&gt; array_merge( (array) $this-&gt;query_vars['type'], (array) $this-&gt;query_vars['type__in'] ),
+		'NOT IN' =&gt; (array) $this-&gt;query_vars['type__not_in'],
+	);
+
+	$comment_types = array();
+	foreach ( $raw_types as $operator =&gt; $_raw_types ) {
+		$_raw_types = array_unique( $_raw_types );
+
+		foreach ( $_raw_types as $type ) {
+			switch ( $type ) {
+				// An empty translates to 'all', for backward compatibility.
+				case '':
+				case 'all':
+					break;
+
+				case 'comment':
+				case 'comments':
+					$comment_types[ $operator ][] = "''";
+					$comment_types[ $operator ][] = "'comment'";
+					break;
+
+				case 'pings':
+					$comment_types[ $operator ][] = "'pingback'";
+					$comment_types[ $operator ][] = "'trackback'";
+					break;
+
+				default:
+					$comment_types[ $operator ][] = $wpdb-&gt;prepare( '%s', $type );
+					break;
+			}
+		}
+
+		if ( ! empty( $comment_types[ $operator ] ) ) {
+			$types_sql = implode( ', ', $comment_types[ $operator ] );
+			$this-&gt;sql_clauses['where'][ 'comment_type__' . strtolower( str_replace( ' ', '_', $operator ) ) ] = "comment_type $operator ($types_sql)";
+		}
+	}
+
+	$parent = $this-&gt;query_vars['parent'];
+	if ( $this-&gt;query_vars['hierarchical'] &amp;&amp; ! $parent ) {
+		$parent = 0;
+	}
+
+	if ( '' !== $parent ) {
+		$this-&gt;sql_clauses['where']['parent'] = $wpdb-&gt;prepare( 'comment_parent = %d', $parent );
+	}
+
+	if ( is_array( $this-&gt;query_vars['user_id'] ) ) {
+		$this-&gt;sql_clauses['where']['user_id'] = 'user_id IN (' . implode( ',', array_map( 'absint', $this-&gt;query_vars['user_id'] ) ) . ')';
+	} elseif ( '' !== $this-&gt;query_vars['user_id'] ) {
+		$this-&gt;sql_clauses['where']['user_id'] = $wpdb-&gt;prepare( 'user_id = %d', $this-&gt;query_vars['user_id'] );
+	}
+
+	// Falsey search strings are ignored.
+	if ( isset( $this-&gt;query_vars['search'] ) &amp;&amp; strlen( $this-&gt;query_vars['search'] ) ) {
+		$search_sql = $this-&gt;get_search_sql(
+			$this-&gt;query_vars['search'],
+			array( 'comment_author', 'comment_author_email', 'comment_author_url', 'comment_author_IP', 'comment_content' )
+		);
+
+		// Strip leading 'AND'.
+		$this-&gt;sql_clauses['where']['search'] = preg_replace( '/^\s*AND\s*/', '', $search_sql );
+	}
+
+	// If any post-related query vars are passed, join the posts table.
+	$join_posts_table = false;
+	$plucked          = wp_array_slice_assoc( $this-&gt;query_vars, array( 'post_author', 'post_name', 'post_parent' ) );
+	$post_fields      = array_filter( $plucked );
+
+	if ( ! empty( $post_fields ) ) {
+		$join_posts_table = true;
+		foreach ( $post_fields as $field_name =&gt; $field_value ) {
+			// $field_value may be an array.
+			$esses = array_fill( 0, count( (array) $field_value ), '%s' );
+
+			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+			$this-&gt;sql_clauses['where'][ $field_name ] = $wpdb-&gt;prepare( " {$wpdb-&gt;posts}.{$field_name} IN (" . implode( ',', $esses ) . ')', $field_value );
+		}
+	}
+
+	// 'post_status' and 'post_type' are handled separately, due to the specialized behavior of 'any'.
+	foreach ( array( 'post_status', 'post_type' ) as $field_name ) {
+		$q_values = array();
+		if ( ! empty( $this-&gt;query_vars[ $field_name ] ) ) {
+			$q_values = $this-&gt;query_vars[ $field_name ];
+			if ( ! is_array( $q_values ) ) {
+				$q_values = explode( ',', $q_values );
+			}
+
+			// 'any' will cause the query var to be ignored.
+			if ( in_array( 'any', $q_values, true ) || empty( $q_values ) ) {
+				continue;
+			}
+
+			$join_posts_table = true;
+
+			$esses = array_fill( 0, count( $q_values ), '%s' );
+
+			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+			$this-&gt;sql_clauses['where'][ $field_name ] = $wpdb-&gt;prepare( " {$wpdb-&gt;posts}.{$field_name} IN (" . implode( ',', $esses ) . ')', $q_values );
+		}
+	}
+
+	// Comment author IDs for an IN clause.
+	if ( ! empty( $this-&gt;query_vars['author__in'] ) ) {
+		$this-&gt;sql_clauses['where']['author__in'] = 'user_id IN ( ' . implode( ',', wp_parse_id_list( $this-&gt;query_vars['author__in'] ) ) . ' )';
+	}
+
+	// Comment author IDs for a NOT IN clause.
+	if ( ! empty( $this-&gt;query_vars['author__not_in'] ) ) {
+		$this-&gt;sql_clauses['where']['author__not_in'] = 'user_id NOT IN ( ' . implode( ',', wp_parse_id_list( $this-&gt;query_vars['author__not_in'] ) ) . ' )';
+	}
+
+	// Post author IDs for an IN clause.
+	if ( ! empty( $this-&gt;query_vars['post_author__in'] ) ) {
+		$join_posts_table                              = true;
+		$this-&gt;sql_clauses['where']['post_author__in'] = 'post_author IN ( ' . implode( ',', wp_parse_id_list( $this-&gt;query_vars['post_author__in'] ) ) . ' )';
+	}
+
+	// Post author IDs for a NOT IN clause.
+	if ( ! empty( $this-&gt;query_vars['post_author__not_in'] ) ) {
+		$join_posts_table                                  = true;
+		$this-&gt;sql_clauses['where']['post_author__not_in'] = 'post_author NOT IN ( ' . implode( ',', wp_parse_id_list( $this-&gt;query_vars['post_author__not_in'] ) ) . ' )';
+	}
+
+	$join    = '';
+	$groupby = '';
+
+	if ( $join_posts_table ) {
+		$join .= "JOIN $wpdb-&gt;posts ON $wpdb-&gt;posts.ID = $wpdb-&gt;comments.comment_post_ID";
+	}
+
+	if ( ! empty( $this-&gt;meta_query_clauses ) ) {
+		$join .= $this-&gt;meta_query_clauses['join'];
+
+		// Strip leading 'AND'.
+		$this-&gt;sql_clauses['where']['meta_query'] = preg_replace( '/^\s*AND\s*/', '', $this-&gt;meta_query_clauses['where'] );
+
+		if ( ! $this-&gt;query_vars['count'] ) {
+			$groupby = "{$wpdb-&gt;comments}.comment_ID";
+		}
+	}
+
+	if ( ! empty( $this-&gt;query_vars['date_query'] ) &amp;&amp; is_array( $this-&gt;query_vars['date_query'] ) ) {
+		$this-&gt;date_query = new WP_Date_Query( $this-&gt;query_vars['date_query'], 'comment_date' );
+
+		// Strip leading 'AND'.
+		$this-&gt;sql_clauses['where']['date_query'] = preg_replace( '/^\s*AND\s*/', '', $this-&gt;date_query-&gt;get_sql() );
+	}
+
+	$where = implode( ' AND ', $this-&gt;sql_clauses['where'] );
+
+	$pieces = array( 'fields', 'join', 'where', 'orderby', 'limits', 'groupby' );
+
+	/**
+	 * Filters the comment query clauses.
+	 *
+	 * @since 3.1.0
+	 *
+	 * @param string[]         $clauses An associative array of comment query clauses.
+	 * @param WP_Comment_Query $query   Current instance of WP_Comment_Query (passed by reference).
+	 */
+	$clauses = apply_filters_ref_array( 'comments_clauses', array( compact( $pieces ), &amp;$this ) );
+
+	$fields  = isset( $clauses['fields'] ) ? $clauses['fields'] : '';
+	$join    = isset( $clauses['join'] ) ? $clauses['join'] : '';
+	$where   = isset( $clauses['where'] ) ? $clauses['where'] : '';
+	$orderby = isset( $clauses['orderby'] ) ? $clauses['orderby'] : '';
+	$limits  = isset( $clauses['limits'] ) ? $clauses['limits'] : '';
+	$groupby = isset( $clauses['groupby'] ) ? $clauses['groupby'] : '';
+
+	$this-&gt;filtered_where_clause = $where;
+
+	if ( $where ) {
+		$where = 'WHERE ' . $where;
+	}
+
+	if ( $groupby ) {
+		$groupby = 'GROUP BY ' . $groupby;
+	}
+
+	if ( $orderby ) {
+		$orderby = "ORDER BY $orderby";
+	}
+
+	$found_rows = '';
+	if ( ! $this-&gt;query_vars['no_found_rows'] ) {
+		$found_rows = 'SQL_CALC_FOUND_ROWS';
+	}
+
+	$this-&gt;sql_clauses['select']  = "SELECT $found_rows $fields";
+	$this-&gt;sql_clauses['from']    = "FROM $wpdb-&gt;comments $join";
+	$this-&gt;sql_clauses['groupby'] = $groupby;
+	$this-&gt;sql_clauses['orderby'] = $orderby;
+	$this-&gt;sql_clauses['limits']  = $limits;
+
+	$this-&gt;request = "
+		{$this-&gt;sql_clauses['select']}
+		{$this-&gt;sql_clauses['from']}
+		{$where}
+		{$this-&gt;sql_clauses['groupby']}
+		{$this-&gt;sql_clauses['orderby']}
+		{$this-&gt;sql_clauses['limits']}
+	";
+
+	if ( $this-&gt;query_vars['count'] ) {
+		return (int) $wpdb-&gt;get_var( $this-&gt;request );
+	} else {
+		$comment_ids = $wpdb-&gt;get_col( $this-&gt;request );
+		return array_map( 'intval', $comment_ids );
+	}
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/comments_clauses.html" style="text-decoration: none"> <span class="hook-func">apply_filters_ref_array</span>( 'comments_clauses', <nobr><span class="arg-type">string[]</span> <span class="arg-name">$clauses</span></nobr>, <nobr><span class="arg-type">WP_Comment_Query</span> <span class="arg-name">$query</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the comment query clauses.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="../../functions/wp_parse_list.html">wp_parse_list()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Converts a comma- or space-separated list of scalar values to an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="parse_orderby.html">WP_Comment_Query::parse_orderby()</a> <span>wp-includes/class-wp-comment-query.php</span> </td> <td class="related-desc"> <p>Parse and sanitize ‘orderby’ keys passed to the comment query.</p> </td> </tr> <tr> <td class="related-title"> <a href="parse_order.html">WP_Comment_Query::parse_order()</a> <span>wp-includes/class-wp-comment-query.php</span> </td> <td class="related-desc"> <p>Parse an ‘order’ query variable and cast it to ASC or DESC as necessary.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_parse_id_list.html">wp_parse_id_list()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Cleans up an array, comma- or space-separated list of IDs.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_array_slice_assoc.html">wp_array_slice_assoc()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Extracts a slice of an array, given a list of keys.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_date_query/__construct.html">WP_Date_Query::__construct()</a> <span>wp-includes/class-wp-date-query.php</span> </td> <td class="related-desc"> <p>Constructor.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters_ref_array.html">apply_filters_ref_array()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook, specifying arguments in an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/get_col.html">wpdb::get_col()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Retrieves one column from the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_search_sql.html">WP_Comment_Query::get_search_sql()</a> <span>wp-includes/class-wp-comment-query.php</span> </td> <td class="related-desc"> <p>Used internally to generate an SQL string for searching across multiple columns.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/absint.html">absint()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Converts a value to non-negative integer.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/get_var.html">wpdb::get_var()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Retrieves one variable from the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/prepare.html">wpdb::prepare()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Prepares a SQL query for safe execution.</p> </td> </tr> </tbody>
+
+</table>   </article>  <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="get_comments.html">WP_Comment_Query::get_comments()</a> <span>wp-includes/class-wp-comment-query.php</span> </td> <td class="related-desc"> <p>Get a list of comments matching the query vars.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.4.0/" alt="WordPress 4.4.0">4.4.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_comment_query/get_comment_ids" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_comment_query/get_comment_ids</a>
+  </p>
+</div>

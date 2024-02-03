@@ -1,0 +1,113 @@
+<h1>spawn_cron( int $gmt_time ): bool</h1>  <section> <p>Sends a request to run cron through HTTP request that doesn’t halt page loading.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$gmt_time</code> <span class="type"><span class="int">int</span></span> <span class="required">Optional</span> </dt> <dd> <div class="desc"> <span class="description"> Unix timestamp (UTC). Default 0 (current time is used).</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">bool</span> True if spawned, false if no events spawned.</p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/cron.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/cron.php/">View all references</a> </p> <pre class="wp-block-code" data-start="824" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">function spawn_cron( $gmt_time = 0 ) {
+	if ( ! $gmt_time ) {
+		$gmt_time = microtime( true );
+	}
+
+	if ( defined( 'DOING_CRON' ) || isset( $_GET['doing_wp_cron'] ) ) {
+		return false;
+	}
+
+	/*
+	 * Get the cron lock, which is a Unix timestamp of when the last cron was spawned
+	 * and has not finished running.
+	 *
+	 * Multiple processes on multiple web servers can run this code concurrently,
+	 * this lock attempts to make spawning as atomic as possible.
+	 */
+	$lock = get_transient( 'doing_cron' );
+
+	if ( $lock &gt; $gmt_time + 10 * MINUTE_IN_SECONDS ) {
+		$lock = 0;
+	}
+
+	// Don't run if another process is currently running it or more than once every 60 sec.
+	if ( $lock + WP_CRON_LOCK_TIMEOUT &gt; $gmt_time ) {
+		return false;
+	}
+
+	// Sanity check.
+	$crons = wp_get_ready_cron_jobs();
+	if ( empty( $crons ) ) {
+		return false;
+	}
+
+	$keys = array_keys( $crons );
+	if ( isset( $keys[0] ) &amp;&amp; $keys[0] &gt; $gmt_time ) {
+		return false;
+	}
+
+	if ( defined( 'ALTERNATE_WP_CRON' ) &amp;&amp; ALTERNATE_WP_CRON ) {
+		if ( 'GET' !== $_SERVER['REQUEST_METHOD'] || defined( 'DOING_AJAX' ) || defined( 'XMLRPC_REQUEST' ) ) {
+			return false;
+		}
+
+		$doing_wp_cron = sprintf( '%.22F', $gmt_time );
+		set_transient( 'doing_cron', $doing_wp_cron );
+
+		ob_start();
+		wp_redirect( add_query_arg( 'doing_wp_cron', $doing_wp_cron, wp_unslash( $_SERVER['REQUEST_URI'] ) ) );
+		echo ' ';
+
+		// Flush any buffers and send the headers.
+		wp_ob_end_flush_all();
+		flush();
+
+		include_once ABSPATH . 'wp-cron.php';
+		return true;
+	}
+
+	// Set the cron lock with the current unix timestamp, when the cron is being spawned.
+	$doing_wp_cron = sprintf( '%.22F', $gmt_time );
+	set_transient( 'doing_cron', $doing_wp_cron );
+
+	/**
+	 * Filters the cron request arguments.
+	 *
+	 * @since 3.5.0
+	 * @since 4.5.0 The `$doing_wp_cron` parameter was added.
+	 *
+	 * @param array $cron_request_array {
+	 *     An array of cron request URL arguments.
+	 *
+	 *     @type string $url  The cron request URL.
+	 *     @type int    $key  The 22 digit GMT microtime.
+	 *     @type array  $args {
+	 *         An array of cron request arguments.
+	 *
+	 *         @type int  $timeout   The request timeout in seconds. Default .01 seconds.
+	 *         @type bool $blocking  Whether to set blocking for the request. Default false.
+	 *         @type bool $sslverify Whether SSL should be verified for the request. Default false.
+	 *     }
+	 * }
+	 * @param string $doing_wp_cron The unix timestamp of the cron lock.
+	 */
+	$cron_request = apply_filters(
+		'cron_request',
+		array(
+			'url'  =&gt; add_query_arg( 'doing_wp_cron', $doing_wp_cron, site_url( 'wp-cron.php' ) ),
+			'key'  =&gt; $doing_wp_cron,
+			'args' =&gt; array(
+				'timeout'   =&gt; 0.01,
+				'blocking'  =&gt; false,
+				/** This filter is documented in wp-includes/class-wp-http-streams.php */
+				'sslverify' =&gt; apply_filters( 'https_local_ssl_verify', false ),
+			),
+		),
+		$doing_wp_cron
+	);
+
+	$result = wp_remote_post( $cron_request['url'], $cron_request['args'] );
+	return ! is_wp_error( $result );
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../hooks/cron_request.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'cron_request', <nobr><span class="arg-type">array</span> <span class="arg-name">$cron_request_array</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$doing_wp_cron</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the cron request arguments.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../hooks/https_local_ssl_verify.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'https_local_ssl_verify', <nobr><span class="arg-type">bool</span> <span class="arg-name">$ssl_verify</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$url</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters whether SSL should be verified for local HTTP API requests.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="wp_get_ready_cron_jobs.html">wp_get_ready_cron_jobs()</a> <span>wp-includes/cron.php</span> </td> <td class="related-desc"> <p>Retrieve cron jobs ready to be run.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_redirect.html">wp_redirect()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Redirects to another page.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_ob_end_flush_all.html">wp_ob_end_flush_all()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Flushes all output buffers for PHP 5.2.</p> </td> </tr> <tr> <td class="related-title"> <a href="site_url.html">site_url()</a> <span>wp-includes/link-template.php</span> </td> <td class="related-desc"> <p>Retrieves the URL for the current site where WordPress application files (e.g. wp-blog-header.php or the wp-admin/ folder) are accessible.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_remote_post.html">wp_remote_post()</a> <span>wp-includes/http.php</span> </td> <td class="related-desc"> <p>Performs an HTTP request using the POST method and returns its response.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_transient.html">get_transient()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Retrieves the value of a transient.</p> </td> </tr> <tr> <td class="related-title"> <a href="set_transient.html">set_transient()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Sets/updates the value of a transient.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_unslash.html">wp_unslash()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Removes slashes from a string or recursively removes slashes from strings within an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="add_query_arg.html">add_query_arg()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Retrieves a modified URL query string.</p> </td> </tr> <tr> <td class="related-title"> <a href="apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> </tbody>
+
+</table>   </article>  <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="_wp_cron.html">_wp_cron()</a> <span>wp-includes/cron.php</span> </td> <td class="related-desc"> <p>Run scheduled callbacks or spawn cron for all scheduled events.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/5.1.0/" alt="WordPress 5.1.0">5.1.0</a></td> <td><span class="since-description">Return values added.</span></td> </tr> <tr> <td><a href="https://developer.wordpress.org/reference/since/2.1.0/" alt="WordPress 2.1.0">2.1.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/functions/spawn_cron" class="_attribution-link">https://developer.wordpress.org/reference/functions/spawn_cron</a>
+  </p>
+</div>

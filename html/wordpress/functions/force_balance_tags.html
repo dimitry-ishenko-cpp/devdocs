@@ -1,0 +1,152 @@
+<h1>force_balance_tags( string $text ): string</h1>  <section> <p>Balances tags of string using a modified stack.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$text</code> <span class="type"><span class="string">string</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Text to be balanced.</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">string</span> Balanced text.</p> </section>  <section> <header class="toc-header"><h2 id="more-information">More Information</h2></header> <h5>Usage:</h5> <pre class="wp-block-code" data-language="php"><code lang="php" class="language-php ">&lt;?php $balanced_text = force_balance_tags( $text ); ?&gt;</code></pre> <p>This function is used in the short post excerpt list, to prevent unmatched elements. For example, it makes</p> <pre class="wp-block-code" data-language="php"><code lang="php" class="language-php ">&lt;div&gt;&lt;b&gt;This is an excerpt. &lt;!--more--&gt; and this is more text... &lt;/b&gt;&lt;/div&gt;</code></pre> <p>not break, when the html after the more tag is cut off. </p> <pre class="wp-block-code" data-language="php"><code lang="php" class="language-php ">&lt;div&gt;&lt;b&gt;This is an excerpt.</code></pre> <p>should be changed to:</p> <pre class="wp-block-code" data-language="php"><code lang="php" class="language-php ">&lt;div&gt;&lt;b&gt;This is an excerpt. &lt;/b&gt;&lt;/div&gt;</code></pre> <p>by the <code>force_balance_tags</code> function.</p> <h5>Notes:</h5> <ul> <li>Ignores the ‘<code>use_balanceTags</code>‘ option.</li> <li>This function is not used for all WP pages due to bugs and performance issues. This function doesn’t use an HTML parser but some potentially expensive regular expressions. This function shall only be used if the length of the excerpt can be controlled; otherwise memory issues or some <a href="https://core.trac.wordpress.org/ticket/19855">obscure bugs</a> can occur.</li> <li>This function uses two hard-coded lists of elements for single tags and nestable tags. WordPress uses multiple such lists and the lists not kept in sync. If an element isn’t part of these lists or changed its nesting behavior, it may lead to incorrect markup.</li> </ul> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/formatting.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/formatting.php/">View all references</a> </p> <pre class="wp-block-code" data-start="2541" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">function force_balance_tags( $text ) {
+	$tagstack  = array();
+	$stacksize = 0;
+	$tagqueue  = '';
+	$newtext   = '';
+	// Known single-entity/self-closing tags.
+	$single_tags = array( 'area', 'base', 'basefont', 'br', 'col', 'command', 'embed', 'frame', 'hr', 'img', 'input', 'isindex', 'link', 'meta', 'param', 'source', 'track', 'wbr' );
+	// Tags that can be immediately nested within themselves.
+	$nestable_tags = array( 'article', 'aside', 'blockquote', 'details', 'div', 'figure', 'object', 'q', 'section', 'span' );
+
+	// WP bug fix for comments - in case you REALLY meant to type '&lt; !--'.
+	$text = str_replace( '&lt; !--', '&lt;    !--', $text );
+	// WP bug fix for LOVE &lt;3 (and other situations with '&lt;' before a number).
+	$text = preg_replace( '#&lt;([0-9]{1})#', '&amp;lt;$1', $text );
+
+	/**
+	 * Matches supported tags.
+	 *
+	 * To get the pattern as a string without the comments paste into a PHP
+	 * REPL like `php -a`.
+	 *
+	 * @see https://html.spec.whatwg.org/#elements-2
+	 * @see https://html.spec.whatwg.org/multipage/custom-elements.html#valid-custom-element-name
+	 *
+	 * @example
+	 * ~# php -a
+	 * php &gt; $s = [paste copied contents of expression below including parentheses];
+	 * php &gt; echo $s;
+	 */
+	$tag_pattern = (
+		'#&lt;' . // Start with an opening bracket.
+		'(/?)' . // Group 1 - If it's a closing tag it'll have a leading slash.
+		'(' . // Group 2 - Tag name.
+			// Custom element tags have more lenient rules than HTML tag names.
+			'(?:[a-z](?:[a-z0-9._]*)-(?:[a-z0-9._-]+)+)' .
+				'|' .
+			// Traditional tag rules approximate HTML tag names.
+			'(?:[\w:]+)' .
+		')' .
+		'(?:' .
+			// We either immediately close the tag with its '&gt;' and have nothing here.
+			'\s*' .
+			'(/?)' . // Group 3 - "attributes" for empty tag.
+				'|' .
+			// Or we must start with space characters to separate the tag name from the attributes (or whitespace).
+			'(\s+)' . // Group 4 - Pre-attribute whitespace.
+			'([^&gt;]*)' . // Group 5 - Attributes.
+		')' .
+		'&gt;#' // End with a closing bracket.
+	);
+
+	while ( preg_match( $tag_pattern, $text, $regex ) ) {
+		$full_match        = $regex[0];
+		$has_leading_slash = ! empty( $regex[1] );
+		$tag_name          = $regex[2];
+		$tag               = strtolower( $tag_name );
+		$is_single_tag     = in_array( $tag, $single_tags, true );
+		$pre_attribute_ws  = isset( $regex[4] ) ? $regex[4] : '';
+		$attributes        = trim( isset( $regex[5] ) ? $regex[5] : $regex[3] );
+		$has_self_closer   = '/' === substr( $attributes, -1 );
+
+		$newtext .= $tagqueue;
+
+		$i = strpos( $text, $full_match );
+		$l = strlen( $full_match );
+
+		// Clear the shifter.
+		$tagqueue = '';
+		if ( $has_leading_slash ) { // End tag.
+			// If too many closing tags.
+			if ( $stacksize &lt;= 0 ) {
+				$tag = '';
+				// Or close to be safe $tag = '/' . $tag.
+
+				// If stacktop value = tag close value, then pop.
+			} elseif ( $tagstack[ $stacksize - 1 ] === $tag ) { // Found closing tag.
+				$tag = '&lt;/' . $tag . '&gt;'; // Close tag.
+				array_pop( $tagstack );
+				$stacksize--;
+			} else { // Closing tag not at top, search for it.
+				for ( $j = $stacksize - 1; $j &gt;= 0; $j-- ) {
+					if ( $tagstack[ $j ] === $tag ) {
+						// Add tag to tagqueue.
+						for ( $k = $stacksize - 1; $k &gt;= $j; $k-- ) {
+							$tagqueue .= '&lt;/' . array_pop( $tagstack ) . '&gt;';
+							$stacksize--;
+						}
+						break;
+					}
+				}
+				$tag = '';
+			}
+		} else { // Begin tag.
+			if ( $has_self_closer ) { // If it presents itself as a self-closing tag...
+				// ...but it isn't a known single-entity self-closing tag, then don't let it be treated as such
+				// and immediately close it with a closing tag (the tag will encapsulate no text as a result).
+				if ( ! $is_single_tag ) {
+					$attributes = trim( substr( $attributes, 0, -1 ) ) . "&gt;&lt;/$tag";
+				}
+			} elseif ( $is_single_tag ) { // Else if it's a known single-entity tag but it doesn't close itself, do so.
+				$pre_attribute_ws = ' ';
+				$attributes      .= '/';
+			} else { // It's not a single-entity tag.
+				// If the top of the stack is the same as the tag we want to push, close previous tag.
+				if ( $stacksize &gt; 0 &amp;&amp; ! in_array( $tag, $nestable_tags, true ) &amp;&amp; $tagstack[ $stacksize - 1 ] === $tag ) {
+					$tagqueue = '&lt;/' . array_pop( $tagstack ) . '&gt;';
+					$stacksize--;
+				}
+				$stacksize = array_push( $tagstack, $tag );
+			}
+
+			// Attributes.
+			if ( $has_self_closer &amp;&amp; $is_single_tag ) {
+				// We need some space - avoid &lt;br/&gt; and prefer &lt;br /&gt;.
+				$pre_attribute_ws = ' ';
+			}
+
+			$tag = '&lt;' . $tag . $pre_attribute_ws . $attributes . '&gt;';
+			// If already queuing a close tag, then put this tag on too.
+			if ( ! empty( $tagqueue ) ) {
+				$tagqueue .= $tag;
+				$tag       = '';
+			}
+		}
+		$newtext .= substr( $text, 0, $i ) . $tag;
+		$text     = substr( $text, $i + $l );
+	}
+
+	// Clear tag queue.
+	$newtext .= $tagqueue;
+
+	// Add remaining text.
+	$newtext .= $text;
+
+	while ( $x = array_pop( $tagstack ) ) {
+		$newtext .= '&lt;/' . $x . '&gt;'; // Add remaining tags to close.
+	}
+
+	// WP fix for the bug with HTML comments.
+	$newtext = str_replace( '&lt; !--', '&lt;!--', $newtext );
+	$newtext = str_replace( '&lt;    !--', '&lt; !--', $newtext );
+
+	return $newtext;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="balancetags.html">balanceTags()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Balances tags if forced to, or if the ‘use_balanceTags’ option is set to true.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_the_content.html">get_the_content()</a> <span>wp-includes/post-template.php</span> </td> <td class="related-desc"> <p>Retrieves the post content.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/5.3.0/" alt="WordPress 5.3.0">5.3.0</a></td> <td><span class="since-description">Improve accuracy and add support for custom element tags.</span></td> </tr> <tr> <td><a href="https://developer.wordpress.org/reference/since/2.0.4/" alt="WordPress 2.0.4">2.0.4</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/functions/force_balance_tags" class="_attribution-link">https://developer.wordpress.org/reference/functions/force_balance_tags</a>
+  </p>
+</div>

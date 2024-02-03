@@ -1,0 +1,247 @@
+<h1>wp_xmlrpc_server::pingback_ping( array $args ): string|IXR_Error</h1>  <section> <p>Retrieves a pingback and registers it.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$args</code> <span class="type"><span class="array">array</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Method arguments. Note: arguments must be ordered as documented.<br> <ul class="param-hash">
+<li>
+<span class="type">string</span><div class="desc">URL of page linked from.</div>
+</li> <li>
+<code>1</code><span class="type">string</span><div class="desc">URL of page linked to.</div>
+</li> </ul> </span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">string|<a href="../ixr_error.html" rel="class">IXR_Error</a></span> </p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/class-wp-xmlrpc-server.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-xmlrpc-server.php/">View all references</a> </p> <pre class="wp-block-code" data-start="6830" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function pingback_ping( $args ) {
+	global $wpdb;
+
+	/** This action is documented in wp-includes/class-wp-xmlrpc-server.php */
+	do_action( 'xmlrpc_call', 'pingback.ping', $args, $this );
+
+	$this-&gt;escape( $args );
+
+	$pagelinkedfrom = str_replace( '&amp;amp;', '&amp;', $args[0] );
+	$pagelinkedto   = str_replace( '&amp;amp;', '&amp;', $args[1] );
+	$pagelinkedto   = str_replace( '&amp;', '&amp;amp;', $pagelinkedto );
+
+	/**
+	 * Filters the pingback source URI.
+	 *
+	 * @since 3.6.0
+	 *
+	 * @param string $pagelinkedfrom URI of the page linked from.
+	 * @param string $pagelinkedto   URI of the page linked to.
+	 */
+	$pagelinkedfrom = apply_filters( 'pingback_ping_source_uri', $pagelinkedfrom, $pagelinkedto );
+
+	if ( ! $pagelinkedfrom ) {
+		return $this-&gt;pingback_error( 0, __( 'A valid URL was not provided.' ) );
+	}
+
+	// Check if the page linked to is on our site.
+	$pos1 = strpos( $pagelinkedto, str_replace( array( 'http://www.', 'http://', 'https://www.', 'https://' ), '', get_option( 'home' ) ) );
+	if ( ! $pos1 ) {
+		return $this-&gt;pingback_error( 0, __( 'Is there no link to us?' ) );
+	}
+
+	/*
+	 * Let's find which post is linked to.
+	 * FIXME: Does url_to_postid() cover all these cases already?
+	 * If so, then let's use it and drop the old code.
+	 */
+	$urltest = parse_url( $pagelinkedto );
+	$post_ID = url_to_postid( $pagelinkedto );
+	if ( $post_ID ) {
+		// $way
+	} elseif ( isset( $urltest['path'] ) &amp;&amp; preg_match( '#p/[0-9]{1,}#', $urltest['path'], $match ) ) {
+		// The path defines the post_ID (archives/p/XXXX).
+		$blah    = explode( '/', $match[0] );
+		$post_ID = (int) $blah[1];
+	} elseif ( isset( $urltest['query'] ) &amp;&amp; preg_match( '#p=[0-9]{1,}#', $urltest['query'], $match ) ) {
+		// The query string defines the post_ID (?p=XXXX).
+		$blah    = explode( '=', $match[0] );
+		$post_ID = (int) $blah[1];
+	} elseif ( isset( $urltest['fragment'] ) ) {
+		// An #anchor is there, it's either...
+		if ( (int) $urltest['fragment'] ) {
+			// ...an integer #XXXX (simplest case),
+			$post_ID = (int) $urltest['fragment'];
+		} elseif ( preg_match( '/post-[0-9]+/', $urltest['fragment'] ) ) {
+			// ...a post ID in the form 'post-###',
+			$post_ID = preg_replace( '/[^0-9]+/', '', $urltest['fragment'] );
+		} elseif ( is_string( $urltest['fragment'] ) ) {
+			// ...or a string #title, a little more complicated.
+			$title   = preg_replace( '/[^a-z0-9]/i', '.', $urltest['fragment'] );
+			$sql     = $wpdb-&gt;prepare( "SELECT ID FROM $wpdb-&gt;posts WHERE post_title RLIKE %s", $title );
+			$post_ID = $wpdb-&gt;get_var( $sql );
+			if ( ! $post_ID ) {
+				// Returning unknown error '0' is better than die()'ing.
+				return $this-&gt;pingback_error( 0, '' );
+			}
+		}
+	} else {
+		// TODO: Attempt to extract a post ID from the given URL.
+		return $this-&gt;pingback_error( 33, __( 'The specified target URL cannot be used as a target. It either does not exist, or it is not a pingback-enabled resource.' ) );
+	}
+	$post_ID = (int) $post_ID;
+
+	$post = get_post( $post_ID );
+
+	if ( ! $post ) { // Post not found.
+		return $this-&gt;pingback_error( 33, __( 'The specified target URL cannot be used as a target. It either does not exist, or it is not a pingback-enabled resource.' ) );
+	}
+
+	if ( url_to_postid( $pagelinkedfrom ) == $post_ID ) {
+		return $this-&gt;pingback_error( 0, __( 'The source URL and the target URL cannot both point to the same resource.' ) );
+	}
+
+	// Check if pings are on.
+	if ( ! pings_open( $post ) ) {
+		return $this-&gt;pingback_error( 33, __( 'The specified target URL cannot be used as a target. It either does not exist, or it is not a pingback-enabled resource.' ) );
+	}
+
+	// Let's check that the remote site didn't already pingback this entry.
+	if ( $wpdb-&gt;get_results( $wpdb-&gt;prepare( "SELECT * FROM $wpdb-&gt;comments WHERE comment_post_ID = %d AND comment_author_url = %s", $post_ID, $pagelinkedfrom ) ) ) {
+		return $this-&gt;pingback_error( 48, __( 'The pingback has already been registered.' ) );
+	}
+
+	// Very stupid, but gives time to the 'from' server to publish!
+	sleep( 1 );
+
+	$remote_ip = preg_replace( '/[^0-9a-fA-F:., ]/', '', $_SERVER['REMOTE_ADDR'] );
+
+	/** This filter is documented in wp-includes/class-wp-http.php */
+	$user_agent = apply_filters( 'http_headers_useragent', 'WordPress/' . get_bloginfo( 'version' ) . '; ' . get_bloginfo( 'url' ), $pagelinkedfrom );
+
+	// Let's check the remote site.
+	$http_api_args = array(
+		'timeout'             =&gt; 10,
+		'redirection'         =&gt; 0,
+		'limit_response_size' =&gt; 153600, // 150 KB
+		'user-agent'          =&gt; "$user_agent; verifying pingback from $remote_ip",
+		'headers'             =&gt; array(
+			'X-Pingback-Forwarded-For' =&gt; $remote_ip,
+		),
+	);
+
+	$request                = wp_safe_remote_get( $pagelinkedfrom, $http_api_args );
+	$remote_source          = wp_remote_retrieve_body( $request );
+	$remote_source_original = $remote_source;
+
+	if ( ! $remote_source ) {
+		return $this-&gt;pingback_error( 16, __( 'The source URL does not exist.' ) );
+	}
+
+	/**
+	 * Filters the pingback remote source.
+	 *
+	 * @since 2.5.0
+	 *
+	 * @param string $remote_source Response source for the page linked from.
+	 * @param string $pagelinkedto  URL of the page linked to.
+	 */
+	$remote_source = apply_filters( 'pre_remote_source', $remote_source, $pagelinkedto );
+
+	// Work around bug in strip_tags():
+	$remote_source = str_replace( '&lt;!DOC', '&lt;DOC', $remote_source );
+	$remote_source = preg_replace( '/[\r\n\t ]+/', ' ', $remote_source ); // normalize spaces
+	$remote_source = preg_replace( '/&lt;\/*(h1|h2|h3|h4|h5|h6|p|th|td|li|dt|dd|pre|caption|input|textarea|button|body)[^&gt;]*&gt;/', "\n\n", $remote_source );
+
+	preg_match( '|&lt;title&gt;([^&lt;]*?)&lt;/title&gt;|is', $remote_source, $matchtitle );
+	$title = isset( $matchtitle[1] ) ? $matchtitle[1] : '';
+	if ( empty( $title ) ) {
+		return $this-&gt;pingback_error( 32, __( 'A title on that page cannot be found.' ) );
+	}
+
+	// Remove all script and style tags including their content.
+	$remote_source = preg_replace( '@&lt;(script|style)[^&gt;]*?&gt;.*?&lt;/\\1&gt;@si', '', $remote_source );
+	// Just keep the tag we need.
+	$remote_source = strip_tags( $remote_source, '&lt;a&gt;' );
+
+	$p = explode( "\n\n", $remote_source );
+
+	$preg_target = preg_quote( $pagelinkedto, '|' );
+
+	foreach ( $p as $para ) {
+		if ( strpos( $para, $pagelinkedto ) !== false ) { // It exists, but is it a link?
+			preg_match( '|&lt;a[^&gt;]+?' . $preg_target . '[^&gt;]*&gt;([^&gt;]+?)&lt;/a&gt;|', $para, $context );
+
+			// If the URL isn't in a link context, keep looking.
+			if ( empty( $context ) ) {
+				continue;
+			}
+
+			// We're going to use this fake tag to mark the context in a bit.
+			// The marker is needed in case the link text appears more than once in the paragraph.
+			$excerpt = preg_replace( '|\&lt;/?wpcontext\&gt;|', '', $para );
+
+			// prevent really long link text
+			if ( strlen( $context[1] ) &gt; 100 ) {
+				$context[1] = substr( $context[1], 0, 100 ) . '&amp;#8230;';
+			}
+
+			$marker      = '&lt;wpcontext&gt;' . $context[1] . '&lt;/wpcontext&gt;';  // Set up our marker.
+			$excerpt     = str_replace( $context[0], $marker, $excerpt ); // Swap out the link for our marker.
+			$excerpt     = strip_tags( $excerpt, '&lt;wpcontext&gt;' );         // Strip all tags but our context marker.
+			$excerpt     = trim( $excerpt );
+			$preg_marker = preg_quote( $marker, '|' );
+			$excerpt     = preg_replace( "|.*?\s(.{0,100}$preg_marker.{0,100})\s.*|s", '$1', $excerpt );
+			$excerpt     = strip_tags( $excerpt ); // YES, again, to remove the marker wrapper.
+			break;
+		}
+	}
+
+	if ( empty( $context ) ) { // Link to target not found.
+		return $this-&gt;pingback_error( 17, __( 'The source URL does not contain a link to the target URL, and so cannot be used as a source.' ) );
+	}
+
+	$pagelinkedfrom = str_replace( '&amp;', '&amp;amp;', $pagelinkedfrom );
+
+	$context        = '[&amp;#8230;] ' . esc_html( $excerpt ) . ' [&amp;#8230;]';
+	$pagelinkedfrom = $this-&gt;escape( $pagelinkedfrom );
+
+	$comment_post_id      = (int) $post_ID;
+	$comment_author       = $title;
+	$comment_author_email = '';
+	$this-&gt;escape( $comment_author );
+	$comment_author_url = $pagelinkedfrom;
+	$comment_content    = $context;
+	$this-&gt;escape( $comment_content );
+	$comment_type = 'pingback';
+
+	$commentdata = array(
+		'comment_post_ID' =&gt; $comment_post_id,
+	);
+
+	$commentdata += compact(
+		'comment_author',
+		'comment_author_url',
+		'comment_author_email',
+		'comment_content',
+		'comment_type',
+		'remote_source',
+		'remote_source_original'
+	);
+
+	$comment_ID = wp_new_comment( $commentdata );
+
+	if ( is_wp_error( $comment_ID ) ) {
+		return $this-&gt;pingback_error( 0, $comment_ID-&gt;get_error_message() );
+	}
+
+	/**
+	 * Fires after a post pingback has been sent.
+	 *
+	 * @since 0.71
+	 *
+	 * @param int $comment_ID Comment ID.
+	 */
+	do_action( 'pingback_post', $comment_ID );
+
+	/* translators: 1: URL of the page linked from, 2: URL of the page linked to. */
+	return sprintf( __( 'Pingback from %1$s to %2$s registered. Keep the web talking! :-)' ), $pagelinkedfrom, $pagelinkedto );
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/http_headers_useragent.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'http_headers_useragent', <nobr><span class="arg-type">string</span> <span class="arg-name">$user_agent</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$url</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the user agent value sent with an HTTP request.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/pingback_ping_source_uri.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'pingback_ping_source_uri', <nobr><span class="arg-type">string</span> <span class="arg-name">$pagelinkedfrom</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$pagelinkedto</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the pingback source URI.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/pingback_post.html" style="text-decoration: none"> <span class="hook-func">do_action</span>( 'pingback_post', <nobr><span class="arg-type">int</span> <span class="arg-name">$comment_ID</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Fires after a post pingback has been sent.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/pre_remote_source.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'pre_remote_source', <nobr><span class="arg-type">string</span> <span class="arg-name">$remote_source</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$pagelinkedto</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the pingback remote source.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/xmlrpc_call.html" style="text-decoration: none"> <span class="hook-func">do_action</span>( 'xmlrpc_call', <nobr><span class="arg-type">string</span> <span class="arg-name">$name</span></nobr>, <nobr><span class="arg-type">array|string</span> <span class="arg-name">$args</span></nobr>, <nobr><span class="arg-type">wp_xmlrpc_server</span> <span class="arg-name">$server</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Fires after the XML-RPC user has been authenticated but before the rest of the method logic begins.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="../../functions/url_to_postid.html">url_to_postid()</a> <span>wp-includes/rewrite.php</span> </td> <td class="related-desc"> <p>Examines a URL and try to determine the post ID it represents.</p> </td> </tr> <tr> <td class="related-title"> <a href="pingback_error.html">wp_xmlrpc_server::pingback_error()</a> <span>wp-includes/class-wp-xmlrpc-server.php</span> </td> <td class="related-desc"> <p>Sends a pingback error based on the given error code and message.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_new_comment.html">wp_new_comment()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Adds a new comment to the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_safe_remote_get.html">wp_safe_remote_get()</a> <span>wp-includes/http.php</span> </td> <td class="related-desc"> <p>Retrieve the raw response from a safe HTTP request using the GET method.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_remote_retrieve_body.html">wp_remote_retrieve_body()</a> <span>wp-includes/http.php</span> </td> <td class="related-desc"> <p>Retrieve only the body from the raw response.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/pings_open.html">pings_open()</a> <span>wp-includes/comment-template.php</span> </td> <td class="related-desc"> <p>Determines whether the current post is open for pings.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/prepare.html">wpdb::prepare()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Prepares a SQL query for safe execution.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/get_results.html">wpdb::get_results()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Retrieves an entire SQL result set from the database (i.e., many rows).</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/get_var.html">wpdb::get_var()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Retrieves one variable from the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="escape.html">wp_xmlrpc_server::escape()</a> <span>wp-includes/class-wp-xmlrpc-server.php</span> </td> <td class="related-desc"> <p>Escape string or array of strings for database.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/esc_html.html">esc_html()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Escaping for HTML blocks.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post.html">get_post()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves post data given a post ID or post object.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_option.html">get_option()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Retrieves an option value based on an option name.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/do_action.html">do_action()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to an action hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_bloginfo.html">get_bloginfo()</a> <span>wp-includes/general-template.php</span> </td> <td class="related-desc"> <p>Retrieves information about the current site.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/1.5.0/" alt="WordPress 1.5.0">1.5.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_xmlrpc_server/pingback_ping" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_xmlrpc_server/pingback_ping</a>
+  </p>
+</div>

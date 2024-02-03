@@ -1,0 +1,209 @@
+<h1>bulk_edit_posts( array|null $post_data = null ): array</h1>  <section> <p>Processes the post data for the bulk editing of posts.</p> </section>   <section> <header class="toc-header"><h2 id="description">Description</h2></header> <p>Updates all bulk edited posts/pages, adding (but not removing) tags and categories. Skips pages when they would be their own parent or child.</p> </section>  <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$post_data</code> <span class="type"><span class="array">array</span>|<span class="null">null</span></span> <span class="required">Optional</span> </dt> <dd> <div class="desc"> <span class="description"> The array of post data to process.<br> Defaults to the <code>$_POST</code> superglobal.</span> </div> <p class="default">Default: <code>null</code></p> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">array</span> </p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-admin/includes/post.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-admin/includes/post.php/">View all references</a> </p> <pre class="wp-block-code" data-start="471" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">function bulk_edit_posts( $post_data = null ) {
+	global $wpdb;
+
+	if ( empty( $post_data ) ) {
+		$post_data = &amp;$_POST;
+	}
+
+	if ( isset( $post_data['post_type'] ) ) {
+		$ptype = get_post_type_object( $post_data['post_type'] );
+	} else {
+		$ptype = get_post_type_object( 'post' );
+	}
+
+	if ( ! current_user_can( $ptype-&gt;cap-&gt;edit_posts ) ) {
+		if ( 'page' === $ptype-&gt;name ) {
+			wp_die( __( 'Sorry, you are not allowed to edit pages.' ) );
+		} else {
+			wp_die( __( 'Sorry, you are not allowed to edit posts.' ) );
+		}
+	}
+
+	if ( -1 == $post_data['_status'] ) {
+		$post_data['post_status'] = null;
+		unset( $post_data['post_status'] );
+	} else {
+		$post_data['post_status'] = $post_data['_status'];
+	}
+	unset( $post_data['_status'] );
+
+	if ( ! empty( $post_data['post_status'] ) ) {
+		$post_data['post_status'] = sanitize_key( $post_data['post_status'] );
+
+		if ( 'inherit' === $post_data['post_status'] ) {
+			unset( $post_data['post_status'] );
+		}
+	}
+
+	$post_IDs = array_map( 'intval', (array) $post_data['post'] );
+
+	$reset = array(
+		'post_author',
+		'post_status',
+		'post_password',
+		'post_parent',
+		'page_template',
+		'comment_status',
+		'ping_status',
+		'keep_private',
+		'tax_input',
+		'post_category',
+		'sticky',
+		'post_format',
+	);
+
+	foreach ( $reset as $field ) {
+		if ( isset( $post_data[ $field ] ) &amp;&amp; ( '' === $post_data[ $field ] || -1 == $post_data[ $field ] ) ) {
+			unset( $post_data[ $field ] );
+		}
+	}
+
+	if ( isset( $post_data['post_category'] ) ) {
+		if ( is_array( $post_data['post_category'] ) &amp;&amp; ! empty( $post_data['post_category'] ) ) {
+			$new_cats = array_map( 'absint', $post_data['post_category'] );
+		} else {
+			unset( $post_data['post_category'] );
+		}
+	}
+
+	$tax_input = array();
+	if ( isset( $post_data['tax_input'] ) ) {
+		foreach ( $post_data['tax_input'] as $tax_name =&gt; $terms ) {
+			if ( empty( $terms ) ) {
+				continue;
+			}
+			if ( is_taxonomy_hierarchical( $tax_name ) ) {
+				$tax_input[ $tax_name ] = array_map( 'absint', $terms );
+			} else {
+				$comma = _x( ',', 'tag delimiter' );
+				if ( ',' !== $comma ) {
+					$terms = str_replace( $comma, ',', $terms );
+				}
+				$tax_input[ $tax_name ] = explode( ',', trim( $terms, " \n\t\r\0\x0B," ) );
+			}
+		}
+	}
+
+	if ( isset( $post_data['post_parent'] ) &amp;&amp; (int) $post_data['post_parent'] ) {
+		$parent   = (int) $post_data['post_parent'];
+		$pages    = $wpdb-&gt;get_results( "SELECT ID, post_parent FROM $wpdb-&gt;posts WHERE post_type = 'page'" );
+		$children = array();
+
+		for ( $i = 0; $i &lt; 50 &amp;&amp; $parent &gt; 0; $i++ ) {
+			$children[] = $parent;
+
+			foreach ( $pages as $page ) {
+				if ( (int) $page-&gt;ID === $parent ) {
+					$parent = (int) $page-&gt;post_parent;
+					break;
+				}
+			}
+		}
+	}
+
+	$updated          = array();
+	$skipped          = array();
+	$locked           = array();
+	$shared_post_data = $post_data;
+
+	foreach ( $post_IDs as $post_ID ) {
+		// Start with fresh post data with each iteration.
+		$post_data = $shared_post_data;
+
+		$post_type_object = get_post_type_object( get_post_type( $post_ID ) );
+
+		if ( ! isset( $post_type_object )
+			|| ( isset( $children ) &amp;&amp; in_array( $post_ID, $children, true ) )
+			|| ! current_user_can( 'edit_post', $post_ID )
+		) {
+			$skipped[] = $post_ID;
+			continue;
+		}
+
+		if ( wp_check_post_lock( $post_ID ) ) {
+			$locked[] = $post_ID;
+			continue;
+		}
+
+		$post      = get_post( $post_ID );
+		$tax_names = get_object_taxonomies( $post );
+
+		foreach ( $tax_names as $tax_name ) {
+			$taxonomy_obj = get_taxonomy( $tax_name );
+
+			if ( ! $taxonomy_obj-&gt;show_in_quick_edit ) {
+				continue;
+			}
+
+			if ( isset( $tax_input[ $tax_name ] ) &amp;&amp; current_user_can( $taxonomy_obj-&gt;cap-&gt;assign_terms ) ) {
+				$new_terms = $tax_input[ $tax_name ];
+			} else {
+				$new_terms = array();
+			}
+
+			if ( $taxonomy_obj-&gt;hierarchical ) {
+				$current_terms = (array) wp_get_object_terms( $post_ID, $tax_name, array( 'fields' =&gt; 'ids' ) );
+			} else {
+				$current_terms = (array) wp_get_object_terms( $post_ID, $tax_name, array( 'fields' =&gt; 'names' ) );
+			}
+
+			$post_data['tax_input'][ $tax_name ] = array_merge( $current_terms, $new_terms );
+		}
+
+		if ( isset( $new_cats ) &amp;&amp; in_array( 'category', $tax_names, true ) ) {
+			$cats                       = (array) wp_get_post_categories( $post_ID );
+			$post_data['post_category'] = array_unique( array_merge( $cats, $new_cats ) );
+			unset( $post_data['tax_input']['category'] );
+		}
+
+		$post_data['post_ID']        = $post_ID;
+		$post_data['post_type']      = $post-&gt;post_type;
+		$post_data['post_mime_type'] = $post-&gt;post_mime_type;
+
+		foreach ( array( 'comment_status', 'ping_status', 'post_author' ) as $field ) {
+			if ( ! isset( $post_data[ $field ] ) ) {
+				$post_data[ $field ] = $post-&gt;$field;
+			}
+		}
+
+		$post_data = _wp_translate_postdata( true, $post_data );
+		if ( is_wp_error( $post_data ) ) {
+			$skipped[] = $post_ID;
+			continue;
+		}
+		$post_data = _wp_get_allowed_postdata( $post_data );
+
+		if ( isset( $shared_post_data['post_format'] ) ) {
+			set_post_format( $post_ID, $shared_post_data['post_format'] );
+		}
+
+		// Prevent wp_insert_post() from overwriting post format with the old data.
+		unset( $post_data['tax_input']['post_format'] );
+
+		$post_id = wp_update_post( $post_data );
+		update_post_meta( $post_id, '_edit_last', get_current_user_id() );
+		$updated[] = $post_id;
+
+		if ( isset( $post_data['sticky'] ) &amp;&amp; current_user_can( $ptype-&gt;cap-&gt;edit_others_posts ) ) {
+			if ( 'sticky' === $post_data['sticky'] ) {
+				stick_post( $post_ID );
+			} else {
+				unstick_post( $post_ID );
+			}
+		}
+	}
+
+	return array(
+		'updated' =&gt; $updated,
+		'skipped' =&gt; $skipped,
+		'locked'  =&gt; $locked,
+	);
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="_wp_get_allowed_postdata.html">_wp_get_allowed_postdata()</a> <span>wp-admin/includes/post.php</span> </td> <td class="related-desc"> <p>Returns only allowed post data fields.</p> </td> </tr> <tr> <td class="related-title"> <a href="unstick_post.html">unstick_post()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Un-sticks a post.</p> </td> </tr> <tr> <td class="related-title"> <a href="_wp_translate_postdata.html">_wp_translate_postdata()</a> <span>wp-admin/includes/post.php</span> </td> <td class="related-desc"> <p>Renames <code>$_POST</code> data from form names to DB post columns.</p> </td> </tr> <tr> <td class="related-title"> <a href="set_post_format.html">set_post_format()</a> <span>wp-includes/post-formats.php</span> </td> <td class="related-desc"> <p>Assign a format to a post</p> </td> </tr> <tr> <td class="related-title"> <a href="get_post_type.html">get_post_type()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves the post type of the current post or of a given post.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_get_object_terms.html">wp_get_object_terms()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Retrieves the terms associated with the given object(s), in the supplied taxonomies.</p> </td> </tr> <tr> <td class="related-title"> <a href="is_taxonomy_hierarchical.html">is_taxonomy_hierarchical()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Determines whether the taxonomy object is hierarchical.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_object_taxonomies.html">get_object_taxonomies()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Returns the names or objects of the taxonomies which are registered for the requested object or object type, such as a post object or post type name.</p> </td> </tr> <tr> <td class="related-title"> <a href="update_post_meta.html">update_post_meta()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Updates a post meta field based on the given post ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_check_post_lock.html">wp_check_post_lock()</a> <span>wp-admin/includes/post.php</span> </td> <td class="related-desc"> <p>Determines whether the post is currently being edited by another user.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_get_post_categories.html">wp_get_post_categories()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves the list of categories for a post.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_update_post.html">wp_update_post()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Updates a post with new post data.</p> </td> </tr> <tr> <td class="related-title"> <a href="stick_post.html">stick_post()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Makes a post sticky.</p> </td> </tr> <tr> <td class="related-title"> <a href="../classes/wpdb/get_results.html">wpdb::get_results()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Retrieves an entire SQL result set from the database (i.e., many rows).</p> </td> </tr> <tr> <td class="related-title"> <a href="get_post.html">get_post()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves post data given a post ID or post object.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_post_type_object.html">get_post_type_object()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves a post type object by name.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_current_user_id.html">get_current_user_id()</a> <span>wp-includes/user.php</span> </td> <td class="related-desc"> <p>Gets the current user’s ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_taxonomy.html">get_taxonomy()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Retrieves the taxonomy object of $taxonomy.</p> </td> </tr> <tr> <td class="related-title"> <a href="wp_die.html">wp_die()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Kills WordPress execution and displays HTML page with an error message.</p> </td> </tr> <tr> <td class="related-title"> <a href="sanitize_key.html">sanitize_key()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Sanitizes a string key.</p> </td> </tr> <tr> <td class="related-title"> <a href="_x.html">_x()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves translated string with gettext context.</p> </td> </tr> <tr> <td class="related-title"> <a href="__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="current_user_can.html">current_user_can()</a> <span>wp-includes/capabilities.php</span> </td> <td class="related-desc"> <p>Returns whether the current user has the specified capability.</p> </td> </tr> <tr> <td class="related-title"> <a href="is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/2.7.0/" alt="WordPress 2.7.0">2.7.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/functions/bulk_edit_posts" class="_attribution-link">https://developer.wordpress.org/reference/functions/bulk_edit_posts</a>
+  </p>
+</div>

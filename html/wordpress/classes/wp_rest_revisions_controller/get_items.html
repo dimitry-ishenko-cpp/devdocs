@@ -1,0 +1,149 @@
+<h1>WP_REST_Revisions_Controller::get_items( WP_REST_Request $request ): WP_REST_Response|WP_Error</h1>  <section> <p>Gets a collection of revisions.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$request</code> <span class="type"><span class="WP_REST_Request"><a href="../wp_rest_request.html" rel="class">WP_REST_Request</a></span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Full details about the request.</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type"><a href="../wp_rest_response.html" rel="class">WP_REST_Response</a>|<a href="../wp_error.html" rel="class">WP_Error</a></span> Response object on success, or <a href="../wp_error.html" rel="class">WP_Error</a> object on failure.</p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/rest-api/endpoints/class-wp-rest-revisions-controller.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/rest-api/endpoints/class-wp-rest-revisions-controller.php/">View all references</a> </p> <pre class="wp-block-code" data-start="218" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function get_items( $request ) {
+	$parent = $this-&gt;get_parent( $request['parent'] );
+	if ( is_wp_error( $parent ) ) {
+		return $parent;
+	}
+
+	// Ensure a search string is set in case the orderby is set to 'relevance'.
+	if ( ! empty( $request['orderby'] ) &amp;&amp; 'relevance' === $request['orderby'] &amp;&amp; empty( $request['search'] ) ) {
+		return new WP_Error(
+			'rest_no_search_term_defined',
+			__( 'You need to define a search term to order by relevance.' ),
+			array( 'status' =&gt; 400 )
+		);
+	}
+
+	// Ensure an include parameter is set in case the orderby is set to 'include'.
+	if ( ! empty( $request['orderby'] ) &amp;&amp; 'include' === $request['orderby'] &amp;&amp; empty( $request['include'] ) ) {
+		return new WP_Error(
+			'rest_orderby_include_missing_include',
+			__( 'You need to define an include parameter to order by include.' ),
+			array( 'status' =&gt; 400 )
+		);
+	}
+
+	if ( wp_revisions_enabled( $parent ) ) {
+		$registered = $this-&gt;get_collection_params();
+		$args       = array(
+			'post_parent'      =&gt; $parent-&gt;ID,
+			'post_type'        =&gt; 'revision',
+			'post_status'      =&gt; 'inherit',
+			'posts_per_page'   =&gt; -1,
+			'orderby'          =&gt; 'date ID',
+			'order'            =&gt; 'DESC',
+			'suppress_filters' =&gt; true,
+		);
+
+		$parameter_mappings = array(
+			'exclude'  =&gt; 'post__not_in',
+			'include'  =&gt; 'post__in',
+			'offset'   =&gt; 'offset',
+			'order'    =&gt; 'order',
+			'orderby'  =&gt; 'orderby',
+			'page'     =&gt; 'paged',
+			'per_page' =&gt; 'posts_per_page',
+			'search'   =&gt; 's',
+		);
+
+		foreach ( $parameter_mappings as $api_param =&gt; $wp_param ) {
+			if ( isset( $registered[ $api_param ], $request[ $api_param ] ) ) {
+				$args[ $wp_param ] = $request[ $api_param ];
+			}
+		}
+
+		// For backward-compatibility, 'date' needs to resolve to 'date ID'.
+		if ( isset( $args['orderby'] ) &amp;&amp; 'date' === $args['orderby'] ) {
+			$args['orderby'] = 'date ID';
+		}
+
+		/** This filter is documented in wp-includes/rest-api/endpoints/class-wp-rest-posts-controller.php */
+		$args       = apply_filters( 'rest_revision_query', $args, $request );
+		$query_args = $this-&gt;prepare_items_query( $args, $request );
+
+		$revisions_query = new WP_Query();
+		$revisions       = $revisions_query-&gt;query( $query_args );
+		$offset          = isset( $query_args['offset'] ) ? (int) $query_args['offset'] : 0;
+		$page            = (int) $query_args['paged'];
+		$total_revisions = $revisions_query-&gt;found_posts;
+
+		if ( $total_revisions &lt; 1 ) {
+			// Out-of-bounds, run the query again without LIMIT for total count.
+			unset( $query_args['paged'], $query_args['offset'] );
+
+			$count_query = new WP_Query();
+			$count_query-&gt;query( $query_args );
+
+			$total_revisions = $count_query-&gt;found_posts;
+		}
+
+		if ( $revisions_query-&gt;query_vars['posts_per_page'] &gt; 0 ) {
+			$max_pages = ceil( $total_revisions / (int) $revisions_query-&gt;query_vars['posts_per_page'] );
+		} else {
+			$max_pages = $total_revisions &gt; 0 ? 1 : 0;
+		}
+
+		if ( $total_revisions &gt; 0 ) {
+			if ( $offset &gt;= $total_revisions ) {
+				return new WP_Error(
+					'rest_revision_invalid_offset_number',
+					__( 'The offset number requested is larger than or equal to the number of available revisions.' ),
+					array( 'status' =&gt; 400 )
+				);
+			} elseif ( ! $offset &amp;&amp; $page &gt; $max_pages ) {
+				return new WP_Error(
+					'rest_revision_invalid_page_number',
+					__( 'The page number requested is larger than the number of pages available.' ),
+					array( 'status' =&gt; 400 )
+				);
+			}
+		}
+	} else {
+		$revisions       = array();
+		$total_revisions = 0;
+		$max_pages       = 0;
+		$page            = (int) $request['page'];
+	}
+
+	$response = array();
+
+	foreach ( $revisions as $revision ) {
+		$data       = $this-&gt;prepare_item_for_response( $revision, $request );
+		$response[] = $this-&gt;prepare_response_for_collection( $data );
+	}
+
+	$response = rest_ensure_response( $response );
+
+	$response-&gt;header( 'X-WP-Total', (int) $total_revisions );
+	$response-&gt;header( 'X-WP-TotalPages', (int) $max_pages );
+
+	$request_params = $request-&gt;get_query_params();
+	$base_path      = rest_url( sprintf( '%s/%s/%d/%s', $this-&gt;namespace, $this-&gt;parent_base, $request['parent'], $this-&gt;rest_base ) );
+	$base           = add_query_arg( urlencode_deep( $request_params ), $base_path );
+
+	if ( $page &gt; 1 ) {
+		$prev_page = $page - 1;
+
+		if ( $prev_page &gt; $max_pages ) {
+			$prev_page = $max_pages;
+		}
+
+		$prev_link = add_query_arg( 'page', $prev_page, $base );
+		$response-&gt;link_header( 'prev', $prev_link );
+	}
+	if ( $max_pages &gt; $page ) {
+		$next_page = $page + 1;
+		$next_link = add_query_arg( 'page', $next_page, $base );
+
+		$response-&gt;link_header( 'next', $next_link );
+	}
+
+	return $response;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="prepare_items_query.html">WP_REST_Revisions_Controller::prepare_items_query()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-revisions-controller.php</span> </td> <td class="related-desc"> <p>Determines the allowed query_vars for a get_items() response and prepares them for <a href="../wp_query.html" rel="class">WP_Query</a>.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_parent.html">WP_REST_Revisions_Controller::get_parent()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-revisions-controller.php</span> </td> <td class="related-desc"> <p>Get the parent post, if the ID is valid.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_collection_params.html">WP_REST_Revisions_Controller::get_collection_params()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-revisions-controller.php</span> </td> <td class="related-desc"> <p>Retrieves the query params for collections.</p> </td> </tr> <tr> <td class="related-title"> <a href="prepare_item_for_response.html">WP_REST_Revisions_Controller::prepare_item_for_response()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-revisions-controller.php</span> </td> <td class="related-desc"> <p>Prepares the revision for the REST response.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/urlencode_deep.html">urlencode_deep()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Navigates through an array, object, or scalar, and encodes the values to be used in a URL.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_query/__construct.html">WP_Query::__construct()</a> <span>wp-includes/class-wp-query.php</span> </td> <td class="related-desc"> <p>Constructor.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_revisions_enabled.html">wp_revisions_enabled()</a> <span>wp-includes/revision.php</span> </td> <td class="related-desc"> <p>Determines whether revisions are enabled for a given post.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/rest_ensure_response.html">rest_ensure_response()</a> <span>wp-includes/rest-api.php</span> </td> <td class="related-desc"> <p>Ensures a REST response is a response object (for consistency).</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/rest_url.html">rest_url()</a> <span>wp-includes/rest-api.php</span> </td> <td class="related-desc"> <p>Retrieves the URL to a REST endpoint.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/add_query_arg.html">add_query_arg()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Retrieves a modified URL query string.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_error/__construct.html">WP_Error::__construct()</a> <span>wp-includes/class-wp-error.php</span> </td> <td class="related-desc"> <p>Initializes the error.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.7.0/" alt="WordPress 4.7.0">4.7.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_rest_revisions_controller/get_items" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_rest_revisions_controller/get_items</a>
+  </p>
+</div>

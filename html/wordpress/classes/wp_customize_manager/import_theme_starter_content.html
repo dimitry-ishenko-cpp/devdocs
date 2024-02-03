@@ -1,0 +1,453 @@
+<h1>WP_Customize_Manager::import_theme_starter_content( array $starter_content = array() )</h1>  <section> <p>Imports theme starter content into the customized state.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$starter_content</code> <span class="type"><span class="array">array</span></span> <span class="required">Optional</span> </dt> <dd> <div class="desc"> <span class="description">Starter content. Defaults to <code>get_theme_starter_content()</code>.</span> </div> <p class="default">Default: <code>array()</code></p> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/class-wp-customize-manager.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-customize-manager.php/">View all references</a> </p> <pre class="wp-block-code" data-start="1189" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function import_theme_starter_content( $starter_content = array() ) {
+	if ( empty( $starter_content ) ) {
+		$starter_content = get_theme_starter_content();
+	}
+
+	$changeset_data = array();
+	if ( $this-&gt;changeset_post_id() ) {
+		/*
+		 * Don't re-import starter content into a changeset saved persistently.
+		 * This will need to be revisited in the future once theme switching
+		 * is allowed with drafted/scheduled changesets, since switching to
+		 * another theme could result in more starter content being applied.
+		 * However, when doing an explicit save it is currently possible for
+		 * nav menus and nav menu items specifically to lose their starter_content
+		 * flags, thus resulting in duplicates being created since they fail
+		 * to get re-used. See #40146.
+		 */
+		if ( 'auto-draft' !== get_post_status( $this-&gt;changeset_post_id() ) ) {
+			return;
+		}
+
+		$changeset_data = $this-&gt;get_changeset_post_data( $this-&gt;changeset_post_id() );
+	}
+
+	$sidebars_widgets = isset( $starter_content['widgets'] ) &amp;&amp; ! empty( $this-&gt;widgets ) ? $starter_content['widgets'] : array();
+	$attachments      = isset( $starter_content['attachments'] ) &amp;&amp; ! empty( $this-&gt;nav_menus ) ? $starter_content['attachments'] : array();
+	$posts            = isset( $starter_content['posts'] ) &amp;&amp; ! empty( $this-&gt;nav_menus ) ? $starter_content['posts'] : array();
+	$options          = isset( $starter_content['options'] ) ? $starter_content['options'] : array();
+	$nav_menus        = isset( $starter_content['nav_menus'] ) &amp;&amp; ! empty( $this-&gt;nav_menus ) ? $starter_content['nav_menus'] : array();
+	$theme_mods       = isset( $starter_content['theme_mods'] ) ? $starter_content['theme_mods'] : array();
+
+	// Widgets.
+	$max_widget_numbers = array();
+	foreach ( $sidebars_widgets as $sidebar_id =&gt; $widgets ) {
+		$sidebar_widget_ids = array();
+		foreach ( $widgets as $widget ) {
+			list( $id_base, $instance ) = $widget;
+
+			if ( ! isset( $max_widget_numbers[ $id_base ] ) ) {
+
+				// When $settings is an array-like object, get an intrinsic array for use with array_keys().
+				$settings = get_option( "widget_{$id_base}", array() );
+				if ( $settings instanceof ArrayObject || $settings instanceof ArrayIterator ) {
+					$settings = $settings-&gt;getArrayCopy();
+				}
+
+				unset( $settings['_multiwidget'] );
+
+				// Find the max widget number for this type.
+				$widget_numbers = array_keys( $settings );
+				if ( count( $widget_numbers ) &gt; 0 ) {
+					$widget_numbers[]               = 1;
+					$max_widget_numbers[ $id_base ] = max( ...$widget_numbers );
+				} else {
+					$max_widget_numbers[ $id_base ] = 1;
+				}
+			}
+			$max_widget_numbers[ $id_base ] += 1;
+
+			$widget_id  = sprintf( '%s-%d', $id_base, $max_widget_numbers[ $id_base ] );
+			$setting_id = sprintf( 'widget_%s[%d]', $id_base, $max_widget_numbers[ $id_base ] );
+
+			$setting_value = $this-&gt;widgets-&gt;sanitize_widget_js_instance( $instance );
+			if ( empty( $changeset_data[ $setting_id ] ) || ! empty( $changeset_data[ $setting_id ]['starter_content'] ) ) {
+				$this-&gt;set_post_value( $setting_id, $setting_value );
+				$this-&gt;pending_starter_content_settings_ids[] = $setting_id;
+			}
+			$sidebar_widget_ids[] = $widget_id;
+		}
+
+		$setting_id = sprintf( 'sidebars_widgets[%s]', $sidebar_id );
+		if ( empty( $changeset_data[ $setting_id ] ) || ! empty( $changeset_data[ $setting_id ]['starter_content'] ) ) {
+			$this-&gt;set_post_value( $setting_id, $sidebar_widget_ids );
+			$this-&gt;pending_starter_content_settings_ids[] = $setting_id;
+		}
+	}
+
+	$starter_content_auto_draft_post_ids = array();
+	if ( ! empty( $changeset_data['nav_menus_created_posts']['value'] ) ) {
+		$starter_content_auto_draft_post_ids = array_merge( $starter_content_auto_draft_post_ids, $changeset_data['nav_menus_created_posts']['value'] );
+	}
+
+	// Make an index of all the posts needed and what their slugs are.
+	$needed_posts = array();
+	$attachments  = $this-&gt;prepare_starter_content_attachments( $attachments );
+	foreach ( $attachments as $attachment ) {
+		$key                  = 'attachment:' . $attachment['post_name'];
+		$needed_posts[ $key ] = true;
+	}
+	foreach ( array_keys( $posts ) as $post_symbol ) {
+		if ( empty( $posts[ $post_symbol ]['post_name'] ) &amp;&amp; empty( $posts[ $post_symbol ]['post_title'] ) ) {
+			unset( $posts[ $post_symbol ] );
+			continue;
+		}
+		if ( empty( $posts[ $post_symbol ]['post_name'] ) ) {
+			$posts[ $post_symbol ]['post_name'] = sanitize_title( $posts[ $post_symbol ]['post_title'] );
+		}
+		if ( empty( $posts[ $post_symbol ]['post_type'] ) ) {
+			$posts[ $post_symbol ]['post_type'] = 'post';
+		}
+		$needed_posts[ $posts[ $post_symbol ]['post_type'] . ':' . $posts[ $post_symbol ]['post_name'] ] = true;
+	}
+	$all_post_slugs = array_merge(
+		wp_list_pluck( $attachments, 'post_name' ),
+		wp_list_pluck( $posts, 'post_name' )
+	);
+
+	/*
+	 * Obtain all post types referenced in starter content to use in query.
+	 * This is needed because 'any' will not account for post types not yet registered.
+	 */
+	$post_types = array_filter( array_merge( array( 'attachment' ), wp_list_pluck( $posts, 'post_type' ) ) );
+
+	// Re-use auto-draft starter content posts referenced in the current customized state.
+	$existing_starter_content_posts = array();
+	if ( ! empty( $starter_content_auto_draft_post_ids ) ) {
+		$existing_posts_query = new WP_Query(
+			array(
+				'post__in'       =&gt; $starter_content_auto_draft_post_ids,
+				'post_status'    =&gt; 'auto-draft',
+				'post_type'      =&gt; $post_types,
+				'posts_per_page' =&gt; -1,
+			)
+		);
+		foreach ( $existing_posts_query-&gt;posts as $existing_post ) {
+			$post_name = $existing_post-&gt;post_name;
+			if ( empty( $post_name ) ) {
+				$post_name = get_post_meta( $existing_post-&gt;ID, '_customize_draft_post_name', true );
+			}
+			$existing_starter_content_posts[ $existing_post-&gt;post_type . ':' . $post_name ] = $existing_post;
+		}
+	}
+
+	// Re-use non-auto-draft posts.
+	if ( ! empty( $all_post_slugs ) ) {
+		$existing_posts_query = new WP_Query(
+			array(
+				'post_name__in'  =&gt; $all_post_slugs,
+				'post_status'    =&gt; array_diff( get_post_stati(), array( 'auto-draft' ) ),
+				'post_type'      =&gt; 'any',
+				'posts_per_page' =&gt; -1,
+			)
+		);
+		foreach ( $existing_posts_query-&gt;posts as $existing_post ) {
+			$key = $existing_post-&gt;post_type . ':' . $existing_post-&gt;post_name;
+			if ( isset( $needed_posts[ $key ] ) &amp;&amp; ! isset( $existing_starter_content_posts[ $key ] ) ) {
+				$existing_starter_content_posts[ $key ] = $existing_post;
+			}
+		}
+	}
+
+	// Attachments are technically posts but handled differently.
+	if ( ! empty( $attachments ) ) {
+
+		$attachment_ids = array();
+
+		foreach ( $attachments as $symbol =&gt; $attachment ) {
+			$file_array    = array(
+				'name' =&gt; $attachment['file_name'],
+			);
+			$file_path     = $attachment['file_path'];
+			$attachment_id = null;
+			$attached_file = null;
+			if ( isset( $existing_starter_content_posts[ 'attachment:' . $attachment['post_name'] ] ) ) {
+				$attachment_post = $existing_starter_content_posts[ 'attachment:' . $attachment['post_name'] ];
+				$attachment_id   = $attachment_post-&gt;ID;
+				$attached_file   = get_attached_file( $attachment_id );
+				if ( empty( $attached_file ) || ! file_exists( $attached_file ) ) {
+					$attachment_id = null;
+					$attached_file = null;
+				} elseif ( $this-&gt;get_stylesheet() !== get_post_meta( $attachment_post-&gt;ID, '_starter_content_theme', true ) ) {
+
+					// Re-generate attachment metadata since it was previously generated for a different theme.
+					$metadata = wp_generate_attachment_metadata( $attachment_post-&gt;ID, $attached_file );
+					wp_update_attachment_metadata( $attachment_id, $metadata );
+					update_post_meta( $attachment_id, '_starter_content_theme', $this-&gt;get_stylesheet() );
+				}
+			}
+
+			// Insert the attachment auto-draft because it doesn't yet exist or the attached file is gone.
+			if ( ! $attachment_id ) {
+
+				// Copy file to temp location so that original file won't get deleted from theme after sideloading.
+				$temp_file_name = wp_tempnam( wp_basename( $file_path ) );
+				if ( $temp_file_name &amp;&amp; copy( $file_path, $temp_file_name ) ) {
+					$file_array['tmp_name'] = $temp_file_name;
+				}
+				if ( empty( $file_array['tmp_name'] ) ) {
+					continue;
+				}
+
+				$attachment_post_data = array_merge(
+					wp_array_slice_assoc( $attachment, array( 'post_title', 'post_content', 'post_excerpt' ) ),
+					array(
+						'post_status' =&gt; 'auto-draft', // So attachment will be garbage collected in a week if changeset is never published.
+					)
+				);
+
+				$attachment_id = media_handle_sideload( $file_array, 0, null, $attachment_post_data );
+				if ( is_wp_error( $attachment_id ) ) {
+					continue;
+				}
+				update_post_meta( $attachment_id, '_starter_content_theme', $this-&gt;get_stylesheet() );
+				update_post_meta( $attachment_id, '_customize_draft_post_name', $attachment['post_name'] );
+			}
+
+			$attachment_ids[ $symbol ] = $attachment_id;
+		}
+		$starter_content_auto_draft_post_ids = array_merge( $starter_content_auto_draft_post_ids, array_values( $attachment_ids ) );
+	}
+
+	// Posts &amp; pages.
+	if ( ! empty( $posts ) ) {
+		foreach ( array_keys( $posts ) as $post_symbol ) {
+			if ( empty( $posts[ $post_symbol ]['post_type'] ) || empty( $posts[ $post_symbol ]['post_name'] ) ) {
+				continue;
+			}
+			$post_type = $posts[ $post_symbol ]['post_type'];
+			if ( ! empty( $posts[ $post_symbol ]['post_name'] ) ) {
+				$post_name = $posts[ $post_symbol ]['post_name'];
+			} elseif ( ! empty( $posts[ $post_symbol ]['post_title'] ) ) {
+				$post_name = sanitize_title( $posts[ $post_symbol ]['post_title'] );
+			} else {
+				continue;
+			}
+
+			// Use existing auto-draft post if one already exists with the same type and name.
+			if ( isset( $existing_starter_content_posts[ $post_type . ':' . $post_name ] ) ) {
+				$posts[ $post_symbol ]['ID'] = $existing_starter_content_posts[ $post_type . ':' . $post_name ]-&gt;ID;
+				continue;
+			}
+
+			// Translate the featured image symbol.
+			if ( ! empty( $posts[ $post_symbol ]['thumbnail'] )
+				&amp;&amp; preg_match( '/^{{(?P&lt;symbol&gt;.+)}}$/', $posts[ $post_symbol ]['thumbnail'], $matches )
+				&amp;&amp; isset( $attachment_ids[ $matches['symbol'] ] ) ) {
+				$posts[ $post_symbol ]['meta_input']['_thumbnail_id'] = $attachment_ids[ $matches['symbol'] ];
+			}
+
+			if ( ! empty( $posts[ $post_symbol ]['template'] ) ) {
+				$posts[ $post_symbol ]['meta_input']['_wp_page_template'] = $posts[ $post_symbol ]['template'];
+			}
+
+			$r = $this-&gt;nav_menus-&gt;insert_auto_draft_post( $posts[ $post_symbol ] );
+			if ( $r instanceof WP_Post ) {
+				$posts[ $post_symbol ]['ID'] = $r-&gt;ID;
+			}
+		}
+
+		$starter_content_auto_draft_post_ids = array_merge( $starter_content_auto_draft_post_ids, wp_list_pluck( $posts, 'ID' ) );
+	}
+
+	// The nav_menus_created_posts setting is why nav_menus component is dependency for adding posts.
+	if ( ! empty( $this-&gt;nav_menus ) &amp;&amp; ! empty( $starter_content_auto_draft_post_ids ) ) {
+		$setting_id = 'nav_menus_created_posts';
+		$this-&gt;set_post_value( $setting_id, array_unique( array_values( $starter_content_auto_draft_post_ids ) ) );
+		$this-&gt;pending_starter_content_settings_ids[] = $setting_id;
+	}
+
+	// Nav menus.
+	$placeholder_id              = -1;
+	$reused_nav_menu_setting_ids = array();
+	foreach ( $nav_menus as $nav_menu_location =&gt; $nav_menu ) {
+
+		$nav_menu_term_id    = null;
+		$nav_menu_setting_id = null;
+		$matches             = array();
+
+		// Look for an existing placeholder menu with starter content to re-use.
+		foreach ( $changeset_data as $setting_id =&gt; $setting_params ) {
+			$can_reuse = (
+				! empty( $setting_params['starter_content'] )
+				&amp;&amp;
+				! in_array( $setting_id, $reused_nav_menu_setting_ids, true )
+				&amp;&amp;
+				preg_match( '#^nav_menu\[(?P&lt;nav_menu_id&gt;-?\d+)\]$#', $setting_id, $matches )
+			);
+			if ( $can_reuse ) {
+				$nav_menu_term_id              = (int) $matches['nav_menu_id'];
+				$nav_menu_setting_id           = $setting_id;
+				$reused_nav_menu_setting_ids[] = $setting_id;
+				break;
+			}
+		}
+
+		if ( ! $nav_menu_term_id ) {
+			while ( isset( $changeset_data[ sprintf( 'nav_menu[%d]', $placeholder_id ) ] ) ) {
+				$placeholder_id--;
+			}
+			$nav_menu_term_id    = $placeholder_id;
+			$nav_menu_setting_id = sprintf( 'nav_menu[%d]', $placeholder_id );
+		}
+
+		$this-&gt;set_post_value(
+			$nav_menu_setting_id,
+			array(
+				'name' =&gt; isset( $nav_menu['name'] ) ? $nav_menu['name'] : $nav_menu_location,
+			)
+		);
+		$this-&gt;pending_starter_content_settings_ids[] = $nav_menu_setting_id;
+
+		// @todo Add support for menu_item_parent.
+		$position = 0;
+		foreach ( $nav_menu['items'] as $nav_menu_item ) {
+			$nav_menu_item_setting_id = sprintf( 'nav_menu_item[%d]', $placeholder_id-- );
+			if ( ! isset( $nav_menu_item['position'] ) ) {
+				$nav_menu_item['position'] = $position++;
+			}
+			$nav_menu_item['nav_menu_term_id'] = $nav_menu_term_id;
+
+			if ( isset( $nav_menu_item['object_id'] ) ) {
+				if ( 'post_type' === $nav_menu_item['type'] &amp;&amp; preg_match( '/^{{(?P&lt;symbol&gt;.+)}}$/', $nav_menu_item['object_id'], $matches ) &amp;&amp; isset( $posts[ $matches['symbol'] ] ) ) {
+					$nav_menu_item['object_id'] = $posts[ $matches['symbol'] ]['ID'];
+					if ( empty( $nav_menu_item['title'] ) ) {
+						$original_object        = get_post( $nav_menu_item['object_id'] );
+						$nav_menu_item['title'] = $original_object-&gt;post_title;
+					}
+				} else {
+					continue;
+				}
+			} else {
+				$nav_menu_item['object_id'] = 0;
+			}
+
+			if ( empty( $changeset_data[ $nav_menu_item_setting_id ] ) || ! empty( $changeset_data[ $nav_menu_item_setting_id ]['starter_content'] ) ) {
+				$this-&gt;set_post_value( $nav_menu_item_setting_id, $nav_menu_item );
+				$this-&gt;pending_starter_content_settings_ids[] = $nav_menu_item_setting_id;
+			}
+		}
+
+		$setting_id = sprintf( 'nav_menu_locations[%s]', $nav_menu_location );
+		if ( empty( $changeset_data[ $setting_id ] ) || ! empty( $changeset_data[ $setting_id ]['starter_content'] ) ) {
+			$this-&gt;set_post_value( $setting_id, $nav_menu_term_id );
+			$this-&gt;pending_starter_content_settings_ids[] = $setting_id;
+		}
+	}
+
+	// Options.
+	foreach ( $options as $name =&gt; $value ) {
+
+		// Serialize the value to check for post symbols.
+		$value = maybe_serialize( $value );
+
+		if ( is_serialized( $value ) ) {
+			if ( preg_match( '/s:\d+:"{{(?P&lt;symbol&gt;.+)}}"/', $value, $matches ) ) {
+				if ( isset( $posts[ $matches['symbol'] ] ) ) {
+					$symbol_match = $posts[ $matches['symbol'] ]['ID'];
+				} elseif ( isset( $attachment_ids[ $matches['symbol'] ] ) ) {
+					$symbol_match = $attachment_ids[ $matches['symbol'] ];
+				}
+
+				// If we have any symbol matches, update the values.
+				if ( isset( $symbol_match ) ) {
+					// Replace found string matches with post IDs.
+					$value = str_replace( $matches[0], "i:{$symbol_match}", $value );
+				} else {
+					continue;
+				}
+			}
+		} elseif ( preg_match( '/^{{(?P&lt;symbol&gt;.+)}}$/', $value, $matches ) ) {
+			if ( isset( $posts[ $matches['symbol'] ] ) ) {
+				$value = $posts[ $matches['symbol'] ]['ID'];
+			} elseif ( isset( $attachment_ids[ $matches['symbol'] ] ) ) {
+				$value = $attachment_ids[ $matches['symbol'] ];
+			} else {
+				continue;
+			}
+		}
+
+		// Unserialize values after checking for post symbols, so they can be properly referenced.
+		$value = maybe_unserialize( $value );
+
+		if ( empty( $changeset_data[ $name ] ) || ! empty( $changeset_data[ $name ]['starter_content'] ) ) {
+			$this-&gt;set_post_value( $name, $value );
+			$this-&gt;pending_starter_content_settings_ids[] = $name;
+		}
+	}
+
+	// Theme mods.
+	foreach ( $theme_mods as $name =&gt; $value ) {
+
+		// Serialize the value to check for post symbols.
+		$value = maybe_serialize( $value );
+
+		// Check if value was serialized.
+		if ( is_serialized( $value ) ) {
+			if ( preg_match( '/s:\d+:"{{(?P&lt;symbol&gt;.+)}}"/', $value, $matches ) ) {
+				if ( isset( $posts[ $matches['symbol'] ] ) ) {
+					$symbol_match = $posts[ $matches['symbol'] ]['ID'];
+				} elseif ( isset( $attachment_ids[ $matches['symbol'] ] ) ) {
+					$symbol_match = $attachment_ids[ $matches['symbol'] ];
+				}
+
+				// If we have any symbol matches, update the values.
+				if ( isset( $symbol_match ) ) {
+					// Replace found string matches with post IDs.
+					$value = str_replace( $matches[0], "i:{$symbol_match}", $value );
+				} else {
+					continue;
+				}
+			}
+		} elseif ( preg_match( '/^{{(?P&lt;symbol&gt;.+)}}$/', $value, $matches ) ) {
+			if ( isset( $posts[ $matches['symbol'] ] ) ) {
+				$value = $posts[ $matches['symbol'] ]['ID'];
+			} elseif ( isset( $attachment_ids[ $matches['symbol'] ] ) ) {
+				$value = $attachment_ids[ $matches['symbol'] ];
+			} else {
+				continue;
+			}
+		}
+
+		// Unserialize values after checking for post symbols, so they can be properly referenced.
+		$value = maybe_unserialize( $value );
+
+		// Handle header image as special case since setting has a legacy format.
+		if ( 'header_image' === $name ) {
+			$name     = 'header_image_data';
+			$metadata = wp_get_attachment_metadata( $value );
+			if ( empty( $metadata ) ) {
+				continue;
+			}
+			$value = array(
+				'attachment_id' =&gt; $value,
+				'url'           =&gt; wp_get_attachment_url( $value ),
+				'height'        =&gt; $metadata['height'],
+				'width'         =&gt; $metadata['width'],
+			);
+		} elseif ( 'background_image' === $name ) {
+			$value = wp_get_attachment_url( $value );
+		}
+
+		if ( empty( $changeset_data[ $name ] ) || ! empty( $changeset_data[ $name ]['starter_content'] ) ) {
+			$this-&gt;set_post_value( $name, $value );
+			$this-&gt;pending_starter_content_settings_ids[] = $name;
+		}
+	}
+
+	if ( ! empty( $this-&gt;pending_starter_content_settings_ids ) ) {
+		if ( did_action( 'customize_register' ) ) {
+			$this-&gt;_save_starter_content_changeset();
+		} else {
+			add_action( 'customize_register', array( $this, '_save_starter_content_changeset' ), 1000 );
+		}
+	}
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="prepare_starter_content_attachments.html">WP_Customize_Manager::prepare_starter_content_attachments()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Prepares starter content attachments.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_array_slice_assoc.html">wp_array_slice_assoc()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Extracts a slice of an array, given a list of keys.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_attached_file.html">get_attached_file()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves attached file path based on attachment ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post_stati.html">get_post_stati()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Gets a list of post statuses.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post_status.html">get_post_status()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves the post status based on the post ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/update_post_meta.html">update_post_meta()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Updates a post meta field based on the given post ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_get_attachment_url.html">wp_get_attachment_url()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves the URL for an attachment.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_get_attachment_metadata.html">wp_get_attachment_metadata()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves attachment metadata for attachment ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_update_attachment_metadata.html">wp_update_attachment_metadata()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Updates metadata for an attachment.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/did_action.html">did_action()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Retrieves the number of times an action has been fired during the current request.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/maybe_unserialize.html">maybe_unserialize()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Unserializes data only if it was serialized.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_serialized.html">is_serialized()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Checks value to find if it was serialized.</p> </td> </tr> <tr> <td class="related-title"> <a href="_save_starter_content_changeset.html">WP_Customize_Manager::_save_starter_content_changeset()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Saves starter content changeset.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/maybe_serialize.html">maybe_serialize()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Serializes data, if needed.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_list_pluck.html">wp_list_pluck()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Plucks a certain field out of each object or array in an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_query/__construct.html">WP_Query::__construct()</a> <span>wp-includes/class-wp-query.php</span> </td> <td class="related-desc"> <p>Constructor.</p> </td> </tr> <tr> <td class="related-title"> <a href="changeset_post_id.html">WP_Customize_Manager::changeset_post_id()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Gets the changeset post ID for the loaded changeset.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_changeset_post_data.html">WP_Customize_Manager::get_changeset_post_data()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Gets the data stored in a changeset post.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_theme_starter_content.html">get_theme_starter_content()</a> <span>wp-includes/theme.php</span> </td> <td class="related-desc"> <p>Expands a theme’s starter content configuration using core-provided data.</p> </td> </tr> <tr> <td class="related-title"> <a href="set_post_value.html">WP_Customize_Manager::set_post_value()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Overrides a setting’s value in the current customized state.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_generate_attachment_metadata.html">wp_generate_attachment_metadata()</a> <span>wp-admin/includes/image.php</span> </td> <td class="related-desc"> <p>Generates attachment meta data and create image sub-sizes for images.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/media_handle_sideload.html">media_handle_sideload()</a> <span>wp-admin/includes/media.php</span> </td> <td class="related-desc"> <p>Handles a side-loaded file in the same way as an uploaded file is handled by <a href="../../functions/media_handle_upload.html" rel="function">media_handle_upload()</a> .</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_tempnam.html">wp_tempnam()</a> <span>wp-admin/includes/file.php</span> </td> <td class="related-desc"> <p>Returns a filename of a temporary unique file.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_stylesheet.html">WP_Customize_Manager::get_stylesheet()</a> <span>wp-includes/class-wp-customize-manager.php</span> </td> <td class="related-desc"> <p>Retrieves the stylesheet name of the previewed theme.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/sanitize_title.html">sanitize_title()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Sanitizes a string into a slug, which can be used in URLs or HTML attributes.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_option.html">get_option()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Retrieves an option value based on an option name.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post_meta.html">get_post_meta()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves a post meta field for the given post ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/add_action.html">add_action()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Adds a callback function to an action hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_basename.html">wp_basename()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>i18n-friendly version of basename().</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post.html">get_post()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Retrieves post data given a post ID or post object.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.7.0/" alt="WordPress 4.7.0">4.7.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_customize_manager/import_theme_starter_content" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_customize_manager/import_theme_starter_content</a>
+  </p>
+</div>

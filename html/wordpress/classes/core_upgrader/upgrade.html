@@ -1,0 +1,221 @@
+<h1>Core_Upgrader::upgrade( object $current, array $args = array() ): string|false|WP_Error</h1>  <section> <p>Upgrade WordPress core.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$current</code> <span class="type"><span class="object">object</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Response object for whether WordPress is current.</span> </div> </dd> <dt> <code>$args</code> <span class="type"><span class="array">array</span></span> <span class="required">Optional</span> </dt> <dd> <div class="desc"> <span class="description">Arguments for upgrading WordPress core. <br> <ul class="param-hash">
+<li>
+<code>pre_check_md5</code><span class="type">bool</span><div class="desc">Whether to check the file checksums before attempting the upgrade. Default true.</div>
+</li> <li>
+<code>attempt_rollback</code><span class="type">bool</span><div class="desc">Whether to attempt to rollback the chances if there is a problem. Default false.</div>
+</li> <li>
+<code>do_rollback</code><span class="type">bool</span><div class="desc">Whether to perform this "upgrade" as a rollback.<br> Default false.</div>
+</li> </ul> </span> </div> <p class="default">Default: <code>array()</code></p> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">string|false|<a href="../wp_error.html" rel="class">WP_Error</a></span> New WordPress version on success, false or <a href="../wp_error.html" rel="class">WP_Error</a> on failure.</p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-admin/includes/class-core-upgrader.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-admin/includes/class-core-upgrader.php/">View all references</a> </p> <pre class="wp-block-code" data-start="62" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function upgrade( $current, $args = array() ) {
+	global $wp_filesystem;
+
+	require ABSPATH . WPINC . '/version.php'; // $wp_version;
+
+	$start_time = time();
+
+	$defaults    = array(
+		'pre_check_md5'                =&gt; true,
+		'attempt_rollback'             =&gt; false,
+		'do_rollback'                  =&gt; false,
+		'allow_relaxed_file_ownership' =&gt; false,
+	);
+	$parsed_args = wp_parse_args( $args, $defaults );
+
+	$this-&gt;init();
+	$this-&gt;upgrade_strings();
+
+	// Is an update available?
+	if ( ! isset( $current-&gt;response ) || 'latest' === $current-&gt;response ) {
+		return new WP_Error( 'up_to_date', $this-&gt;strings['up_to_date'] );
+	}
+
+	$res = $this-&gt;fs_connect( array( ABSPATH, WP_CONTENT_DIR ), $parsed_args['allow_relaxed_file_ownership'] );
+	if ( ! $res || is_wp_error( $res ) ) {
+		return $res;
+	}
+
+	$wp_dir = trailingslashit( $wp_filesystem-&gt;abspath() );
+
+	$partial = true;
+	if ( $parsed_args['do_rollback'] ) {
+		$partial = false;
+	} elseif ( $parsed_args['pre_check_md5'] &amp;&amp; ! $this-&gt;check_files() ) {
+		$partial = false;
+	}
+
+	/*
+	 * If partial update is returned from the API, use that, unless we're doing
+	 * a reinstallation. If we cross the new_bundled version number, then use
+	 * the new_bundled zip. Don't though if the constant is set to skip bundled items.
+	 * If the API returns a no_content zip, go with it. Finally, default to the full zip.
+	 */
+	if ( $parsed_args['do_rollback'] &amp;&amp; $current-&gt;packages-&gt;rollback ) {
+		$to_download = 'rollback';
+	} elseif ( $current-&gt;packages-&gt;partial &amp;&amp; 'reinstall' !== $current-&gt;response &amp;&amp; $wp_version === $current-&gt;partial_version &amp;&amp; $partial ) {
+		$to_download = 'partial';
+	} elseif ( $current-&gt;packages-&gt;new_bundled &amp;&amp; version_compare( $wp_version, $current-&gt;new_bundled, '&lt;' )
+		&amp;&amp; ( ! defined( 'CORE_UPGRADE_SKIP_NEW_BUNDLED' ) || ! CORE_UPGRADE_SKIP_NEW_BUNDLED ) ) {
+		$to_download = 'new_bundled';
+	} elseif ( $current-&gt;packages-&gt;no_content ) {
+		$to_download = 'no_content';
+	} else {
+		$to_download = 'full';
+	}
+
+	// Lock to prevent multiple Core Updates occurring.
+	$lock = WP_Upgrader::create_lock( 'core_updater', 15 * MINUTE_IN_SECONDS );
+	if ( ! $lock ) {
+		return new WP_Error( 'locked', $this-&gt;strings['locked'] );
+	}
+
+	$download = $this-&gt;download_package( $current-&gt;packages-&gt;$to_download, true );
+
+	// Allow for signature soft-fail.
+	// WARNING: This may be removed in the future.
+	if ( is_wp_error( $download ) &amp;&amp; $download-&gt;get_error_data( 'softfail-filename' ) ) {
+		// Output the failure error as a normal feedback, and not as an error:
+		/** This filter is documented in wp-admin/includes/update-core.php */
+		apply_filters( 'update_feedback', $download-&gt;get_error_message() );
+
+		// Report this failure back to WordPress.org for debugging purposes.
+		wp_version_check(
+			array(
+				'signature_failure_code' =&gt; $download-&gt;get_error_code(),
+				'signature_failure_data' =&gt; $download-&gt;get_error_data(),
+			)
+		);
+
+		// Pretend this error didn't happen.
+		$download = $download-&gt;get_error_data( 'softfail-filename' );
+	}
+
+	if ( is_wp_error( $download ) ) {
+		WP_Upgrader::release_lock( 'core_updater' );
+		return $download;
+	}
+
+	$working_dir = $this-&gt;unpack_package( $download );
+	if ( is_wp_error( $working_dir ) ) {
+		WP_Upgrader::release_lock( 'core_updater' );
+		return $working_dir;
+	}
+
+	// Copy update-core.php from the new version into place.
+	if ( ! $wp_filesystem-&gt;copy( $working_dir . '/wordpress/wp-admin/includes/update-core.php', $wp_dir . 'wp-admin/includes/update-core.php', true ) ) {
+		$wp_filesystem-&gt;delete( $working_dir, true );
+		WP_Upgrader::release_lock( 'core_updater' );
+		return new WP_Error( 'copy_failed_for_update_core_file', __( 'The update cannot be installed because some files could not be copied. This is usually due to inconsistent file permissions.' ), 'wp-admin/includes/update-core.php' );
+	}
+	$wp_filesystem-&gt;chmod( $wp_dir . 'wp-admin/includes/update-core.php', FS_CHMOD_FILE );
+
+	wp_opcache_invalidate( ABSPATH . 'wp-admin/includes/update-core.php' );
+	require_once ABSPATH . 'wp-admin/includes/update-core.php';
+
+	if ( ! function_exists( 'update_core' ) ) {
+		WP_Upgrader::release_lock( 'core_updater' );
+		return new WP_Error( 'copy_failed_space', $this-&gt;strings['copy_failed_space'] );
+	}
+
+	$result = update_core( $working_dir, $wp_dir );
+
+	// In the event of an issue, we may be able to roll back.
+	if ( $parsed_args['attempt_rollback'] &amp;&amp; $current-&gt;packages-&gt;rollback &amp;&amp; ! $parsed_args['do_rollback'] ) {
+		$try_rollback = false;
+		if ( is_wp_error( $result ) ) {
+			$error_code = $result-&gt;get_error_code();
+			/*
+			 * Not all errors are equal. These codes are critical: copy_failed__copy_dir,
+			 * mkdir_failed__copy_dir, copy_failed__copy_dir_retry, and disk_full.
+			 * do_rollback allows for update_core() to trigger a rollback if needed.
+			 */
+			if ( false !== strpos( $error_code, 'do_rollback' ) ) {
+				$try_rollback = true;
+			} elseif ( false !== strpos( $error_code, '__copy_dir' ) ) {
+				$try_rollback = true;
+			} elseif ( 'disk_full' === $error_code ) {
+				$try_rollback = true;
+			}
+		}
+
+		if ( $try_rollback ) {
+			/** This filter is documented in wp-admin/includes/update-core.php */
+			apply_filters( 'update_feedback', $result );
+
+			/** This filter is documented in wp-admin/includes/update-core.php */
+			apply_filters( 'update_feedback', $this-&gt;strings['start_rollback'] );
+
+			$rollback_result = $this-&gt;upgrade( $current, array_merge( $parsed_args, array( 'do_rollback' =&gt; true ) ) );
+
+			$original_result = $result;
+			$result          = new WP_Error(
+				'rollback_was_required',
+				$this-&gt;strings['rollback_was_required'],
+				(object) array(
+					'update'   =&gt; $original_result,
+					'rollback' =&gt; $rollback_result,
+				)
+			);
+		}
+	}
+
+	/** This action is documented in wp-admin/includes/class-wp-upgrader.php */
+	do_action(
+		'upgrader_process_complete',
+		$this,
+		array(
+			'action' =&gt; 'update',
+			'type'   =&gt; 'core',
+		)
+	);
+
+	// Clear the current updates.
+	delete_site_transient( 'update_core' );
+
+	if ( ! $parsed_args['do_rollback'] ) {
+		$stats = array(
+			'update_type'      =&gt; $current-&gt;response,
+			'success'          =&gt; true,
+			'fs_method'        =&gt; $wp_filesystem-&gt;method,
+			'fs_method_forced' =&gt; defined( 'FS_METHOD' ) || has_filter( 'filesystem_method' ),
+			'fs_method_direct' =&gt; ! empty( $GLOBALS['_wp_filesystem_direct_method'] ) ? $GLOBALS['_wp_filesystem_direct_method'] : '',
+			'time_taken'       =&gt; time() - $start_time,
+			'reported'         =&gt; $wp_version,
+			'attempted'        =&gt; $current-&gt;version,
+		);
+
+		if ( is_wp_error( $result ) ) {
+			$stats['success'] = false;
+			// Did a rollback occur?
+			if ( ! empty( $try_rollback ) ) {
+				$stats['error_code'] = $original_result-&gt;get_error_code();
+				$stats['error_data'] = $original_result-&gt;get_error_data();
+				// Was the rollback successful? If not, collect its error too.
+				$stats['rollback'] = ! is_wp_error( $rollback_result );
+				if ( is_wp_error( $rollback_result ) ) {
+					$stats['rollback_code'] = $rollback_result-&gt;get_error_code();
+					$stats['rollback_data'] = $rollback_result-&gt;get_error_data();
+				}
+			} else {
+				$stats['error_code'] = $result-&gt;get_error_code();
+				$stats['error_data'] = $result-&gt;get_error_data();
+			}
+		}
+
+		wp_version_check( $stats );
+	}
+
+	WP_Upgrader::release_lock( 'core_updater' );
+
+	return $result;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/update_feedback.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'update_feedback', <nobr><span class="arg-type">string</span> <span class="arg-name">$feedback</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters feedback messages displayed during the core update process.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/upgrader_process_complete.html" style="text-decoration: none"> <span class="hook-func">do_action</span>( 'upgrader_process_complete', <nobr><span class="arg-type">WP_Upgrader</span> <span class="arg-name">$upgrader</span></nobr>, <nobr><span class="arg-type">array</span> <span class="arg-name">$hook_extra</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Fires when the upgrader process is complete.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="../../functions/wp_opcache_invalidate.html">wp_opcache_invalidate()</a> <span>wp-admin/includes/file.php</span> </td> <td class="related-desc"> <p>Attempts to clear the opcode cache for an individual PHP file.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/has_filter.html">has_filter()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Checks if any filter has been registered for a hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_upgrader/release_lock.html">WP_Upgrader::release_lock()</a> <span>wp-admin/includes/class-wp-upgrader.php</span> </td> <td class="related-desc"> <p>Releases an upgrader lock.</p> </td> </tr> <tr> <td class="related-title"> <a href="check_files.html">Core_Upgrader::check_files()</a> <span>wp-admin/includes/class-core-upgrader.php</span> </td> <td class="related-desc"> <p>Compare the disk file checksums against the expected checksums.</p> </td> </tr> <tr> <td class="related-title"> <a href="upgrade_strings.html">Core_Upgrader::upgrade_strings()</a> <span>wp-admin/includes/class-core-upgrader.php</span> </td> <td class="related-desc"> <p>Initialize the upgrade strings.</p> </td> </tr> <tr> <td class="related-title"> <a href="upgrade.html">Core_Upgrader::upgrade()</a> <span>wp-admin/includes/class-core-upgrader.php</span> </td> <td class="related-desc"> <p>Upgrade WordPress core.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/update_core.html">update_core()</a> <span>wp-admin/includes/update-core.php</span> </td> <td class="related-desc"> <p>Upgrades the core of WordPress.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_upgrader/create_lock.html">WP_Upgrader::create_lock()</a> <span>wp-admin/includes/class-wp-upgrader.php</span> </td> <td class="related-desc"> <p>Creates a lock using WordPress options.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/delete_site_transient.html">delete_site_transient()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Deletes a site transient.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_version_check.html">wp_version_check()</a> <span>wp-includes/update.php</span> </td> <td class="related-desc"> <p>Checks WordPress version against the newest version.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/do_action.html">do_action()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to an action hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/trailingslashit.html">trailingslashit()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Appends a trailing slash.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_parse_args.html">wp_parse_args()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Merges user defined arguments into defaults array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_error/__construct.html">WP_Error::__construct()</a> <span>wp-includes/class-wp-error.php</span> </td> <td class="related-desc"> <p>Initializes the error.</p> </td> </tr> </tbody>
+
+</table>   </article>  <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="upgrade.html">Core_Upgrader::upgrade()</a> <span>wp-admin/includes/class-core-upgrader.php</span> </td> <td class="related-desc"> <p>Upgrade WordPress core.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/2.8.0/" alt="WordPress 2.8.0">2.8.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/core_upgrader/upgrade" class="_attribution-link">https://developer.wordpress.org/reference/classes/core_upgrader/upgrade</a>
+  </p>
+</div>

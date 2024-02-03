@@ -1,0 +1,278 @@
+<h1>WP_Meta_Query::get_sql_for_clause( array $clause, array $parent_query, string $clause_key = '' ): string[]</h1>  <section> <p>Generate SQL JOIN and WHERE clauses for a first-order query clause.</p> </section>   <section> <header class="toc-header"><h2 id="description">Description</h2></header> <p>"First-order" means that it’s an array with a ‘key’ or ‘value’.</p> </section>  <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$clause</code> <span class="type"><span class="array">array</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Query clause (passed by reference).</span> </div> </dd> <dt> <code>$parent_query</code> <span class="type"><span class="array">array</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Parent query array.</span> </div> </dd> <dt> <code>$clause_key</code> <span class="type"><span class="string">string</span></span> <span class="required">Optional</span> </dt> <dd> <div class="desc"> <span class="description"> The array key used to name the clause in the original <code>$meta_query</code> parameters. If not provided, a key will be generated automatically.</span> </div> <p class="default">Default: <code>''</code></p> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">string[]</span> Array containing JOIN and WHERE SQL clauses to append to a first-order query.<br> </p>
+<ul class="param-hash">
+<li>
+<code>join</code><span class="type">string</span><div class="desc">SQL fragment to append to the main JOIN clause.</div>
+</li> <li>
+<code>where</code><span class="type">string</span><div class="desc">SQL fragment to append to the main WHERE clause.</div>
+</li> </ul> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/class-wp-meta-query.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-meta-query.php/">View all references</a> </p> <pre class="wp-block-code" data-start="531" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function get_sql_for_clause( &amp;$clause, $parent_query, $clause_key = '' ) {
+	global $wpdb;
+
+	$sql_chunks = array(
+		'where' =&gt; array(),
+		'join'  =&gt; array(),
+	);
+
+	if ( isset( $clause['compare'] ) ) {
+		$clause['compare'] = strtoupper( $clause['compare'] );
+	} else {
+		$clause['compare'] = isset( $clause['value'] ) &amp;&amp; is_array( $clause['value'] ) ? 'IN' : '=';
+	}
+
+	$non_numeric_operators = array(
+		'=',
+		'!=',
+		'LIKE',
+		'NOT LIKE',
+		'IN',
+		'NOT IN',
+		'EXISTS',
+		'NOT EXISTS',
+		'RLIKE',
+		'REGEXP',
+		'NOT REGEXP',
+	);
+
+	$numeric_operators = array(
+		'&gt;',
+		'&gt;=',
+		'&lt;',
+		'&lt;=',
+		'BETWEEN',
+		'NOT BETWEEN',
+	);
+
+	if ( ! in_array( $clause['compare'], $non_numeric_operators, true ) &amp;&amp; ! in_array( $clause['compare'], $numeric_operators, true ) ) {
+		$clause['compare'] = '=';
+	}
+
+	if ( isset( $clause['compare_key'] ) ) {
+		$clause['compare_key'] = strtoupper( $clause['compare_key'] );
+	} else {
+		$clause['compare_key'] = isset( $clause['key'] ) &amp;&amp; is_array( $clause['key'] ) ? 'IN' : '=';
+	}
+
+	if ( ! in_array( $clause['compare_key'], $non_numeric_operators, true ) ) {
+		$clause['compare_key'] = '=';
+	}
+
+	$meta_compare     = $clause['compare'];
+	$meta_compare_key = $clause['compare_key'];
+
+	// First build the JOIN clause, if one is required.
+	$join = '';
+
+	// We prefer to avoid joins if possible. Look for an existing join compatible with this clause.
+	$alias = $this-&gt;find_compatible_table_alias( $clause, $parent_query );
+	if ( false === $alias ) {
+		$i     = count( $this-&gt;table_aliases );
+		$alias = $i ? 'mt' . $i : $this-&gt;meta_table;
+
+		// JOIN clauses for NOT EXISTS have their own syntax.
+		if ( 'NOT EXISTS' === $meta_compare ) {
+			$join .= " LEFT JOIN $this-&gt;meta_table";
+			$join .= $i ? " AS $alias" : '';
+
+			if ( 'LIKE' === $meta_compare_key ) {
+				$join .= $wpdb-&gt;prepare( " ON ( $this-&gt;primary_table.$this-&gt;primary_id_column = $alias.$this-&gt;meta_id_column AND $alias.meta_key LIKE %s )", '%' . $wpdb-&gt;esc_like( $clause['key'] ) . '%' );
+			} else {
+				$join .= $wpdb-&gt;prepare( " ON ( $this-&gt;primary_table.$this-&gt;primary_id_column = $alias.$this-&gt;meta_id_column AND $alias.meta_key = %s )", $clause['key'] );
+			}
+
+			// All other JOIN clauses.
+		} else {
+			$join .= " INNER JOIN $this-&gt;meta_table";
+			$join .= $i ? " AS $alias" : '';
+			$join .= " ON ( $this-&gt;primary_table.$this-&gt;primary_id_column = $alias.$this-&gt;meta_id_column )";
+		}
+
+		$this-&gt;table_aliases[] = $alias;
+		$sql_chunks['join'][]  = $join;
+	}
+
+	// Save the alias to this clause, for future siblings to find.
+	$clause['alias'] = $alias;
+
+	// Determine the data type.
+	$_meta_type     = isset( $clause['type'] ) ? $clause['type'] : '';
+	$meta_type      = $this-&gt;get_cast_for_type( $_meta_type );
+	$clause['cast'] = $meta_type;
+
+	// Fallback for clause keys is the table alias. Key must be a string.
+	if ( is_int( $clause_key ) || ! $clause_key ) {
+		$clause_key = $clause['alias'];
+	}
+
+	// Ensure unique clause keys, so none are overwritten.
+	$iterator        = 1;
+	$clause_key_base = $clause_key;
+	while ( isset( $this-&gt;clauses[ $clause_key ] ) ) {
+		$clause_key = $clause_key_base . '-' . $iterator;
+		$iterator++;
+	}
+
+	// Store the clause in our flat array.
+	$this-&gt;clauses[ $clause_key ] =&amp; $clause;
+
+	// Next, build the WHERE clause.
+
+	// meta_key.
+	if ( array_key_exists( 'key', $clause ) ) {
+		if ( 'NOT EXISTS' === $meta_compare ) {
+			$sql_chunks['where'][] = $alias . '.' . $this-&gt;meta_id_column . ' IS NULL';
+		} else {
+			/**
+			 * In joined clauses negative operators have to be nested into a
+			 * NOT EXISTS clause and flipped, to avoid returning records with
+			 * matching post IDs but different meta keys. Here we prepare the
+			 * nested clause.
+			 */
+			if ( in_array( $meta_compare_key, array( '!=', 'NOT IN', 'NOT LIKE', 'NOT EXISTS', 'NOT REGEXP' ), true ) ) {
+				// Negative clauses may be reused.
+				$i                     = count( $this-&gt;table_aliases );
+				$subquery_alias        = $i ? 'mt' . $i : $this-&gt;meta_table;
+				$this-&gt;table_aliases[] = $subquery_alias;
+
+				$meta_compare_string_start  = 'NOT EXISTS (';
+				$meta_compare_string_start .= "SELECT 1 FROM $wpdb-&gt;postmeta $subquery_alias ";
+				$meta_compare_string_start .= "WHERE $subquery_alias.post_ID = $alias.post_ID ";
+				$meta_compare_string_end    = 'LIMIT 1';
+				$meta_compare_string_end   .= ')';
+			}
+
+			switch ( $meta_compare_key ) {
+				case '=':
+				case 'EXISTS':
+					$where = $wpdb-&gt;prepare( "$alias.meta_key = %s", trim( $clause['key'] ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					break;
+				case 'LIKE':
+					$meta_compare_value = '%' . $wpdb-&gt;esc_like( trim( $clause['key'] ) ) . '%';
+					$where              = $wpdb-&gt;prepare( "$alias.meta_key LIKE %s", $meta_compare_value ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					break;
+				case 'IN':
+					$meta_compare_string = "$alias.meta_key IN (" . substr( str_repeat( ',%s', count( $clause['key'] ) ), 1 ) . ')';
+					$where               = $wpdb-&gt;prepare( $meta_compare_string, $clause['key'] ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+					break;
+				case 'RLIKE':
+				case 'REGEXP':
+					$operator = $meta_compare_key;
+					if ( isset( $clause['type_key'] ) &amp;&amp; 'BINARY' === strtoupper( $clause['type_key'] ) ) {
+						$cast     = 'BINARY';
+						$meta_key = "CAST($alias.meta_key AS BINARY)";
+					} else {
+						$cast     = '';
+						$meta_key = "$alias.meta_key";
+					}
+					$where = $wpdb-&gt;prepare( "$meta_key $operator $cast %s", trim( $clause['key'] ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					break;
+
+				case '!=':
+				case 'NOT EXISTS':
+					$meta_compare_string = $meta_compare_string_start . "AND $subquery_alias.meta_key = %s " . $meta_compare_string_end;
+					$where               = $wpdb-&gt;prepare( $meta_compare_string, $clause['key'] ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+					break;
+				case 'NOT LIKE':
+					$meta_compare_string = $meta_compare_string_start . "AND $subquery_alias.meta_key LIKE %s " . $meta_compare_string_end;
+
+					$meta_compare_value = '%' . $wpdb-&gt;esc_like( trim( $clause['key'] ) ) . '%';
+					$where              = $wpdb-&gt;prepare( $meta_compare_string, $meta_compare_value ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+					break;
+				case 'NOT IN':
+					$array_subclause     = '(' . substr( str_repeat( ',%s', count( $clause['key'] ) ), 1 ) . ') ';
+					$meta_compare_string = $meta_compare_string_start . "AND $subquery_alias.meta_key IN " . $array_subclause . $meta_compare_string_end;
+					$where               = $wpdb-&gt;prepare( $meta_compare_string, $clause['key'] ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+					break;
+				case 'NOT REGEXP':
+					$operator = $meta_compare_key;
+					if ( isset( $clause['type_key'] ) &amp;&amp; 'BINARY' === strtoupper( $clause['type_key'] ) ) {
+						$cast     = 'BINARY';
+						$meta_key = "CAST($subquery_alias.meta_key AS BINARY)";
+					} else {
+						$cast     = '';
+						$meta_key = "$subquery_alias.meta_key";
+					}
+
+					$meta_compare_string = $meta_compare_string_start . "AND $meta_key REGEXP $cast %s " . $meta_compare_string_end;
+					$where               = $wpdb-&gt;prepare( $meta_compare_string, $clause['key'] ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+					break;
+			}
+
+			$sql_chunks['where'][] = $where;
+		}
+	}
+
+	// meta_value.
+	if ( array_key_exists( 'value', $clause ) ) {
+		$meta_value = $clause['value'];
+
+		if ( in_array( $meta_compare, array( 'IN', 'NOT IN', 'BETWEEN', 'NOT BETWEEN' ), true ) ) {
+			if ( ! is_array( $meta_value ) ) {
+				$meta_value = preg_split( '/[,\s]+/', $meta_value );
+			}
+		} elseif ( is_string( $meta_value ) ) {
+			$meta_value = trim( $meta_value );
+		}
+
+		switch ( $meta_compare ) {
+			case 'IN':
+			case 'NOT IN':
+				$meta_compare_string = '(' . substr( str_repeat( ',%s', count( $meta_value ) ), 1 ) . ')';
+				$where               = $wpdb-&gt;prepare( $meta_compare_string, $meta_value );
+				break;
+
+			case 'BETWEEN':
+			case 'NOT BETWEEN':
+				$where = $wpdb-&gt;prepare( '%s AND %s', $meta_value[0], $meta_value[1] );
+				break;
+
+			case 'LIKE':
+			case 'NOT LIKE':
+				$meta_value = '%' . $wpdb-&gt;esc_like( $meta_value ) . '%';
+				$where      = $wpdb-&gt;prepare( '%s', $meta_value );
+				break;
+
+			// EXISTS with a value is interpreted as '='.
+			case 'EXISTS':
+				$meta_compare = '=';
+				$where        = $wpdb-&gt;prepare( '%s', $meta_value );
+				break;
+
+			// 'value' is ignored for NOT EXISTS.
+			case 'NOT EXISTS':
+				$where = '';
+				break;
+
+			default:
+				$where = $wpdb-&gt;prepare( '%s', $meta_value );
+				break;
+
+		}
+
+		if ( $where ) {
+			if ( 'CHAR' === $meta_type ) {
+				$sql_chunks['where'][] = "$alias.meta_value {$meta_compare} {$where}";
+			} else {
+				$sql_chunks['where'][] = "CAST($alias.meta_value AS {$meta_type}) {$meta_compare} {$where}";
+			}
+		}
+	}
+
+	/*
+	 * Multiple WHERE clauses (for meta_key and meta_value) should
+	 * be joined in parentheses.
+	 */
+	if ( 1 &lt; count( $sql_chunks['where'] ) ) {
+		$sql_chunks['where'] = array( '( ' . implode( ' AND ', $sql_chunks['where'] ) . ' )' );
+	}
+
+	return $sql_chunks;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="3">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="find_compatible_table_alias.html">WP_Meta_Query::find_compatible_table_alias()</a> <span>wp-includes/class-wp-meta-query.php</span> </td> <td class="related-desc"> <p>Identify an existing table alias that is compatible with the current query clause.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/esc_like.html">wpdb::esc_like()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>First half of escaping for <code>LIKE</code> special characters <code>%</code> and <code>_</code> before preparing for SQL.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_cast_for_type.html">WP_Meta_Query::get_cast_for_type()</a> <span>wp-includes/class-wp-meta-query.php</span> </td> <td class="related-desc"> <p>Return the appropriate alias for the given meta type if applicable.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/prepare.html">wpdb::prepare()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Prepares a SQL query for safe execution.</p> </td> </tr> </tbody>
+
+</table>   </article>  <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="get_sql_for_query.html">WP_Meta_Query::get_sql_for_query()</a> <span>wp-includes/class-wp-meta-query.php</span> </td> <td class="related-desc"> <p>Generate SQL clauses for a single query array.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.1.0/" alt="WordPress 4.1.0">4.1.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_meta_query/get_sql_for_clause" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_meta_query/get_sql_for_clause</a>
+  </p>
+</div>

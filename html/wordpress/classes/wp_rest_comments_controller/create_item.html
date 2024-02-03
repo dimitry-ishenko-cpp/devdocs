@@ -1,0 +1,212 @@
+<h1>WP_REST_Comments_Controller::create_item( WP_REST_Request $request ): WP_REST_Response|WP_Error</h1>  <section> <p>Creates a comment.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$request</code> <span class="type"><span class="WP_REST_Request"><a href="../wp_rest_request.html" rel="class">WP_REST_Request</a></span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Full details about the request.</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type"><a href="../wp_rest_response.html" rel="class">WP_REST_Response</a>|<a href="../wp_error.html" rel="class">WP_Error</a></span> Response object on success, or error object on failure.</p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/rest-api/endpoints/class-wp-rest-comments-controller.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/rest-api/endpoints/class-wp-rest-comments-controller.php/">View all references</a> </p> <pre class="wp-block-code" data-start="567" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function create_item( $request ) {
+	if ( ! empty( $request['id'] ) ) {
+		return new WP_Error(
+			'rest_comment_exists',
+			__( 'Cannot create existing comment.' ),
+			array( 'status' =&gt; 400 )
+		);
+	}
+
+	// Do not allow comments to be created with a non-default type.
+	if ( ! empty( $request['type'] ) &amp;&amp; 'comment' !== $request['type'] ) {
+		return new WP_Error(
+			'rest_invalid_comment_type',
+			__( 'Cannot create a comment with that type.' ),
+			array( 'status' =&gt; 400 )
+		);
+	}
+
+	$prepared_comment = $this-&gt;prepare_item_for_database( $request );
+	if ( is_wp_error( $prepared_comment ) ) {
+		return $prepared_comment;
+	}
+
+	$prepared_comment['comment_type'] = 'comment';
+
+	if ( ! isset( $prepared_comment['comment_content'] ) ) {
+		$prepared_comment['comment_content'] = '';
+	}
+
+	if ( ! $this-&gt;check_is_comment_content_allowed( $prepared_comment ) ) {
+		return new WP_Error(
+			'rest_comment_content_invalid',
+			__( 'Invalid comment content.' ),
+			array( 'status' =&gt; 400 )
+		);
+	}
+
+	// Setting remaining values before wp_insert_comment so we can use wp_allow_comment().
+	if ( ! isset( $prepared_comment['comment_date_gmt'] ) ) {
+		$prepared_comment['comment_date_gmt'] = current_time( 'mysql', true );
+	}
+
+	// Set author data if the user's logged in.
+	$missing_author = empty( $prepared_comment['user_id'] )
+		&amp;&amp; empty( $prepared_comment['comment_author'] )
+		&amp;&amp; empty( $prepared_comment['comment_author_email'] )
+		&amp;&amp; empty( $prepared_comment['comment_author_url'] );
+
+	if ( is_user_logged_in() &amp;&amp; $missing_author ) {
+		$user = wp_get_current_user();
+
+		$prepared_comment['user_id']              = $user-&gt;ID;
+		$prepared_comment['comment_author']       = $user-&gt;display_name;
+		$prepared_comment['comment_author_email'] = $user-&gt;user_email;
+		$prepared_comment['comment_author_url']   = $user-&gt;user_url;
+	}
+
+	// Honor the discussion setting that requires a name and email address of the comment author.
+	if ( get_option( 'require_name_email' ) ) {
+		if ( empty( $prepared_comment['comment_author'] ) || empty( $prepared_comment['comment_author_email'] ) ) {
+			return new WP_Error(
+				'rest_comment_author_data_required',
+				__( 'Creating a comment requires valid author name and email values.' ),
+				array( 'status' =&gt; 400 )
+			);
+		}
+	}
+
+	if ( ! isset( $prepared_comment['comment_author_email'] ) ) {
+		$prepared_comment['comment_author_email'] = '';
+	}
+
+	if ( ! isset( $prepared_comment['comment_author_url'] ) ) {
+		$prepared_comment['comment_author_url'] = '';
+	}
+
+	if ( ! isset( $prepared_comment['comment_agent'] ) ) {
+		$prepared_comment['comment_agent'] = '';
+	}
+
+	$check_comment_lengths = wp_check_comment_data_max_lengths( $prepared_comment );
+
+	if ( is_wp_error( $check_comment_lengths ) ) {
+		$error_code = $check_comment_lengths-&gt;get_error_code();
+		return new WP_Error(
+			$error_code,
+			__( 'Comment field exceeds maximum length allowed.' ),
+			array( 'status' =&gt; 400 )
+		);
+	}
+
+	$prepared_comment['comment_approved'] = wp_allow_comment( $prepared_comment, true );
+
+	if ( is_wp_error( $prepared_comment['comment_approved'] ) ) {
+		$error_code    = $prepared_comment['comment_approved']-&gt;get_error_code();
+		$error_message = $prepared_comment['comment_approved']-&gt;get_error_message();
+
+		if ( 'comment_duplicate' === $error_code ) {
+			return new WP_Error(
+				$error_code,
+				$error_message,
+				array( 'status' =&gt; 409 )
+			);
+		}
+
+		if ( 'comment_flood' === $error_code ) {
+			return new WP_Error(
+				$error_code,
+				$error_message,
+				array( 'status' =&gt; 400 )
+			);
+		}
+
+		return $prepared_comment['comment_approved'];
+	}
+
+	/**
+	 * Filters a comment before it is inserted via the REST API.
+	 *
+	 * Allows modification of the comment right before it is inserted via wp_insert_comment().
+	 * Returning a WP_Error value from the filter will short-circuit insertion and allow
+	 * skipping further processing.
+	 *
+	 * @since 4.7.0
+	 * @since 4.8.0 `$prepared_comment` can now be a WP_Error to short-circuit insertion.
+	 *
+	 * @param array|WP_Error  $prepared_comment The prepared comment data for wp_insert_comment().
+	 * @param WP_REST_Request $request          Request used to insert the comment.
+	 */
+	$prepared_comment = apply_filters( 'rest_pre_insert_comment', $prepared_comment, $request );
+	if ( is_wp_error( $prepared_comment ) ) {
+		return $prepared_comment;
+	}
+
+	$comment_id = wp_insert_comment( wp_filter_comment( wp_slash( (array) $prepared_comment ) ) );
+
+	if ( ! $comment_id ) {
+		return new WP_Error(
+			'rest_comment_failed_create',
+			__( 'Creating comment failed.' ),
+			array( 'status' =&gt; 500 )
+		);
+	}
+
+	if ( isset( $request['status'] ) ) {
+		$this-&gt;handle_status_param( $request['status'], $comment_id );
+	}
+
+	$comment = get_comment( $comment_id );
+
+	/**
+	 * Fires after a comment is created or updated via the REST API.
+	 *
+	 * @since 4.7.0
+	 *
+	 * @param WP_Comment      $comment  Inserted or updated comment object.
+	 * @param WP_REST_Request $request  Request object.
+	 * @param bool            $creating True when creating a comment, false
+	 *                                  when updating.
+	 */
+	do_action( 'rest_insert_comment', $comment, $request, true );
+
+	$schema = $this-&gt;get_item_schema();
+
+	if ( ! empty( $schema['properties']['meta'] ) &amp;&amp; isset( $request['meta'] ) ) {
+		$meta_update = $this-&gt;meta-&gt;update_value( $request['meta'], $comment_id );
+
+		if ( is_wp_error( $meta_update ) ) {
+			return $meta_update;
+		}
+	}
+
+	$fields_update = $this-&gt;update_additional_fields_for_object( $comment, $request );
+
+	if ( is_wp_error( $fields_update ) ) {
+		return $fields_update;
+	}
+
+	$context = current_user_can( 'moderate_comments' ) ? 'edit' : 'view';
+	$request-&gt;set_param( 'context', $context );
+
+	/**
+	 * Fires completely after a comment is created or updated via the REST API.
+	 *
+	 * @since 5.0.0
+	 *
+	 * @param WP_Comment      $comment  Inserted or updated comment object.
+	 * @param WP_REST_Request $request  Request object.
+	 * @param bool            $creating True when creating a comment, false
+	 *                                  when updating.
+	 */
+	do_action( 'rest_after_insert_comment', $comment, $request, true );
+
+	$response = $this-&gt;prepare_item_for_response( $comment, $request );
+	$response = rest_ensure_response( $response );
+
+	$response-&gt;set_status( 201 );
+	$response-&gt;header( 'Location', rest_url( sprintf( '%s/%s/%d', $this-&gt;namespace, $this-&gt;rest_base, $comment_id ) ) );
+
+	return $response;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/rest_after_insert_comment.html" style="text-decoration: none"> <span class="hook-func">do_action</span>( 'rest_after_insert_comment', <nobr><span class="arg-type">WP_Comment</span> <span class="arg-name">$comment</span></nobr>, <nobr><span class="arg-type">WP_REST_Request</span> <span class="arg-name">$request</span></nobr>, <nobr><span class="arg-type">bool</span> <span class="arg-name">$creating</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Fires completely after a comment is created or updated via the REST API.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/rest_insert_comment.html" style="text-decoration: none"> <span class="hook-func">do_action</span>( 'rest_insert_comment', <nobr><span class="arg-type">WP_Comment</span> <span class="arg-name">$comment</span></nobr>, <nobr><span class="arg-type">WP_REST_Request</span> <span class="arg-name">$request</span></nobr>, <nobr><span class="arg-type">bool</span> <span class="arg-name">$creating</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Fires after a comment is created or updated via the REST API.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/rest_pre_insert_comment.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'rest_pre_insert_comment', <nobr><span class="arg-type">array|WP_Error</span> <span class="arg-name">$prepared_comment</span></nobr>, <nobr><span class="arg-type">WP_REST_Request</span> <span class="arg-name">$request</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters a comment before it is inserted via the REST API.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="check_is_comment_content_allowed.html">WP_REST_Comments_Controller::check_is_comment_content_allowed()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-comments-controller.php</span> </td> <td class="related-desc"> <p>If empty comments are not allowed, checks if the provided comment content is not empty.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_item_schema.html">WP_REST_Comments_Controller::get_item_schema()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-comments-controller.php</span> </td> <td class="related-desc"> <p>Retrieves the comment’s schema, conforming to JSON Schema.</p> </td> </tr> <tr> <td class="related-title"> <a href="prepare_item_for_database.html">WP_REST_Comments_Controller::prepare_item_for_database()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-comments-controller.php</span> </td> <td class="related-desc"> <p>Prepares a single comment to be inserted into the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="prepare_item_for_response.html">WP_REST_Comments_Controller::prepare_item_for_response()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-comments-controller.php</span> </td> <td class="related-desc"> <p>Prepares a single comment output for response.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_check_comment_data_max_lengths.html">wp_check_comment_data_max_lengths()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Compares the lengths of comment data against the maximum character limits.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_allow_comment.html">wp_allow_comment()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Validates whether this comment is allowed to be made.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_filter_comment.html">wp_filter_comment()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Filters and sanitizes comment data.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_insert_comment.html">wp_insert_comment()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Inserts a comment into the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="handle_status_param.html">WP_REST_Comments_Controller::handle_status_param()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-comments-controller.php</span> </td> <td class="related-desc"> <p>Sets the comment_status of a given comment object when creating or updating a comment.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_get_current_user.html">wp_get_current_user()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Retrieves the current user object.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/current_time.html">current_time()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Retrieves the current time based on specified type.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_option.html">get_option()</a> <span>wp-includes/option.php</span> </td> <td class="related-desc"> <p>Retrieves an option value based on an option name.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_comment.html">get_comment()</a> <span>wp-includes/comment.php</span> </td> <td class="related-desc"> <p>Retrieves comment data given a comment ID or comment object.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_user_logged_in.html">is_user_logged_in()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Determines whether the current visitor is a logged in user.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/do_action.html">do_action()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to an action hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_slash.html">wp_slash()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Adds slashes to a string or recursively adds slashes to strings within an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/current_user_can.html">current_user_can()</a> <span>wp-includes/capabilities.php</span> </td> <td class="related-desc"> <p>Returns whether the current user has the specified capability.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/rest_url.html">rest_url()</a> <span>wp-includes/rest-api.php</span> </td> <td class="related-desc"> <p>Retrieves the URL to a REST endpoint.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/rest_ensure_response.html">rest_ensure_response()</a> <span>wp-includes/rest-api.php</span> </td> <td class="related-desc"> <p>Ensures a REST response is a response object (for consistency).</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_error/__construct.html">WP_Error::__construct()</a> <span>wp-includes/class-wp-error.php</span> </td> <td class="related-desc"> <p>Initializes the error.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.7.0/" alt="WordPress 4.7.0">4.7.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_rest_comments_controller/create_item" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_rest_comments_controller/create_item</a>
+  </p>
+</div>

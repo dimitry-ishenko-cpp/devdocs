@@ -1,0 +1,142 @@
+<h1>WP_REST_Users_Controller::get_items( WP_REST_Request $request ): WP_REST_Response|WP_Error</h1>  <section> <p>Retrieves all users.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$request</code> <span class="type"><span class="WP_REST_Request"><a href="../wp_rest_request.html" rel="class">WP_REST_Request</a></span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">Full details about the request.</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type"><a href="../wp_rest_response.html" rel="class">WP_REST_Response</a>|<a href="../wp_error.html" rel="class">WP_Error</a></span> Response object on success, or <a href="../wp_error.html" rel="class">WP_Error</a> object on failure.</p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/rest-api/endpoints/class-wp-rest-users-controller.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/rest-api/endpoints/class-wp-rest-users-controller.php/">View all references</a> </p> <pre class="wp-block-code" data-start="254" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function get_items( $request ) {
+
+	// Retrieve the list of registered collection query parameters.
+	$registered = $this-&gt;get_collection_params();
+
+	/*
+	 * This array defines mappings between public API query parameters whose
+	 * values are accepted as-passed, and their internal WP_Query parameter
+	 * name equivalents (some are the same). Only values which are also
+	 * present in $registered will be set.
+	 */
+	$parameter_mappings = array(
+		'exclude'      =&gt; 'exclude',
+		'include'      =&gt; 'include',
+		'order'        =&gt; 'order',
+		'per_page'     =&gt; 'number',
+		'search'       =&gt; 'search',
+		'roles'        =&gt; 'role__in',
+		'capabilities' =&gt; 'capability__in',
+		'slug'         =&gt; 'nicename__in',
+	);
+
+	$prepared_args = array();
+
+	/*
+	 * For each known parameter which is both registered and present in the request,
+	 * set the parameter's value on the query $prepared_args.
+	 */
+	foreach ( $parameter_mappings as $api_param =&gt; $wp_param ) {
+		if ( isset( $registered[ $api_param ], $request[ $api_param ] ) ) {
+			$prepared_args[ $wp_param ] = $request[ $api_param ];
+		}
+	}
+
+	if ( isset( $registered['offset'] ) &amp;&amp; ! empty( $request['offset'] ) ) {
+		$prepared_args['offset'] = $request['offset'];
+	} else {
+		$prepared_args['offset'] = ( $request['page'] - 1 ) * $prepared_args['number'];
+	}
+
+	if ( isset( $registered['orderby'] ) ) {
+		$orderby_possibles        = array(
+			'id'              =&gt; 'ID',
+			'include'         =&gt; 'include',
+			'name'            =&gt; 'display_name',
+			'registered_date' =&gt; 'registered',
+			'slug'            =&gt; 'user_nicename',
+			'include_slugs'   =&gt; 'nicename__in',
+			'email'           =&gt; 'user_email',
+			'url'             =&gt; 'user_url',
+		);
+		$prepared_args['orderby'] = $orderby_possibles[ $request['orderby'] ];
+	}
+
+	if ( isset( $registered['who'] ) &amp;&amp; ! empty( $request['who'] ) &amp;&amp; 'authors' === $request['who'] ) {
+		$prepared_args['who'] = 'authors';
+	} elseif ( ! current_user_can( 'list_users' ) ) {
+		$prepared_args['has_published_posts'] = get_post_types( array( 'show_in_rest' =&gt; true ), 'names' );
+	}
+
+	if ( ! empty( $request['has_published_posts'] ) ) {
+		$prepared_args['has_published_posts'] = ( true === $request['has_published_posts'] )
+			? get_post_types( array( 'show_in_rest' =&gt; true ), 'names' )
+			: (array) $request['has_published_posts'];
+	}
+
+	if ( ! empty( $prepared_args['search'] ) ) {
+		$prepared_args['search'] = '*' . $prepared_args['search'] . '*';
+	}
+	/**
+	 * Filters WP_User_Query arguments when querying users via the REST API.
+	 *
+	 * @link https://developer.wordpress.org/reference/classes/wp_user_query/
+	 *
+	 * @since 4.7.0
+	 *
+	 * @param array           $prepared_args Array of arguments for WP_User_Query.
+	 * @param WP_REST_Request $request       The REST API request.
+	 */
+	$prepared_args = apply_filters( 'rest_user_query', $prepared_args, $request );
+
+	$query = new WP_User_Query( $prepared_args );
+
+	$users = array();
+
+	foreach ( $query-&gt;results as $user ) {
+		$data    = $this-&gt;prepare_item_for_response( $user, $request );
+		$users[] = $this-&gt;prepare_response_for_collection( $data );
+	}
+
+	$response = rest_ensure_response( $users );
+
+	// Store pagination values for headers then unset for count query.
+	$per_page = (int) $prepared_args['number'];
+	$page     = ceil( ( ( (int) $prepared_args['offset'] ) / $per_page ) + 1 );
+
+	$prepared_args['fields'] = 'ID';
+
+	$total_users = $query-&gt;get_total();
+
+	if ( $total_users &lt; 1 ) {
+		// Out-of-bounds, run the query again without LIMIT for total count.
+		unset( $prepared_args['number'], $prepared_args['offset'] );
+		$count_query = new WP_User_Query( $prepared_args );
+		$total_users = $count_query-&gt;get_total();
+	}
+
+	$response-&gt;header( 'X-WP-Total', (int) $total_users );
+
+	$max_pages = ceil( $total_users / $per_page );
+
+	$response-&gt;header( 'X-WP-TotalPages', (int) $max_pages );
+
+	$base = add_query_arg( urlencode_deep( $request-&gt;get_query_params() ), rest_url( sprintf( '%s/%s', $this-&gt;namespace, $this-&gt;rest_base ) ) );
+	if ( $page &gt; 1 ) {
+		$prev_page = $page - 1;
+
+		if ( $prev_page &gt; $max_pages ) {
+			$prev_page = $max_pages;
+		}
+
+		$prev_link = add_query_arg( 'page', $prev_page, $base );
+		$response-&gt;link_header( 'prev', $prev_link );
+	}
+	if ( $max_pages &gt; $page ) {
+		$next_page = $page + 1;
+		$next_link = add_query_arg( 'page', $next_page, $base );
+
+		$response-&gt;link_header( 'next', $next_link );
+	}
+
+	return $response;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/rest_user_query.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'rest_user_query', <nobr><span class="arg-type">array</span> <span class="arg-name">$prepared_args</span></nobr>, <nobr><span class="arg-type">WP_REST_Request</span> <span class="arg-name">$request</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters <a href="../wp_user_query.html" rel="class">WP_User_Query</a> arguments when querying users via the REST API.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="4">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="get_collection_params.html">WP_REST_Users_Controller::get_collection_params()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-users-controller.php</span> </td> <td class="related-desc"> <p>Retrieves the query params for collections.</p> </td> </tr> <tr> <td class="related-title"> <a href="prepare_item_for_response.html">WP_REST_Users_Controller::prepare_item_for_response()</a> <span>wp-includes/rest-api/endpoints/class-wp-rest-users-controller.php</span> </td> <td class="related-desc"> <p>Prepares a single user output for response.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/urlencode_deep.html">urlencode_deep()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Navigates through an array, object, or scalar, and encodes the values to be used in a URL.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_user_query/__construct.html">WP_User_Query::__construct()</a> <span>wp-includes/class-wp-user-query.php</span> </td> <td class="related-desc"> <p>PHP5 constructor.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/rest_ensure_response.html">rest_ensure_response()</a> <span>wp-includes/rest-api.php</span> </td> <td class="related-desc"> <p>Ensures a REST response is a response object (for consistency).</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/rest_url.html">rest_url()</a> <span>wp-includes/rest-api.php</span> </td> <td class="related-desc"> <p>Retrieves the URL to a REST endpoint.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/current_user_can.html">current_user_can()</a> <span>wp-includes/capabilities.php</span> </td> <td class="related-desc"> <p>Returns whether the current user has the specified capability.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/add_query_arg.html">add_query_arg()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Retrieves a modified URL query string.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_post_types.html">get_post_types()</a> <span>wp-includes/post.php</span> </td> <td class="related-desc"> <p>Gets a list of all registered post type objects.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.7.0/" alt="WordPress 4.7.0">4.7.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_rest_users_controller/get_items" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_rest_users_controller/get_items</a>
+  </p>
+</div>

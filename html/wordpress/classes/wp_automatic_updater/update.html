@@ -1,0 +1,145 @@
+<h1>WP_Automatic_Updater::update( string $type, object $item ): null|WP_Error</h1>  <section> <p>Updates an item, if appropriate.</p> </section>   <section> <header class="toc-header"><h2 id="parameters">Parameters</h2></header> <dl> <dt> <code>$type</code> <span class="type"><span class="string">string</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">The type of update being checked: <code>'core'</code>, <code>'theme'</code>, <code>'plugin'</code>, <code>'translation'</code>.</span> </div> </dd> <dt> <code>$item</code> <span class="type"><span class="object">object</span></span> <span class="required">Required</span> </dt> <dd> <div class="desc"> <span class="description">The update offer.</span> </div> </dd> </dl> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type">null|<a href="../wp_error.html" rel="class">WP_Error</a></span> </p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-admin/includes/class-wp-automatic-updater.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-admin/includes/class-wp-automatic-updater.php/">View all references</a> </p> <pre class="wp-block-code" data-start="307" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function update( $type, $item ) {
+	$skin = new Automatic_Upgrader_Skin;
+
+	switch ( $type ) {
+		case 'core':
+			// The Core upgrader doesn't use the Upgrader's skin during the actual main part of the upgrade, instead, firing a filter.
+			add_filter( 'update_feedback', array( $skin, 'feedback' ) );
+			$upgrader = new Core_Upgrader( $skin );
+			$context  = ABSPATH;
+			break;
+		case 'plugin':
+			$upgrader = new Plugin_Upgrader( $skin );
+			$context  = WP_PLUGIN_DIR; // We don't support custom Plugin directories, or updates for WPMU_PLUGIN_DIR.
+			break;
+		case 'theme':
+			$upgrader = new Theme_Upgrader( $skin );
+			$context  = get_theme_root( $item-&gt;theme );
+			break;
+		case 'translation':
+			$upgrader = new Language_Pack_Upgrader( $skin );
+			$context  = WP_CONTENT_DIR; // WP_LANG_DIR;
+			break;
+	}
+
+	// Determine whether we can and should perform this update.
+	if ( ! $this-&gt;should_update( $type, $item, $context ) ) {
+		return false;
+	}
+
+	/**
+	 * Fires immediately prior to an auto-update.
+	 *
+	 * @since 4.4.0
+	 *
+	 * @param string $type    The type of update being checked: 'core', 'theme', 'plugin', or 'translation'.
+	 * @param object $item    The update offer.
+	 * @param string $context The filesystem context (a path) against which filesystem access and status
+	 *                        should be checked.
+	 */
+	do_action( 'pre_auto_update', $type, $item, $context );
+
+	$upgrader_item = $item;
+	switch ( $type ) {
+		case 'core':
+			/* translators: %s: WordPress version. */
+			$skin-&gt;feedback( __( 'Updating to WordPress %s' ), $item-&gt;version );
+			/* translators: %s: WordPress version. */
+			$item_name = sprintf( __( 'WordPress %s' ), $item-&gt;version );
+			break;
+		case 'theme':
+			$upgrader_item = $item-&gt;theme;
+			$theme         = wp_get_theme( $upgrader_item );
+			$item_name     = $theme-&gt;Get( 'Name' );
+			// Add the current version so that it can be reported in the notification email.
+			$item-&gt;current_version = $theme-&gt;get( 'Version' );
+			if ( empty( $item-&gt;current_version ) ) {
+				$item-&gt;current_version = false;
+			}
+			/* translators: %s: Theme name. */
+			$skin-&gt;feedback( __( 'Updating theme: %s' ), $item_name );
+			break;
+		case 'plugin':
+			$upgrader_item = $item-&gt;plugin;
+			$plugin_data   = get_plugin_data( $context . '/' . $upgrader_item );
+			$item_name     = $plugin_data['Name'];
+			// Add the current version so that it can be reported in the notification email.
+			$item-&gt;current_version = $plugin_data['Version'];
+			if ( empty( $item-&gt;current_version ) ) {
+				$item-&gt;current_version = false;
+			}
+			/* translators: %s: Plugin name. */
+			$skin-&gt;feedback( __( 'Updating plugin: %s' ), $item_name );
+			break;
+		case 'translation':
+			$language_item_name = $upgrader-&gt;get_name_for_update( $item );
+			/* translators: %s: Project name (plugin, theme, or WordPress). */
+			$item_name = sprintf( __( 'Translations for %s' ), $language_item_name );
+			/* translators: 1: Project name (plugin, theme, or WordPress), 2: Language. */
+			$skin-&gt;feedback( sprintf( __( 'Updating translations for %1$s (%2$s)&amp;#8230;' ), $language_item_name, $item-&gt;language ) );
+			break;
+	}
+
+	$allow_relaxed_file_ownership = false;
+	if ( 'core' === $type &amp;&amp; isset( $item-&gt;new_files ) &amp;&amp; ! $item-&gt;new_files ) {
+		$allow_relaxed_file_ownership = true;
+	}
+
+	// Boom, this site's about to get a whole new splash of paint!
+	$upgrade_result = $upgrader-&gt;upgrade(
+		$upgrader_item,
+		array(
+			'clear_update_cache'           =&gt; false,
+			// Always use partial builds if possible for core updates.
+			'pre_check_md5'                =&gt; false,
+			// Only available for core updates.
+			'attempt_rollback'             =&gt; true,
+			// Allow relaxed file ownership in some scenarios.
+			'allow_relaxed_file_ownership' =&gt; $allow_relaxed_file_ownership,
+		)
+	);
+
+	// If the filesystem is unavailable, false is returned.
+	if ( false === $upgrade_result ) {
+		$upgrade_result = new WP_Error( 'fs_unavailable', __( 'Could not access filesystem.' ) );
+	}
+
+	if ( 'core' === $type ) {
+		if ( is_wp_error( $upgrade_result )
+			&amp;&amp; ( 'up_to_date' === $upgrade_result-&gt;get_error_code()
+				|| 'locked' === $upgrade_result-&gt;get_error_code() )
+		) {
+			// These aren't actual errors, treat it as a skipped-update instead
+			// to avoid triggering the post-core update failure routines.
+			return false;
+		}
+
+		// Core doesn't output this, so let's append it, so we don't get confused.
+		if ( is_wp_error( $upgrade_result ) ) {
+			$upgrade_result-&gt;add( 'installation_failed', __( 'Installation failed.' ) );
+			$skin-&gt;error( $upgrade_result );
+		} else {
+			$skin-&gt;feedback( __( 'WordPress updated successfully.' ) );
+		}
+	}
+
+	$this-&gt;update_results[ $type ][] = (object) array(
+		'item'     =&gt; $item,
+		'result'   =&gt; $upgrade_result,
+		'name'     =&gt; $item_name,
+		'messages' =&gt; $skin-&gt;get_upgrade_messages(),
+	);
+
+	return $upgrade_result;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/pre_auto_update.html" style="text-decoration: none"> <span class="hook-func">do_action</span>( 'pre_auto_update', <nobr><span class="arg-type">string</span> <span class="arg-name">$type</span></nobr>, <nobr><span class="arg-type">object</span> <span class="arg-name">$item</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$context</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Fires immediately prior to an auto-update.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="3">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="should_update.html">WP_Automatic_Updater::should_update()</a> <span>wp-admin/includes/class-wp-automatic-updater.php</span> </td> <td class="related-desc"> <p>Tests to see if we can and should update a specific item.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_plugin_data.html">get_plugin_data()</a> <span>wp-admin/includes/plugin.php</span> </td> <td class="related-desc"> <p>Parses the plugin contents to retrieve plugin’s metadata.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_theme_root.html">get_theme_root()</a> <span>wp-includes/theme.php</span> </td> <td class="related-desc"> <p>Retrieves path to themes directory.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_get_theme.html">wp_get_theme()</a> <span>wp-includes/theme.php</span> </td> <td class="related-desc"> <p>Gets a <a href="../wp_theme.html" rel="class">WP_Theme</a> object for a theme.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/__.html">__()</a> <span>wp-includes/l10n.php</span> </td> <td class="related-desc"> <p>Retrieves the translation of $text.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/add_filter.html">add_filter()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Adds a callback function to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/do_action.html">do_action()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to an action hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_error/__construct.html">WP_Error::__construct()</a> <span>wp-includes/class-wp-error.php</span> </td> <td class="related-desc"> <p>Initializes the error.</p> </td> </tr> </tbody>
+
+</table>   </article>  <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="run.html">WP_Automatic_Updater::run()</a> <span>wp-admin/includes/class-wp-automatic-updater.php</span> </td> <td class="related-desc"> <p>Kicks off the background update process, looping through all pending updates.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/3.7.0/" alt="WordPress 3.7.0">3.7.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_automatic_updater/update" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_automatic_updater/update</a>
+  </p>
+</div>

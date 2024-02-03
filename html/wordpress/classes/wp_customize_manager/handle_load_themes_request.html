@@ -1,0 +1,171 @@
+<h1>WP_Customize_Manager::handle_load_themes_request()</h1>  <section> <p>Loads themes into the theme browsing/installation UI.</p> </section>   <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/class-wp-customize-manager.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-customize-manager.php/">View all references</a> </p> <pre class="wp-block-code" data-start="5787" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function handle_load_themes_request() {
+	check_ajax_referer( 'switch_themes', 'nonce' );
+
+	if ( ! current_user_can( 'switch_themes' ) ) {
+		wp_die( -1 );
+	}
+
+	if ( empty( $_POST['theme_action'] ) ) {
+		wp_send_json_error( 'missing_theme_action' );
+	}
+	$theme_action = sanitize_key( $_POST['theme_action'] );
+	$themes       = array();
+	$args         = array();
+
+	// Define query filters based on user input.
+	if ( ! array_key_exists( 'search', $_POST ) ) {
+		$args['search'] = '';
+	} else {
+		$args['search'] = sanitize_text_field( wp_unslash( $_POST['search'] ) );
+	}
+
+	if ( ! array_key_exists( 'tags', $_POST ) ) {
+		$args['tag'] = '';
+	} else {
+		$args['tag'] = array_map( 'sanitize_text_field', wp_unslash( (array) $_POST['tags'] ) );
+	}
+
+	if ( ! array_key_exists( 'page', $_POST ) ) {
+		$args['page'] = 1;
+	} else {
+		$args['page'] = absint( $_POST['page'] );
+	}
+
+	require_once ABSPATH . 'wp-admin/includes/theme.php';
+
+	if ( 'installed' === $theme_action ) {
+
+		// Load all installed themes from wp_prepare_themes_for_js().
+		$themes = array( 'themes' =&gt; array() );
+		foreach ( wp_prepare_themes_for_js() as $theme ) {
+			$theme['type']      = 'installed';
+			$theme['active']    = ( isset( $_POST['customized_theme'] ) &amp;&amp; $_POST['customized_theme'] === $theme['id'] );
+			$themes['themes'][] = $theme;
+		}
+	} elseif ( 'wporg' === $theme_action ) {
+
+		// Load WordPress.org themes from the .org API and normalize data to match installed theme objects.
+		if ( ! current_user_can( 'install_themes' ) ) {
+			wp_die( -1 );
+		}
+
+		// Arguments for all queries.
+		$wporg_args = array(
+			'per_page' =&gt; 100,
+			'fields'   =&gt; array(
+				'reviews_url' =&gt; true, // Explicitly request the reviews URL to be linked from the customizer.
+			),
+		);
+
+		$args = array_merge( $wporg_args, $args );
+
+		if ( '' === $args['search'] &amp;&amp; '' === $args['tag'] ) {
+			$args['browse'] = 'new'; // Sort by latest themes by default.
+		}
+
+		// Load themes from the .org API.
+		$themes = themes_api( 'query_themes', $args );
+		if ( is_wp_error( $themes ) ) {
+			wp_send_json_error();
+		}
+
+		// This list matches the allowed tags in wp-admin/includes/theme-install.php.
+		$themes_allowedtags                     = array_fill_keys(
+			array( 'a', 'abbr', 'acronym', 'code', 'pre', 'em', 'strong', 'div', 'p', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'img' ),
+			array()
+		);
+		$themes_allowedtags['a']                = array_fill_keys( array( 'href', 'title', 'target' ), true );
+		$themes_allowedtags['acronym']['title'] = true;
+		$themes_allowedtags['abbr']['title']    = true;
+		$themes_allowedtags['img']              = array_fill_keys( array( 'src', 'class', 'alt' ), true );
+
+		// Prepare a list of installed themes to check against before the loop.
+		$installed_themes = array();
+		$wp_themes        = wp_get_themes();
+		foreach ( $wp_themes as $theme ) {
+			$installed_themes[] = $theme-&gt;get_stylesheet();
+		}
+		$update_php = network_admin_url( 'update.php?action=install-theme' );
+
+		// Set up properties for themes available on WordPress.org.
+		foreach ( $themes-&gt;themes as &amp;$theme ) {
+			$theme-&gt;install_url = add_query_arg(
+				array(
+					'theme'    =&gt; $theme-&gt;slug,
+					'_wpnonce' =&gt; wp_create_nonce( 'install-theme_' . $theme-&gt;slug ),
+				),
+				$update_php
+			);
+
+			$theme-&gt;name        = wp_kses( $theme-&gt;name, $themes_allowedtags );
+			$theme-&gt;version     = wp_kses( $theme-&gt;version, $themes_allowedtags );
+			$theme-&gt;description = wp_kses( $theme-&gt;description, $themes_allowedtags );
+			$theme-&gt;stars       = wp_star_rating(
+				array(
+					'rating' =&gt; $theme-&gt;rating,
+					'type'   =&gt; 'percent',
+					'number' =&gt; $theme-&gt;num_ratings,
+					'echo'   =&gt; false,
+				)
+			);
+			$theme-&gt;num_ratings = number_format_i18n( $theme-&gt;num_ratings );
+			$theme-&gt;preview_url = set_url_scheme( $theme-&gt;preview_url );
+
+			// Handle themes that are already installed as installed themes.
+			if ( in_array( $theme-&gt;slug, $installed_themes, true ) ) {
+				$theme-&gt;type = 'installed';
+			} else {
+				$theme-&gt;type = $theme_action;
+			}
+
+			// Set active based on customized theme.
+			$theme-&gt;active = ( isset( $_POST['customized_theme'] ) &amp;&amp; $_POST['customized_theme'] === $theme-&gt;slug );
+
+			// Map available theme properties to installed theme properties.
+			$theme-&gt;id            = $theme-&gt;slug;
+			$theme-&gt;screenshot    = array( $theme-&gt;screenshot_url );
+			$theme-&gt;authorAndUri  = wp_kses( $theme-&gt;author['display_name'], $themes_allowedtags );
+			$theme-&gt;compatibleWP  = is_wp_version_compatible( $theme-&gt;requires ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName
+			$theme-&gt;compatiblePHP = is_php_version_compatible( $theme-&gt;requires_php ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName
+
+			if ( isset( $theme-&gt;parent ) ) {
+				$theme-&gt;parent = $theme-&gt;parent['slug'];
+			} else {
+				$theme-&gt;parent = false;
+			}
+			unset( $theme-&gt;slug );
+			unset( $theme-&gt;screenshot_url );
+			unset( $theme-&gt;author );
+		} // End foreach().
+	} // End if().
+
+	/**
+	 * Filters the theme data loaded in the customizer.
+	 *
+	 * This allows theme data to be loading from an external source,
+	 * or modification of data loaded from `wp_prepare_themes_for_js()`
+	 * or WordPress.org via `themes_api()`.
+	 *
+	 * @since 4.9.0
+	 *
+	 * @see wp_prepare_themes_for_js()
+	 * @see themes_api()
+	 * @see WP_Customize_Manager::__construct()
+	 *
+	 * @param array|stdClass       $themes  Nested array or object of theme data.
+	 * @param array                $args    List of arguments, such as page, search term, and tags to query for.
+	 * @param WP_Customize_Manager $manager Instance of Customize manager.
+	 */
+	$themes = apply_filters( 'customize_load_themes', $themes, $args, $this );
+
+	wp_send_json_success( $themes );
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/customize_load_themes.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'customize_load_themes', <nobr><span class="arg-type">array|stdClass</span> <span class="arg-name">$themes</span></nobr>, <nobr><span class="arg-type">array</span> <span class="arg-name">$args</span></nobr>, <nobr><span class="arg-type">WP_Customize_Manager</span> <span class="arg-name">$manager</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the theme data loaded in the customizer.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="../../functions/is_wp_version_compatible.html">is_wp_version_compatible()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Checks compatibility with the current WordPress version.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_prepare_themes_for_js.html">wp_prepare_themes_for_js()</a> <span>wp-admin/includes/theme.php</span> </td> <td class="related-desc"> <p>Prepares themes for JavaScript.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/themes_api.html">themes_api()</a> <span>wp-admin/includes/theme.php</span> </td> <td class="related-desc"> <p>Retrieves theme installer pages from the WordPress.org Themes API.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_star_rating.html">wp_star_rating()</a> <span>wp-admin/includes/template.php</span> </td> <td class="related-desc"> <p>Outputs a HTML element with a star rating for a given rating.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_get_themes.html">wp_get_themes()</a> <span>wp-includes/theme.php</span> </td> <td class="related-desc"> <p>Returns an array of <a href="../wp_theme.html" rel="class">WP_Theme</a> objects based on the arguments.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/sanitize_text_field.html">sanitize_text_field()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Sanitizes a string from user input or from the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/network_admin_url.html">network_admin_url()</a> <span>wp-includes/link-template.php</span> </td> <td class="related-desc"> <p>Retrieves the URL to the admin area for the network.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/set_url_scheme.html">set_url_scheme()</a> <span>wp-includes/link-template.php</span> </td> <td class="related-desc"> <p>Sets the scheme for a URL.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_create_nonce.html">wp_create_nonce()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Creates a cryptographic token tied to a specific action, user, user session, and window of time.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_php_version_compatible.html">is_php_version_compatible()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Checks compatibility with the current PHP version.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_kses.html">wp_kses()</a> <span>wp-includes/kses.php</span> </td> <td class="related-desc"> <p>Filters text content and strips out disallowed HTML.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_die.html">wp_die()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Kills WordPress execution and displays HTML page with an error message.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/number_format_i18n.html">number_format_i18n()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Converts float number to format based on the locale.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/add_query_arg.html">add_query_arg()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Retrieves a modified URL query string.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/check_ajax_referer.html">check_ajax_referer()</a> <span>wp-includes/pluggable.php</span> </td> <td class="related-desc"> <p>Verifies the Ajax request to prevent processing requests external of the blog.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_send_json_success.html">wp_send_json_success()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Sends a JSON response back to an Ajax request, indicating success.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/absint.html">absint()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Converts a value to non-negative integer.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_send_json_error.html">wp_send_json_error()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Sends a JSON response back to an Ajax request, indicating failure.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/sanitize_key.html">sanitize_key()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Sanitizes a string key.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_unslash.html">wp_unslash()</a> <span>wp-includes/formatting.php</span> </td> <td class="related-desc"> <p>Removes slashes from a string or recursively removes slashes from strings within an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/current_user_can.html">current_user_can()</a> <span>wp-includes/capabilities.php</span> </td> <td class="related-desc"> <p>Returns whether the current user has the specified capability.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_wp_error.html">is_wp_error()</a> <span>wp-includes/load.php</span> </td> <td class="related-desc"> <p>Checks whether the given variable is a WordPress Error.</p> </td> </tr> </tbody>
+
+</table>   </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.9.0/" alt="WordPress 4.9.0">4.9.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_customize_manager/handle_load_themes_request" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_customize_manager/handle_load_themes_request</a>
+  </p>
+</div>

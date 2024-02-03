@@ -1,0 +1,575 @@
+<h1>WP_Term_Query::get_terms(): WP_Term[]|int[]|string[]|string</h1>  <section> <p>Retrieves the query results.</p> </section>   <section> <header class="toc-header"><h2 id="description">Description</h2></header> <p>The return type varies depending on the value passed to <code>$args['fields']</code>.</p> <p>The following will result in an array of <code>WP_Term</code> objects being returned:</p> <ul> <li>‘all’</li> <li>‘all_with_object_id’</li> </ul> <p>The following will result in a numeric string being returned:</p> <ul> <li>‘count’</li> </ul> <p>The following will result in an array of text strings being returned:</p> <ul> <li>‘id=&gt;name’</li> <li>‘id=&gt;slug’</li> <li>‘names’</li> <li>‘slugs’</li> </ul> <p>The following will result in an array of numeric strings being returned:</p> <ul> <li>‘id=&gt;parent’</li> </ul> <p>The following will result in an array of integers being returned:</p> <ul> <li>‘ids’</li> <li>‘tt_ids’</li> </ul> </section>  <section> <header class="toc-header"><h2 id="return">Return</h2></header> <p><span class="return-type"><a href="../wp_term.html" rel="class">WP_Term</a>[]|int[]|string[]|string</span> Array of terms, or number of terms as numeric string when <code>'count'</code> is passed as a query var.</p> </section>  <section> <header class="toc-header"><h2 id="source">Source</h2></header> <p> File: <code>wp-includes/class-wp-term-query.php</code>. <a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-term-query.php/">View all references</a> </p> <pre class="wp-block-code" data-start="348" aria-label="Function source code" data-language="php"><code lang="php" class="language-php line-numbers">public function get_terms() {
+	global $wpdb;
+
+	$this-&gt;parse_query( $this-&gt;query_vars );
+	$args = &amp;$this-&gt;query_vars;
+
+	// Set up meta_query so it's available to 'pre_get_terms'.
+	$this-&gt;meta_query = new WP_Meta_Query();
+	$this-&gt;meta_query-&gt;parse_query_vars( $args );
+
+	/**
+	 * Fires before terms are retrieved.
+	 *
+	 * @since 4.6.0
+	 *
+	 * @param WP_Term_Query $query Current instance of WP_Term_Query (passed by reference).
+	 */
+	do_action_ref_array( 'pre_get_terms', array( &amp;$this ) );
+
+	$taxonomies = (array) $args['taxonomy'];
+
+	// Save queries by not crawling the tree in the case of multiple taxes or a flat tax.
+	$has_hierarchical_tax = false;
+	if ( $taxonomies ) {
+		foreach ( $taxonomies as $_tax ) {
+			if ( is_taxonomy_hierarchical( $_tax ) ) {
+				$has_hierarchical_tax = true;
+			}
+		}
+	} else {
+		// When no taxonomies are provided, assume we have to descend the tree.
+		$has_hierarchical_tax = true;
+	}
+
+	if ( ! $has_hierarchical_tax ) {
+		$args['hierarchical'] = false;
+		$args['pad_counts']   = false;
+	}
+
+	// 'parent' overrides 'child_of'.
+	if ( 0 &lt; (int) $args['parent'] ) {
+		$args['child_of'] = false;
+	}
+
+	if ( 'all' === $args['get'] ) {
+		$args['childless']    = false;
+		$args['child_of']     = 0;
+		$args['hide_empty']   = 0;
+		$args['hierarchical'] = false;
+		$args['pad_counts']   = false;
+	}
+
+	/**
+	 * Filters the terms query arguments.
+	 *
+	 * @since 3.1.0
+	 *
+	 * @param array    $args       An array of get_terms() arguments.
+	 * @param string[] $taxonomies An array of taxonomy names.
+	 */
+	$args = apply_filters( 'get_terms_args', $args, $taxonomies );
+
+	// Avoid the query if the queried parent/child_of term has no descendants.
+	$child_of = $args['child_of'];
+	$parent   = $args['parent'];
+
+	if ( $child_of ) {
+		$_parent = $child_of;
+	} elseif ( $parent ) {
+		$_parent = $parent;
+	} else {
+		$_parent = false;
+	}
+
+	if ( $_parent ) {
+		$in_hierarchy = false;
+		foreach ( $taxonomies as $_tax ) {
+			$hierarchy = _get_term_hierarchy( $_tax );
+
+			if ( isset( $hierarchy[ $_parent ] ) ) {
+				$in_hierarchy = true;
+			}
+		}
+
+		if ( ! $in_hierarchy ) {
+			if ( 'count' === $args['fields'] ) {
+				return 0;
+			} else {
+				$this-&gt;terms = array();
+				return $this-&gt;terms;
+			}
+		}
+	}
+
+	// 'term_order' is a legal sort order only when joining the relationship table.
+	$_orderby = $this-&gt;query_vars['orderby'];
+	if ( 'term_order' === $_orderby &amp;&amp; empty( $this-&gt;query_vars['object_ids'] ) ) {
+		$_orderby = 'term_id';
+	}
+
+	$orderby = $this-&gt;parse_orderby( $_orderby );
+
+	if ( $orderby ) {
+		$orderby = "ORDER BY $orderby";
+	}
+
+	$order = $this-&gt;parse_order( $this-&gt;query_vars['order'] );
+
+	if ( $taxonomies ) {
+		$this-&gt;sql_clauses['where']['taxonomy'] =
+			"tt.taxonomy IN ('" . implode( "', '", array_map( 'esc_sql', $taxonomies ) ) . "')";
+	}
+
+	if ( empty( $args['exclude'] ) ) {
+		$args['exclude'] = array();
+	}
+
+	if ( empty( $args['include'] ) ) {
+		$args['include'] = array();
+	}
+
+	$exclude      = $args['exclude'];
+	$exclude_tree = $args['exclude_tree'];
+	$include      = $args['include'];
+
+	$inclusions = '';
+	if ( ! empty( $include ) ) {
+		$exclude      = '';
+		$exclude_tree = '';
+		$inclusions   = implode( ',', wp_parse_id_list( $include ) );
+	}
+
+	if ( ! empty( $inclusions ) ) {
+		$this-&gt;sql_clauses['where']['inclusions'] = 't.term_id IN ( ' . $inclusions . ' )';
+	}
+
+	$exclusions = array();
+	if ( ! empty( $exclude_tree ) ) {
+		$exclude_tree      = wp_parse_id_list( $exclude_tree );
+		$excluded_children = $exclude_tree;
+
+		foreach ( $exclude_tree as $extrunk ) {
+			$excluded_children = array_merge(
+				$excluded_children,
+				(array) get_terms(
+					array(
+						'taxonomy'   =&gt; reset( $taxonomies ),
+						'child_of'   =&gt; (int) $extrunk,
+						'fields'     =&gt; 'ids',
+						'hide_empty' =&gt; 0,
+					)
+				)
+			);
+		}
+
+		$exclusions = array_merge( $excluded_children, $exclusions );
+	}
+
+	if ( ! empty( $exclude ) ) {
+		$exclusions = array_merge( wp_parse_id_list( $exclude ), $exclusions );
+	}
+
+	// 'childless' terms are those without an entry in the flattened term hierarchy.
+	$childless = (bool) $args['childless'];
+	if ( $childless ) {
+		foreach ( $taxonomies as $_tax ) {
+			$term_hierarchy = _get_term_hierarchy( $_tax );
+			$exclusions     = array_merge( array_keys( $term_hierarchy ), $exclusions );
+		}
+	}
+
+	if ( ! empty( $exclusions ) ) {
+		$exclusions = 't.term_id NOT IN (' . implode( ',', array_map( 'intval', $exclusions ) ) . ')';
+	} else {
+		$exclusions = '';
+	}
+
+	/**
+	 * Filters the terms to exclude from the terms query.
+	 *
+	 * @since 2.3.0
+	 *
+	 * @param string   $exclusions `NOT IN` clause of the terms query.
+	 * @param array    $args       An array of terms query arguments.
+	 * @param string[] $taxonomies An array of taxonomy names.
+	 */
+	$exclusions = apply_filters( 'list_terms_exclusions', $exclusions, $args, $taxonomies );
+
+	if ( ! empty( $exclusions ) ) {
+		// Strip leading 'AND'. Must do string manipulation here for backward compatibility with filter.
+		$this-&gt;sql_clauses['where']['exclusions'] = preg_replace( '/^\s*AND\s*/', '', $exclusions );
+	}
+
+	if ( '' === $args['name'] ) {
+		$args['name'] = array();
+	} else {
+		$args['name'] = (array) $args['name'];
+	}
+
+	if ( ! empty( $args['name'] ) ) {
+		$names = $args['name'];
+
+		foreach ( $names as &amp;$_name ) {
+			// `sanitize_term_field()` returns slashed data.
+			$_name = stripslashes( sanitize_term_field( 'name', $_name, 0, reset( $taxonomies ), 'db' ) );
+		}
+
+		$this-&gt;sql_clauses['where']['name'] = "t.name IN ('" . implode( "', '", array_map( 'esc_sql', $names ) ) . "')";
+	}
+
+	if ( '' === $args['slug'] ) {
+		$args['slug'] = array();
+	} else {
+		$args['slug'] = array_map( 'sanitize_title', (array) $args['slug'] );
+	}
+
+	if ( ! empty( $args['slug'] ) ) {
+		$slug = implode( "', '", $args['slug'] );
+
+		$this-&gt;sql_clauses['where']['slug'] = "t.slug IN ('" . $slug . "')";
+	}
+
+	if ( '' === $args['term_taxonomy_id'] ) {
+		$args['term_taxonomy_id'] = array();
+	} else {
+		$args['term_taxonomy_id'] = array_map( 'intval', (array) $args['term_taxonomy_id'] );
+	}
+
+	if ( ! empty( $args['term_taxonomy_id'] ) ) {
+		$tt_ids = implode( ',', $args['term_taxonomy_id'] );
+
+		$this-&gt;sql_clauses['where']['term_taxonomy_id'] = "tt.term_taxonomy_id IN ({$tt_ids})";
+	}
+
+	if ( ! empty( $args['name__like'] ) ) {
+		$this-&gt;sql_clauses['where']['name__like'] = $wpdb-&gt;prepare(
+			't.name LIKE %s',
+			'%' . $wpdb-&gt;esc_like( $args['name__like'] ) . '%'
+		);
+	}
+
+	if ( ! empty( $args['description__like'] ) ) {
+		$this-&gt;sql_clauses['where']['description__like'] = $wpdb-&gt;prepare(
+			'tt.description LIKE %s',
+			'%' . $wpdb-&gt;esc_like( $args['description__like'] ) . '%'
+		);
+	}
+
+	if ( '' === $args['object_ids'] ) {
+		$args['object_ids'] = array();
+	} else {
+		$args['object_ids'] = array_map( 'intval', (array) $args['object_ids'] );
+	}
+
+	if ( ! empty( $args['object_ids'] ) ) {
+		$object_ids = implode( ', ', $args['object_ids'] );
+
+		$this-&gt;sql_clauses['where']['object_ids'] = "tr.object_id IN ($object_ids)";
+	}
+
+	/*
+	 * When querying for object relationships, the 'count &gt; 0' check
+	 * added by 'hide_empty' is superfluous.
+	 */
+	if ( ! empty( $args['object_ids'] ) ) {
+		$args['hide_empty'] = false;
+	}
+
+	if ( '' !== $parent ) {
+		$parent                               = (int) $parent;
+		$this-&gt;sql_clauses['where']['parent'] = "tt.parent = '$parent'";
+	}
+
+	$hierarchical = $args['hierarchical'];
+	if ( 'count' === $args['fields'] ) {
+		$hierarchical = false;
+	}
+	if ( $args['hide_empty'] &amp;&amp; ! $hierarchical ) {
+		$this-&gt;sql_clauses['where']['count'] = 'tt.count &gt; 0';
+	}
+
+	$number = $args['number'];
+	$offset = $args['offset'];
+
+	// Don't limit the query results when we have to descend the family tree.
+	if ( $number &amp;&amp; ! $hierarchical &amp;&amp; ! $child_of &amp;&amp; '' === $parent ) {
+		if ( $offset ) {
+			$limits = 'LIMIT ' . $offset . ',' . $number;
+		} else {
+			$limits = 'LIMIT ' . $number;
+		}
+	} else {
+		$limits = '';
+	}
+
+	if ( ! empty( $args['search'] ) ) {
+		$this-&gt;sql_clauses['where']['search'] = $this-&gt;get_search_sql( $args['search'] );
+	}
+
+	// Meta query support.
+	$join     = '';
+	$distinct = '';
+
+	// Reparse meta_query query_vars, in case they were modified in a 'pre_get_terms' callback.
+	$this-&gt;meta_query-&gt;parse_query_vars( $this-&gt;query_vars );
+	$mq_sql       = $this-&gt;meta_query-&gt;get_sql( 'term', 't', 'term_id' );
+	$meta_clauses = $this-&gt;meta_query-&gt;get_clauses();
+
+	if ( ! empty( $meta_clauses ) ) {
+		$join .= $mq_sql['join'];
+
+		// Strip leading 'AND'.
+		$this-&gt;sql_clauses['where']['meta_query'] = preg_replace( '/^\s*AND\s*/', '', $mq_sql['where'] );
+
+		$distinct .= 'DISTINCT';
+
+	}
+
+	$selects = array();
+	switch ( $args['fields'] ) {
+		case 'count':
+			$orderby = '';
+			$order   = '';
+			$selects = array( 'COUNT(*)' );
+			break;
+		default:
+			$selects = array( 't.term_id' );
+			if ( 'all_with_object_id' === $args['fields'] &amp;&amp; ! empty( $args['object_ids'] ) ) {
+				$selects[] = 'tr.object_id';
+			}
+			break;
+	}
+
+	$_fields = $args['fields'];
+
+	/**
+	 * Filters the fields to select in the terms query.
+	 *
+	 * Field lists modified using this filter will only modify the term fields returned
+	 * by the function when the `$fields` parameter set to 'count' or 'all'. In all other
+	 * cases, the term fields in the results array will be determined by the `$fields`
+	 * parameter alone.
+	 *
+	 * Use of this filter can result in unpredictable behavior, and is not recommended.
+	 *
+	 * @since 2.8.0
+	 *
+	 * @param string[] $selects    An array of fields to select for the terms query.
+	 * @param array    $args       An array of term query arguments.
+	 * @param string[] $taxonomies An array of taxonomy names.
+	 */
+	$fields = implode( ', ', apply_filters( 'get_terms_fields', $selects, $args, $taxonomies ) );
+
+	$join .= " INNER JOIN $wpdb-&gt;term_taxonomy AS tt ON t.term_id = tt.term_id";
+
+	if ( ! empty( $this-&gt;query_vars['object_ids'] ) ) {
+		$join    .= " INNER JOIN {$wpdb-&gt;term_relationships} AS tr ON tr.term_taxonomy_id = tt.term_taxonomy_id";
+		$distinct = 'DISTINCT';
+	}
+
+	$where = implode( ' AND ', $this-&gt;sql_clauses['where'] );
+
+	$pieces = array( 'fields', 'join', 'where', 'distinct', 'orderby', 'order', 'limits' );
+
+	/**
+	 * Filters the terms query SQL clauses.
+	 *
+	 * @since 3.1.0
+	 *
+	 * @param string[] $clauses {
+	 *     Associative array of the clauses for the query.
+	 *
+	 *     @type string $fields   The SELECT clause of the query.
+	 *     @type string $join     The JOIN clause of the query.
+	 *     @type string $where    The WHERE clause of the query.
+	 *     @type string $distinct The DISTINCT clause of the query.
+	 *     @type string $orderby  The ORDER BY clause of the query.
+	 *     @type string $order    The ORDER clause of the query.
+	 *     @type string $limits   The LIMIT clause of the query.
+	 * }
+	 * @param string[] $taxonomies An array of taxonomy names.
+	 * @param array    $args       An array of term query arguments.
+	 */
+	$clauses = apply_filters( 'terms_clauses', compact( $pieces ), $taxonomies, $args );
+
+	$fields   = isset( $clauses['fields'] ) ? $clauses['fields'] : '';
+	$join     = isset( $clauses['join'] ) ? $clauses['join'] : '';
+	$where    = isset( $clauses['where'] ) ? $clauses['where'] : '';
+	$distinct = isset( $clauses['distinct'] ) ? $clauses['distinct'] : '';
+	$orderby  = isset( $clauses['orderby'] ) ? $clauses['orderby'] : '';
+	$order    = isset( $clauses['order'] ) ? $clauses['order'] : '';
+	$limits   = isset( $clauses['limits'] ) ? $clauses['limits'] : '';
+
+	if ( $where ) {
+		$where = "WHERE $where";
+	}
+
+	$this-&gt;sql_clauses['select']  = "SELECT $distinct $fields";
+	$this-&gt;sql_clauses['from']    = "FROM $wpdb-&gt;terms AS t $join";
+	$this-&gt;sql_clauses['orderby'] = $orderby ? "$orderby $order" : '';
+	$this-&gt;sql_clauses['limits']  = $limits;
+
+	$this-&gt;request = "
+		{$this-&gt;sql_clauses['select']}
+		{$this-&gt;sql_clauses['from']}
+		{$where}
+		{$this-&gt;sql_clauses['orderby']}
+		{$this-&gt;sql_clauses['limits']}
+	";
+
+	$this-&gt;terms = null;
+
+	/**
+	 * Filters the terms array before the query takes place.
+	 *
+	 * Return a non-null value to bypass WordPress' default term queries.
+	 *
+	 * @since 5.3.0
+	 *
+	 * @param array|null    $terms Return an array of term data to short-circuit WP's term query,
+	 *                             or null to allow WP queries to run normally.
+	 * @param WP_Term_Query $query The WP_Term_Query instance, passed by reference.
+	 */
+	$this-&gt;terms = apply_filters_ref_array( 'terms_pre_query', array( $this-&gt;terms, &amp;$this ) );
+
+	if ( null !== $this-&gt;terms ) {
+		return $this-&gt;terms;
+	}
+
+	// $args can be anything. Only use the args defined in defaults to compute the key.
+	$cache_args = wp_array_slice_assoc( $args, array_keys( $this-&gt;query_var_defaults ) );
+
+	unset( $cache_args['update_term_meta_cache'] );
+
+	if ( 'count' !== $_fields &amp;&amp; 'all_with_object_id' !== $_fields ) {
+		$cache_args['fields'] = 'all';
+	}
+
+	$key          = md5( serialize( $cache_args ) . serialize( $taxonomies ) . $this-&gt;request );
+	$last_changed = wp_cache_get_last_changed( 'terms' );
+	$cache_key    = "get_terms:$key:$last_changed";
+	$cache        = wp_cache_get( $cache_key, 'terms' );
+
+	if ( false !== $cache ) {
+		if ( 'ids' === $_fields ) {
+			$cache = array_map( 'intval', $cache );
+		} elseif ( 'count' !== $_fields ) {
+			if ( ( 'all_with_object_id' === $_fields &amp;&amp; ! empty( $args['object_ids'] ) )
+				|| ( 'all' === $_fields &amp;&amp; $args['pad_counts'] )
+			) {
+				$term_ids = wp_list_pluck( $cache, 'term_id' );
+			} else {
+				$term_ids = array_map( 'intval', $cache );
+			}
+
+			_prime_term_caches( $term_ids, $args['update_term_meta_cache'] );
+
+			$term_objects = $this-&gt;populate_terms( $cache );
+			$cache        = $this-&gt;format_terms( $term_objects, $_fields );
+		}
+
+		$this-&gt;terms = $cache;
+		return $this-&gt;terms;
+	}
+
+	if ( 'count' === $_fields ) {
+		$count = $wpdb-&gt;get_var( $this-&gt;request ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		wp_cache_set( $cache_key, $count, 'terms' );
+		return $count;
+	}
+
+	$terms = $wpdb-&gt;get_results( $this-&gt;request ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+
+	if ( empty( $terms ) ) {
+		wp_cache_add( $cache_key, array(), 'terms' );
+		return array();
+	}
+
+	$term_ids = wp_list_pluck( $terms, 'term_id' );
+	_prime_term_caches( $term_ids, false );
+	$term_objects = $this-&gt;populate_terms( $terms );
+
+	if ( $child_of ) {
+		foreach ( $taxonomies as $_tax ) {
+			$children = _get_term_hierarchy( $_tax );
+			if ( ! empty( $children ) ) {
+				$term_objects = _get_term_children( $child_of, $term_objects, $_tax );
+			}
+		}
+	}
+
+	// Update term counts to include children.
+	if ( $args['pad_counts'] &amp;&amp; 'all' === $_fields ) {
+		foreach ( $taxonomies as $_tax ) {
+			_pad_term_counts( $term_objects, $_tax );
+		}
+	}
+
+	// Make sure we show empty categories that have children.
+	if ( $hierarchical &amp;&amp; $args['hide_empty'] &amp;&amp; is_array( $term_objects ) ) {
+		foreach ( $term_objects as $k =&gt; $term ) {
+			if ( ! $term-&gt;count ) {
+				$children = get_term_children( $term-&gt;term_id, $term-&gt;taxonomy );
+
+				if ( is_array( $children ) ) {
+					foreach ( $children as $child_id ) {
+						$child = get_term( $child_id, $term-&gt;taxonomy );
+						if ( $child-&gt;count ) {
+							continue 2;
+						}
+					}
+				}
+
+				// It really is empty.
+				unset( $term_objects[ $k ] );
+			}
+		}
+	}
+
+	// Hierarchical queries are not limited, so 'offset' and 'number' must be handled now.
+	if ( $hierarchical &amp;&amp; $number &amp;&amp; is_array( $term_objects ) ) {
+		if ( $offset &gt;= count( $term_objects ) ) {
+			$term_objects = array();
+		} else {
+			$term_objects = array_slice( $term_objects, $offset, $number, true );
+		}
+	}
+
+	// Prime termmeta cache.
+	if ( $args['update_term_meta_cache'] ) {
+		$term_ids = wp_list_pluck( $term_objects, 'term_id' );
+		update_termmeta_cache( $term_ids );
+	}
+
+	if ( 'all_with_object_id' === $_fields &amp;&amp; ! empty( $args['object_ids'] ) ) {
+		$term_cache = array();
+		foreach ( $term_objects as $term ) {
+			$object            = new stdClass();
+			$object-&gt;term_id   = $term-&gt;term_id;
+			$object-&gt;object_id = $term-&gt;object_id;
+			$term_cache[]      = $object;
+		}
+	} elseif ( 'all' === $_fields &amp;&amp; $args['pad_counts'] ) {
+		$term_cache = array();
+		foreach ( $term_objects as $term ) {
+			$object          = new stdClass();
+			$object-&gt;term_id = $term-&gt;term_id;
+			$object-&gt;count   = $term-&gt;count;
+			$term_cache[]    = $object;
+		}
+	} else {
+		$term_cache = wp_list_pluck( $term_objects, 'term_id' );
+	}
+
+	wp_cache_add( $cache_key, $term_cache, 'terms' );
+	$this-&gt;terms = $this-&gt;format_terms( $term_objects, $_fields );
+
+	return $this-&gt;terms;
+}
+</code></pre>  </section>  <section> <header class="toc-header"><h2 id="hooks">Hooks</h2></header> <article class="hooks"> <dl> <dt class="signature-highlight"> <a href="../../hooks/get_terms_args.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'get_terms_args', <nobr><span class="arg-type">array</span> <span class="arg-name">$args</span></nobr>, <nobr><span class="arg-type">string[]</span> <span class="arg-name">$taxonomies</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the terms query arguments.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/get_terms_fields.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'get_terms_fields', <nobr><span class="arg-type">string[]</span> <span class="arg-name">$selects</span></nobr>, <nobr><span class="arg-type">array</span> <span class="arg-name">$args</span></nobr>, <nobr><span class="arg-type">string[]</span> <span class="arg-name">$taxonomies</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the fields to select in the terms query.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/list_terms_exclusions.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'list_terms_exclusions', <nobr><span class="arg-type">string</span> <span class="arg-name">$exclusions</span></nobr>, <nobr><span class="arg-type">array</span> <span class="arg-name">$args</span></nobr>, <nobr><span class="arg-type">string[]</span> <span class="arg-name">$taxonomies</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the terms to exclude from the terms query.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/pre_get_terms.html" style="text-decoration: none"> <span class="hook-func">do_action_ref_array</span>( 'pre_get_terms', <nobr><span class="arg-type">WP_Term_Query</span> <span class="arg-name">$query</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Fires before terms are retrieved.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/terms_clauses.html" style="text-decoration: none"> <span class="hook-func">apply_filters</span>( 'terms_clauses', <nobr><span class="arg-type">string[]</span> <span class="arg-name">$clauses</span></nobr>, <nobr><span class="arg-type">string[]</span> <span class="arg-name">$taxonomies</span></nobr>, <nobr><span class="arg-type">array</span> <span class="arg-name">$args</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the terms query SQL clauses.</p> </dd> </dl> <dl> <dt class="signature-highlight"> <a href="../../hooks/terms_pre_query.html" style="text-decoration: none"> <span class="hook-func">apply_filters_ref_array</span>( 'terms_pre_query', <nobr><span class="arg-type">array|null</span> <span class="arg-name">$terms</span></nobr>, <nobr><span class="arg-type">WP_Term_Query</span> <span class="arg-name">$query</span></nobr> ) </a> </dt> <dd class="hook-desc"> 
+<p>Filters the terms array before the query takes place.</p> </dd> </dl> </article> </section>  <section> <header class="toc-header"><h2 id="related">Related</h2></header> <article class="uses"> <header class="toc-header"><h3 id="uses">Uses</h3></header> <table id="uses-table" data-show="5">  <thead> <tr> <th>Uses</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="format_terms.html">WP_Term_Query::format_terms()</a> <span>wp-includes/class-wp-term-query.php</span> </td> <td class="related-desc"> <p>Format response depending on field requested.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_array_slice_assoc.html">wp_array_slice_assoc()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Extracts a slice of an array, given a list of keys.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters_ref_array.html">apply_filters_ref_array()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook, specifying arguments in an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/do_action_ref_array.html">do_action_ref_array()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to an action hook, specifying arguments in an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/is_taxonomy_hierarchical.html">is_taxonomy_hierarchical()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Determines whether the taxonomy object is hierarchical.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_term_children.html">get_term_children()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Merges all term children into a single array of their IDs.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/sanitize_term_field.html">sanitize_term_field()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Sanitizes the field value in the term based on the context.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_terms.html">get_terms()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Retrieves the terms in a given taxonomy or list of taxonomies.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/_pad_term_counts.html">_pad_term_counts()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Adds count of children to parent count.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/_get_term_children.html">_get_term_children()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Gets the subset of $terms that are descendants of $term_id.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/_get_term_hierarchy.html">_get_term_hierarchy()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Retrieves children of taxonomy as term IDs.</p> </td> </tr> <tr> <td class="related-title"> <a href="populate_terms.html">WP_Term_Query::populate_terms()</a> <span>wp-includes/class-wp-term-query.php</span> </td> <td class="related-desc"> <p>Creates an array of term objects from an array of term IDs.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_list_pluck.html">wp_list_pluck()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Plucks a certain field out of each object or array in an array.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_parse_id_list.html">wp_parse_id_list()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Cleans up an array, comma- or space-separated list of IDs.</p> </td> </tr> <tr> <td class="related-title"> <a href="parse_query.html">WP_Term_Query::parse_query()</a> <span>wp-includes/class-wp-term-query.php</span> </td> <td class="related-desc"> <p>Parse arguments passed to the term query with default query parameters.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_cache_get_last_changed.html">wp_cache_get_last_changed()</a> <span>wp-includes/functions.php</span> </td> <td class="related-desc"> <p>Gets last changed date for the specified cache group.</p> </td> </tr> <tr> <td class="related-title"> <a href="parse_order.html">WP_Term_Query::parse_order()</a> <span>wp-includes/class-wp-term-query.php</span> </td> <td class="related-desc"> <p>Parse an ‘order’ query variable and cast it to ASC or DESC as necessary.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_cache_add.html">wp_cache_add()</a> <span>wp-includes/cache.php</span> </td> <td class="related-desc"> <p>Adds data to the cache, if the cache key doesn’t already exist.</p> </td> </tr> <tr> <td class="related-title"> <a href="parse_orderby.html">WP_Term_Query::parse_orderby()</a> <span>wp-includes/class-wp-term-query.php</span> </td> <td class="related-desc"> <p>Parse and sanitize ‘orderby’ keys passed to the term query.</p> </td> </tr> <tr> <td class="related-title"> <a href="get_search_sql.html">WP_Term_Query::get_search_sql()</a> <span>wp-includes/class-wp-term-query.php</span> </td> <td class="related-desc"> <p>Used internally to generate a SQL string related to the ‘search’ parameter.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/_prime_term_caches.html">_prime_term_caches()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Adds any terms from the given IDs to the cache that do not already exist in cache.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/update_termmeta_cache.html">update_termmeta_cache()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Updates metadata cache for list of term IDs.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/esc_like.html">wpdb::esc_like()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>First half of escaping for <code>LIKE</code> special characters <code>%</code> and <code>_</code> before preparing for SQL.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_cache_set.html">wp_cache_set()</a> <span>wp-includes/cache.php</span> </td> <td class="related-desc"> <p>Saves the data to the cache.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wp_meta_query/__construct.html">WP_Meta_Query::__construct()</a> <span>wp-includes/class-wp-meta-query.php</span> </td> <td class="related-desc"> <p>Constructor.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/get_term.html">get_term()</a> <span>wp-includes/taxonomy.php</span> </td> <td class="related-desc"> <p>Gets all term data from database by term ID.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/wp_cache_get.html">wp_cache_get()</a> <span>wp-includes/cache.php</span> </td> <td class="related-desc"> <p>Retrieves the cache contents from the cache by key and group.</p> </td> </tr> <tr> <td class="related-title"> <a href="../../functions/apply_filters.html">apply_filters()</a> <span>wp-includes/plugin.php</span> </td> <td class="related-desc"> <p>Calls the callback functions that have been added to a filter hook.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/get_var.html">wpdb::get_var()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Retrieves one variable from the database.</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/get_results.html">wpdb::get_results()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Retrieves an entire SQL result set from the database (i.e., many rows).</p> </td> </tr> <tr> <td class="related-title"> <a href="../wpdb/prepare.html">wpdb::prepare()</a> <span>wp-includes/class-wpdb.php</span> </td> <td class="related-desc"> <p>Prepares a SQL query for safe execution.</p> </td> </tr> </tbody>
+
+</table>   </article>  <article class="used-by"> <header class="toc-header"><h3 id="used-by">Used By</h3></header> <table id="used-by-table" data-show="5">  <thead> <tr> <th>Used By</th> <th class="related-desc">Description</th> </tr> </thead> <tbody> <tr> <td class="related-title"> <a href="query.html">WP_Term_Query::query()</a> <span>wp-includes/class-wp-term-query.php</span> </td> <td class="related-desc"> <p>Sets up the query and retrieves the results.</p> </td> </tr> </tbody>
+
+</table> </article> </section>  <section> <header class="toc-header"><h2 id="changelog">Changelog</h2></header> <table>  <thead> <tr> <th class="changelog-version">Version</th> <th class="changelog-desc">Description</th> </tr> </thead> <tbody> <tr> <td><a href="https://developer.wordpress.org/reference/since/4.6.0/" alt="WordPress 4.6.0">4.6.0</a></td> <td>Introduced.</td> </tr> </tbody> </table> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2022 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_term_query/get_terms" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_term_query/get_terms</a>
+  </p>
+</div>
