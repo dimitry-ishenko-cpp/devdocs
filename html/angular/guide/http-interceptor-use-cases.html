@@ -1,0 +1,137 @@
+  <h1 id="http----interceptor-use-cases">HTTP - interceptor use-cases</h1> <p>Following are a number of common uses for interceptors.</p> <h2 id="set-default-headers">Set default headers</h2> <p>Apps often use an interceptor to set default headers on outgoing requests.</p> <p>The sample app has an <code>AuthService</code> that produces an authorization token. Here is its <code>AuthInterceptor</code> that injects that service to get the token and adds an authorization header with that token to every outgoing request:</p> <pre header="app/http-interceptors/auth-interceptor.ts" data-language="typescript">import { AuthService } from '../auth.service';
+
+@Injectable()
+export class AuthInterceptor implements HttpInterceptor {
+
+  constructor(private auth: AuthService) {}
+
+  intercept(req: HttpRequest&lt;any&gt;, next: HttpHandler) {
+    // Get the auth token from the service.
+    const authToken = this.auth.getAuthorizationToken();
+
+    // Clone the request and replace the original headers with
+    // cloned headers, updated with the authorization.
+    const authReq = req.clone({
+      headers: req.headers.set('Authorization', authToken)
+    });
+
+    // send cloned request with header to the next handler.
+    return next.handle(authReq);
+  }
+}</pre> <p>The practice of cloning a request to set new headers is so common that there's a <code>setHeaders</code> shortcut for it:</p> <pre data-language="typescript">// Clone the request and set the new header in one step.
+const authReq = req.clone({ setHeaders: { Authorization: authToken } });</pre> <p>An interceptor that alters headers can be used for a number of different operations, including:</p> <ul> <li>Authentication/authorization</li> <li>Caching behavior; for example, <code>If-Modified-Since</code>
+</li> <li>XSRF protection</li> </ul> <h2 id="log-request-and-response-pairs">Log request and response pairs</h2> <p>Because interceptors can process the request and response <em>together</em>, they can perform tasks such as timing and logging an entire HTTP operation.</p> <p>Consider the following <code>LoggingInterceptor</code>, which captures the time of the request, the time of the response, and logs the outcome with the elapsed time with the injected <code>MessageService</code>.</p> <pre header="app/http-interceptors/logging-interceptor.ts)" data-language="typescript">import { finalize, tap } from 'rxjs';
+import { MessageService } from '../message.service';
+
+@Injectable()
+export class LoggingInterceptor implements HttpInterceptor {
+  constructor(private messenger: MessageService) {}
+
+  intercept(req: HttpRequest&lt;any&gt;, next: HttpHandler) {
+    const started = Date.now();
+    let ok: string;
+
+    // extend server response observable with logging
+    return next.handle(req)
+      .pipe(
+        tap({
+          // Succeeds when there is a response; ignore other events
+          next: (event) =&gt; (ok = event instanceof HttpResponse ? 'succeeded' : ''),
+          // Operation failed; error is an HttpErrorResponse
+          error: (_error) =&gt; (ok = 'failed')
+        }),
+        // Log when response observable either completes or errors
+        finalize(() =&gt; {
+          const elapsed = Date.now() - started;
+          const msg = `${req.method} "${req.urlWithParams}"
+             ${ok} in ${elapsed} ms.`;
+          this.messenger.add(msg);
+        })
+      );
+  }
+}</pre> <p>The RxJS <code>tap</code> operator captures whether the request succeeded or failed. The RxJS <code>finalize</code> operator is called when the response observable either returns an error or completes and reports the outcome to the <code>MessageService</code>.</p> <p>Neither <code>tap</code> nor <code>finalize</code> touch the values of the observable stream returned to the caller.</p>  <h2 id="custom-json-parsing">Custom JSON parsing</h2> <p>Interceptors can be used to replace the built-in JSON parsing with a custom implementation.</p> <p>The <code>CustomJsonInterceptor</code> in the following example demonstrates how to achieve this. If the intercepted request expects a <code>'json'</code> response, the <code>responseType</code> is changed to <code>'text'</code> to disable the built-in JSON parsing. Then the response is parsed via the injected <code>JsonParser</code>.</p> <pre header="app/http-interceptors/custom-json-interceptor.ts" data-language="typescript">// The JsonParser class acts as a base class for custom parsers and as the DI token.
+@Injectable()
+export abstract class JsonParser {
+  abstract parse(text: string): any;
+}
+
+@Injectable()
+export class CustomJsonInterceptor implements HttpInterceptor {
+  constructor(private jsonParser: JsonParser) {}
+
+  intercept(httpRequest: HttpRequest&lt;any&gt;, next: HttpHandler) {
+    if (httpRequest.responseType === 'json') {
+      // If the expected response type is JSON then handle it here.
+      return this.handleJsonResponse(httpRequest, next);
+    } else {
+      return next.handle(httpRequest);
+    }
+  }
+
+  private handleJsonResponse(httpRequest: HttpRequest&lt;any&gt;, next: HttpHandler) {
+    // Override the responseType to disable the default JSON parsing.
+    httpRequest = httpRequest.clone({responseType: 'text'});
+    // Handle the response using the custom parser.
+    return next.handle(httpRequest).pipe(map(event =&gt; this.parseJsonResponse(event)));
+  }
+
+  private parseJsonResponse(event: HttpEvent&lt;any&gt;) {
+    if (event instanceof HttpResponse &amp;&amp; typeof event.body === 'string') {
+      return event.clone({body: this.jsonParser.parse(event.body)});
+    } else {
+      return event;
+    }
+  }
+}</pre> <p>You can then implement your own custom <code>JsonParser</code>. Here is a custom JsonParser that has a special date reviver.</p> <pre header="app/http-interceptors/custom-json-interceptor.ts" data-language="typescript">@Injectable()
+export class CustomJsonParser implements JsonParser {
+  parse(text: string): any {
+    return JSON.parse(text, dateReviver);
+  }
+}
+
+function dateReviver(key: string, value: any) {
+  /* . . . */
+}</pre> <p>Finally, provide the <code>CustomParser</code> along with the <code>CustomJsonInterceptor</code> in that same <code>httpInterceptorProviders</code> array.</p> <pre header="app/http-interceptors/index.ts" data-language="typescript">{ provide: HTTP_INTERCEPTORS, useClass: CustomJsonInterceptor, multi: true },
+{ provide: JsonParser, useClass: CustomJsonParser },</pre>  <h2 id="cache-requests">Cache requests</h2> <p>Interceptors can handle requests by themselves, without forwarding to <code>next.handle()</code>.</p> <p>For example, you might decide to cache certain requests and responses to improve performance. You can delegate caching to an interceptor without disturbing your existing data services.</p> <p>The <code>CachingInterceptor</code> in the following example demonstrates this approach.</p> <pre header="app/http-interceptors/caching-interceptor.ts)" data-language="typescript">@Injectable()
+export class CachingInterceptor implements HttpInterceptor {
+  constructor(private cache: RequestCache) {}
+
+  intercept(req: HttpRequest&lt;any&gt;, next: HttpHandler) {
+    // continue if not cacheable.
+    if (!isCacheable(req)) { return next.handle(req); }
+
+    const cachedResponse = this.cache.get(req);
+    return cachedResponse ?
+      of(cachedResponse) : sendRequest(req, next, this.cache);
+  }
+}</pre> <ul> <li> <p>The <code>isCacheable()</code> function determines if the request is cacheable. In this sample, only GET requests to the package search API are cacheable.</p> </li> <li> <p>If the request is not cacheable, the interceptor forwards the request to the next handler in the chain</p> </li> <li> <p>If a cacheable request is found in the cache, the interceptor returns an <code>of()</code> <em>observable</em> with the cached response, by-passing the <code>next</code> handler and all other interceptors downstream</p> </li> <li> <p>If a cacheable request is not in cache, the code calls <code>sendRequest()</code>. This function forwards the request to <code>next.handle()</code> which ultimately calls the server and returns the server's response.</p> </li> </ul>  <pre data-language="typescript">/**
+ * Get server response observable by sending request to `next()`.
+ * Will add the response to the cache on the way out.
+ */
+function sendRequest(
+  req: HttpRequest&lt;any&gt;,
+  next: HttpHandler,
+  cache: RequestCache): Observable&lt;HttpEvent&lt;any&gt;&gt; {
+  return next.handle(req).pipe(
+    tap(event =&gt; {
+      // There may be other events besides the response.
+      if (event instanceof HttpResponse) {
+        cache.put(req, event); // Update the cache.
+      }
+    })
+  );
+}</pre> <blockquote class="alert is-helpful"> <p>Notice how <code>sendRequest()</code> intercepts the response on its way back to the application. This method pipes the response through the <code>tap()</code> operator, whose callback adds the response to the cache.</p> <p>The original response continues untouched back up through the chain of interceptors to the application caller.</p> <p>Data services, such as <code>PackageSearchService</code>, are unaware that some of their <code><a href="../api/common/http/httpclient.html" class="code-anchor">HttpClient</a></code> requests actually return cached responses.</p> </blockquote>  <h2 id="use-interceptors-to-request-multiple-values">Use interceptors to request multiple values</h2> <p>The <code><a href="../api/common/http/httpclient.html#get" class="code-anchor">HttpClient.get()</a></code> method normally returns an observable that emits a single value, either the data or an error. An interceptor can change this to an observable that emits <a href="observables.html">multiple values</a>.</p> <p>The following revised version of the <code>CachingInterceptor</code> optionally returns an observable that immediately emits the cached response, sends the request on to the package search API, and emits again later with the updated search results.</p> <pre data-language="typescript">// cache-then-refresh
+if (req.headers.get('x-refresh')) {
+  const results$ = sendRequest(req, next, this.cache);
+  return cachedResponse ?
+    results$.pipe( startWith(cachedResponse) ) :
+    results$;
+}
+// cache-or-fetch
+return cachedResponse ?
+  of(cachedResponse) : sendRequest(req, next, this.cache);</pre> <blockquote class="alert is-helpful"> <p>The <em>cache-then-refresh</em> option is triggered by the presence of a custom <code>x-refresh</code> header.</p> <p>A checkbox on the <code>PackageSearchComponent</code> toggles a <code>withRefresh</code> flag, which is one of the arguments to <code>PackageSearchService.search()</code>. That <code>search()</code> method creates the custom <code>x-refresh</code> header and adds it to the request before calling <code><a href="../api/common/http/httpclient.html#get" class="code-anchor">HttpClient.get()</a></code>.</p> </blockquote> <p>The revised <code>CachingInterceptor</code> sets up a server request whether there's a cached value or not, using the same <code>sendRequest()</code> method described <a href="http-interceptor-use-cases#send-request">above</a>. The <code>results$</code> observable makes the request when subscribed.</p> <ul> <li>If there's no cached value, the interceptor returns <code>results$</code>.</li> <li>If there is a cached value, the code <em>pipes</em> the cached response onto <code>results$</code>. This produces a recomposed observable that emits two responses, so subscribers will see a sequence of these two responses: </li> <li>The cached response that's emitted immediately</li> <li>The response from the server, that's emitted later</li> </ul>  <div class="reviewed">Last reviewed on Tue Nov 08 2022</div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2023 Google, Inc.<br>Licensed under the Creative Commons Attribution License 4.0.<br>
+    <a href="https://angular.io/guide/http-interceptor-use-cases" class="_attribution-link">https://angular.io/guide/http-interceptor-use-cases</a>
+  </p>
+</div>
