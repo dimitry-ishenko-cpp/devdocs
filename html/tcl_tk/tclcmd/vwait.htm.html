@@ -1,0 +1,145 @@
+<h1>vwait</h1>  <h2 id="M2">Name</h2> vwait — Process events until a variable is written <h2 id="M3">Synopsis</h2> <b>vwait</b> <i>varName</i><br> <h2 id="M4">Description</h2> This command enters the Tcl event loop to process events, blocking the application if no events are ready. It continues processing events until some event handler sets the value of the global variable <i>varName</i>. Once <i>varName</i> has been set, the <b>vwait</b> command will return as soon as the event handler that modified <i>varName</i> completes. The <i>varName</i> argument is always interpreted as a variable name with respect to the global namespace, but can refer to any namespace's variables if the fully-qualified name is given. <p> In some cases the <b>vwait</b> command may not return immediately after <i>varName</i> is set. This happens if the event handler that sets <i>varName</i> does not complete immediately. For example, if an event handler sets <i>varName</i> and then itself calls <b>vwait</b> to wait for a different variable, then it may not return for a long time. During this time the top-level <b>vwait</b> is blocked waiting for the event handler to complete, so it cannot return either. (See the <b><a href="#M6">NESTED VWAITS BY EXAMPLE</a></b> below.) </p>
+<p> To be clear, <i>multiple </i><b>vwait</b><i> calls will nest and will not happen in parallel</i>. The outermost call to <b>vwait</b> will not return until all the inner ones do. It is recommended that code should never nest <b>vwait</b> calls (by avoiding putting them in event callbacks) but when that is not possible, care should be taken to add interlock variables to the code to prevent all reentrant calls to <b>vwait</b> that are not <i>strictly</i> necessary. Be aware that the synchronous modes of operation of some Tcl packages (e.g., <b><a href="http.htm">http</a></b>) use <b>vwait</b> internally; if using the event loop, it is best to use the asynchronous callback-based modes of operation of those packages where available. </p>
+<h2 id="M5">Examples</h2> Run the event-loop continually until some event calls <b><a href="exit.htm.html">exit</a></b>. (You can use any variable not mentioned elsewhere, but the name <i>forever</i> reminds you at a glance of the intent.) 
+<pre><b>vwait</b> forever</pre> <p> Wait five seconds for a connection to a server socket, otherwise close the socket and continue running the script: </p>
+
+<pre># Initialise the state
+after 5000 set state timeout
+set server [socket -server accept 12345]
+proc accept {args} {
+    global state connectionInfo
+    set state accepted
+    set connectionInfo $args
+}
+
+# Wait for something to happen
+<b>vwait</b> state
+
+# Clean up events that could have happened
+close $server
+after cancel set state timeout
+
+# Do something based on how the vwait finished...
+switch $state {
+    timeout {
+        puts "no connection on port 12345"
+    }
+    accepted {
+       puts "connection: $connectionInfo"
+       puts [lindex $connectionInfo 0] "Hello there!"
+    }
+}</pre> <p> A command that will wait for some time delay by waiting for a namespace variable to be set. Includes an interlock to prevent nested waits. </p>
+
+<pre>namespace eval example {
+    variable v done
+    proc wait {delay} {
+        variable v
+        if {$v ne "waiting"} {
+            set v waiting
+            after $delay [namespace code {set v done}]
+            <b>vwait</b> [namespace which -variable v]
+        }
+        return $v
+    }
+}</pre> <p> When running inside a <b><a href="coroutine.htm.html">coroutine</a></b>, an alternative to using <b>vwait</b> is to <b><a href="coroutine.htm.html">yield</a></b> to an outer event loop and to get recommenced when the variable is set, or at an idle moment after that. </p>
+
+<pre>coroutine task apply {{} {
+    # simulate [after 1000]
+    after 1000 [info coroutine]
+    yield
+
+    # schedule the setting of a global variable, as normal
+    after 2000 {set var 1}
+
+    # simulate [<b>vwait</b> var]
+    proc updatedVar {task args} {
+        after idle $task
+        trace remove variable ::var write "updatedVar $task"
+    }
+    trace add variable ::var write "updatedVar [info coroutine]"
+    yield
+}}</pre> <h3 id="M6">Nested vwaits by example</h3> This example demonstrates what can happen when the <b>vwait</b> command is nested. The script will never finish because the waiting for the <i>a</i> variable never finishes; that <b>vwait</b> command is still waiting for a script scheduled with <b><a href="after.htm.html">after</a></b> to complete, which just happens to be running an inner <b>vwait</b> (for <i>b</i>) even though the event that the outer <b>vwait</b> was waiting for (the setting of <i>a</i>) has occurred. 
+<pre>after 500 {
+    puts "waiting for b"
+    <b>vwait</b> b
+    puts "b was set"
+}
+after 1000 {
+    puts "setting a"
+    set a 10
+}
+puts "waiting for a"
+<b>vwait</b> a
+puts "a was set"
+puts "setting b"
+set b 42</pre> <p> If you run the above code, you get this output: </p>
+
+<pre>waiting for a
+waiting for b
+setting a</pre> <p> The script will never print “a was set” until after it has printed “b was set” because of the nesting of <b>vwait</b> commands, and yet <i>b</i> will not be set until after the outer <b>vwait</b> returns, so the script has deadlocked. The only ways to avoid this are to either structure the overall program in continuation-passing style or to use <b><a href="coroutine.htm.html">coroutine</a></b> to make the continuations implicit. The first of these options would be written as: </p>
+
+<pre>after 500 {
+    puts "waiting for b"
+    trace add variable b write {apply {args {
+        global a b
+        trace remove variable ::b write \
+                [lrange [info level 0] 0 1]
+        puts "b was set"
+        set ::done ok
+    }}}
+}
+after 1000 {
+    puts "setting a"
+    set a 10
+}
+puts "waiting for a"
+trace add variable a write {apply {args {
+    global a b
+    trace remove variable a write [lrange [info level 0] 0 1]
+    puts "a was set"
+    puts "setting b"
+    set b 42
+}}}
+<b>vwait</b> done</pre> <p> The second option, with <b><a href="coroutine.htm.html">coroutine</a></b> and some helper procedures, is done like this: </p>
+
+<pre># A coroutine-based wait-for-variable command
+proc waitvar globalVar {
+    trace add variable ::$globalVar write \
+            [list apply {{v c args} {
+        trace remove variable $v write \
+                [lrange [info level 0] 0 3]
+        after 0 $c
+    }} ::$globalVar [info coroutine]]
+    yield
+}
+# A coroutine-based wait-for-some-time command
+proc waittime ms {
+    after $ms [info coroutine]
+    yield
+}
+
+coroutine task-1 eval {
+    puts "waiting for a"
+    waitvar a
+    puts "a was set"
+    puts "setting b"
+    set b 42
+}
+coroutine task-2 eval {
+    waittime 500
+    puts "waiting for b"
+    waitvar b
+    puts "b was set"
+    set done ok
+}
+coroutine task-3 eval {
+    waittime 1000
+    puts "setting a"
+    set a 10
+}
+<b>vwait</b> done</pre> <h2 id="M7">See also</h2> <b><a href="global.htm.html">global</a></b>, <b><a href="update.htm.html">update</a></b>   <div class="_attribution"><p class="_attribution-p">Copyright © 1995-1996 Sun Microsystems, Inc. </p></div><div class="_attribution">
+  <p class="_attribution-p">
+    Licensed under <a href="http://tcl.tk/software/tcltk/license.html">Tcl/Tk terms</a><br>
+    <a href="https://www.tcl.tk/man/tcl/TclCmd/vwait.htm" class="_attribution-link">https://www.tcl.tk/man/tcl/TclCmd/vwait.htm</a>
+  </p>
+</div>
