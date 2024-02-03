@@ -1,0 +1,138 @@
+<h1 id="class-ActiveSupport::Concurrency::ShareLock" class="class"> class ActiveSupport::Concurrency::ShareLock </h1>
+<dl class="meta">
+<dt>Parent:</dt>
+<dd class="meta-parent"><a href="../../object.html">Object</a></dd>
+<dt>Included modules:</dt>
+
+</dl> <section class="description"> <p>A share/exclusive lock, otherwise known as a read/write lock.</p> <p><a href="https://en.wikipedia.org/wiki/Readers%E2%80%93writer_lock">en.wikipedia.org/wiki/Readers%E2%80%93writer_lock</a></p> </section> <section id="5Buntitled-5D" class="documentation-section"> <section id="public-class-5Buntitled-5D-method-details" class="method-section"> <header> <h3>Public Class Methods</h3> </header> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-c-new"> <span class="method-name">new</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="new-source"> <pre class="ruby" data-language="ruby"># File activesupport/lib/active_support/concurrency/share_lock.rb, line 50
+def initialize
+  super()
+
+  @cv = new_cond
+
+  @sharing = Hash.new(0)
+  @waiting = {}
+  @sleeping = {}
+  @exclusive_thread = nil
+  @exclusive_depth = 0
+end</pre> </div> <div class="method-calls-super"> Calls superclass method </div>  </div> </div> </section> <section id="public-instance-5Buntitled-5D-method-details" class="method-section"> <header> <h3>Public Instance Methods</h3> </header> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-exclusive"> <span class="method-name">exclusive</span><span class="method-args">(purpose: nil, compatible: [], after_compatible: [], no_wait: false) { || ... }</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="exclusive-source"> <pre class="ruby" data-language="ruby"># File activesupport/lib/active_support/concurrency/share_lock.rb, line 148
+def exclusive(purpose: nil, compatible: [], after_compatible: [], no_wait: false)
+  if start_exclusive(purpose: purpose, compatible: compatible, no_wait: no_wait)
+    begin
+      yield
+    ensure
+      stop_exclusive(compatible: after_compatible)
+    end
+  end
+end</pre> </div> <p>Execute the supplied block while holding the Exclusive lock. If <code>no_wait</code> is set and the lock is not immediately available, returns <code>nil</code> without yielding. Otherwise, returns the result of the block.</p> <p>See <code>start_exclusive</code> for other options.</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-sharing"> <span class="method-name">sharing</span><span class="method-args">() { || ... }</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="sharing-source"> <pre class="ruby" data-language="ruby"># File activesupport/lib/active_support/concurrency/share_lock.rb, line 159
+def sharing
+  start_sharing
+  begin
+    yield
+  ensure
+    stop_sharing
+  end
+end</pre> </div> <p>Execute the supplied block while holding the Share lock.</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-start_exclusive"> <span class="method-name">start_exclusive</span><span class="method-args">(purpose: nil, compatible: [], no_wait: false)</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="start_exclusive-source"> <pre class="ruby" data-language="ruby"># File activesupport/lib/active_support/concurrency/share_lock.rb, line 76
+def start_exclusive(purpose: nil, compatible: [], no_wait: false)
+  synchronize do
+    unless @exclusive_thread == Thread.current
+      if busy_for_exclusive?(purpose)
+        return false if no_wait
+
+        yield_shares(purpose: purpose, compatible: compatible, block_share: true) do
+          wait_for(:start_exclusive) { busy_for_exclusive?(purpose) }
+        end
+      end
+      @exclusive_thread = Thread.current
+    end
+    @exclusive_depth += 1
+
+    true
+  end
+end</pre> </div> <p>Returns false if <code>no_wait</code> is set and the lock is not immediately available. Otherwise, returns true after the lock has been acquired.</p> <p><code>purpose</code> and <code>compatible</code> work together; while this thread is waiting for the exclusive lock, it will yield its share (if any) to any other attempt whose <code>purpose</code> appears in this attempt’s <code>compatible</code> list. This allows a “loose” upgrade, which, being less strict, prevents some classes of deadlocks.</p> <p>For many resources, loose upgrades are sufficient: if a thread is awaiting a lock, it is not running any other code. With <code>purpose</code> matching, it is possible to yield only to other threads whose activity will not interfere.</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-start_sharing"> <span class="method-name">start_sharing</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="start_sharing-source"> <pre class="ruby" data-language="ruby"># File activesupport/lib/active_support/concurrency/share_lock.rb, line 114
+def start_sharing
+  synchronize do
+    if @sharing[Thread.current] &gt; 0 || @exclusive_thread == Thread.current
+      # We already hold a lock; nothing to wait for
+    elsif @waiting[Thread.current]
+      # We're nested inside a +yield_shares+ call: we'll resume as
+      # soon as there isn't an exclusive lock in our way
+      wait_for(:start_sharing) { @exclusive_thread }
+    else
+      # This is an initial / outermost share call: any outstanding
+      # requests for an exclusive lock get to go first
+      wait_for(:start_sharing) { busy_for_sharing?(false) }
+    end
+    @sharing[Thread.current] += 1
+  end
+end</pre> </div>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-stop_exclusive"> <span class="method-name">stop_exclusive</span><span class="method-args">(compatible: [])</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="stop_exclusive-source"> <pre class="ruby" data-language="ruby"># File activesupport/lib/active_support/concurrency/share_lock.rb, line 96
+def stop_exclusive(compatible: [])
+  synchronize do
+    raise "invalid unlock" if @exclusive_thread != Thread.current
+
+    @exclusive_depth -= 1
+    if @exclusive_depth == 0
+      @exclusive_thread = nil
+
+      if eligible_waiters?(compatible)
+        yield_shares(compatible: compatible, block_share: true) do
+          wait_for(:stop_exclusive) { @exclusive_thread || eligible_waiters?(compatible) }
+        end
+      end
+      @cv.broadcast
+    end
+  end
+end</pre> </div> <p>Relinquish the exclusive lock. Must only be called by the thread that called <a href="sharelock.html#method-i-start_exclusive"><code>start_exclusive</code></a> (and currently holds the lock).</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-stop_sharing"> <span class="method-name">stop_sharing</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="stop_sharing-source"> <pre class="ruby" data-language="ruby"># File activesupport/lib/active_support/concurrency/share_lock.rb, line 131
+def stop_sharing
+  synchronize do
+    if @sharing[Thread.current] &gt; 1
+      @sharing[Thread.current] -= 1
+    else
+      @sharing.delete Thread.current
+      @cv.broadcast
+    end
+  end
+end</pre> </div>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-yield_shares"> <span class="method-name">yield_shares</span><span class="method-args">(purpose: nil, compatible: [], block_share: false) { || ... }</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="yield_shares-source"> <pre class="ruby" data-language="ruby"># File activesupport/lib/active_support/concurrency/share_lock.rb, line 171
+def yield_shares(purpose: nil, compatible: [], block_share: false)
+  loose_shares = previous_wait = nil
+  synchronize do
+    if loose_shares = @sharing.delete(Thread.current)
+      if previous_wait = @waiting[Thread.current]
+        purpose = nil unless purpose == previous_wait[0]
+        compatible &amp;= previous_wait[1]
+      end
+      compatible |= [false] unless block_share
+      @waiting[Thread.current] = [purpose, compatible]
+    end
+
+    @cv.broadcast
+  end
+
+  begin
+    yield
+  ensure
+    synchronize do
+      wait_for(:yield_shares) { @exclusive_thread &amp;&amp; @exclusive_thread != Thread.current }
+
+      if previous_wait
+        @waiting[Thread.current] = previous_wait
+      else
+        @waiting.delete Thread.current
+      end
+      @sharing[Thread.current] = loose_shares if loose_shares
+    end
+  end
+end</pre> </div> <p>Temporarily give up all held Share locks while executing the supplied block, allowing any <code>compatible</code> exclusive lock request to proceed.</p>  </div> </div> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2004&ndash;2021 David Heinemeier Hansson<br>Licensed under the MIT License.<br>
+    
+  </p>
+</div>
