@@ -1,0 +1,154 @@
+<div class="sphx-glr-download-link-note admonition note"> <p class="admonition-title">Note</p> <p>Click <a class="reference internal" href="#sphx-glr-download-auto-examples-compose-plot-column-transformer-py"><span class="std std-ref">here</span></a> to download the full example code or to run this example in your browser via Binder</p> </div> <section class="sphx-glr-example-title" id="column-transformer-with-heterogeneous-data-sources"> <h1 id="sphx-glr-auto-examples-compose-plot-column-transformer-py">Column Transformer with Heterogeneous Data Sources</h1> <p>Datasets can often contain components that require different feature extraction and processing pipelines. This scenario might occur when:</p> <ol class="arabic simple"> <li>your dataset consists of heterogeneous data types (e.g. raster images and text captions),</li> <li>your dataset is stored in a <a class="reference external" href="https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.html#pandas.DataFrame" title="(in pandas v1.5.1)"><code>pandas.DataFrame</code></a> and different columns require different processing pipelines.</li> </ol> <p>This example demonstrates how to use <a class="reference internal" href="../../modules/generated/sklearn.compose.columntransformer.html#sklearn.compose.ColumnTransformer" title="sklearn.compose.ColumnTransformer"><code>ColumnTransformer</code></a> on a dataset containing different types of features. The choice of features is not particularly helpful, but serves to illustrate the technique.</p> <pre data-language="python"># Author: Matt Terry &lt;matt.terry@gmail.com&gt;
+#
+# License: BSD 3 clause
+
+import numpy as np
+
+from sklearn.preprocessing import FunctionTransformer
+from sklearn.datasets import fetch_20newsgroups
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import classification_report
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.svm import LinearSVC
+</pre> <section id="newsgroups-dataset"> <h2>20 newsgroups dataset</h2> <p>We will use the <a class="reference internal" href="https://scikit-learn.org/1.1/datasets/real_world.html#newsgroups-dataset"><span class="std std-ref">20 newsgroups dataset</span></a>, which comprises posts from newsgroups on 20 topics. This dataset is split into train and test subsets based on messages posted before and after a specific date. We will only use posts from 2 categories to speed up running time.</p> <pre data-language="python">categories = ["sci.med", "sci.space"]
+X_train, y_train = fetch_20newsgroups(
+    random_state=1,
+    subset="train",
+    categories=categories,
+    remove=("footers", "quotes"),
+    return_X_y=True,
+)
+X_test, y_test = fetch_20newsgroups(
+    random_state=1,
+    subset="test",
+    categories=categories,
+    remove=("footers", "quotes"),
+    return_X_y=True,
+)
+</pre> <p>Each feature comprises meta information about that post, such as the subject, and the body of the news post.</p> <pre data-language="python">print(X_train[0])
+</pre> <pre data-language="none">From: mccall@mksol.dseg.ti.com (fred j mccall 575-3539)
+Subject: Re: Metric vs English
+Article-I.D.: mksol.1993Apr6.131900.8407
+Organization: Texas Instruments Inc
+Lines: 31
+
+
+
+
+American, perhaps, but nothing military about it.  I learned (mostly)
+slugs when we talked English units in high school physics and while
+the teacher was an ex-Navy fighter jock the book certainly wasn't
+produced by the military.
+
+[Poundals were just too flinking small and made the math come out
+funny; sort of the same reason proponents of SI give for using that.]
+
+--
+"Insisting on perfect safety is for people who don't have the balls to live
+ in the real world."   -- Mary Shafer, NASA Ames Dryden
+</pre> </section> <section id="creating-transformers"> <h2>Creating transformers</h2> <p>First, we would like a transformer that extracts the subject and body of each post. Since this is a stateless transformation (does not require state information from training data), we can define a function that performs the data transformation then use <a class="reference internal" href="../../modules/generated/sklearn.preprocessing.functiontransformer.html#sklearn.preprocessing.FunctionTransformer" title="sklearn.preprocessing.FunctionTransformer"><code>FunctionTransformer</code></a> to create a scikit-learn transformer.</p> <pre data-language="python">def subject_body_extractor(posts):
+    # construct object dtype array with two columns
+    # first column = 'subject' and second column = 'body'
+    features = np.empty(shape=(len(posts), 2), dtype=object)
+    for i, text in enumerate(posts):
+        # temporary variable `_` stores '\n\n'
+        headers, _, body = text.partition("\n\n")
+        # store body text in second column
+        features[i, 1] = body
+
+        prefix = "Subject:"
+        sub = ""
+        # save text after 'Subject:' in first column
+        for line in headers.split("\n"):
+            if line.startswith(prefix):
+                sub = line[len(prefix) :]
+                break
+        features[i, 0] = sub
+
+    return features
+
+
+subject_body_transformer = FunctionTransformer(subject_body_extractor)
+</pre> <p>We will also create a transformer that extracts the length of the text and the number of sentences.</p> <pre data-language="python">def text_stats(posts):
+    return [{"length": len(text), "num_sentences": text.count(".")} for text in posts]
+
+
+text_stats_transformer = FunctionTransformer(text_stats)
+</pre> </section> <section id="classification-pipeline"> <h2>Classification pipeline</h2> <p>The pipeline below extracts the subject and body from each post using <code>SubjectBodyExtractor</code>, producing a (n_samples, 2) array. This array is then used to compute standard bag-of-words features for the subject and body as well as text length and number of sentences on the body, using <code>ColumnTransformer</code>. We combine them, with weights, then train a classifier on the combined set of features.</p> <pre data-language="python">pipeline = Pipeline(
+    [
+        # Extract subject &amp; body
+        ("subjectbody", subject_body_transformer),
+        # Use ColumnTransformer to combine the subject and body features
+        (
+            "union",
+            ColumnTransformer(
+                [
+                    # bag-of-words for subject (col 0)
+                    ("subject", TfidfVectorizer(min_df=50), 0),
+                    # bag-of-words with decomposition for body (col 1)
+                    (
+                        "body_bow",
+                        Pipeline(
+                            [
+                                ("tfidf", TfidfVectorizer()),
+                                ("best", TruncatedSVD(n_components=50)),
+                            ]
+                        ),
+                        1,
+                    ),
+                    # Pipeline for pulling text stats from post's body
+                    (
+                        "body_stats",
+                        Pipeline(
+                            [
+                                (
+                                    "stats",
+                                    text_stats_transformer,
+                                ),  # returns a list of dicts
+                                (
+                                    "vect",
+                                    DictVectorizer(),
+                                ),  # list of dicts -&gt; feature matrix
+                            ]
+                        ),
+                        1,
+                    ),
+                ],
+                # weight above ColumnTransformer features
+                transformer_weights={
+                    "subject": 0.8,
+                    "body_bow": 0.5,
+                    "body_stats": 1.0,
+                },
+            ),
+        ),
+        # Use a SVC classifier on the combined features
+        ("svc", LinearSVC(dual=False)),
+    ],
+    verbose=True,
+)
+</pre> <p>Finally, we fit our pipeline on the training data and use it to predict topics for <code>X_test</code>. Performance metrics of our pipeline are then printed.</p> <pre data-language="python">pipeline.fit(X_train, y_train)
+y_pred = pipeline.predict(X_test)
+print("Classification report:\n\n{}".format(classification_report(y_test, y_pred)))
+</pre> <pre data-language="none">[Pipeline] ....... (step 1 of 3) Processing subjectbody, total=   0.0s
+[Pipeline] ............. (step 2 of 3) Processing union, total=   0.4s
+[Pipeline] ............... (step 3 of 3) Processing svc, total=   0.0s
+Classification report:
+
+              precision    recall  f1-score   support
+
+           0       0.84      0.87      0.86       396
+           1       0.87      0.83      0.85       394
+
+    accuracy                           0.85       790
+   macro avg       0.85      0.85      0.85       790
+weighted avg       0.85      0.85      0.85       790
+</pre> <p class="sphx-glr-timing"><strong>Total running time of the script:</strong> ( 0 minutes 2.388 seconds)</p> <div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-auto-examples-compose-plot-column-transformer-py"> <div class="binder-badge docutils container"> <a class="reference external image-reference" href="https://mybinder.org/v2/gh/scikit-learn/scikit-learn/1.1.X?urlpath=lab/tree/notebooks/auto_examples/compose/plot_column_transformer.ipynb"><img alt="Launch binder" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB3aWR0aD0iMTA5IiBoZWlnaHQ9IjIwIj48bGluZWFyR3JhZGllbnQgaWQ9ImIiIHgyPSIwIiB5Mj0iMTAwJSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjYmJiIiBzdG9wLW9wYWNpdHk9Ii4xIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLW9wYWNpdHk9Ii4xIi8+PC9saW5lYXJHcmFkaWVudD48Y2xpcFBhdGggaWQ9ImEiPjxyZWN0IHdpZHRoPSIxMDkiIGhlaWdodD0iMjAiIHJ4PSIzIiBmaWxsPSIjZmZmIi8+PC9jbGlwUGF0aD48ZyBjbGlwLXBhdGg9InVybCgjYSkiPjxwYXRoIGZpbGw9IiM1NTUiIGQ9Ik0wIDBoNjR2MjBIMHoiLz48cGF0aCBmaWxsPSIjNTc5YWNhIiBkPSJNNjQgMGg0NXYyMEg2NHoiLz48cGF0aCBmaWxsPSJ1cmwoI2IpIiBkPSJNMCAwaDEwOXYyMEgweiIvPjwvZz48ZyBmaWxsPSIjZmZmIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LWZhbWlseT0iRGVqYVZ1IFNhbnMsVmVyZGFuYSxHZW5ldmEsc2Fucy1zZXJpZiIgZm9udC1zaXplPSIxMTAiPjxpbWFnZSB4PSI1IiB5PSIzIiB3aWR0aD0iMTQiIGhlaWdodD0iMTQiIHhsaW5rOmhyZWY9ImRhdGE6aW1hZ2UvcG5nO2Jhc2U2NCxpVkJPUncwS0dnb0FBQUFOU1VoRVVnQUFBRmtBQUFCWkNBTUFBQUJpMVhpZEFBQUI4bEJNVkVYLy8vOVhtc3JtWllIMW9sSlhtc3Ixb2xKWG1zcm1aWUgxb2xKWG1zcjFvbEpYbXNybVpZSDFvbEwxb2xKWG1zcjFvbEpYbXNybVpZSDFvbEwxb2xKWG1zcm1aWUgxb2xKWG1zcjFvbEwxb2xKWG1zcm1aWUgxb2xMMW9sSlhtc3JtWllIMW9sTDFvbEwwbkZmMW9sSlhtc3JtWllIMW9sSlhtc3E4ZFpiMW9sSlhtc3JtWllIMW9sSlhtc3BYbXNwWG1zcjFvbEwxb2xKWG1zcm1aWUgxb2xKWG1zcjFvbEwxb2xKWG1zcm1aWUgxb2xMMW9sTGVhSVZYbXNybVpZSDFvbEwxb2xMMW9sSlhtc3JtWllIMW9sTG5hMzFYbXNyMW9sSlhtc3Ixb2xKWG1zcm1aWUgxb2xMcW9WcjFvbEpYbXNyMW9sSlhtc3JtWllIMW9sTDFvbEtrZmFQb2JYdnZpR2FiZ2FkWG1zcVRoS3VvZktIbVo0RG9ibnIxb2xKWG1zcjFvbEpYbXNwWG1zcjFvbEpYbXNyZlo0VHVoV24xb2xMMW9sSlhtc3FCaTdYMW9sSlhtc3BabXNsYm1NaGJtc2RlbXNWZmw4Wmdtc05pbThKcGs4RjBtN1I0bTdGNW5MQjZqYmg3amJpRGlyT0VpYk9HbkthTWhxK1BuYUNWZzZxV2c2cWVnS2FmZjZXaG5wS29mS0d0bm9teGVaeTNub0c2ZFppK24zdkNjcFBEY3BQR24zYkxiNC9NYjQ3VWJJclZhNHJZb0dqZGFJYmVhSVhob1dIbVpZSG9iWHZwY0hqcWRIWHJlSExyb1Zyc2ZHL3VoR251aDJid2oySHhrMTd5bDF2em1sanptMWowbmxYMW9sTDNBSlhXQUFBQWJYUlNUbE1BRUJBUUh4OGdJQ0F1TGpBd01EdzlQVUJBUUVwUVVGQlhWMWhnWUdCa2NIQndjWGw4Z0lDQWdvaUlrSkNRbEppY25KMmdvS0NtcUsrd3NMQzR1c0RBd01qUDBORFExTmJXM056ZzRPRGk1KzN2OFBEdzgvVDA5UFgyOXZiMzkvZjUrZnI3Ky96OC9QejkvdjcremN6Q3hnQUFCQzVKUkVGVWVBSE4xdWwzazBVVUJ2Q2IxQ1RWcG1wYWl0QUdTTFNwU3VLQ0xXcGJUS05KRkdsY1NNQUZGNjNpVW1SY2NORzZnTGJ1eGtYVTY2SkFVZWYvOUxTcG1YbnlMcjNUNUFPL3J6bDV6ajEzN3AxMzZCSVN5NDRmS0pYdUdOL2QxOVBVZlllTzY3Wm5xdGYyS0gzM0lkMXBzWG9GZFczMHNQWjFzTXZzMkQwNjBBSHF3czRGSGVKb2pMWnFudzUzY21mdmcrWFI4bUMwT0VqdXhyWEVrWDV5ZGVWSkxWSWxWMGUxMFBYazVrN2RZZUh1N0NqMWorNDl1S2c3dUxVNjF0R0x3MWxxMjd1Z1FZbGNsSEM0Ymd2N1ZRK1RBeWo1WmMvVWpzUHZzMXNkNWNXcnlXT2J0dldUMkVQYTRydG5XVzNKa3BqZ2dFcGJPc1ByN0Y3RXlOZXd0cEJJc2xBN3A0M0hDc253b29YVEVjM1VtUG1DTm41bHJxVEp4eTZuUm1jYXZHWlZ0LzNEYTJwRDVOSHZzT0hKQ3JkYzFHMnIzRElUcFU3eWljN3cvN1J4bmpjMGt0NUdDNGRqaXYyU3ozRmIyaUVaZzQxL2Rkc0ZEb3l1WXJJa21GZWh6MEhSMnRoUGdRcU15UVliMk90QjBXeHNaM0JlRzMrd3BSYjF2emwyVVlCb2c4RmZHaHR0RktqdEFjbG5aWXJSbzlyeUc5dUcvRlpRVTRBRWc4WkU5TGpHTXpUbXFLWFBMbmxXVm5JbFFRVHZ4SmY4aXA3VmdqWmp5VlByancxdGU1b3RNN1JtUDd4bStzSzJHdjlJOEdpKytCUmJFa1I5RUJ3OHpSVWNLeHdwNzN4a2FMaXFRYitrR2R1SlROSEc3MnpjVzlMb0pncVF4cFAzL1RqLy9jM3lCMHRxemFtbDA1LytvckhMa3NWTys5NWtYNy83cWdKdm5qbHJmcjJHZ3N5eDBlb3k5dVB6TjVTUGQ4NmFYZ2dPc0VLVzJQcno3ZHUzVklEMy90enMvc1NSczJ3N292VkhLdGpyWDJwZDdaTWxUeEFZZkJBTDlqaUR3ZkxrcTU1VG03aWZoTWxUR1B5Q0FzN1JGUmhuNDdKbmxjQjlSTTVUOTdBU3VaWEljVk51VURJbmRwRGJkc2ZycXNPcHBlWGw1WStYVktkakZDVGgrekdhVnVqMGQ5enkwNVBQSzNRekJhbXhkd3RUQ3J6eWcvMlJ2ZjJFc3RVam9yZEd3YS9reDltU0pMcjhtTEx0Q1c4SEhHSmMyUjVoUzIxOUlpRjZQblR1c09xY01sNTdnbTBaOGthbktNQVFnMHFTeXVaZm43ekl0c2JHeU85UWxueFkwZUN1RDFYTDJ5cy9Nc3JRaGx0RTdVZzB1Rk96dWZKRkUyUHhCby9ZQXg4WFBQZER3V04wTXJEUllJWkYwbVNNS0NOSGdhSVZGb0JiTm9MSjd0RVFES3hHRjBrY0xRaW1vakNab3B2ME9rTk95V0NDZzlYTVZBaTdBUkp6UWRNMlFVaDBnbUJvempjM1NrZzZkU0JScURHWVNVT3U2NlpnK0kyZk5acy9NMy9mL0dybC9YbnlGMUd3M1ZLQ2V6MFBONUlVZkZMcXZnVU40QzBxTnFZczVZaFBMK2FWWllERTRJcFVrNTdvU0ZuSm00RnlDcXFPRTBqaFkyU015TEZvbzU2enlvNmJlY09TNVVWRGRqN1ZpaDB6cCt0Y01od1JwQmVMeXF0SWpsSktBSVpTYkk4U0dTRjNrMHBBM21SNXRIdXdQRm9hN043cmVvcTJicUNzQWsxSHFDdTV1dkkxbjZKdVJYSStTMU1jbzU0WW1ZVHdjbjZBZWljK2tzc1hpOFhwWEM0VjN0Ny9BRHVUTkthUUpkU2NBQUFBQUVsRlRrU3VRbUNDIi8+IDx0ZXh0IHg9IjQxNSIgeT0iMTUwIiBmaWxsPSIjMDEwMTAxIiBmaWxsLW9wYWNpdHk9Ii4zIiB0cmFuc2Zvcm09InNjYWxlKC4xKSIgdGV4dExlbmd0aD0iMzcwIj5sYXVuY2g8L3RleHQ+PHRleHQgeD0iNDE1IiB5PSIxNDAiIHRyYW5zZm9ybT0ic2NhbGUoLjEpIiB0ZXh0TGVuZ3RoPSIzNzAiPmxhdW5jaDwvdGV4dD48dGV4dCB4PSI4NTUiIHk9IjE1MCIgZmlsbD0iIzAxMDEwMSIgZmlsbC1vcGFjaXR5PSIuMyIgdHJhbnNmb3JtPSJzY2FsZSguMSkiIHRleHRMZW5ndGg9IjM1MCI+YmluZGVyPC90ZXh0Pjx0ZXh0IHg9Ijg1NSIgeT0iMTQwIiB0cmFuc2Zvcm09InNjYWxlKC4xKSIgdGV4dExlbmd0aD0iMzUwIj5iaW5kZXI8L3RleHQ+PC9nPiA8L3N2Zz4=" width="150px"></a> </div> <div class="sphx-glr-download sphx-glr-download-python docutils container"> <p><a class="reference download internal" download="" href="https://scikit-learn.org/1.1/_downloads/3e8abcbcde21489054beb05cb87da525/plot_column_transformer.py"><code>Download Python source code: plot_column_transformer.py</code></a></p> </div> <div class="sphx-glr-download sphx-glr-download-jupyter docutils container"> <p><a class="reference download internal" download="" href="https://scikit-learn.org/1.1/_downloads/15dc6d7a809edf988a7328336a25faec/plot_column_transformer.ipynb"><code>Download Jupyter notebook: plot_column_transformer.ipynb</code></a></p> </div> </div>  </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2007&ndash;2022 The scikit-learn developers<br>Licensed under the 3-clause BSD License.<br>
+    <a href="https://scikit-learn.org/1.1/auto_examples/compose/plot_column_transformer.html" class="_attribution-link">https://scikit-learn.org/1.1/auto_examples/compose/plot_column_transformer.html</a>
+  </p>
+</div>

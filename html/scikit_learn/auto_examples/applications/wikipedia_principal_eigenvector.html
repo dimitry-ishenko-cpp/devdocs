@@ -1,0 +1,184 @@
+<div class="sphx-glr-download-link-note admonition note"> <p class="admonition-title">Note</p> <p>Click <a class="reference internal" href="#sphx-glr-download-auto-examples-applications-wikipedia-principal-eigenvector-py"><span class="std std-ref">here</span></a> to download the full example code or to run this example in your browser via Binder</p> </div> <section class="sphx-glr-example-title" id="wikipedia-principal-eigenvector"> <h1 id="sphx-glr-auto-examples-applications-wikipedia-principal-eigenvector-py">Wikipedia principal eigenvector</h1> <p>A classical way to assert the relative importance of vertices in a graph is to compute the principal eigenvector of the adjacency matrix so as to assign to each vertex the values of the components of the first eigenvector as a centrality score:</p>  <p><a class="reference external" href="https://en.wikipedia.org/wiki/Eigenvector_centrality">https://en.wikipedia.org/wiki/Eigenvector_centrality</a></p>  <p>On the graph of webpages and links those values are called the PageRank scores by Google.</p> <p>The goal of this example is to analyze the graph of links inside wikipedia articles to rank articles by relative importance according to this eigenvector centrality.</p> <p>The traditional way to compute the principal eigenvector is to use the power iteration method:</p>  <p><a class="reference external" href="https://en.wikipedia.org/wiki/Power_iteration">https://en.wikipedia.org/wiki/Power_iteration</a></p>  <p>Here the computation is achieved thanks to Martinsson’s Randomized SVD algorithm implemented in scikit-learn.</p> <p>The graph data is fetched from the DBpedia dumps. DBpedia is an extraction of the latent structured data of the Wikipedia content.</p> <pre data-language="python"># Author: Olivier Grisel &lt;olivier.grisel@ensta.org&gt;
+# License: BSD 3 clause
+
+from bz2 import BZ2File
+import os
+from datetime import datetime
+from pprint import pprint
+from time import time
+
+import numpy as np
+
+from scipy import sparse
+
+from sklearn.decomposition import randomized_svd
+from urllib.request import urlopen
+</pre> <section id="download-data-if-not-already-on-disk"> <h2>Download data, if not already on disk</h2> <pre data-language="python">redirects_url = "http://downloads.dbpedia.org/3.5.1/en/redirects_en.nt.bz2"
+redirects_filename = redirects_url.rsplit("/", 1)[1]
+
+page_links_url = "http://downloads.dbpedia.org/3.5.1/en/page_links_en.nt.bz2"
+page_links_filename = page_links_url.rsplit("/", 1)[1]
+
+resources = [
+    (redirects_url, redirects_filename),
+    (page_links_url, page_links_filename),
+]
+
+for url, filename in resources:
+    if not os.path.exists(filename):
+        print("Downloading data from '%s', please wait..." % url)
+        opener = urlopen(url)
+        open(filename, "wb").write(opener.read())
+        print()
+</pre> </section> <section id="loading-the-redirect-files"> <h2>Loading the redirect files</h2> <pre data-language="python">def index(redirects, index_map, k):
+    """Find the index of an article name after redirect resolution"""
+    k = redirects.get(k, k)
+    return index_map.setdefault(k, len(index_map))
+
+
+DBPEDIA_RESOURCE_PREFIX_LEN = len("http://dbpedia.org/resource/")
+SHORTNAME_SLICE = slice(DBPEDIA_RESOURCE_PREFIX_LEN + 1, -1)
+
+
+def short_name(nt_uri):
+    """Remove the &lt; and &gt; URI markers and the common URI prefix"""
+    return nt_uri[SHORTNAME_SLICE]
+
+
+def get_redirects(redirects_filename):
+    """Parse the redirections and build a transitively closed map out of it"""
+    redirects = {}
+    print("Parsing the NT redirect file")
+    for l, line in enumerate(BZ2File(redirects_filename)):
+        split = line.split()
+        if len(split) != 4:
+            print("ignoring malformed line: " + line)
+            continue
+        redirects[short_name(split[0])] = short_name(split[2])
+        if l % 1000000 == 0:
+            print("[%s] line: %08d" % (datetime.now().isoformat(), l))
+
+    # compute the transitive closure
+    print("Computing the transitive closure of the redirect relation")
+    for l, source in enumerate(redirects.keys()):
+        transitive_target = None
+        target = redirects[source]
+        seen = {source}
+        while True:
+            transitive_target = target
+            target = redirects.get(target)
+            if target is None or target in seen:
+                break
+            seen.add(target)
+        redirects[source] = transitive_target
+        if l % 1000000 == 0:
+            print("[%s] line: %08d" % (datetime.now().isoformat(), l))
+
+    return redirects
+</pre> </section> <section id="computing-the-adjacency-matrix"> <h2>Computing the Adjacency matrix</h2> <pre data-language="python">def get_adjacency_matrix(redirects_filename, page_links_filename, limit=None):
+    """Extract the adjacency graph as a scipy sparse matrix
+
+    Redirects are resolved first.
+
+    Returns X, the scipy sparse adjacency matrix, redirects as python
+    dict from article names to article names and index_map a python dict
+    from article names to python int (article indexes).
+    """
+
+    print("Computing the redirect map")
+    redirects = get_redirects(redirects_filename)
+
+    print("Computing the integer index map")
+    index_map = dict()
+    links = list()
+    for l, line in enumerate(BZ2File(page_links_filename)):
+        split = line.split()
+        if len(split) != 4:
+            print("ignoring malformed line: " + line)
+            continue
+        i = index(redirects, index_map, short_name(split[0]))
+        j = index(redirects, index_map, short_name(split[2]))
+        links.append((i, j))
+        if l % 1000000 == 0:
+            print("[%s] line: %08d" % (datetime.now().isoformat(), l))
+
+        if limit is not None and l &gt;= limit - 1:
+            break
+
+    print("Computing the adjacency matrix")
+    X = sparse.lil_matrix((len(index_map), len(index_map)), dtype=np.float32)
+    for i, j in links:
+        X[i, j] = 1.0
+    del links
+    print("Converting to CSR representation")
+    X = X.tocsr()
+    print("CSR conversion done")
+    return X, redirects, index_map
+
+
+# stop after 5M links to make it possible to work in RAM
+X, redirects, index_map = get_adjacency_matrix(
+    redirects_filename, page_links_filename, limit=5000000
+)
+names = {i: name for name, i in index_map.items()}
+</pre> </section> <section id="computing-principal-singular-vector-using-randomized-svd"> <h2>Computing Principal Singular Vector using Randomized SVD</h2> <pre data-language="python">print("Computing the principal singular vectors using randomized_svd")
+t0 = time()
+U, s, V = randomized_svd(X, 5, n_iter=3)
+print("done in %0.3fs" % (time() - t0))
+
+# print the names of the wikipedia related strongest components of the
+# principal singular vector which should be similar to the highest eigenvector
+print("Top wikipedia pages according to principal singular vectors")
+pprint([names[i] for i in np.abs(U.T[0]).argsort()[-10:]])
+pprint([names[i] for i in np.abs(V[0]).argsort()[-10:]])
+</pre> </section> <section id="computing-centrality-scores"> <h2>Computing Centrality scores</h2> <pre data-language="python">def centrality_scores(X, alpha=0.85, max_iter=100, tol=1e-10):
+    """Power iteration computation of the principal eigenvector
+
+    This method is also known as Google PageRank and the implementation
+    is based on the one from the NetworkX project (BSD licensed too)
+    with copyrights by:
+
+      Aric Hagberg &lt;hagberg@lanl.gov&gt;
+      Dan Schult &lt;dschult@colgate.edu&gt;
+      Pieter Swart &lt;swart@lanl.gov&gt;
+    """
+    n = X.shape[0]
+    X = X.copy()
+    incoming_counts = np.asarray(X.sum(axis=1)).ravel()
+
+    print("Normalizing the graph")
+    for i in incoming_counts.nonzero()[0]:
+        X.data[X.indptr[i] : X.indptr[i + 1]] *= 1.0 / incoming_counts[i]
+    dangle = np.asarray(np.where(np.isclose(X.sum(axis=1), 0), 1.0 / n, 0)).ravel()
+
+    scores = np.full(n, 1.0 / n, dtype=np.float32)  # initial guess
+    for i in range(max_iter):
+        print("power iteration #%d" % i)
+        prev_scores = scores
+        scores = (
+            alpha * (scores * X + np.dot(dangle, prev_scores))
+            + (1 - alpha) * prev_scores.sum() / n
+        )
+        # check convergence: normalized l_inf norm
+        scores_max = np.abs(scores).max()
+        if scores_max == 0.0:
+            scores_max = 1.0
+        err = np.abs(scores - prev_scores).max() / scores_max
+        print("error: %0.6f" % err)
+        if err &lt; n * tol:
+            return scores
+
+    return scores
+
+
+print("Computing principal eigenvector score using a power iteration method")
+t0 = time()
+scores = centrality_scores(X, max_iter=100)
+print("done in %0.3fs" % (time() - t0))
+pprint([names[i] for i in np.abs(scores).argsort()[-10:]])
+</pre> <p class="sphx-glr-timing"><strong>Total running time of the script:</strong> ( 0 minutes 0.000 seconds)</p> <div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-auto-examples-applications-wikipedia-principal-eigenvector-py"> <div class="binder-badge docutils container"> <a class="reference external image-reference" href="https://mybinder.org/v2/gh/scikit-learn/scikit-learn/1.1.X?urlpath=lab/tree/notebooks/auto_examples/applications/wikipedia_principal_eigenvector.ipynb"><img alt="Launch binder" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB3aWR0aD0iMTA5IiBoZWlnaHQ9IjIwIj48bGluZWFyR3JhZGllbnQgaWQ9ImIiIHgyPSIwIiB5Mj0iMTAwJSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjYmJiIiBzdG9wLW9wYWNpdHk9Ii4xIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLW9wYWNpdHk9Ii4xIi8+PC9saW5lYXJHcmFkaWVudD48Y2xpcFBhdGggaWQ9ImEiPjxyZWN0IHdpZHRoPSIxMDkiIGhlaWdodD0iMjAiIHJ4PSIzIiBmaWxsPSIjZmZmIi8+PC9jbGlwUGF0aD48ZyBjbGlwLXBhdGg9InVybCgjYSkiPjxwYXRoIGZpbGw9IiM1NTUiIGQ9Ik0wIDBoNjR2MjBIMHoiLz48cGF0aCBmaWxsPSIjNTc5YWNhIiBkPSJNNjQgMGg0NXYyMEg2NHoiLz48cGF0aCBmaWxsPSJ1cmwoI2IpIiBkPSJNMCAwaDEwOXYyMEgweiIvPjwvZz48ZyBmaWxsPSIjZmZmIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LWZhbWlseT0iRGVqYVZ1IFNhbnMsVmVyZGFuYSxHZW5ldmEsc2Fucy1zZXJpZiIgZm9udC1zaXplPSIxMTAiPjxpbWFnZSB4PSI1IiB5PSIzIiB3aWR0aD0iMTQiIGhlaWdodD0iMTQiIHhsaW5rOmhyZWY9ImRhdGE6aW1hZ2UvcG5nO2Jhc2U2NCxpVkJPUncwS0dnb0FBQUFOU1VoRVVnQUFBRmtBQUFCWkNBTUFBQUJpMVhpZEFBQUI4bEJNVkVYLy8vOVhtc3JtWllIMW9sSlhtc3Ixb2xKWG1zcm1aWUgxb2xKWG1zcjFvbEpYbXNybVpZSDFvbEwxb2xKWG1zcjFvbEpYbXNybVpZSDFvbEwxb2xKWG1zcm1aWUgxb2xKWG1zcjFvbEwxb2xKWG1zcm1aWUgxb2xMMW9sSlhtc3JtWllIMW9sTDFvbEwwbkZmMW9sSlhtc3JtWllIMW9sSlhtc3E4ZFpiMW9sSlhtc3JtWllIMW9sSlhtc3BYbXNwWG1zcjFvbEwxb2xKWG1zcm1aWUgxb2xKWG1zcjFvbEwxb2xKWG1zcm1aWUgxb2xMMW9sTGVhSVZYbXNybVpZSDFvbEwxb2xMMW9sSlhtc3JtWllIMW9sTG5hMzFYbXNyMW9sSlhtc3Ixb2xKWG1zcm1aWUgxb2xMcW9WcjFvbEpYbXNyMW9sSlhtc3JtWllIMW9sTDFvbEtrZmFQb2JYdnZpR2FiZ2FkWG1zcVRoS3VvZktIbVo0RG9ibnIxb2xKWG1zcjFvbEpYbXNwWG1zcjFvbEpYbXNyZlo0VHVoV24xb2xMMW9sSlhtc3FCaTdYMW9sSlhtc3BabXNsYm1NaGJtc2RlbXNWZmw4Wmdtc05pbThKcGs4RjBtN1I0bTdGNW5MQjZqYmg3amJpRGlyT0VpYk9HbkthTWhxK1BuYUNWZzZxV2c2cWVnS2FmZjZXaG5wS29mS0d0bm9teGVaeTNub0c2ZFppK24zdkNjcFBEY3BQR24zYkxiNC9NYjQ3VWJJclZhNHJZb0dqZGFJYmVhSVhob1dIbVpZSG9iWHZwY0hqcWRIWHJlSExyb1Zyc2ZHL3VoR251aDJid2oySHhrMTd5bDF2em1sanptMWowbmxYMW9sTDNBSlhXQUFBQWJYUlNUbE1BRUJBUUh4OGdJQ0F1TGpBd01EdzlQVUJBUUVwUVVGQlhWMWhnWUdCa2NIQndjWGw4Z0lDQWdvaUlrSkNRbEppY25KMmdvS0NtcUsrd3NMQzR1c0RBd01qUDBORFExTmJXM056ZzRPRGk1KzN2OFBEdzgvVDA5UFgyOXZiMzkvZjUrZnI3Ky96OC9QejkvdjcremN6Q3hnQUFCQzVKUkVGVWVBSE4xdWwzazBVVUJ2Q2IxQ1RWcG1wYWl0QUdTTFNwU3VLQ0xXcGJUS05KRkdsY1NNQUZGNjNpVW1SY2NORzZnTGJ1eGtYVTY2SkFVZWYvOUxTcG1YbnlMcjNUNUFPL3J6bDV6ajEzN3AxMzZCSVN5NDRmS0pYdUdOL2QxOVBVZlllTzY3Wm5xdGYyS0gzM0lkMXBzWG9GZFczMHNQWjFzTXZzMkQwNjBBSHF3czRGSGVKb2pMWnFudzUzY21mdmcrWFI4bUMwT0VqdXhyWEVrWDV5ZGVWSkxWSWxWMGUxMFBYazVrN2RZZUh1N0NqMWorNDl1S2c3dUxVNjF0R0x3MWxxMjd1Z1FZbGNsSEM0Ymd2N1ZRK1RBeWo1WmMvVWpzUHZzMXNkNWNXcnlXT2J0dldUMkVQYTRydG5XVzNKa3BqZ2dFcGJPc1ByN0Y3RXlOZXd0cEJJc2xBN3A0M0hDc253b29YVEVjM1VtUG1DTm41bHJxVEp4eTZuUm1jYXZHWlZ0LzNEYTJwRDVOSHZzT0hKQ3JkYzFHMnIzRElUcFU3eWljN3cvN1J4bmpjMGt0NUdDNGRqaXYyU3ozRmIyaUVaZzQxL2Rkc0ZEb3l1WXJJa21GZWh6MEhSMnRoUGdRcU15UVliMk90QjBXeHNaM0JlRzMrd3BSYjF2emwyVVlCb2c4RmZHaHR0RktqdEFjbG5aWXJSbzlyeUc5dUcvRlpRVTRBRWc4WkU5TGpHTXpUbXFLWFBMbmxXVm5JbFFRVHZ4SmY4aXA3VmdqWmp5VlByancxdGU1b3RNN1JtUDd4bStzSzJHdjlJOEdpKytCUmJFa1I5RUJ3OHpSVWNLeHdwNzN4a2FMaXFRYitrR2R1SlROSEc3MnpjVzlMb0pncVF4cFAzL1RqLy9jM3lCMHRxemFtbDA1LytvckhMa3NWTys5NWtYNy83cWdKdm5qbHJmcjJHZ3N5eDBlb3k5dVB6TjVTUGQ4NmFYZ2dPc0VLVzJQcno3ZHUzVklEMy90enMvc1NSczJ3N292VkhLdGpyWDJwZDdaTWxUeEFZZkJBTDlqaUR3ZkxrcTU1VG03aWZoTWxUR1B5Q0FzN1JGUmhuNDdKbmxjQjlSTTVUOTdBU3VaWEljVk51VURJbmRwRGJkc2ZycXNPcHBlWGw1WStYVktkakZDVGgrekdhVnVqMGQ5enkwNVBQSzNRekJhbXhkd3RUQ3J6eWcvMlJ2ZjJFc3RVam9yZEd3YS9reDltU0pMcjhtTEx0Q1c4SEhHSmMyUjVoUzIxOUlpRjZQblR1c09xY01sNTdnbTBaOGthbktNQVFnMHFTeXVaZm43ekl0c2JHeU85UWxueFkwZUN1RDFYTDJ5cy9Nc3JRaGx0RTdVZzB1Rk96dWZKRkUyUHhCby9ZQXg4WFBQZER3V04wTXJEUllJWkYwbVNNS0NOSGdhSVZGb0JiTm9MSjd0RVFES3hHRjBrY0xRaW1vakNab3B2ME9rTk95V0NDZzlYTVZBaTdBUkp6UWRNMlFVaDBnbUJvempjM1NrZzZkU0JScURHWVNVT3U2NlpnK0kyZk5acy9NMy9mL0dybC9YbnlGMUd3M1ZLQ2V6MFBONUlVZkZMcXZnVU40QzBxTnFZczVZaFBMK2FWWllERTRJcFVrNTdvU0ZuSm00RnlDcXFPRTBqaFkyU015TEZvbzU2enlvNmJlY09TNVVWRGRqN1ZpaDB6cCt0Y01od1JwQmVMeXF0SWpsSktBSVpTYkk4U0dTRjNrMHBBM21SNXRIdXdQRm9hN043cmVvcTJicUNzQWsxSHFDdTV1dkkxbjZKdVJYSStTMU1jbzU0WW1ZVHdjbjZBZWljK2tzc1hpOFhwWEM0VjN0Ny9BRHVUTkthUUpkU2NBQUFBQUVsRlRrU3VRbUNDIi8+IDx0ZXh0IHg9IjQxNSIgeT0iMTUwIiBmaWxsPSIjMDEwMTAxIiBmaWxsLW9wYWNpdHk9Ii4zIiB0cmFuc2Zvcm09InNjYWxlKC4xKSIgdGV4dExlbmd0aD0iMzcwIj5sYXVuY2g8L3RleHQ+PHRleHQgeD0iNDE1IiB5PSIxNDAiIHRyYW5zZm9ybT0ic2NhbGUoLjEpIiB0ZXh0TGVuZ3RoPSIzNzAiPmxhdW5jaDwvdGV4dD48dGV4dCB4PSI4NTUiIHk9IjE1MCIgZmlsbD0iIzAxMDEwMSIgZmlsbC1vcGFjaXR5PSIuMyIgdHJhbnNmb3JtPSJzY2FsZSguMSkiIHRleHRMZW5ndGg9IjM1MCI+YmluZGVyPC90ZXh0Pjx0ZXh0IHg9Ijg1NSIgeT0iMTQwIiB0cmFuc2Zvcm09InNjYWxlKC4xKSIgdGV4dExlbmd0aD0iMzUwIj5iaW5kZXI8L3RleHQ+PC9nPiA8L3N2Zz4=" width="150px"></a> </div> <div class="sphx-glr-download sphx-glr-download-python docutils container"> <p><a class="reference download internal" download="" href="https://scikit-learn.org/1.1/_downloads/51bc3899ceeec0ecf99c5f72ff1fd241/wikipedia_principal_eigenvector.py"><code>Download Python source code: wikipedia_principal_eigenvector.py</code></a></p> </div> <div class="sphx-glr-download sphx-glr-download-jupyter docutils container"> <p><a class="reference download internal" download="" href="https://scikit-learn.org/1.1/_downloads/948a4dfa149766b475b1cf2515f289d1/wikipedia_principal_eigenvector.ipynb"><code>Download Jupyter notebook: wikipedia_principal_eigenvector.ipynb</code></a></p> </div> </div>  </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2007&ndash;2022 The scikit-learn developers<br>Licensed under the 3-clause BSD License.<br>
+    <a href="https://scikit-learn.org/1.1/auto_examples/applications/wikipedia_principal_eigenvector.html" class="_attribution-link">https://scikit-learn.org/1.1/auto_examples/applications/wikipedia_principal_eigenvector.html</a>
+  </p>
+</div>

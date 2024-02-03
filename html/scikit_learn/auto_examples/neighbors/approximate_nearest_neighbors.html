@@ -1,0 +1,291 @@
+<div class="sphx-glr-download-link-note admonition note"> <p class="admonition-title">Note</p> <p>Click <a class="reference internal" href="#sphx-glr-download-auto-examples-neighbors-approximate-nearest-neighbors-py"><span class="std std-ref">here</span></a> to download the full example code or to run this example in your browser via Binder</p> </div> <section class="sphx-glr-example-title" id="approximate-nearest-neighbors-in-tsne"> <h1 id="sphx-glr-auto-examples-neighbors-approximate-nearest-neighbors-py">Approximate nearest neighbors in TSNE</h1> <p>This example presents how to chain KNeighborsTransformer and TSNE in a pipeline. It also shows how to wrap the packages <code>annoy</code> and <code>nmslib</code> to replace KNeighborsTransformer and perform approximate nearest neighbors. These packages can be installed with <code>pip install annoy nmslib</code>.</p> <p>Note: In KNeighborsTransformer we use the definition which includes each training point as its own neighbor in the count of <code>n_neighbors</code>, and for compatibility reasons, one extra neighbor is computed when <code>mode == 'distance'</code>. Please note that we do the same in the proposed wrappers.</p> <p>Sample output:</p> <pre data-language="python">Benchmarking on MNIST_2000:
+---------------------------
+AnnoyTransformer:                    0.305 sec
+NMSlibTransformer:                   0.144 sec
+KNeighborsTransformer:               0.090 sec
+TSNE with AnnoyTransformer:          2.818 sec
+TSNE with NMSlibTransformer:         2.592 sec
+TSNE with KNeighborsTransformer:     2.338 sec
+TSNE with internal NearestNeighbors: 2.364 sec
+
+Benchmarking on MNIST_10000:
+----------------------------
+AnnoyTransformer:                    2.874 sec
+NMSlibTransformer:                   1.098 sec
+KNeighborsTransformer:               1.264 sec
+TSNE with AnnoyTransformer:          16.118 sec
+TSNE with NMSlibTransformer:         15.281 sec
+TSNE with KNeighborsTransformer:     15.400 sec
+TSNE with internal NearestNeighbors: 15.573 sec
+</pre> <p>Note that the prediction speed KNeighborsTransformer was optimized in scikit-learn 1.1 and therefore approximate methods are not necessarily faster because computing the index takes time and can nullify the gains obtained at prediction time.</p> <pre data-language="python"># Author: Tom Dupre la Tour
+#
+# License: BSD 3 clause
+import time
+import sys
+
+try:
+    import annoy
+except ImportError:
+    print("The package 'annoy' is required to run this example.")
+    sys.exit()
+
+try:
+    import nmslib
+except ImportError:
+    print("The package 'nmslib' is required to run this example.")
+    sys.exit()
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import NullFormatter
+from scipy.sparse import csr_matrix
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.neighbors import KNeighborsTransformer
+from sklearn.utils._testing import assert_array_almost_equal
+from sklearn.datasets import fetch_openml
+from sklearn.pipeline import make_pipeline
+from sklearn.manifold import TSNE
+from sklearn.utils import shuffle
+
+
+class NMSlibTransformer(TransformerMixin, BaseEstimator):
+    """Wrapper for using nmslib as sklearn's KNeighborsTransformer"""
+
+    def __init__(self, n_neighbors=5, metric="euclidean", method="sw-graph", n_jobs=1):
+        self.n_neighbors = n_neighbors
+        self.method = method
+        self.metric = metric
+        self.n_jobs = n_jobs
+
+    def fit(self, X):
+        self.n_samples_fit_ = X.shape[0]
+
+        # see more metric in the manual
+        # https://github.com/nmslib/nmslib/tree/master/manual
+        space = {
+            "euclidean": "l2",
+            "cosine": "cosinesimil",
+            "l1": "l1",
+            "l2": "l2",
+        }[self.metric]
+
+        self.nmslib_ = nmslib.init(method=self.method, space=space)
+        self.nmslib_.addDataPointBatch(X)
+        self.nmslib_.createIndex()
+        return self
+
+    def transform(self, X):
+        n_samples_transform = X.shape[0]
+
+        # For compatibility reasons, as each sample is considered as its own
+        # neighbor, one extra neighbor will be computed.
+        n_neighbors = self.n_neighbors + 1
+
+        results = self.nmslib_.knnQueryBatch(X, k=n_neighbors, num_threads=self.n_jobs)
+        indices, distances = zip(*results)
+        indices, distances = np.vstack(indices), np.vstack(distances)
+
+        indptr = np.arange(0, n_samples_transform * n_neighbors + 1, n_neighbors)
+        kneighbors_graph = csr_matrix(
+            (distances.ravel(), indices.ravel(), indptr),
+            shape=(n_samples_transform, self.n_samples_fit_),
+        )
+
+        return kneighbors_graph
+
+
+class AnnoyTransformer(TransformerMixin, BaseEstimator):
+    """Wrapper for using annoy.AnnoyIndex as sklearn's KNeighborsTransformer"""
+
+    def __init__(self, n_neighbors=5, metric="euclidean", n_trees=10, search_k=-1):
+        self.n_neighbors = n_neighbors
+        self.n_trees = n_trees
+        self.search_k = search_k
+        self.metric = metric
+
+    def fit(self, X):
+        self.n_samples_fit_ = X.shape[0]
+        self.annoy_ = annoy.AnnoyIndex(X.shape[1], metric=self.metric)
+        for i, x in enumerate(X):
+            self.annoy_.add_item(i, x.tolist())
+        self.annoy_.build(self.n_trees)
+        return self
+
+    def transform(self, X):
+        return self._transform(X)
+
+    def fit_transform(self, X, y=None):
+        return self.fit(X)._transform(X=None)
+
+    def _transform(self, X):
+        """As `transform`, but handles X is None for faster `fit_transform`."""
+
+        n_samples_transform = self.n_samples_fit_ if X is None else X.shape[0]
+
+        # For compatibility reasons, as each sample is considered as its own
+        # neighbor, one extra neighbor will be computed.
+        n_neighbors = self.n_neighbors + 1
+
+        indices = np.empty((n_samples_transform, n_neighbors), dtype=int)
+        distances = np.empty((n_samples_transform, n_neighbors))
+
+        if X is None:
+            for i in range(self.annoy_.get_n_items()):
+                ind, dist = self.annoy_.get_nns_by_item(
+                    i, n_neighbors, self.search_k, include_distances=True
+                )
+
+                indices[i], distances[i] = ind, dist
+        else:
+            for i, x in enumerate(X):
+                indices[i], distances[i] = self.annoy_.get_nns_by_vector(
+                    x.tolist(), n_neighbors, self.search_k, include_distances=True
+                )
+
+        indptr = np.arange(0, n_samples_transform * n_neighbors + 1, n_neighbors)
+        kneighbors_graph = csr_matrix(
+            (distances.ravel(), indices.ravel(), indptr),
+            shape=(n_samples_transform, self.n_samples_fit_),
+        )
+
+        return kneighbors_graph
+
+
+def test_transformers():
+    """Test that AnnoyTransformer and KNeighborsTransformer give same results"""
+    X = np.random.RandomState(42).randn(10, 2)
+
+    knn = KNeighborsTransformer()
+    Xt0 = knn.fit_transform(X)
+
+    ann = AnnoyTransformer()
+    Xt1 = ann.fit_transform(X)
+
+    nms = NMSlibTransformer()
+    Xt2 = nms.fit_transform(X)
+
+    assert_array_almost_equal(Xt0.toarray(), Xt1.toarray(), decimal=5)
+    assert_array_almost_equal(Xt0.toarray(), Xt2.toarray(), decimal=5)
+
+
+def load_mnist(n_samples):
+    """Load MNIST, shuffle the data, and return only n_samples."""
+    mnist = fetch_openml("mnist_784", as_frame=False)
+    X, y = shuffle(mnist.data, mnist.target, random_state=2)
+    return X[:n_samples] / 255, y[:n_samples]
+
+
+def run_benchmark():
+    datasets = [
+        ("MNIST_2000", load_mnist(n_samples=2000)),
+        ("MNIST_10000", load_mnist(n_samples=10000)),
+    ]
+
+    n_iter = 500
+    perplexity = 30
+    metric = "euclidean"
+    # TSNE requires a certain number of neighbors which depends on the
+    # perplexity parameter.
+    # Add one since we include each sample as its own neighbor.
+    n_neighbors = int(3.0 * perplexity + 1) + 1
+
+    tsne_params = dict(
+        init="random",  # pca not supported for sparse matrices
+        perplexity=perplexity,
+        method="barnes_hut",
+        random_state=42,
+        n_iter=n_iter,
+        learning_rate="auto",
+    )
+
+    transformers = [
+        ("AnnoyTransformer", AnnoyTransformer(n_neighbors=n_neighbors, metric=metric)),
+        (
+            "NMSlibTransformer",
+            NMSlibTransformer(n_neighbors=n_neighbors, metric=metric),
+        ),
+        (
+            "KNeighborsTransformer",
+            KNeighborsTransformer(
+                n_neighbors=n_neighbors, mode="distance", metric=metric
+            ),
+        ),
+        (
+            "TSNE with AnnoyTransformer",
+            make_pipeline(
+                AnnoyTransformer(n_neighbors=n_neighbors, metric=metric),
+                TSNE(metric="precomputed", **tsne_params),
+            ),
+        ),
+        (
+            "TSNE with NMSlibTransformer",
+            make_pipeline(
+                NMSlibTransformer(n_neighbors=n_neighbors, metric=metric),
+                TSNE(metric="precomputed", **tsne_params),
+            ),
+        ),
+        (
+            "TSNE with KNeighborsTransformer",
+            make_pipeline(
+                KNeighborsTransformer(
+                    n_neighbors=n_neighbors, mode="distance", metric=metric
+                ),
+                TSNE(metric="precomputed", **tsne_params),
+            ),
+        ),
+        ("TSNE with internal NearestNeighbors", TSNE(metric=metric, **tsne_params)),
+    ]
+
+    # init the plot
+    nrows = len(datasets)
+    ncols = np.sum([1 for name, model in transformers if "TSNE" in name])
+    fig, axes = plt.subplots(
+        nrows=nrows, ncols=ncols, squeeze=False, figsize=(5 * ncols, 4 * nrows)
+    )
+    axes = axes.ravel()
+    i_ax = 0
+
+    for dataset_name, (X, y) in datasets:
+
+        msg = "Benchmarking on %s:" % dataset_name
+        print("\n%s\n%s" % (msg, "-" * len(msg)))
+
+        for transformer_name, transformer in transformers:
+            start = time.time()
+            Xt = transformer.fit_transform(X)
+            duration = time.time() - start
+
+            # print the duration report
+            longest = np.max([len(name) for name, model in transformers])
+            whitespaces = " " * (longest - len(transformer_name))
+            print("%s: %s%.3f sec" % (transformer_name, whitespaces, duration))
+
+            # plot TSNE embedding which should be very similar across methods
+            if "TSNE" in transformer_name:
+                axes[i_ax].set_title(transformer_name + "\non " + dataset_name)
+                axes[i_ax].scatter(
+                    Xt[:, 0],
+                    Xt[:, 1],
+                    c=y.astype(np.int32),
+                    alpha=0.2,
+                    cmap=plt.cm.viridis,
+                )
+                axes[i_ax].xaxis.set_major_formatter(NullFormatter())
+                axes[i_ax].yaxis.set_major_formatter(NullFormatter())
+                axes[i_ax].axis("tight")
+                i_ax += 1
+
+    fig.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    test_transformers()
+    run_benchmark()
+</pre> <p class="sphx-glr-timing"><strong>Total running time of the script:</strong> ( 0 minutes 0.000 seconds)</p> <div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-auto-examples-neighbors-approximate-nearest-neighbors-py"> <div class="binder-badge docutils container"> <a class="reference external image-reference" href="https://mybinder.org/v2/gh/scikit-learn/scikit-learn/1.1.X?urlpath=lab/tree/notebooks/auto_examples/neighbors/approximate_nearest_neighbors.ipynb"><img alt="Launch binder" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB3aWR0aD0iMTA5IiBoZWlnaHQ9IjIwIj48bGluZWFyR3JhZGllbnQgaWQ9ImIiIHgyPSIwIiB5Mj0iMTAwJSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjYmJiIiBzdG9wLW9wYWNpdHk9Ii4xIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLW9wYWNpdHk9Ii4xIi8+PC9saW5lYXJHcmFkaWVudD48Y2xpcFBhdGggaWQ9ImEiPjxyZWN0IHdpZHRoPSIxMDkiIGhlaWdodD0iMjAiIHJ4PSIzIiBmaWxsPSIjZmZmIi8+PC9jbGlwUGF0aD48ZyBjbGlwLXBhdGg9InVybCgjYSkiPjxwYXRoIGZpbGw9IiM1NTUiIGQ9Ik0wIDBoNjR2MjBIMHoiLz48cGF0aCBmaWxsPSIjNTc5YWNhIiBkPSJNNjQgMGg0NXYyMEg2NHoiLz48cGF0aCBmaWxsPSJ1cmwoI2IpIiBkPSJNMCAwaDEwOXYyMEgweiIvPjwvZz48ZyBmaWxsPSIjZmZmIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LWZhbWlseT0iRGVqYVZ1IFNhbnMsVmVyZGFuYSxHZW5ldmEsc2Fucy1zZXJpZiIgZm9udC1zaXplPSIxMTAiPjxpbWFnZSB4PSI1IiB5PSIzIiB3aWR0aD0iMTQiIGhlaWdodD0iMTQiIHhsaW5rOmhyZWY9ImRhdGE6aW1hZ2UvcG5nO2Jhc2U2NCxpVkJPUncwS0dnb0FBQUFOU1VoRVVnQUFBRmtBQUFCWkNBTUFBQUJpMVhpZEFBQUI4bEJNVkVYLy8vOVhtc3JtWllIMW9sSlhtc3Ixb2xKWG1zcm1aWUgxb2xKWG1zcjFvbEpYbXNybVpZSDFvbEwxb2xKWG1zcjFvbEpYbXNybVpZSDFvbEwxb2xKWG1zcm1aWUgxb2xKWG1zcjFvbEwxb2xKWG1zcm1aWUgxb2xMMW9sSlhtc3JtWllIMW9sTDFvbEwwbkZmMW9sSlhtc3JtWllIMW9sSlhtc3E4ZFpiMW9sSlhtc3JtWllIMW9sSlhtc3BYbXNwWG1zcjFvbEwxb2xKWG1zcm1aWUgxb2xKWG1zcjFvbEwxb2xKWG1zcm1aWUgxb2xMMW9sTGVhSVZYbXNybVpZSDFvbEwxb2xMMW9sSlhtc3JtWllIMW9sTG5hMzFYbXNyMW9sSlhtc3Ixb2xKWG1zcm1aWUgxb2xMcW9WcjFvbEpYbXNyMW9sSlhtc3JtWllIMW9sTDFvbEtrZmFQb2JYdnZpR2FiZ2FkWG1zcVRoS3VvZktIbVo0RG9ibnIxb2xKWG1zcjFvbEpYbXNwWG1zcjFvbEpYbXNyZlo0VHVoV24xb2xMMW9sSlhtc3FCaTdYMW9sSlhtc3BabXNsYm1NaGJtc2RlbXNWZmw4Wmdtc05pbThKcGs4RjBtN1I0bTdGNW5MQjZqYmg3amJpRGlyT0VpYk9HbkthTWhxK1BuYUNWZzZxV2c2cWVnS2FmZjZXaG5wS29mS0d0bm9teGVaeTNub0c2ZFppK24zdkNjcFBEY3BQR24zYkxiNC9NYjQ3VWJJclZhNHJZb0dqZGFJYmVhSVhob1dIbVpZSG9iWHZwY0hqcWRIWHJlSExyb1Zyc2ZHL3VoR251aDJid2oySHhrMTd5bDF2em1sanptMWowbmxYMW9sTDNBSlhXQUFBQWJYUlNUbE1BRUJBUUh4OGdJQ0F1TGpBd01EdzlQVUJBUUVwUVVGQlhWMWhnWUdCa2NIQndjWGw4Z0lDQWdvaUlrSkNRbEppY25KMmdvS0NtcUsrd3NMQzR1c0RBd01qUDBORFExTmJXM056ZzRPRGk1KzN2OFBEdzgvVDA5UFgyOXZiMzkvZjUrZnI3Ky96OC9QejkvdjcremN6Q3hnQUFCQzVKUkVGVWVBSE4xdWwzazBVVUJ2Q2IxQ1RWcG1wYWl0QUdTTFNwU3VLQ0xXcGJUS05KRkdsY1NNQUZGNjNpVW1SY2NORzZnTGJ1eGtYVTY2SkFVZWYvOUxTcG1YbnlMcjNUNUFPL3J6bDV6ajEzN3AxMzZCSVN5NDRmS0pYdUdOL2QxOVBVZlllTzY3Wm5xdGYyS0gzM0lkMXBzWG9GZFczMHNQWjFzTXZzMkQwNjBBSHF3czRGSGVKb2pMWnFudzUzY21mdmcrWFI4bUMwT0VqdXhyWEVrWDV5ZGVWSkxWSWxWMGUxMFBYazVrN2RZZUh1N0NqMWorNDl1S2c3dUxVNjF0R0x3MWxxMjd1Z1FZbGNsSEM0Ymd2N1ZRK1RBeWo1WmMvVWpzUHZzMXNkNWNXcnlXT2J0dldUMkVQYTRydG5XVzNKa3BqZ2dFcGJPc1ByN0Y3RXlOZXd0cEJJc2xBN3A0M0hDc253b29YVEVjM1VtUG1DTm41bHJxVEp4eTZuUm1jYXZHWlZ0LzNEYTJwRDVOSHZzT0hKQ3JkYzFHMnIzRElUcFU3eWljN3cvN1J4bmpjMGt0NUdDNGRqaXYyU3ozRmIyaUVaZzQxL2Rkc0ZEb3l1WXJJa21GZWh6MEhSMnRoUGdRcU15UVliMk90QjBXeHNaM0JlRzMrd3BSYjF2emwyVVlCb2c4RmZHaHR0RktqdEFjbG5aWXJSbzlyeUc5dUcvRlpRVTRBRWc4WkU5TGpHTXpUbXFLWFBMbmxXVm5JbFFRVHZ4SmY4aXA3VmdqWmp5VlByancxdGU1b3RNN1JtUDd4bStzSzJHdjlJOEdpKytCUmJFa1I5RUJ3OHpSVWNLeHdwNzN4a2FMaXFRYitrR2R1SlROSEc3MnpjVzlMb0pncVF4cFAzL1RqLy9jM3lCMHRxemFtbDA1LytvckhMa3NWTys5NWtYNy83cWdKdm5qbHJmcjJHZ3N5eDBlb3k5dVB6TjVTUGQ4NmFYZ2dPc0VLVzJQcno3ZHUzVklEMy90enMvc1NSczJ3N292VkhLdGpyWDJwZDdaTWxUeEFZZkJBTDlqaUR3ZkxrcTU1VG03aWZoTWxUR1B5Q0FzN1JGUmhuNDdKbmxjQjlSTTVUOTdBU3VaWEljVk51VURJbmRwRGJkc2ZycXNPcHBlWGw1WStYVktkakZDVGgrekdhVnVqMGQ5enkwNVBQSzNRekJhbXhkd3RUQ3J6eWcvMlJ2ZjJFc3RVam9yZEd3YS9reDltU0pMcjhtTEx0Q1c4SEhHSmMyUjVoUzIxOUlpRjZQblR1c09xY01sNTdnbTBaOGthbktNQVFnMHFTeXVaZm43ekl0c2JHeU85UWxueFkwZUN1RDFYTDJ5cy9Nc3JRaGx0RTdVZzB1Rk96dWZKRkUyUHhCby9ZQXg4WFBQZER3V04wTXJEUllJWkYwbVNNS0NOSGdhSVZGb0JiTm9MSjd0RVFES3hHRjBrY0xRaW1vakNab3B2ME9rTk95V0NDZzlYTVZBaTdBUkp6UWRNMlFVaDBnbUJvempjM1NrZzZkU0JScURHWVNVT3U2NlpnK0kyZk5acy9NMy9mL0dybC9YbnlGMUd3M1ZLQ2V6MFBONUlVZkZMcXZnVU40QzBxTnFZczVZaFBMK2FWWllERTRJcFVrNTdvU0ZuSm00RnlDcXFPRTBqaFkyU015TEZvbzU2enlvNmJlY09TNVVWRGRqN1ZpaDB6cCt0Y01od1JwQmVMeXF0SWpsSktBSVpTYkk4U0dTRjNrMHBBM21SNXRIdXdQRm9hN043cmVvcTJicUNzQWsxSHFDdTV1dkkxbjZKdVJYSStTMU1jbzU0WW1ZVHdjbjZBZWljK2tzc1hpOFhwWEM0VjN0Ny9BRHVUTkthUUpkU2NBQUFBQUVsRlRrU3VRbUNDIi8+IDx0ZXh0IHg9IjQxNSIgeT0iMTUwIiBmaWxsPSIjMDEwMTAxIiBmaWxsLW9wYWNpdHk9Ii4zIiB0cmFuc2Zvcm09InNjYWxlKC4xKSIgdGV4dExlbmd0aD0iMzcwIj5sYXVuY2g8L3RleHQ+PHRleHQgeD0iNDE1IiB5PSIxNDAiIHRyYW5zZm9ybT0ic2NhbGUoLjEpIiB0ZXh0TGVuZ3RoPSIzNzAiPmxhdW5jaDwvdGV4dD48dGV4dCB4PSI4NTUiIHk9IjE1MCIgZmlsbD0iIzAxMDEwMSIgZmlsbC1vcGFjaXR5PSIuMyIgdHJhbnNmb3JtPSJzY2FsZSguMSkiIHRleHRMZW5ndGg9IjM1MCI+YmluZGVyPC90ZXh0Pjx0ZXh0IHg9Ijg1NSIgeT0iMTQwIiB0cmFuc2Zvcm09InNjYWxlKC4xKSIgdGV4dExlbmd0aD0iMzUwIj5iaW5kZXI8L3RleHQ+PC9nPiA8L3N2Zz4=" width="150px"></a> </div> <div class="sphx-glr-download sphx-glr-download-python docutils container"> <p><a class="reference download internal" download="" href="https://scikit-learn.org/1.1/_downloads/dcd99fee3ee8ac76b69a1d2d6f5c7e78/approximate_nearest_neighbors.py"><code>Download Python source code: approximate_nearest_neighbors.py</code></a></p> </div> <div class="sphx-glr-download sphx-glr-download-jupyter docutils container"> <p><a class="reference download internal" download="" href="https://scikit-learn.org/1.1/_downloads/73ec8f08ae3ece02509539ee03cc3cdd/approximate_nearest_neighbors.ipynb"><code>Download Jupyter notebook: approximate_nearest_neighbors.ipynb</code></a></p> </div> </div>  </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2007&ndash;2022 The scikit-learn developers<br>Licensed under the 3-clause BSD License.<br>
+    <a href="https://scikit-learn.org/1.1/auto_examples/neighbors/approximate_nearest_neighbors.html" class="_attribution-link">https://scikit-learn.org/1.1/auto_examples/neighbors/approximate_nearest_neighbors.html</a>
+  </p>
+</div>
