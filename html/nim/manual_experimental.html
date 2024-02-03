@@ -1,0 +1,878 @@
+<h1 class="title">Nim Experimental Features</h1>   <h2 id="about-this-document">About this document</h2>
+<p>This document describes features of Nim that are to be considered experimental. Some of these are not covered by the <code>.experimental</code> pragma or <code>--experimental</code> switch because they are already behind a special syntax and one may want to use Nim libraries using these features without using them oneself.</p> <p><strong>Note</strong>: Unless otherwise indicated, these features are not to be removed, but refined and overhauled.</p> <h2 id="package-level-objects">Package level objects</h2>
+<p>Every Nim module resides in a (nimble) package. An object type can be attached to the package it resides in. If that is done, the type can be referenced from other modules as an <span id="incomplete_1">incomplete</span> object type. This feature allows to break up recursive type dependencies across module boundaries. Incomplete object types are always passed <code>byref</code> and can only be used in pointer like contexts (<code>var/ref/ptr IncompleteObject</code>) in general since the compiler does not yet know the size of the object. To complete an incomplete object the <code>package</code> pragma has to be used. <code>package</code> implies <code>byref</code>.</p> <p>As long as a type <code>T</code> is incomplete, neither <code>sizeof(T)</code> nor runtime type information for <code>T</code> is available.</p> <p>Example:</p> <pre class="listing" data-language="nim"># module A (in an arbitrary package)
+type
+  Pack.SomeObject = object ## declare as incomplete object of package 'Pack'
+  Triple = object
+    a, b, c: ref SomeObject ## pointers to incomplete objects are allowed
+
+## Incomplete objects can be used as parameters:
+proc myproc(x: SomeObject) = discard</pre>
+<pre class="listing" data-language="nim"># module B (in package "Pack")
+type
+  SomeObject* {.package.} = object ## Use 'package' to complete the object
+    s, t: string
+    x, y: int</pre> <h2 id="void-type">Void type</h2>
+<p>The <code>void</code> type denotes the absence of any type. Parameters of type <code>void</code> are treated as non-existent, <code>void</code> as a return type means that the procedure does not return a value:</p> <pre class="listing" data-language="nim">proc nothing(x, y: void): void =
+  echo "ha"
+
+nothing() # writes "ha" to stdout</pre>
+<p>The <code>void</code> type is particularly useful for generic code:</p> <pre class="listing" data-language="nim">proc callProc[T](p: proc (x: T), x: T) =
+  when T is void:
+    p()
+  else:
+    p(x)
+
+proc intProc(x: int) = discard
+proc emptyProc() = discard
+
+callProc[int](intProc, 12)
+callProc[void](emptyProc)</pre>
+<p>However, a <code>void</code> type cannot be inferred in generic code:</p> <pre class="listing" data-language="nim">callProc(emptyProc)
+# Error: type mismatch: got (proc ())
+# but expected one of:
+# callProc(p: proc (T), x: T)</pre>
+<p>The <code>void</code> type is only valid for parameters and return types; other symbols cannot have the type <code>void</code>.</p> <h2 id="covariance">Covariance</h2>
+<p>Covariance in Nim can be introduced only through pointer-like types such as <code>ptr</code> and <code>ref</code>. Sequence, Array and OpenArray types, instantiated with pointer-like types will be considered covariant if and only if they are also immutable. The introduction of a <code>var</code> modifier or additional <code>ptr</code> or <code>ref</code> indirections would result in invariant treatment of these types.</p> <p><code>proc</code> types are currently always invariant, but future versions of Nim may relax this rule.</p> <p>User-defined generic types may also be covariant with respect to some of their parameters. By default, all generic params are considered invariant, but you may choose the apply the prefix modifier <code>in</code> to a parameter to make it contravariant or <code>out</code> to make it covariant:</p> <pre class="listing" data-language="nim">type
+  AnnotatedPtr[out T] =
+    metadata: MyTypeInfo
+    p: ref T
+  
+  RingBuffer[out T] =
+    startPos: int
+    data: seq[T]
+  
+  Action {.importcpp: "std::function&lt;void ('0)&gt;".} [in T] = object</pre>
+<p>When the designated generic parameter is used to instantiate a pointer-like type as in the case of <code>AnnotatedPtr</code> above, the resulting generic type will also have pointer-like covariance:</p> <pre class="listing" data-language="nim">type
+  GuiWidget = object of RootObj
+  Button = object of GuiWidget
+  ComboBox = object of GuiWidget
+
+var
+  widgetPtr: AnnotatedPtr[GuiWidget]
+  buttonPtr: AnnotatedPtr[Button]
+
+...
+
+proc drawWidget[T](x: AnnotatedPtr[GuiWidget]) = ...
+
+# you can call procs expecting base types by supplying a derived type
+drawWidget(buttonPtr)
+
+# and you can convert more-specific pointer types to more general ones
+widgetPtr = buttonPtr</pre>
+<p>Just like with regular pointers, covariance will be enabled only for immutable values:</p> <pre class="listing" data-language="nim">proc makeComboBox[T](x: var AnnotatedPtr[GuiWidget]) =
+  x.p = new(ComboBox)
+
+makeComboBox(buttonPtr) # Error, AnnotatedPtr[Button] cannot be modified
+                        # to point to a ComboBox</pre>
+<p>On the other hand, in the <code>RingBuffer</code> example above, the designated generic param is used to instantiate the non-pointer <code>seq</code> type, which means that the resulting generic type will have covariance that mimics an array or sequence (i.e. it will be covariant only when instantiated with <code>ptr</code> and <code>ref</code> types):</p> <pre class="listing" data-language="nim">type
+  Base = object of RootObj
+  Derived = object of Base
+
+proc consumeBaseValues(b: RingBuffer[Base]) = ...
+
+var derivedValues: RingBuffer[Derived]
+
+consumeBaseValues(derivedValues) # Error, Base and Derived values may differ
+                                 # in size
+
+proc consumeBasePointers(b: RingBuffer[ptr Base]) = ...
+
+var derivedPointers: RingBuffer[ptr Derived]
+
+consumeBaseValues(derivedPointers) # This is legal</pre>
+<p>Please note that Nim will treat the user-defined pointer-like types as proper alternatives to the built-in pointer types. That is, types such as <code>seq[AnnotatedPtr[T]]</code> or <code>RingBuffer[AnnotatedPtr[T]]</code> will also be considered covariant and you can create new pointer-like types by instantiating other user-defined pointer-like types.</p> <p>The contravariant parameters introduced with the <code>in</code> modifier are currently useful only when interfacing with imported types having such semantics.</p> <h2 id="automatic-dereferencing">Automatic dereferencing</h2>
+<p>Automatic dereferencing is performed for the first argument of a routine call. This feature has to be only enabled via <code>{.experimental: "implicitDeref".}</code>:</p> <pre class="listing" data-language="nim">{.experimental: "implicitDeref".}
+
+proc depth(x: NodeObj): int = ...
+
+var
+  n: Node
+new(n)
+echo n.depth
+# no need to write n[].depth either</pre> <h2 id="code-reordering">Code reordering</h2>
+<p>The code reordering feature can implicitly rearrange procedure, template, and macro definitions along with variable declarations and initializations at the top level scope so that, to a large extent, a programmer should not have to worry about ordering definitions correctly or be forced to use forward declarations to preface definitions inside a module.</p> <p>Example:</p> <pre class="listing" data-language="nim">{.experimental: "codeReordering".}
+
+proc foo(x: int) =
+  bar(x)
+
+proc bar(x: int) =
+  echo(x)
+
+foo(10)</pre>
+<p>Variables can also be reordered as well. Variables that are <em>initialized</em> (i.e. variables that have their declaration and assignment combined in a single statement) can have their entire initialization statement reordered. Be wary of what code is executed at the top level:</p> <pre class="listing" data-language="nim">{.experimental: "codeReordering".}
+
+proc a() =
+  echo(foo)
+
+var foo = 5
+
+a() # outputs: "5"</pre>
+<p>It is important to note that reordering <em>only</em> works for symbols at top level scope. Therefore, the following will <em>fail to compile:</em></p> <pre class="listing" data-language="nim">{.experimental: "codeReordering".}
+
+proc a() =
+  b()
+  proc b() =
+    echo("Hello!")
+
+a()</pre> <h2 id="named-argument-overloading">Named argument overloading</h2>
+<p>Routines with the same type signature can be called differently if a parameter has different names. This does not need an <code>experimental</code> switch, but is an unstable feature.</p> <pre class="listing" data-language="nim">proc foo(x: int) =
+  echo "Using x: ", x
+proc foo(y: int) =
+  echo "Using y: ", y
+
+foo(x = 2)
+# Using x: 2
+foo(y = 2)
+# Using y: 2</pre> <h2 id="do-notation">Do notation</h2>
+<p>As a special more convenient notation, proc expressions involved in procedure calls can use the <code>do</code> keyword:</p> <pre class="listing" data-language="nim">sort(cities) do (x,y: string) -&gt; int:
+  cmp(x.len, y.len)
+
+# Less parenthesis using the method plus command syntax:
+cities = cities.map do (x:string) -&gt; string:
+  "City of " &amp; x
+
+# In macros, the do notation is often used for quasi-quoting
+macroResults.add quote do:
+  if not `ex`:
+    echo `info`, ": Check failed: ", `expString`</pre>
+<p><code>do</code> is written after the parentheses enclosing the regular proc params. The proc expression represented by the do block is appended to them. In calls using the command syntax, the do block will bind to the immediately preceding expression, transforming it in a call.</p> <p><code>do</code> with parentheses is an anonymous <code>proc</code>; however a <code>do</code> without parentheses is just a block of code. The <code>do</code> notation can be used to pass multiple blocks to a macro:</p> <pre class="listing" data-language="nim">macro performWithUndo(task, undo: untyped) = ...
+
+performWithUndo do:
+  # multiple-line block of code
+  # to perform the task
+do:
+  # code to undo it</pre> <h2 id="special-operators">Special Operators</h2> <h3 id="special-operators-dot-operators">dot operators</h3>
+<p><strong>Note</strong>: Dot operators are still experimental and so need to be enabled via <code>{.experimental: "dotOperators".}</code>.</p> <p>Nim offers a special family of dot operators that can be used to intercept and rewrite proc call and field access attempts, referring to previously undeclared symbol names. They can be used to provide a fluent interface to objects lying outside the static confines of the type system such as values from dynamic scripting languages or dynamic file formats such as JSON or XML.</p> <p>When Nim encounters an expression that cannot be resolved by the standard overload resolution rules, the current scope will be searched for a dot operator that can be matched against a re-written form of the expression, where the unknown field or proc name is passed to an <code>untyped</code> parameter:</p> <pre class="listing" data-language="nim">a.b # becomes `.`(a, b)
+a.b(c, d) # becomes `.`(a, b, c, d)</pre>
+<p>The matched dot operators can be symbols of any callable kind (procs, templates and macros), depending on the desired effect:</p> <pre class="listing" data-language="nim">template `.` (js: PJsonNode, field: untyped): JSON = js[astToStr(field)]
+
+var js = parseJson("{ x: 1, y: 2}")
+echo js.x # outputs 1
+echo js.y # outputs 2</pre>
+<p>The following dot operators are available:</p> <h3 id="special-operators-operator-dot">operator <code>.</code>
+</h3>
+<p>This operator will be matched against both field accesses and method calls.</p> <h3 id="special-operators-operator-dot">operator <code>.()</code>
+</h3>
+<p>This operator will be matched exclusively against method calls. It has higher precedence than the <code>.</code> operator and this allows one to handle expressions like <code>x.y</code> and <code>x.y()</code> differently if one is interfacing with a scripting language for example.</p> <h3 id="special-operators-operator-doteq">operator <code>.=</code>
+</h3>
+<p>This operator will be matched against assignments to missing fields.</p> <pre class="listing" data-language="nim">a.b = c # becomes `.=`(a, b, c)</pre> <h2 id="not-nil-annotation">Not nil annotation</h2>
+<p><strong>Note:</strong> This is an experimental feature. It can be enabled with <code>{.experimental: "notnil"}</code>.</p> <p>All types for which <code>nil</code> is a valid value can be annotated with the <code>not nil</code> annotation to exclude <code>nil</code> as a valid value:</p> <pre class="listing" data-language="nim">{.experimental: "notnil"}
+
+type
+  PObject = ref TObj not nil
+  TProc = (proc (x, y: int)) not nil
+
+proc p(x: PObject) =
+  echo "not nil"
+
+# compiler catches this:
+p(nil)
+
+# and also this:
+var x: PObject
+p(x)</pre>
+<p>The compiler ensures that every code path initializes variables which contain non-nilable pointers. The details of this analysis are still to be specified here.</p> <h2 id="concepts">Concepts</h2>
+<p>Concepts, also known as "user-defined type classes", are used to specify an arbitrary set of requirements that the matched type must satisfy.</p> <p>Concepts are written in the following form:</p> <pre class="listing" data-language="nim">type
+  Comparable = concept x, y
+    (x &lt; y) is bool
+  
+  Stack[T] = concept s, var v
+    s.pop() is T
+    v.push(T)
+    
+    s.len is Ordinal
+    
+    for value in s:
+      value is T</pre>
+<p>The concept is a match if:</p> <ol class="simple">
+<li>all of the expressions within the body can be compiled for the tested type</li> <li>all statically evaluable boolean expressions in the body must be true</li> </ol> <p>The identifiers following the <code>concept</code> keyword represent instances of the currently matched type. You can apply any of the standard type modifiers such as <code>var</code>, <code>ref</code>, <code>ptr</code> and <code>static</code> to denote a more specific type of instance. You can also apply the <code>type</code> modifier to create a named instance of the type itself:</p> <pre class="listing" data-language="nim">type
+  MyConcept = concept x, var v, ref r, ptr p, static s, type T
+    ...</pre>
+<p>Within the concept body, types can appear in positions where ordinary values and parameters are expected. This provides a more convenient way to check for the presence of callable symbols with specific signatures:</p> <pre class="listing" data-language="nim">type
+  OutputStream = concept var s
+    s.write(string)</pre>
+<p>In order to check for symbols accepting <code>type</code> params, you must prefix the type with the explicit <code>type</code> modifier. The named instance of the type, following the <code>concept</code> keyword is also considered to have the explicit modifier and will be matched only as a type.</p> <pre class="listing" data-language="nim">type
+  # Let's imagine a user-defined casting framework with operators
+  # such as `val.to(string)` and `val.to(JSonValue)`. We can test
+  # for these with the following concept:
+  MyCastables = concept x
+    x.to(type string)
+    x.to(type JSonValue)
+  
+  # Let's define a couple of concepts, known from Algebra:
+  AdditiveMonoid* = concept x, y, type T
+    x + y is T
+    T.zero is T # require a proc such as `int.zero` or 'Position.zero'
+  
+  AdditiveGroup* = concept x, y, type T
+    x is AdditiveMonoid
+    -x is T
+    x - y is T</pre>
+<p>Please note that the <code>is</code> operator allows one to easily verify the precise type signatures of the required operations, but since type inference and default parameters are still applied in the concept body, it's also possible to describe usage protocols that do not reveal implementation details.</p> <p>Much like generics, concepts are instantiated exactly once for each tested type and any static code included within the body is executed only once.</p> <h3 id="concepts-concept-diagnostics">Concept diagnostics</h3>
+<p>By default, the compiler will report the matching errors in concepts only when no other overload can be selected and a normal compilation error is produced. When you need to understand why the compiler is not matching a particular concept and, as a result, a wrong overload is selected, you can apply the <code>explain</code> pragma to either the concept body or a particular call-site.</p> <pre class="listing" data-language="nim">type
+  MyConcept {.explain.} = concept ...
+
+overloadedProc(x, y, z) {.explain.}</pre>
+<p>This will provide Hints in the compiler output either every time the concept is not matched or only on the particular call-site.</p> <h3 id="concepts-generic-concepts-and-type-binding-rules">Generic concepts and type binding rules</h3>
+<p>The concept types can be parametric just like the regular generic types:</p> <pre class="listing" data-language="nim">### matrixalgo.nim
+
+import typetraits
+
+type
+  AnyMatrix*[R, C: static int; T] = concept m, var mvar, type M
+    M.ValueType is T
+    M.Rows == R
+    M.Cols == C
+    
+    m[int, int] is T
+    mvar[int, int] = T
+    
+    type TransposedType = stripGenericParams(M)[C, R, T]
+  
+  AnySquareMatrix*[N: static int, T] = AnyMatrix[N, N, T]
+  
+  AnyTransform3D* = AnyMatrix[4, 4, float]
+
+proc transposed*(m: AnyMatrix): m.TransposedType =
+  for r in 0 ..&lt; m.R:
+    for c in 0 ..&lt; m.C:
+      result[r, c] = m[c, r]
+
+proc determinant*(m: AnySquareMatrix): int =
+  ...
+
+proc setPerspectiveProjection*(m: AnyTransform3D) =
+  ...
+
+--------------
+### matrix.nim
+
+type
+  Matrix*[M, N: static int; T] = object
+    data: array[M*N, T]
+
+proc `[]`*(M: Matrix; m, n: int): M.T =
+  M.data[m * M.N + n]
+
+proc `[]=`*(M: var Matrix; m, n: int; v: M.T) =
+  M.data[m * M.N + n] = v
+
+# Adapt the Matrix type to the concept's requirements
+template Rows*(M: typedesc[Matrix]): int = M.M
+template Cols*(M: typedesc[Matrix]): int = M.N
+template ValueType*(M: typedesc[Matrix]): typedesc = M.T
+
+-------------
+### usage.nim
+
+import matrix, matrixalgo
+
+var
+  m: Matrix[3, 3, int]
+  projectionMatrix: Matrix[4, 4, float]
+
+echo m.transposed.determinant
+setPerspectiveProjection projectionMatrix</pre>
+<p>When the concept type is matched against a concrete type, the unbound type parameters are inferred from the body of the concept in a way that closely resembles the way generic parameters of callable symbols are inferred on call sites.</p> <p>Unbound types can appear both as params to calls such as <code>s.push(T)</code> and on the right-hand side of the <code>is</code> operator in cases such as <code>x.pop is T</code> and <code>x.data is seq[T]</code>.</p> <p>Unbound static params will be inferred from expressions involving the <code>==</code> operator and also when types dependent on them are being matched:</p> <pre class="listing" data-language="nim">type
+  MatrixReducer[M, N: static int; T] = concept x
+    x.reduce(SquareMatrix[N, T]) is array[M, int]</pre>
+<p>The Nim compiler includes a simple linear equation solver, allowing it to infer static params in some situations where integer arithmetic is involved.</p> <p>Just like in regular type classes, Nim discriminates between <code>bind once</code> and <code>bind many</code> types when matching the concept. You can add the <code>distinct</code> modifier to any of the otherwise inferable types to get a type that will be matched without permanently inferring it. This may be useful when you need to match several procs accepting the same wide class of types:</p> <pre class="listing" data-language="nim">type
+  Enumerable[T] = concept e
+    for v in e:
+      v is T
+
+type
+  MyConcept = concept o
+    # this could be inferred to a type such as Enumerable[int]
+    o.foo is distinct Enumerable
+    
+    # this could be inferred to a different type such as Enumerable[float]
+    o.bar is distinct Enumerable
+    
+    # it's also possible to give an alias name to a `bind many` type class
+    type Enum = distinct Enumerable
+    o.baz is Enum</pre>
+<p>On the other hand, using <code>bind once</code> types allows you to test for equivalent types used in multiple signatures, without actually requiring any concrete types, thus allowing you to encode implementation-defined types:</p> <pre class="listing" data-language="nim">type
+  MyConcept = concept x
+    type T1 = auto
+    x.foo(T1)
+    x.bar(T1) # both procs must accept the same type
+    
+    type T2 = seq[SomeNumber]
+    x.alpha(T2)
+    x.omega(T2) # both procs must accept the same type
+                # and it must be a numeric sequence</pre>
+<p>As seen in the previous examples, you can refer to generic concepts such as <code>Enumerable[T]</code> just by their short name. Much like the regular generic types, the concept will be automatically instantiated with the bind once auto type in the place of each missing generic param.</p> <p>Please note that generic concepts such as <code>Enumerable[T]</code> can be matched against concrete types such as <code>string</code>. Nim doesn't require the concept type to have the same number of parameters as the type being matched. If you wish to express a requirement towards the generic parameters of the matched type, you can use a type mapping operator such as <code>genericHead</code> or <code>stripGenericParams</code> within the body of the concept to obtain the uninstantiated version of the type, which you can then try to instantiate in any required way. For example, here is how one might define the classic <code>Functor</code> concept from Haskell and then demonstrate that Nim's <code>Option[T]</code> type is an instance of it:</p> <pre class="listing" data-language="nim">import sugar, typetraits
+
+type
+  Functor[A] = concept f
+    type MatchedGenericType = genericHead(typeof(f))
+      # `f` will be a value of a type such as `Option[T]`
+      # `MatchedGenericType` will become the `Option` type
+    
+    f.val is A
+      # The Functor should provide a way to obtain
+      # a value stored inside it
+    
+    type T = auto
+    map(f, A -&gt; T) is MatchedGenericType[T]
+      # And it should provide a way to map one instance of
+      # the Functor to a instance of a different type, given
+      # a suitable `map` operation for the enclosed values
+
+import options
+echo Option[int] is Functor # prints true</pre> <h3 id="concepts-concept-derived-values">Concept derived values</h3>
+<p>All top level constants or types appearing within the concept body are accessible through the dot operator in procs where the concept was successfully matched to a concrete type:</p> <pre class="listing" data-language="nim">type
+  DateTime = concept t1, t2, type T
+    const Min = T.MinDate
+    T.Now is T
+    
+    t1 &lt; t2 is bool
+    
+    type TimeSpan = typeof(t1 - t2)
+    TimeSpan * int is TimeSpan
+    TimeSpan + TimeSpan is TimeSpan
+    
+    t1 + TimeSpan is T
+
+proc eventsJitter(events: Enumerable[DateTime]): float =
+  var
+    # this variable will have the inferred TimeSpan type for
+    # the concrete Date-like value the proc was called with:
+    averageInterval: DateTime.TimeSpan
+    
+    deviation: float
+  ...</pre> <h3 id="concepts-concept-refinement">Concept refinement</h3>
+<p>When the matched type within a concept is directly tested against a different concept, we say that the outer concept is a refinement of the inner concept and thus it is more-specific. When both concepts are matched in a call during overload resolution, Nim will assign a higher precedence to the most specific one. As an alternative way of defining concept refinements, you can use the object inheritance syntax involving the <code>of</code> keyword:</p> <pre class="listing" data-language="nim">type
+  Graph = concept g, type G of EquallyComparable, Copyable
+    type
+      VertexType = G.VertexType
+      EdgeType = G.EdgeType
+    
+    VertexType is Copyable
+    EdgeType is Copyable
+    
+    var
+      v: VertexType
+      e: EdgeType
+  
+  IncidendeGraph = concept of Graph
+    # symbols such as variables and types from the refined
+    # concept are automatically in scope:
+    
+    g.source(e) is VertexType
+    g.target(e) is VertexType
+    
+    g.outgoingEdges(v) is Enumerable[EdgeType]
+  
+  BidirectionalGraph = concept g, type G
+    # The following will also turn the concept into a refinement when it
+    # comes to overload resolution, but it doesn't provide the convenient
+    # symbol inheritance
+    g is IncidendeGraph
+    
+    g.incomingEdges(G.VertexType) is Enumerable[G.EdgeType]
+
+proc f(g: IncidendeGraph)
+proc f(g: BidirectionalGraph) # this one will be preferred if we pass a type
+                              # matching the BidirectionalGraph concept</pre> <h2 id="type-bound-operations">Type bound operations</h2>
+<p>There are 4 operations that are bound to a type:</p> <ol class="simple">
+<li>Assignment</li> <li>Moves</li> <li>Destruction</li> <li>Deep copying for communication between threads</li> </ol> <p>These operations can be <em>overridden</em> instead of <em>overloaded</em>. This means the implementation is automatically lifted to structured types. For instance if type <code>T</code> has an overridden assignment operator <code>=</code> this operator is also used for assignments of the type <code>seq[T]</code>. Since these operations are bound to a type they have to be bound to a nominal type for reasons of simplicity of implementation: This means an overridden <code>deepCopy</code> for <code>ref T</code> is really bound to <code>T</code> and not to <code>ref T</code>. This also means that one cannot override <code>deepCopy</code> for both <code>ptr T</code> and <code>ref T</code> at the same time; instead a helper distinct or object type has to be used for one pointer type.</p> <p>Assignments, moves and destruction are specified in the <a href="destructors.html">destructors</a> document.</p> <h3 id="type-bound-operations-deepcopy">deepCopy</h3>
+<p><code>=deepCopy</code> is a builtin that is invoked whenever data is passed to a <code>spawn</code>'ed proc to ensure memory safety. The programmer can override its behaviour for a specific <code>ref</code> or <code>ptr</code> type <code>T</code>. (Later versions of the language may weaken this restriction.)</p> <p>The signature has to be:</p> <pre class="listing" data-language="nim">proc `=deepCopy`(x: T): T</pre>
+<p>This mechanism will be used by most data structures that support shared memory like channels to implement thread safe automatic memory management.</p> <p>The builtin <code>deepCopy</code> can even clone closures and their environments. See the documentation of <a href="#parallel-amp-spawn-spawn-statement">spawn</a> for details.</p> <h2 id="case-statement-macros">Case statement macros</h2>
+<p>A macro that needs to be called <span id="match_1">match</span> can be used to rewrite <code>case</code> statements in order to implement <span id="pattern-matching_1">pattern matching</span> for certain types. The following example implements a simplistic form of pattern matching for tuples, leveraging the existing equality operator for tuples (as provided in <code>system.==</code>):</p> <pre class="listing" data-language="nim">{.experimental: "caseStmtMacros".}
+
+import macros
+
+macro match(n: tuple): untyped =
+  result = newTree(nnkIfStmt)
+  let selector = n[0]
+  for i in 1 ..&lt; n.len:
+    let it = n[i]
+    case it.kind
+    of nnkElse, nnkElifBranch, nnkElifExpr, nnkElseExpr:
+      result.add it
+    of nnkOfBranch:
+      for j in 0..it.len-2:
+        let cond = newCall("==", selector, it[j])
+        result.add newTree(nnkElifBranch, cond, it[^1])
+    else:
+      error "'match' cannot handle this node", it
+  echo repr result
+
+case ("foo", 78)
+of ("foo", 78): echo "yes"
+of ("bar", 88): echo "no"
+else: discard</pre>
+<p>Currently case statement macros must be enabled explicitly via <code>{.experimental: "caseStmtMacros".}</code>.</p> <p><code>match</code> macros are subject to overload resolution. First the <code>case</code>'s selector expression is used to determine which <code>match</code> macro to call. To this macro is then passed the complete <code>case</code> statement body and the macro is evaluated.</p> <p>In other words, the macro needs to transform the full <code>case</code> statement but only the statement's selector expression is used to determine which macro to call.</p> <h2 id="term-rewriting-macros">Term rewriting macros</h2>
+<p>Term rewriting macros are macros or templates that have not only a <em>name</em> but also a <em>pattern</em> that is searched for after the semantic checking phase of the compiler: This means they provide an easy way to enhance the compilation pipeline with user defined optimizations:</p> <pre class="listing" data-language="nim">template optMul{`*`(a, 2)}(a: int): int = a+a
+
+let x = 3
+echo x * 2</pre>
+<p>The compiler now rewrites <code>x * 2</code> as <code>x + x</code>. The code inside the curlies is the pattern to match against. The operators <code>*</code>, <code>**</code>, <code>|</code>, <code>~</code> have a special meaning in patterns if they are written in infix notation, so to match verbatim against <code>*</code> the ordinary function call syntax needs to be used.</p> <p>Term rewriting macro are applied recursively, up to a limit. This means that if the result of a term rewriting macro is eligible for another rewriting, the compiler will try to perform it, and so on, until no more optimizations are applicable. To avoid putting the compiler into an infinite loop, there is a hard limit on how many times a single term rewriting macro can be applied. Once this limit has been passed, the term rewriting macro will be ignored.</p> <p>Unfortunately optimizations are hard to get right and even the tiny example is <strong>wrong</strong>:</p> <pre class="listing" data-language="nim">template optMul{`*`(a, 2)}(a: int): int = a+a
+
+proc f(): int =
+  echo "side effect!"
+  result = 55
+
+echo f() * 2</pre>
+<p>We cannot duplicate 'a' if it denotes an expression that has a side effect! Fortunately Nim supports side effect analysis:</p> <pre class="listing" data-language="nim">template optMul{`*`(a, 2)}(a: int{noSideEffect}): int = a+a
+
+proc f(): int =
+  echo "side effect!"
+  result = 55
+
+echo f() * 2 # not optimized ;-)</pre>
+<p>You can make one overload matching with a constraint and one without, and the one with a constraint will have precedence, and so you can handle both cases differently.</p> <p>So what about <code>2 * a</code>? We should tell the compiler <code>*</code> is commutative. We cannot really do that however as the following code only swaps arguments blindly:</p> <pre class="listing" data-language="nim">template mulIsCommutative{`*`(a, b)}(a, b: int): int = b*a</pre>
+<p>What optimizers really need to do is a <em>canonicalization</em>:</p> <pre class="listing" data-language="nim">template canonMul{`*`(a, b)}(a: int{lit}, b: int): int = b*a</pre>
+<p>The <code>int{lit}</code> parameter pattern matches against an expression of type <code>int</code>, but only if it's a literal.</p> <h3 id="term-rewriting-macros-parameter-constraints">Parameter constraints</h3>
+<p>The <span id="parameter-constraint_1">parameter constraint</span> expression can use the operators <code>|</code> (or), <code>&amp;</code> (and) and <code>~</code> (not) and the following predicates:</p> <table>
+<tr>
+<th>Predicate</th>
+<th>Meaning</th>
+</tr> <tr>
+<td><code>atom</code></td>
+<td>The matching node has no children.</td>
+</tr> <tr>
+<td><code>lit</code></td>
+<td>The matching node is a literal like "abc", 12.</td>
+</tr> <tr>
+<td><code>sym</code></td>
+<td>The matching node must be a symbol (a bound identifier).</td>
+</tr> <tr>
+<td><code>ident</code></td>
+<td>The matching node must be an identifier (an unbound identifier).</td>
+</tr> <tr>
+<td><code>call</code></td>
+<td>The matching AST must be a call/apply expression.</td>
+</tr> <tr>
+<td><code>lvalue</code></td>
+<td>The matching AST must be an lvalue.</td>
+</tr> <tr>
+<td><code>sideeffect</code></td>
+<td>The matching AST must have a side effect.</td>
+</tr> <tr>
+<td><code>nosideeffect</code></td>
+<td>The matching AST must have no side effect.</td>
+</tr> <tr>
+<td><code>param</code></td>
+<td>A symbol which is a parameter.</td>
+</tr> <tr>
+<td><code>genericparam</code></td>
+<td>A symbol which is a generic parameter.</td>
+</tr> <tr>
+<td><code>module</code></td>
+<td>A symbol which is a module.</td>
+</tr> <tr>
+<td><code>type</code></td>
+<td>A symbol which is a type.</td>
+</tr> <tr>
+<td><code>var</code></td>
+<td>A symbol which is a variable.</td>
+</tr> <tr>
+<td><code>let</code></td>
+<td>A symbol which is a <code>let</code> variable.</td>
+</tr> <tr>
+<td><code>const</code></td>
+<td>A symbol which is a constant.</td>
+</tr> <tr>
+<td><code>result</code></td>
+<td>The special <code>result</code> variable.</td>
+</tr> <tr>
+<td><code>proc</code></td>
+<td>A symbol which is a proc.</td>
+</tr> <tr>
+<td><code>method</code></td>
+<td>A symbol which is a method.</td>
+</tr> <tr>
+<td><code>iterator</code></td>
+<td>A symbol which is an iterator.</td>
+</tr> <tr>
+<td><code>converter</code></td>
+<td>A symbol which is a converter.</td>
+</tr> <tr>
+<td><code>macro</code></td>
+<td>A symbol which is a macro.</td>
+</tr> <tr>
+<td><code>template</code></td>
+<td>A symbol which is a template.</td>
+</tr> <tr>
+<td><code>field</code></td>
+<td>A symbol which is a field in a tuple or an object.</td>
+</tr> <tr>
+<td><code>enumfield</code></td>
+<td>A symbol which is a field in an enumeration.</td>
+</tr> <tr>
+<td><code>forvar</code></td>
+<td>A for loop variable.</td>
+</tr> <tr>
+<td><code>label</code></td>
+<td>A label (used in <code>block</code> statements).</td>
+</tr> <tr>
+<td><code>nk*</code></td>
+<td>The matching AST must have the specified kind. (Example: <code>nkIfStmt</code> denotes an <code>if</code> statement.)</td>
+</tr> <tr>
+<td><code>alias</code></td>
+<td>States that the marked parameter needs to alias with <em>some</em> other parameter.</td>
+</tr> <tr>
+<td><code>noalias</code></td>
+<td>States that <em>every</em> other parameter must not alias with the marked parameter.</td>
+</tr> </table>
+<p>Predicates that share their name with a keyword have to be escaped with backticks. The <code>alias</code> and <code>noalias</code> predicates refer not only to the matching AST, but also to every other bound parameter; syntactically they need to occur after the ordinary AST predicates:</p> <pre class="listing" data-language="nim">template ex{a = b + c}(a: int{noalias}, b, c: int) =
+  # this transformation is only valid if 'b' and 'c' do not alias 'a':
+  a = b
+  inc a, c</pre> <h3 id="term-rewriting-macros-pattern-operators">Pattern operators</h3>
+<p>The operators <code>*</code>, <code>**</code>, <code>|</code>, <code>~</code> have a special meaning in patterns if they are written in infix notation.</p> <h4 id="pattern-operators-the-bar-operator">The <code>|</code> operator</h4>
+<p>The <code>|</code> operator if used as infix operator creates an ordered choice:</p> <pre class="listing" data-language="nim">template t{0|1}(): untyped = 3
+let a = 1
+# outputs 3:
+echo a</pre>
+<p>The matching is performed after the compiler performed some optimizations like constant folding, so the following does not work:</p> <pre class="listing" data-language="nim">template t{0|1}(): untyped = 3
+# outputs 1:
+echo 1</pre>
+<p>The reason is that the compiler already transformed the 1 into "1" for the <code>echo</code> statement. However, a term rewriting macro should not change the semantics anyway. In fact they can be deactivated with the <code>--patterns:off</code> command line option or temporarily with the <code>patterns</code> pragma.</p> <h4 id="pattern-operators-the-operator">The <code>{}</code> operator</h4>
+<p>A pattern expression can be bound to a pattern parameter via the <code>expr{param}</code> notation:</p> <pre class="listing" data-language="nim">template t{(0|1|2){x}}(x: untyped): untyped = x+1
+let a = 1
+# outputs 2:
+echo a</pre> <h4 id="pattern-operators-the-tilde-operator">The <code>~</code> operator</h4>
+<p>The <code>~</code> operator is the <strong>not</strong> operator in patterns:</p> <pre class="listing" data-language="nim">template t{x = (~x){y} and (~x){z}}(x, y, z: bool) =
+  x = y
+  if x: x = z
+
+var
+  a = false
+  b = true
+  c = false
+a = b and c
+echo a</pre> <h4 id="pattern-operators-the-star-operator">The <code>*</code> operator</h4>
+<p>The <code>*</code> operator can <em>flatten</em> a nested binary expression like <code>a &amp; b &amp; c</code> to <code>&amp;(a, b, c)</code>:</p> <pre class="listing" data-language="nim">var
+  calls = 0
+
+proc `&amp;&amp;`(s: varargs[string]): string =
+  result = s[0]
+  for i in 1..len(s)-1: result.add s[i]
+  inc calls
+
+template optConc{ `&amp;&amp;` * a }(a: string): untyped = &amp;&amp;a
+
+let space = " "
+echo "my" &amp;&amp; (space &amp; "awe" &amp;&amp; "some " ) &amp;&amp; "concat"
+
+# check that it's been optimized properly:
+doAssert calls == 1</pre>
+<p>The second operator of <code>*</code> must be a parameter; it is used to gather all the arguments. The expression <code>"my" &amp;&amp; (space &amp; "awe" &amp;&amp; "some " ) &amp;&amp; "concat"</code> is passed to <code>optConc</code> in <code>a</code> as a special list (of kind <code>nkArgList</code>) which is flattened into a call expression; thus the invocation of <code>optConc</code> produces:</p> <pre class="listing" data-language="nim">`&amp;&amp;`("my", space &amp; "awe", "some ", "concat")</pre> <h4 id="pattern-operators-the-starstar-operator">The <code>**</code> operator</h4>
+<p>The <code>**</code> is much like the <code>*</code> operator, except that it gathers not only all the arguments, but also the matched operators in reverse polish notation:</p> <pre class="listing" data-language="nim">import macros
+
+type
+  Matrix = object
+    dummy: int
+
+proc `*`(a, b: Matrix): Matrix = discard
+proc `+`(a, b: Matrix): Matrix = discard
+proc `-`(a, b: Matrix): Matrix = discard
+proc `$`(a: Matrix): string = result = $a.dummy
+proc mat21(): Matrix =
+  result.dummy = 21
+
+macro optM{ (`+`|`-`|`*`) ** a }(a: Matrix): untyped =
+  echo treeRepr(a)
+  result = newCall(bindSym"mat21")
+
+var x, y, z: Matrix
+
+echo x + y * z - x</pre>
+<p>This passes the expression <code>x + y * z - x</code> to the <code>optM</code> macro as an <code>nnkArgList</code> node containing:</p>
+<pre data-language="nim">Arglist
+  Sym "x"
+  Sym "y"
+  Sym "z"
+  Sym "*"
+  Sym "+"
+  Sym "x"
+  Sym "-"</pre> <p>(Which is the reverse polish notation of <code>x + y * z - x</code>.)</p> <h3 id="term-rewriting-macros-parameters">Parameters</h3>
+<p>Parameters in a pattern are type checked in the matching process. If a parameter is of the type <code>varargs</code> it is treated specially and it can match 0 or more arguments in the AST to be matched against:</p> <pre class="listing" data-language="nim">template optWrite{
+  write(f, x)
+  ((write|writeLine){w})(f, y)
+}(x, y: varargs[untyped], f: File, w: untyped) =
+  w(f, x, y)</pre> <h3 id="term-rewriting-macros-examplecolon-partial-evaluation">Example: Partial evaluation</h3>
+<p>The following example shows how some simple partial evaluation can be implemented with term rewriting:</p> <pre class="listing" data-language="nim">proc p(x, y: int; cond: bool): int =
+  result = if cond: x + y else: x - y
+
+template optP1{p(x, y, true)}(x, y: untyped): untyped = x + y
+template optP2{p(x, y, false)}(x, y: untyped): untyped = x - y</pre> <h3 id="term-rewriting-macros-examplecolon-hoisting">Example: Hoisting</h3>
+<p>The following example shows how some form of hoisting can be implemented:</p> <pre class="listing" data-language="nim">import pegs
+
+template optPeg{peg(pattern)}(pattern: string{lit}): Peg =
+  var gl {.global, gensym.} = peg(pattern)
+  gl
+
+for i in 0 .. 3:
+  echo match("(a b c)", peg"'(' @ ')'")
+  echo match("W_HI_Le", peg"\y 'while'")</pre>
+<p>The <code>optPeg</code> template optimizes the case of a peg constructor with a string literal, so that the pattern will only be parsed once at program startup and stored in a global <code>gl</code> which is then re-used. This optimization is called hoisting because it is comparable to classical loop hoisting.</p> <h2 id="ast-based-overloading">AST based overloading</h2>
+<p>Parameter constraints can also be used for ordinary routine parameters; these constraints affect ordinary overloading resolution then:</p> <pre class="listing" data-language="nim">proc optLit(a: string{lit|`const`}) =
+  echo "string literal"
+proc optLit(a: string) =
+  echo "no string literal"
+
+const
+  constant = "abc"
+
+var
+  variable = "xyz"
+
+optLit("literal")
+optLit(constant)
+optLit(variable)</pre>
+<p>However, the constraints <code>alias</code> and <code>noalias</code> are not available in ordinary routines.</p> <h2 id="parallel-amp-spawn">Parallel &amp; Spawn</h2>
+<p>Nim has two flavors of parallelism:</p> <ol class="simple">
+<li>
+<span id="structured_1">Structured</span> parallelism via the <code>parallel</code> statement.</li> <li>
+<span id="unstructured_1">Unstructured</span> parallelism via the standalone <code>spawn</code> statement.</li> </ol> <p>Nim has a builtin thread pool that can be used for CPU intensive tasks. For IO intensive tasks the <code>async</code> and <code>await</code> features should be used instead. Both parallel and spawn need the <a href="threadpool.html">threadpool</a> module to work.</p> <p>Somewhat confusingly, <code>spawn</code> is also used in the <code>parallel</code> statement with slightly different semantics. <code>spawn</code> always takes a call expression of the form <code>f(a, ...)</code>. Let <code>T</code> be <code>f</code>'s return type. If <code>T</code> is <code>void</code> then <code>spawn</code>'s return type is also <code>void</code> otherwise it is <code>FlowVar[T]</code>.</p> <p>Within a <code>parallel</code> section sometimes the <code>FlowVar[T]</code> is eliminated to <code>T</code>. This happens when <code>T</code> does not contain any GC'ed memory. The compiler can ensure the location in <code>location = spawn f(...)</code> is not read prematurely within a <code>parallel</code> section and so there is no need for the overhead of an indirection via <code>FlowVar[T]</code> to ensure correctness.</p> <p><strong>Note</strong>: Currently exceptions are not propagated between <code>spawn</code>'ed tasks!</p> <h3 id="parallel-amp-spawn-spawn-statement">Spawn statement</h3>
+<p><span id="spawn_1">spawn</span> can be used to pass a task to the thread pool:</p> <pre class="listing" data-language="nim">import threadpool
+
+proc processLine(line: string) =
+  discard "do some heavy lifting here"
+
+for x in lines("myinput.txt"):
+  spawn processLine(x)
+sync()</pre>
+<p>For reasons of type safety and implementation simplicity the expression that <code>spawn</code> takes is restricted:</p> <ul class="simple">
+<li>It must be a call expression <code>f(a, ...)</code>.</li> <li>
+<code>f</code> must be <code>gcsafe</code>.</li> <li>
+<code>f</code> must not have the calling convention <code>closure</code>.</li> <li>
+<code>f</code>'s parameters may not be of type <code>var</code>. This means one has to use raw <code>ptr</code>'s for data passing reminding the programmer to be careful.</li> <li>
+<code>ref</code> parameters are deeply copied which is a subtle semantic change and can cause performance problems but ensures memory safety. This deep copy is performed via <code>system.deepCopy</code> and so can be overridden.</li> <li>For <em>safe</em> data exchange between <code>f</code> and the caller a global <code>TChannel</code> needs to be used. However, since spawn can return a result, often no further communication is required.</li> </ul> <p><code>spawn</code> executes the passed expression on the thread pool and returns a <span id="data-flow-variable_1">data flow variable</span> <code>FlowVar[T]</code> that can be read from. The reading with the <code>^</code> operator is <strong>blocking</strong>. However, one can use <code>blockUntilAny</code> to wait on multiple flow variables at the same time:</p> <pre class="listing" data-language="nim">import threadpool, ...
+
+# wait until 2 out of 3 servers received the update:
+proc main =
+  var responses = newSeq[FlowVarBase](3)
+  for i in 0..2:
+    responses[i] = spawn tellServer(Update, "key", "value")
+  var index = blockUntilAny(responses)
+  assert index &gt;= 0
+  responses.del(index)
+  discard blockUntilAny(responses)</pre>
+<p>Data flow variables ensure that no data races are possible. Due to technical limitations not every type <code>T</code> is possible in a data flow variable: <code>T</code> has to be of the type <code>ref</code>, <code>string</code>, <code>seq</code> or of a type that doesn't contain a type that is garbage collected. This restriction is not hard to work-around in practice.</p> <h3 id="parallel-amp-spawn-parallel-statement">Parallel statement</h3>
+<p>Example:</p> <pre class="listing" data-language="nim"># Compute PI in an inefficient way
+import strutils, math, threadpool
+{.experimental: "parallel".}
+
+proc term(k: float): float = 4 * math.pow(-1, k) / (2*k + 1)
+
+proc pi(n: int): float =
+  var ch = newSeq[float](n+1)
+  parallel:
+    for k in 0..ch.high:
+      ch[k] = spawn term(float(k))
+  for k in 0..ch.high:
+    result += ch[k]
+
+echo formatFloat(pi(5000))</pre>
+<p>The parallel statement is the preferred mechanism to introduce parallelism in a Nim program. A subset of the Nim language is valid within a <code>parallel</code> section. This subset is checked during semantic analysis to be free of data races. A sophisticated <span id="disjoint-checker_1">disjoint checker</span> ensures that no data races are possible even though shared memory is extensively supported!</p> <p>The subset is in fact the full language with the following restrictions / changes:</p> <ul class="simple">
+<li>
+<code>spawn</code> within a <code>parallel</code> section has special semantics.</li> <li>Every location of the form <code>a[i]</code> and <code>a[i..j]</code> and <code>dest</code> where <code>dest</code> is part of the pattern <code>dest = spawn f(...)</code> has to be provably disjoint. This is called the <em>disjoint check</em>.</li> <li>Every other complex location <code>loc</code> that is used in a spawned proc (<code>spawn f(loc)</code>) has to be immutable for the duration of the <code>parallel</code> section. This is called the <em>immutability check</em>. Currently it is not specified what exactly "complex location" means. We need to make this an optimization!</li> <li>Every array access has to be provably within bounds. This is called the <em>bounds check</em>.</li> <li>Slices are optimized so that no copy is performed. This optimization is not yet performed for ordinary slices outside of a <code>parallel</code> section.</li> </ul> <h2 id="guards-and-locks">Guards and locks</h2>
+<p>Apart from <code>spawn</code> and <code>parallel</code> Nim also provides all the common low level concurrency mechanisms like locks, atomic intrinsics or condition variables.</p> <p>Nim significantly improves on the safety of these features via additional pragmas:</p> <ol class="simple">
+<li>A <span id="guard_1">guard</span> annotation is introduced to prevent data races.</li> <li>Every access of a guarded memory location needs to happen in an appropriate <span id="locks_1">locks</span> statement.</li> <li>Locks and routines can be annotated with <span id="lock-levels_1">lock levels</span> to allow potential deadlocks to be detected during semantic analysis.</li> </ol> <h3 id="guards-and-locks-guards-and-the-locks-section">Guards and the locks section</h3> <h4 id="guards-and-the-locks-section-protecting-global-variables">Protecting global variables</h4>
+<p>Object fields and global variables can be annotated via a <code>guard</code> pragma:</p> <pre class="listing" data-language="nim">var glock: TLock
+var gdata {.guard: glock.}: int</pre>
+<p>The compiler then ensures that every access of <code>gdata</code> is within a <code>locks</code> section:</p> <pre class="listing" data-language="nim">proc invalid =
+  # invalid: unguarded access:
+  echo gdata
+
+proc valid =
+  # valid access:
+  {.locks: [glock].}:
+    echo gdata</pre>
+<p>Top level accesses to <code>gdata</code> are always allowed so that it can be initialized conveniently. It is <em>assumed</em> (but not enforced) that every top level statement is executed before any concurrent action happens.</p> <p>The <code>locks</code> section deliberately looks ugly because it has no runtime semantics and should not be used directly! It should only be used in templates that also implement some form of locking at runtime:</p> <pre class="listing" data-language="nim">template lock(a: TLock; body: untyped) =
+  pthread_mutex_lock(a)
+  {.locks: [a].}:
+    try:
+      body
+    finally:
+      pthread_mutex_unlock(a)</pre>
+<p>The guard does not need to be of any particular type. It is flexible enough to model low level lockfree mechanisms:</p> <pre class="listing" data-language="nim">var dummyLock {.compileTime.}: int
+var atomicCounter {.guard: dummyLock.}: int
+
+template atomicRead(x): untyped =
+  {.locks: [dummyLock].}:
+    memoryReadBarrier()
+    x
+
+echo atomicRead(atomicCounter)</pre>
+<p>The <code>locks</code> pragma takes a list of lock expressions <code>locks: [a, b, ...]</code> in order to support <em>multi lock</em> statements. Why these are essential is explained in the <a href="#guards-and-locks-lock-levels">lock levels</a> section.</p> <h4 id="guards-and-the-locks-section-protecting-general-locations">Protecting general locations</h4>
+<p>The <code>guard</code> annotation can also be used to protect fields within an object. The guard then needs to be another field within the same object or a global variable.</p> <p>Since objects can reside on the heap or on the stack this greatly enhances the expressivity of the language:</p> <pre class="listing" data-language="nim">type
+  ProtectedCounter = object
+    v {.guard: L.}: int
+    L: TLock
+
+proc incCounters(counters: var openArray[ProtectedCounter]) =
+  for i in 0..counters.high:
+    lock counters[i].L:
+      inc counters[i].v</pre>
+<p>The access to field <code>x.v</code> is allowed since its guard <code>x.L</code> is active. After template expansion, this amounts to:</p> <pre class="listing" data-language="nim">proc incCounters(counters: var openArray[ProtectedCounter]) =
+  for i in 0..counters.high:
+    pthread_mutex_lock(counters[i].L)
+    {.locks: [counters[i].L].}:
+      try:
+        inc counters[i].v
+      finally:
+        pthread_mutex_unlock(counters[i].L)</pre>
+<p>There is an analysis that checks that <code>counters[i].L</code> is the lock that corresponds to the protected location <code>counters[i].v</code>. This analysis is called <span id="path-analysis_1">path analysis</span> because it deals with paths to locations like <code>obj.field[i].fieldB[j]</code>.</p> <p>The path analysis is <strong>currently unsound</strong>, but that doesn't make it useless. Two paths are considered equivalent if they are syntactically the same.</p> <p>This means the following compiles (for now) even though it really should not:</p> <pre class="listing" data-language="nim">{.locks: [a[i].L].}:
+  inc i
+  access a[i].v</pre> <h3 id="guards-and-locks-lock-levels">Lock levels</h3>
+<p>Lock levels are used to enforce a global locking order in order to detect potential deadlocks during semantic analysis. A lock level is an constant integer in the range 0..1_000. Lock level 0 means that no lock is acquired at all.</p> <p>If a section of code holds a lock of level <code>M</code> than it can also acquire any lock of level <code>N &lt; M</code>. Another lock of level <code>M</code> cannot be acquired. Locks of the same level can only be acquired <em>at the same time</em> within a single <code>locks</code> section:</p> <pre class="listing" data-language="nim">var a, b: TLock[2]
+var x: TLock[1]
+# invalid locking order: TLock[1] cannot be acquired before TLock[2]:
+{.locks: [x].}:
+  {.locks: [a].}:
+    ...
+# valid locking order: TLock[2] acquired before TLock[1]:
+{.locks: [a].}:
+  {.locks: [x].}:
+    ...
+
+# invalid locking order: TLock[2] acquired before TLock[2]:
+{.locks: [a].}:
+  {.locks: [b].}:
+    ...
+
+# valid locking order, locks of the same level acquired at the same time:
+{.locks: [a, b].}:
+  ...</pre>
+<p>Here is how a typical multilock statement can be implemented in Nim. Note how the runtime check is required to ensure a global ordering for two locks <code>a</code> and <code>b</code> of the same lock level:</p> <pre class="listing" data-language="nim">template multilock(a, b: ptr TLock; body: untyped) =
+  if cast[ByteAddress](a) &lt; cast[ByteAddress](b):
+    pthread_mutex_lock(a)
+    pthread_mutex_lock(b)
+  else:
+    pthread_mutex_lock(b)
+    pthread_mutex_lock(a)
+  {.locks: [a, b].}:
+    try:
+      body
+    finally:
+      pthread_mutex_unlock(a)
+      pthread_mutex_unlock(b)</pre>
+<p>Whole routines can also be annotated with a <code>locks</code> pragma that takes a lock level. This then means that the routine may acquire locks of up to this level. This is essential so that procs can be called within a <code>locks</code> section:</p> <pre class="listing" data-language="nim">proc p() {.locks: 3.} = discard
+
+var a: TLock[4]
+{.locks: [a].}:
+  # p's locklevel (3) is strictly less than a's (4) so the call is allowed:
+  p()</pre>
+<p>As usual <code>locks</code> is an inferred effect and there is a subtype relation: <code>proc () {.locks: N.}</code> is a subtype of <code>proc () {.locks: M.}</code> iff (M &lt;= N).</p> <p>The <code>locks</code> pragma can also take the special value <code>"unknown"</code>. This is useful in the context of dynamic method dispatching. In the following example, the compiler can infer a lock level of 0 for the <code>base</code> case. However, one of the overloaded methods calls a procvar which is potentially locking. Thus, the lock level of calling <code>g.testMethod</code> cannot be inferred statically, leading to compiler warnings. By using <code>{.locks: "unknown".}</code>, the base method can be marked explicitly as having unknown lock level as well:</p> <pre class="listing" data-language="nim">type SomeBase* = ref object of RootObj
+type SomeDerived* = ref object of SomeBase
+  memberProc*: proc ()
+
+method testMethod(g: SomeBase) {.base, locks: "unknown".} = discard
+method testMethod(g: SomeDerived) =
+  if g.memberProc != nil:
+    g.memberProc()</pre> <h3 id="guards-and-locks-norewrite-pragma">noRewrite pragma</h3>
+<p>Term rewriting macros and templates are currently greedy and they will rewrite as long as there is a match. There was no way to ensure some rewrite happens only once, e.g. when rewriting term to same term plus extra content.</p> <p><code>noRewrite</code> pragma can actually prevent further rewriting on marked code, e.g. with given example <code>echo("ab")</code> will be rewritten just once:</p> <pre class="listing" data-language="nim">template pwnEcho{echo(x)}(x: expr) =
+  {.noRewrite.}: echo("pwned!")
+
+echo "ab"</pre>
+<p><code>noRewrite</code> pragma can be useful to control term-rewriting macros recursion.</p> <h2 id="taint-mode">Taint mode</h2>
+<p>The Nim compiler and most parts of the standard library support a taint mode. Input strings are declared with the <span id="taintedstring_1">TaintedString</span> string type declared in the <code>system</code> module.</p> <p>If the taint mode is turned on (via the <code>--taintMode:on</code> command line option) it is a distinct string type which helps to detect input validation errors:</p> <pre class="listing" data-language="nim">echo "your name: "
+var name: TaintedString = stdin.readline
+# it is safe here to output the name without any input validation, so
+# we simply convert `name` to string to make the compiler happy:
+echo "hi, ", name.string</pre>
+<p>If the taint mode is turned off, <code>TaintedString</code> is simply an alias for <code>string</code>.</p> <h2 id="aliasing-restrictions-in-parameter-passing">Aliasing restrictions in parameter passing</h2>
+<p><strong>Note</strong>: The aliasing restrictions are currently not enforced by the implementation and need to be fleshed out further.</p> <p>"Aliasing" here means that the underlying storage locations overlap in memory at runtime. An "output parameter" is a parameter of type <code>var T</code>, an input parameter is any parameter that is not of type <code>var</code>.</p> <ol class="simple">
+<li>Two output parameters should never be aliased.</li> <li>An input and an output parameter should not be aliased.</li> <li>An output parameter should never be aliased with a global or thread local variable referenced by the called proc.</li> <li>An input parameter should not be aliased with a global or thread local variable updated by the called proc.</li> </ol> <p>One problem with rules 3 and 4 is that they affect specific global or thread local variables, but Nim's effect tracking only tracks "uses no global variable" via <code>.noSideEffect</code>. The rules 3 and 4 can also be approximated by a different rule:</p> <ol class="simple">
+<li>A global or thread local variable (or a location derived from such a location) can only passed to a parameter of a <code>.noSideEffect</code> proc.</li> </ol> <h2 id="noalias-annotation">Noalias annotation</h2>
+<p>Since version 1.4 of the Nim compiler, there is a <code>.noalias</code> annotation for variables and parameters. It is mapped directly to C/C++'s <code>restrict</code> keyword and means that the underlying pointer is pointing to a unique location in memory, no other aliases to this location exist. It is <em>unchecked</em> that this alias restriction is followed, if the restriction is violated, the backend optimizer is free to miscompile the code. This is an <strong>unsafe</strong> language feature.</p> <p>Ideally in later versions of the language, the restriction will be enforced at compile time. (Which is also why the name <code>noalias</code> was choosen instead of a more verbose name like <code>unsafeAssumeNoAlias</code>.)</p> <h2 id="strict-funcs">Strict funcs</h2>
+<p>Since version 1.4 a stricter definition of "side effect" is available. In addition to the existing rule that a side effect is calling a function with side effects the following rule is also enforced:</p> <p>Any mutation to an object does count as a side effect if that object is reachable via a parameter that is not declared as a <code>var</code> parameter.</p> <p>For example:</p> <pre class="listing" data-language="nim">{.experimental: "strictFuncs".}
+
+type
+  Node = ref object
+    le, ri: Node
+    data: string
+
+func len(n: Node): int =
+  # valid: len does not have side effects
+  var it = n
+  while it != nil:
+    inc result
+    it = it.ri
+
+func mut(n: Node) =
+  let m = n # is the statement that connected the mutation to the parameter
+  m.data = "yeah" # the mutation is here
+  # Error: 'mut' can have side effects
+  # an object reachable from 'n' is potentially mutated</pre>
+<p>The algorithm behind this analysis is described in the <a href="#view-types-algorithm">view types section</a>.</p> <h2 id="view-types">View types</h2>
+<p><strong>Note</strong>: <code>--experimental:views</code> is more effective with <code>--experimental:strictFuncs</code>.</p> <p>A view type is a type that is or contains one of the following types:</p> <ul class="simple">
+<li>
+<code>var T</code> (mutable view into <code>T</code>)</li> <li>
+<code>lent T</code> (immutable view into <code>T</code>)</li> <li>
+<code>openArray[T]</code> (pair of (pointer to array of <code>T</code>, size))</li> </ul> <p>For example:</p> <pre class="listing" data-language="nim">type
+  View1 = var int
+  View2 = openArray[byte]
+  View3 = lent string
+  View4 = Table[openArray[char], int]</pre>
+<p>Exceptions to this rule are types constructed via <code>ptr</code> or <code>proc</code>. For example, the following types are <strong>not</strong> view types:</p> <pre class="listing" data-language="nim">type
+  NotView1 = proc (x: openArray[int])
+  NotView2 = ptr openArray[char]
+  NotView3 = ptr array[4, var int]</pre>
+<p>A <em>mutable</em> view type is a type that is or contains a <code>var T</code> type. An <em>immutable</em> view type is a view type that is not a mutable view type.</p> <p>A <em>view</em> is a symbol (a let, var, const, etc.) that has a view type.</p> <p>Since version 1.4 Nim allows view types to be used as local variables. This feature needs to be enabled via <code>{.experimental: "views".}</code>.</p> <p>A local variable of a view type <em>borrows</em> from the locations and it is statically enforced that the view does not outlive the location it was borrowed from.</p> <p>For example:</p> <pre class="listing" data-language="nim">{.experimental: "views".}
+
+proc take(a: openArray[int]) =
+  echo a.len
+
+proc main(s: seq[int]) =
+  var x: openArray[int] = s # 'x' is a view into 's'
+  # it is checked that 'x' does not outlive 's' and
+  # that 's' is not mutated.
+  for i in 0 .. high(x):
+    echo x[i]
+  take(x)
+  
+  take(x.toOpenArray(0, 1)) # slicing remains possible
+  let y = x  # create a view from a view
+  take y
+  # it is checked that 'y' does not outlive 'x' and
+  # that 'x' is not mutated as long as 'y' lives.
+
+
+main(@[11, 22, 33])</pre>
+<p>A local variable of a view type can borrow from a location derived from a parameter, another local variable, a global <code>const</code> or <code>let</code> symbol or a thread-local <code>var</code> or <code>let</code>.</p> <p>Let <code>p</code> the proc that is analysed for the correctness of the borrow operation.</p> <p>Let <code>source</code> be one of:</p> <ul class="simple">
+<li>A formal parameter of <code>p</code>. Note that this does not cover parameters of inner procs.</li> <li>The <code>result</code> symbol of <code>p</code>.</li> <li>A local <code>var</code> or <code>let</code> or <code>const</code> of <code>p</code>. Note that this does not cover locals of inner procs.</li> <li>A thread-local <code>var</code> or <code>let</code>.</li> <li>A global <code>let</code> or <code>const</code>.</li> <li>A constant array/seq/object/tuple constructor.</li> </ul> <h3 id="view-types-path-expressions">Path expressions</h3>
+<p>A location derived from <code>source</code> is then defined as a path expression that has <code>source</code> as the owner. A path expression <code>e</code> is defined recursively:</p> <ul class="simple">
+<li>
+<code>source</code> itself is a path expression.</li> <li>Container access like <code>e[i]</code> is a path expression.</li> <li>Tuple access <code>e[0]</code> is a path expression.</li> <li>Object field access <code>e.field</code> is a path expression.</li> <li>
+<code>system.toOpenArray(e, ...)</code> is a path expression.</li> <li>Pointer dereference <code>e[]</code> is a path expression.</li> <li>An address <code>addr e</code>, <code>unsafeAddr e</code> is a path expression.</li> <li>A type conversion <code>T(e)</code> is a path expression.</li> <li>A cast expression <code>cast[T](e)</code> is a path expression.</li> <li>
+<code>f(e, ...)</code> is a path expression if <code>f</code>'s return type is a view type. Because the view can only have been borrowed from <code>e</code>, we then know that owner of <code>f(e, ...)</code> is <code>e</code>.</li> </ul> <p>If a view type is used as a return type, the location must borrow from a location that is derived from the first parameter that is passed to the proc. See <a href="manual.html#procedures-var-return-type">https://nim-lang.org/docs/manual.html#procedures-var-return-type</a> for details about how this is done for <code>var T</code>.</p> <p>A mutable view can borrow from a mutable location, an immutable view can borrow from both a mutable or an immutable location.</p> <p>The <em>duration</em> of a borrow is the span of commands beginning from the assignment to the view and ending with the last usage of the view.</p> <p>For the duration of the borrow operation, no mutations to the borrowed locations may be performed except via the potentially mutable view that borrowed from the location. The borrowed location is said to be <em>sealed</em> during the borrow.</p> <pre class="listing" data-language="nim">{.experimental: "views".}
+
+type
+  Obj = object
+    field: string
+
+proc dangerous(s: var seq[Obj]) =
+  let v: lent Obj = s[0] # seal 's'
+  s.setLen 0  # prevented at compile-time because 's' is sealed.
+  echo v.field</pre>
+<p>The scope of the view does not matter:</p> <pre class="listing" data-language="nim">proc valid(s: var seq[Obj]) =
+  let v: lent Obj = s[0]  # begin of borrow
+  echo v.field            # end of borrow
+  s.setLen 0  # valid because 'v' isn't used afterwards</pre>
+<p>The analysis requires as much precision about mutations as is reasonably obtainable, so it is more effective with the experimental <a href="#strict-funcs">strict funcs</a> feature. In other words <code>--experimental:views</code> works better with <code>--experimental:strictFuncs</code>.</p> <p>The analysis is currently control flow insensitive:</p> <pre class="listing" data-language="nim">proc invalid(s: var seq[Obj]) =
+  let v: lent Obj = s[0]
+  if false:
+    s.setLen 0
+  echo v.field</pre>
+<p>In this example, the compiler assumes that <code>s.setLen 0</code> invalidates the borrow operation of <code>v</code> even though a human being can easily see that it will never do that at runtime.</p> <h3 id="view-types-start-of-a-borrow">Start of a borrow</h3>
+<p>A borrow starts with one of the following:</p> <ul class="simple">
+<li>The assignment of a non-view-type to a view-type.</li> <li>The assignment of a location that is derived from a local parameter to a view-type.</li> </ul> <h3 id="view-types-end-of-a-borrow">End of a borrow</h3>
+<p>A borrow operation ends with the last usage of the view variable.</p> <h3 id="view-types-reborrows">Reborrows</h3>
+<p>A view <code>v</code> can borrow from multiple different locations. However, the borrow is always the full span of <code>v</code>'s lifetime and every location that is borrowed from is sealed during <code>v</code>'s lifetime.</p> <h3 id="view-types-algorithm">Algorithm</h3>
+<p>The following section is an outline of the algorithm that the current implementation uses. The algorithm performs two traversals over the AST of the procedure or global section of code that uses a view variable. No fixpoint iterations are performed, the complexity of the analysis is O(N) where N is the number of nodes of the AST.</p> <p>The first pass over the AST computes the lifetime of each local variable based on a notion of an "abstract time", in the implementation it's a simple integer that is incremented for every visited node.</p> <p>In the second pass information about the underlying object "graphs" is computed. Let <code>v</code> be a parameter or a local variable. Let <code>G(v)</code> be the graph that <code>v</code> belongs to. A graph is defined by the set of variables that belong to the graph. Initially for all <code>v</code>: <code>G(v) = {v}</code>. Every variable can only be part of a single graph.</p> <p>Assignments like <code>a = b</code> "connect" two variables, both variables end up in the same graph <code>{a, b} = G(a) = G(b)</code>. Unfortunately, the pattern to look for is much more complex than that and can involve multiple assignment targets and sources:</p>
+<pre data-language="nim">f(x, y) = g(a, b)</pre> <p>connects <code>x</code> and <code>y</code> to <code>a</code> and <code>b</code>: <code>G(x) = G(y) = G(a) = G(b) = {x, y, a, b}</code>. A type based alias analysis rules out some of these combinations, for example a <code>string</code> value cannot possibly be connected to a <code>seq[int]</code>.</p> <p>A pattern like <code>v[] = value</code> or <code>v.field = value</code> marks <code>G(v)</code> as mutated. After the second pass a set of disjoint graphs was computed.</p> <p>For strict functions it is then enforced that there is no graph that is both mutated and has an element that is an immutable parameter (that is a parameter that is not of type <code>var T</code>).</p> <p>For borrow checking a different set of checks is performed. Let <code>v</code> be the view and <code>b</code> the location that is borrowed from.</p> <ul class="simple">
+<li>The lifetime of <code>v</code> must not exceed <code>b</code>'s lifetime. Note: The lifetime of a parameter is the complete proc body.</li> <li>If <code>v</code> is a mutable view and <code>v</code> is used to actually mutate the borrowed location, then <code>b</code> has to be a mutable location. Note: If it is not actually used for mutation, borrowing a mutable view from an immutable location is allowed! This allows for many important idioms and will be justified in an upcoming RFC.</li> <li>During <code>v</code>'s lifetime, <code>G(b)</code> can only be modified by <code>v</code> (and only if <code>v</code> is a mutable view).</li> <li>If <code>v</code> is <code>result</code> then <code>b</code> has to be a location derived from the first formal parameter or from a constant location.</li> <li>A view cannot be used for a read or a write access before it was assigned to.</li> </ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2006&ndash;2021 Andreas Rumpf<br>Licensed under the MIT License.<br>
+    <a href="https://nim-lang.org/docs/manual_experimental.html" class="_attribution-link">https://nim-lang.org/docs/manual_experimental.html</a>
+  </p>
+</div>

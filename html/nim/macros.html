@@ -1,0 +1,866 @@
+<h1 class="title">macros</h1>  
+<p>This module contains the interface to the compiler's abstract syntax tree (<span id="ast_1">AST</span>). Macros operate on this tree.</p> <p>See also:</p> <ul class="simple">
+<li><a href="https://nim-lang.org/docs/tut3.html">macros tutorial</a></li> <li><a href="manual.html#macros">macros section in Nim manual</a></li> </ul> <h2 id="the-ast-in-nim">The AST in Nim</h2>
+<p>This section describes how the AST is modelled with Nim's type system. The AST consists of nodes (<code>NimNode</code>) with a variable number of children. Each node has a field named <code>kind</code> which describes what the node contains:</p> <pre class="listing" data-language="nim">type
+  NimNodeKind = enum     ## kind of a node; only explanatory
+    nnkNone,             ## invalid node kind
+    nnkEmpty,            ## empty node
+    nnkIdent,            ## node contains an identifier
+    nnkIntLit,           ## node contains an int literal (example: 10)
+    nnkStrLit,           ## node contains a string literal (example: "abc")
+    nnkNilLit,           ## node contains a nil literal (example: nil)
+    nnkCaseStmt,         ## node represents a case statement
+    ...                  ## many more
+  
+  NimNode = ref NimNodeObj
+  NimNodeObj = object
+    case kind: NimNodeKind           ## the node's kind
+    of nnkNone, nnkEmpty, nnkNilLit:
+      discard                        ## node contains no additional fields
+    of nnkCharLit..nnkUInt64Lit:
+      intVal: BiggestInt             ## the int literal
+    of nnkFloatLit..nnkFloat64Lit:
+      floatVal: BiggestFloat         ## the float literal
+    of nnkStrLit..nnkTripleStrLit, nnkCommentStmt, nnkIdent, nnkSym:
+      strVal: string                 ## the string literal
+    else:
+      sons: seq[NimNode]             ## the node's sons (or children)</pre>
+<p>For the <code>NimNode</code> type, the <code>[]</code> operator has been overloaded: <code>n[i]</code> is <code>n</code>'s <code>i</code>-th child.</p> <p>To specify the AST for the different Nim constructs, the notation <code>nodekind(son1, son2, ...)</code> or <code>nodekind(value)</code> or <code>nodekind(field=value)</code> is used.</p> <p>Some child may be missing. A missing child is a node of kind <code>nnkEmpty</code>; a child can never be nil.</p> <h2 id="leaf-nodesslashatoms">Leaf nodes/Atoms</h2>
+<p>A leaf of the AST often corresponds to a terminal symbol in the concrete syntax. Note that the default <code>float</code> in Nim maps to <code>float64</code> such that the default AST for a float is <code>nnkFloat64Lit</code> as below.</p> <table>
+<tr>
+<th>Nim expression</th>
+<th>Corresponding AST</th>
+</tr> <tr>
+<td><code>42</code></td>
+<td><code>nnkIntLit(intVal = 42)</code></td>
+</tr> <tr>
+<td><code>42'i8</code></td>
+<td><code>nnkInt8Lit(intVal = 42)</code></td>
+</tr> <tr>
+<td><code>42'i16</code></td>
+<td><code>nnkInt16Lit(intVal = 42)</code></td>
+</tr> <tr>
+<td><code>42'i32</code></td>
+<td><code>nnkInt32Lit(intVal = 42)</code></td>
+</tr> <tr>
+<td><code>42'i64</code></td>
+<td><code>nnkInt64Lit(intVal = 42)</code></td>
+</tr> <tr>
+<td><code>42'u8</code></td>
+<td><code>nnkUInt8Lit(intVal = 42)</code></td>
+</tr> <tr>
+<td><code>42'u16</code></td>
+<td><code>nnkUInt16Lit(intVal = 42)</code></td>
+</tr> <tr>
+<td><code>42'u32</code></td>
+<td><code>nnkUInt32Lit(intVal = 42)</code></td>
+</tr> <tr>
+<td><code>42'u64</code></td>
+<td><code>nnkUInt64Lit(intVal = 42)</code></td>
+</tr> <tr>
+<td><code>42.0</code></td>
+<td><code>nnkFloat64Lit(floatVal = 42.0)</code></td>
+</tr> <tr>
+<td><code>42.0'f32</code></td>
+<td><code>nnkFloat32Lit(floatVal = 42.0)</code></td>
+</tr> <tr>
+<td><code>42.0'f64</code></td>
+<td><code>nnkFloat64Lit(floatVal = 42.0)</code></td>
+</tr> <tr>
+<td><code>"abc"</code></td>
+<td><code>nnkStrLit(strVal = "abc")</code></td>
+</tr> <tr>
+<td><code>r"abc"</code></td>
+<td><code>nnkRStrLit(strVal = "abc")</code></td>
+</tr> <tr>
+<td><code>"""abc"""</code></td>
+<td><code>nnkTripleStrLit(strVal = "abc")</code></td>
+</tr> <tr>
+<td><code>' '</code></td>
+<td><code>nnkCharLit(intVal = 32)</code></td>
+</tr> <tr>
+<td><code>nil</code></td>
+<td><code>nnkNilLit()</code></td>
+</tr> <tr>
+<td><code>myIdentifier</code></td>
+<td><code>nnkIdent(strVal = "myIdentifier")</code></td>
+</tr> <tr>
+<td><code>myIdentifier</code></td>
+<td>after lookup pass: <code>nnkSym(strVal = "myIdentifier", ...)</code>
+</td>
+</tr> </table>
+<p>Identifiers are <code>nnkIdent</code> nodes. After the name lookup pass these nodes get transferred into <code>nnkSym</code> nodes.</p> <h2 id="callsslashexpressions">Calls/expressions</h2> <h3 id="callsslashexpressions-command-call">Command call</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">echo "abc", "xyz"</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkCommand(
+  nnkIdent("echo"),
+  nnkStrLit("abc"),
+  nnkStrLit("xyz")
+)</pre> <h3 id="callsslashexpressions-call-with">Call with <code>()</code>
+</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">echo("abc", "xyz")</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkCall(
+  nnkIdent("echo"),
+  nnkStrLit("abc"),
+  nnkStrLit("xyz")
+)</pre> <h3 id="callsslashexpressions-infix-operator-call">Infix operator call</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">"abc" &amp; "xyz"</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkInfix(
+  nnkIdent("&amp;"),
+  nnkStrLit("abc"),
+  nnkStrLit("xyz")
+)</pre>
+<p>Note that with multiple infix operators, the command is parsed by operator precedence.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">5 + 3 * 4</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkInfix(
+  nnkIdent("+"),
+  nnkIntLit(5),
+  nnkInfix(
+    nnkIdent("*"),
+    nnkIntLit(3),
+    nnkIntLit(4)
+  )
+)</pre>
+<p>As a side note, if you choose to use infix operators in a prefix form, the AST behaves as a <a href="#callsslashexpressions-call-with">parenthetical function call</a> with <code>nnkAccQuoted</code>, as follows:</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">`+`(3, 4)</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkCall(
+  nnkAccQuoted(
+    nnkIdent("+")
+  ),
+  nnkIntLit(3),
+  nnkIntLit(4)
+)</pre> <h3 id="callsslashexpressions-prefix-operator-call">Prefix operator call</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">? "xyz"</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkPrefix(
+  nnkIdent("?"),
+  nnkStrLit("abc")
+)</pre> <h3 id="callsslashexpressions-postfix-operator-call">Postfix operator call</h3>
+<p><strong>Note:</strong> There are no postfix operators in Nim. However, the <code>nnkPostfix</code> node is used for the <em>asterisk export marker</em> <code>*</code>:</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">identifier*</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkPostfix(
+  nnkIdent("*"),
+  nnkIdent("identifier")
+)</pre> <h3 id="callsslashexpressions-call-with-named-arguments">Call with named arguments</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">writeLine(file=stdout, "hallo")</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkCall(
+  nnkIdent("writeLine"),
+  nnkExprEqExpr(
+    nnkIdent("file"),
+    nnkIdent("stdout")
+  ),
+  nnkStrLit("hallo")
+)</pre> <h3 id="callsslashexpressions-call-with-raw-string-literal">Call with raw string literal</h3>
+<p>This is used, for example, in the <code>bindSym</code> examples <a href="manual.html#macros-bindsym">here</a> and with <code>re"some regexp"</code> in the regular expression module.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">echo"abc"</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkCallStrLit(
+  nnkIdent("echo"),
+  nnkRStrLit("hello")
+)</pre> <h3 id="callsslashexpressions-dereference-operator">Dereference operator <code>[]</code>
+</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">x[]</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkDerefExpr(nnkIdent("x"))</pre> <h3 id="callsslashexpressions-addr-operator">Addr operator</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">addr(x)</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkAddr(nnkIdent("x"))</pre> <h3 id="callsslashexpressions-cast-operator">Cast operator</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">cast[T](x)</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkCast(nnkIdent("T"), nnkIdent("x"))</pre> <h3 id="callsslashexpressions-object-access-operator-dot">Object access operator <code>.</code>
+</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">x.y</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkDotExpr(nnkIdent("x"), nnkIdent("y"))</pre>
+<p>If you use Nim's flexible calling syntax (as in <code>x.len()</code>), the result is the same as above but wrapped in an <code>nnkCall</code>.</p> <h3 id="callsslashexpressions-array-access-operator">Array access operator <code>[]</code>
+</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">x[y]</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkBracketExpr(nnkIdent("x"), nnkIdent("y"))</pre> <h3 id="callsslashexpressions-parentheses">Parentheses</h3>
+<p>Parentheses for affecting operator precedence or tuple construction are built with the <code>nnkPar</code> node.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">(1, 2, (3))</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkPar(nnkIntLit(1), nnkIntLit(2), nnkPar(nnkIntLit(3)))</pre> <h3 id="callsslashexpressions-curly-braces">Curly braces</h3>
+<p>Curly braces are used as the set constructor.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">{1, 2, 3}</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkCurly(nnkIntLit(1), nnkIntLit(2), nnkIntLit(3))</pre>
+<p>When used as a table constructor, the syntax is different.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">{a: 3, b: 5}</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkTableConstr(
+  nnkExprColonExpr(nnkIdent("a"), nnkIntLit(3)),
+  nnkExprColonExpr(nnkIdent("b"), nnkIntLit(5))
+)</pre> <h3 id="callsslashexpressions-brackets">Brackets</h3>
+<p>Brackets are used as the array constructor.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">[1, 2, 3]</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkBracket(nnkIntLit(1), nnkIntLit(2), nnkIntLit(3))</pre> <h3 id="callsslashexpressions-ranges">Ranges</h3>
+<p>Ranges occur in set constructors, case statement branches, or array slices. Internally, the node kind <code>nnkRange</code> is used, but when constructing the AST, construction with <code>..</code> as an infix operator should be used instead.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">1..3</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkInfix(
+  nnkIdent(".."),
+  nnkIntLit(1),
+  nnkIntLit(3)
+)</pre>
+<p>Example code:</p> <pre class="listing" data-language="nim">macro genRepeatEcho(): stmt =
+  result = newNimNode(nnkStmtList)
+  
+  var forStmt = newNimNode(nnkForStmt) # generate a for statement
+  forStmt.add(ident("i")) # use the variable `i` for iteration
+  
+  var rangeDef = newNimNode(nnkInfix).add(
+    ident("..")).add(
+    newIntLitNode(3),newIntLitNode(5)) # iterate over the range 3..5
+  
+  forStmt.add(rangeDef)
+  forStmt.add(newCall(ident("echo"), newIntLitNode(3))) # meat of the loop
+  result.add(forStmt)
+
+genRepeatEcho() # gives:
+                # 3
+                # 3
+                # 3</pre> <h3 id="callsslashexpressions-if-expression">If expression</h3>
+<p>The representation of the <code>if</code> expression is subtle, but easy to traverse.</p> <p>Concrete syntax:</p> <pre class="listing">if cond1: expr1 elif cond2: expr2 else: expr3</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkIfExpr(
+  nnkElifExpr(cond1, expr1),
+  nnkElifExpr(cond2, expr2),
+  nnkElseExpr(expr3)
+)</pre> <h3 id="callsslashexpressions-documentation-comments">Documentation Comments</h3>
+<p>Double-hash (<code>##</code>) comments in the code actually have their own format, using <code>strVal</code> to get and set the comment text. Single-hash (<code>#</code>) comments are ignored.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">## This is a comment
+## This is part of the first comment
+stmt1
+## Yet another</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkCommentStmt() # only appears once for the first two lines!
+stmt1
+nnkCommentStmt() # another nnkCommentStmt because there is another comment
+                 # (separate from the first)</pre> <h3 id="callsslashexpressions-pragmas">Pragmas</h3>
+<p>One of Nim's cool features is pragmas, which allow fine-tuning of various aspects of the language. They come in all types, such as adorning procs and objects, but the standalone <code>emit</code> pragma shows the basics with the AST.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">{.emit: "#include &lt;stdio.h&gt;".}</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkPragma(
+  nnkExprColonExpr(
+    nnkIdent("emit"),
+    nnkStrLit("#include &lt;stdio.h&gt;") # the "argument"
+  )
+)</pre>
+<p>As many <code>nnkIdent</code> appear as there are pragmas between <code>{..}</code>. Note that the declaration of new pragmas is essentially the same:</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">{.pragma: cdeclRename, cdecl.}</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkPragma(
+  nnkExprColonExpr(
+    nnkIdent("pragma"), # this is always first when declaring a new pragma
+    nnkIdent("cdeclRename") # the name of the pragma
+  ),
+  nnkIdent("cdecl")
+)</pre> <h2 id="statements">Statements</h2> <h3 id="statements-if-statement">If statement</h3>
+<p>The representation of the if statement is subtle, but easy to traverse. If there is no <code>else</code> branch, no <code>nnkElse</code> child exists.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">if cond1:
+  stmt1
+elif cond2:
+  stmt2
+elif cond3:
+  stmt3
+else:
+  stmt4</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkIfStmt(
+  nnkElifBranch(cond1, stmt1),
+  nnkElifBranch(cond2, stmt2),
+  nnkElifBranch(cond3, stmt3),
+  nnkElse(stmt4)
+)</pre> <h3 id="statements-when-statement">When statement</h3>
+<p>Like the <code>if</code> statement, but the root has the kind <code>nnkWhenStmt</code>.</p> <h3 id="statements-assignment">Assignment</h3>
+<p>Concrete syntax:</p> <pre class="listing">x = 42</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkAsgn(nnkIdent("x"), nnkIntLit(42))</pre>
+<p>This is not the syntax for assignment when combined with <code>var</code>, <code>let</code>, or <code>const</code>.</p> <h3 id="statements-statement-list">Statement list</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">stmt1
+stmt2
+stmt3</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkStmtList(stmt1, stmt2, stmt3)</pre> <h3 id="statements-case-statement">Case statement</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">case expr1
+of expr2, expr3..expr4:
+  stmt1
+of expr5:
+  stmt2
+elif cond1:
+  stmt3
+else:
+  stmt4</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkCaseStmt(
+  expr1,
+  nnkOfBranch(expr2, nnkRange(expr3, expr4), stmt1),
+  nnkOfBranch(expr5, stmt2),
+  nnkElifBranch(cond1, stmt3),
+  nnkElse(stmt4)
+)</pre>
+<p>The <code>nnkElifBranch</code> and <code>nnkElse</code> parts may be missing.</p> <h3 id="statements-while-statement">While statement</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">while expr1:
+  stmt1</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkWhileStmt(expr1, stmt1)</pre> <h3 id="statements-for-statement">For statement</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">for ident1, ident2 in expr1:
+  stmt1</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkForStmt(ident1, ident2, expr1, stmt1)</pre> <h3 id="statements-try-statement">Try statement</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">try:
+  stmt1
+except e1, e2:
+  stmt2
+except e3:
+  stmt3
+except:
+  stmt4
+finally:
+  stmt5</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkTryStmt(
+  stmt1,
+  nnkExceptBranch(e1, e2, stmt2),
+  nnkExceptBranch(e3, stmt3),
+  nnkExceptBranch(stmt4),
+  nnkFinally(stmt5)
+)</pre> <h3 id="statements-return-statement">Return statement</h3>
+<p>Concrete syntax:</p> <pre class="listing">return expr1</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkReturnStmt(expr1)</pre> <h3 id="statements-yield-statement">Yield statement</h3>
+<p>Like <code>return</code>, but with <code>nnkYieldStmt</code> kind.</p> <pre class="listing" data-language="nim">nnkYieldStmt(expr1)</pre> <h3 id="statements-discard-statement">Discard statement</h3>
+<p>Like <code>return</code>, but with <code>nnkDiscardStmt</code> kind.</p> <pre class="listing" data-language="nim">nnkDiscardStmt(expr1)</pre> <h3 id="statements-continue-statement">Continue statement</h3>
+<p>Concrete syntax:</p> <pre class="listing">continue</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkContinueStmt()</pre> <h3 id="statements-break-statement">Break statement</h3>
+<p>Concrete syntax:</p> <pre class="listing">break otherLocation</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkBreakStmt(nnkIdent("otherLocation"))</pre>
+<p>If <code>break</code> is used without a jump-to location, <code>nnkEmpty</code> replaces <code>nnkIdent</code>.</p> <h3 id="statements-block-statement">Block statement</h3>
+<p>Concrete syntax:</p> <pre class="listing">block name:</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkBlockStmt(nnkIdent("name"), nnkStmtList(...))</pre>
+<p>A <code>block</code> doesn't need an name, in which case <code>nnkEmpty</code> is used.</p> <h3 id="statements-asm-statement">Asm statement</h3>
+<p>Concrete syntax:</p> <pre class="listing" data-language="nim">asm """
+  some asm
+"""</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkAsmStmt(
+  nnkEmpty(), # for pragmas
+  nnkTripleStrLit("some asm"),
+)</pre> <h3 id="statements-import-section">Import section</h3>
+<p>Nim's <code>import</code> statement actually takes different variations depending on what keywords are present. Let's start with the simplest form.</p> <p>Concrete syntax:</p> <pre class="listing">import math</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkImportStmt(nnkIdent("math"))</pre>
+<p>With <code>except</code>, we get <code>nnkImportExceptStmt</code>.</p> <p>Concrete syntax:</p> <pre class="listing">import math except pow</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkImportExceptStmt(nnkIdent("math"),nnkIdent("pow"))</pre>
+<p>Note that <code>import math as m</code> does not use a different node; rather, we use <code>nnkImportStmt</code> with <code>as</code> as an infix operator.</p> <p>Concrete syntax:</p> <pre class="listing">import strutils as su</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkImportStmt(
+  nnkInfix(
+    nnkIdent("as"),
+    nnkIdent("strutils"),
+    nnkIdent("su")
+  )
+)</pre> <h3 id="statements-from-statement">From statement</h3>
+<p>If we use <code>from ... import</code>, the result is different, too.</p> <p>Concrete syntax:</p> <pre class="listing">from math import pow</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkFromStmt(nnkIdent("math"), nnkIdent("pow"))</pre>
+<p>Using <code>from math as m import pow</code> works identically to the <code>as</code> modifier with the <code>import</code> statement, but wrapped in <code>nnkFromStmt</code>.</p> <h3 id="statements-export-statement">Export statement</h3>
+<p>When you are making an imported module accessible by modules that import yours, the <code>export</code> syntax is pretty straightforward.</p> <p>Concrete syntax:</p> <pre class="listing">export unsigned</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkExportStmt(nnkIdent("unsigned"))</pre>
+<p>Similar to the <code>import</code> statement, the AST is different for <code>export ... except</code>.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">export math except pow # we're going to implement our own exponentiation</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkExportExceptStmt(nnkIdent("math"),nnkIdent("pow"))</pre> <h3 id="statements-include-statement">Include statement</h3>
+<p>Like a plain <code>import</code> statement but with <code>nnkIncludeStmt</code>.</p> <p>Concrete syntax:</p> <pre class="listing">include blocks</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkIncludeStmt(nnkIdent("blocks"))</pre> <h3 id="statements-var-section">Var section</h3>
+<p>Concrete syntax:</p> <pre class="listing">var a = 3</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkVarSection(
+  nnkIdentDefs(
+    nnkIdent("a"),
+    nnkEmpty(), # or nnkIdent(...) if the variable declares the type
+    nnkIntLit(3),
+  )
+)</pre>
+<p>Note that either the second or third (or both) parameters above must exist, as the compiler needs to know the type somehow (which it can infer from the given assignment).</p> <p>This is not the same AST for all uses of <code>var</code>. See <a href="macros.html#statements-procedure-declaration">Procedure declaration</a> for details.</p> <h3 id="statements-let-section">Let section</h3>
+<p>This is equivalent to <code>var</code>, but with <code>nnkLetSection</code> rather than <code>nnkVarSection</code>.</p> <p>Concrete syntax:</p> <pre class="listing">let a = 3</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkLetSection(
+  nnkIdentDefs(
+    nnkIdent("a"),
+    nnkEmpty(), # or nnkIdent(...) for the type
+    nnkIntLit(3),
+  )
+)</pre> <h3 id="statements-const-section">Const section</h3>
+<p>Concrete syntax:</p> <pre class="listing">const a = 3</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkConstSection(
+  nnkConstDef( # not nnkConstDefs!
+    nnkIdent("a"),
+    nnkEmpty(), # or nnkIdent(...) if the variable declares the type
+    nnkIntLit(3), # required in a const declaration!
+  )
+)</pre> <h3 id="statements-type-section">Type section</h3>
+<p>Starting with the simplest case, a <code>type</code> section appears much like <code>var</code> and <code>const</code>.</p> <p>Concrete syntax:</p> <pre class="listing">type A = int</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkTypeSection(
+  nnkTypeDef(
+    nnkIdent("A"),
+    nnkEmpty(),
+    nnkIdent("int")
+  )
+)</pre>
+<p>Declaring <code>distinct</code> types is similar, with the last <code>nnkIdent</code> wrapped in <code>nnkDistinctTy</code>.</p> <p>Concrete syntax:</p> <pre class="listing">type MyInt = distinct int</pre>
+<p>AST:</p> <pre class="listing" data-language="nim"># ...
+nnkTypeDef(
+  nnkIdent("MyInt"),
+  nnkEmpty(),
+  nnkDistinctTy(
+    nnkIdent("int")
+  )
+)</pre>
+<p>If a type section uses generic parameters, they are treated here:</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">type A[T] = expr1</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkTypeSection(
+  nnkTypeDef(
+    nnkIdent("A"),
+    nnkGenericParams(
+      nnkIdentDefs(
+        nnkIdent("T"),
+        nnkEmpty(), # if the type is declared with options, like
+                    # ``[T: SomeInteger]``, they are given here
+        nnkEmpty(),
+      )
+    )
+    expr1,
+  )
+)</pre>
+<p>Note that not all <code>nnkTypeDef</code> utilize <code>nnkIdent</code> as their parameter. One of the most common uses of type declarations is to work with objects.</p> <p>Concrete syntax:</p> <pre class="listing">type IO = object of RootObj</pre>
+<p>AST:</p> <pre class="listing" data-language="nim"># ...
+nnkTypeDef(
+  nnkIdent("IO"),
+  nnkEmpty(),
+  nnkObjectTy(
+    nnkEmpty(), # no pragmas here
+    nnkOfInherit(
+      nnkIdent("RootObj") # inherits from RootObj
+    )
+    nnkEmpty()
+  )
+)</pre>
+<p>Nim's object syntax is rich. Let's take a look at an involved example in its entirety to see some of the complexities.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">type Obj[T] = object {.inheritable.}
+  name: string
+  case isFat: bool
+  of true:
+    m: array[100_000, T]
+  of false:
+    m: array[10, T]</pre>
+<p>AST:</p> <pre class="listing" data-language="nim"># ...
+nnkObjectTy(
+  nnkPragma(
+    nnkIdent("inheritable")
+  ),
+  nnkEmpty(),
+  nnkRecList( # list of object parameters
+    nnkIdentDefs(
+      nnkIdent("name"),
+      nnkIdent("string"),
+      nnkEmpty()
+    ),
+    nnkRecCase( # case statement within object (not nnkCaseStmt)
+      nnkIdentDefs(
+        nnkIdent("isFat"),
+        nnkIdent("bool"),
+        nnkEmpty()
+      ),
+      nnkOfBranch(
+        nnkIdent("true"),
+        nnkRecList( # again, a list of object parameters
+          nnkIdentDefs(
+            nnkIdent("m"),
+            nnkBracketExpr(
+              nnkIdent("array"),
+              nnkIntLit(100000),
+              nnkIdent("T")
+            ),
+            nnkEmpty()
+        )
+      ),
+      nnkOfBranch(
+        nnkIdent("false"),
+        nnkRecList(
+          nnkIdentDefs(
+            nnkIdent("m"),
+            nnkBracketExpr(
+              nnkIdent("array"),
+              nnkIntLit(10),
+              nnkIdent("T")
+            ),
+            nnkEmpty()
+          )
+        )
+      )
+    )
+  )
+)</pre>
+<p>Using an <code>enum</code> is similar to using an <code>object</code>.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">type X = enum
+  First</pre>
+<p>AST:</p> <pre class="listing" data-language="nim"># ...
+nnkEnumTy(
+  nnkEmpty(),
+  nnkIdent("First") # you need at least one nnkIdent or the compiler complains
+)</pre>
+<p>The usage of <code>concept</code> (experimental) is similar to objects.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">type Con = concept x,y,z
+  (x &amp; y &amp; z) is string</pre>
+<p>AST:</p> <pre class="listing" data-language="nim"># ...
+nnkTypeClassTy( # note this isn't nnkConceptTy!
+  nnkArglist(
+    # ... idents for x, y, z
+  )
+  # ...
+)</pre>
+<p>Static types, like <code>static[int]</code>, use <code>nnkIdent</code> wrapped in <code>nnkStaticTy</code>.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">type A[T: static[int]] = object</pre>
+<p>AST:</p> <pre class="listing" data-language="nim"># ... within nnkGenericParams
+nnkIdentDefs(
+  nnkIdent("T"),
+  nnkStaticTy(
+    nnkIdent("int")
+  ),
+  nnkEmpty()
+)
+# ...</pre>
+<p>In general, declaring types mirrors this syntax (i.e., <code>nnkStaticTy</code> for <code>static</code>, etc.). Examples follow (exceptions marked by <code>*</code>):</p> <table>
+<tr>
+<th>Nim type</th>
+<th>Corresponding AST</th>
+</tr> <tr>
+<td><code>static</code></td>
+<td><code>nnkStaticTy</code></td>
+</tr> <tr>
+<td><code>tuple</code></td>
+<td><code>nnkTupleTy</code></td>
+</tr> <tr>
+<td><code>var</code></td>
+<td><code>nnkVarTy</code></td>
+</tr> <tr>
+<td><code>ptr</code></td>
+<td><code>nnkPtrTy</code></td>
+</tr> <tr>
+<td><code>ref</code></td>
+<td><code>nnkRefTy</code></td>
+</tr> <tr>
+<td><code>distinct</code></td>
+<td><code>nnkDistinctTy</code></td>
+</tr> <tr>
+<td><code>enum</code></td>
+<td><code>nnkEnumTy</code></td>
+</tr> <tr>
+<td><code>concept</code></td>
+<td>
+<code>nnkTypeClassTy</code>*</td>
+</tr> <tr>
+<td><code>array</code></td>
+<td>
+<code>nnkBracketExpr(nnkIdent("array"),...</code>*</td>
+</tr> <tr>
+<td><code>proc</code></td>
+<td><code>nnkProcTy</code></td>
+</tr> <tr>
+<td><code>iterator</code></td>
+<td><code>nnkIteratorTy</code></td>
+</tr> <tr>
+<td><code>object</code></td>
+<td><code>nnkObjectTy</code></td>
+</tr> </table>
+<p>Take special care when declaring types as <code>proc</code>. The behavior is similar to <code>Procedure declaration</code>, below, but does not treat <code>nnkGenericParams</code>. Generic parameters are treated in the type, not the <code>proc</code> itself.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">type MyProc[T] = proc(x: T)</pre>
+<p>AST:</p> <pre class="listing" data-language="nim"># ...
+nnkTypeDef(
+  nnkIdent("MyProc"),
+  nnkGenericParams( # here, not with the proc
+    # ...
+  )
+  nnkProcTy( # behaves like a procedure declaration from here on
+    nnkFormalParams(
+      # ...
+    )
+  )
+)</pre>
+<p>The same syntax applies to <code>iterator</code> (with <code>nnkIteratorTy</code>), but <em>does not</em> apply to <code>converter</code> or <code>template</code>.</p> <h3 id="statements-mixin-statement">Mixin statement</h3>
+<p>Concrete syntax:</p> <pre class="listing">mixin x</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkMixinStmt(nnkIdent("x"))</pre> <h3 id="statements-bind-statement">Bind statement</h3>
+<p>Concrete syntax:</p> <pre class="listing">bind x</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkBindStmt(nnkIdent("x"))</pre> <h3 id="statements-procedure-declaration">Procedure declaration</h3>
+<p>Let's take a look at a procedure with a lot of interesting aspects to get a feel for how procedure calls are broken down.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">proc hello*[T: SomeInteger](x: int = 3, y: float32): int {.inline.} = discard</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkProcDef(
+  nnkPostfix(nnkIdent("*"), nnkIdent("hello")), # the exported proc name
+  nnkEmpty(), # patterns for term rewriting in templates and macros (not procs)
+  nnkGenericParams( # generic type parameters, like with type declaration
+    nnkIdentDefs(
+      nnkIdent("T"),
+      nnkIdent("SomeInteger"),
+      nnkEmpty()
+    )
+  ),
+  nnkFormalParams(
+    nnkIdent("int"), # the first FormalParam is the return type. nnkEmpty() if there is none
+    nnkIdentDefs(
+      nnkIdent("x"),
+      nnkIdent("int"), # type type (required for procs, not for templates)
+      nnkIntLit(3) # a default value
+    ),
+    nnkIdentDefs(
+      nnkIdent("y"),
+      nnkIdent("float32"),
+      nnkEmpty()
+    )
+  ),
+  nnkPragma(nnkIdent("inline")),
+  nnkEmpty(), # reserved slot for future use
+  nnkStmtList(nnkDiscardStmt(nnkEmpty())) # the meat of the proc
+)</pre>
+<p>There is another consideration. Nim has flexible type identification for its procs. Even though <code>proc(a: int, b: int)</code> and <code>proc(a, b: int)</code> are equivalent in the code, the AST is a little different for the latter.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">proc(a, b: int)</pre>
+<p>AST:</p> <pre class="listing" data-language="nim"># ...AST as above...
+nnkFormalParams(
+  nnkEmpty(), # no return here
+  nnkIdentDefs(
+    nnkIdent("a"), # the first parameter
+    nnkIdent("b"), # directly to the second parameter
+    nnkIdent("int"), # their shared type identifier
+    nnkEmpty(), # default value would go here
+  )
+),
+# ...</pre>
+<p>When a procedure uses the special <code>var</code> type return variable, the result is different from that of a var section.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">proc hello(): var int</pre>
+<p>AST:</p> <pre class="listing" data-language="nim"># ...
+nnkFormalParams(
+  nnkVarTy(
+    nnkIdent("int")
+  )
+)</pre> <h3 id="statements-iterator-declaration">Iterator declaration</h3>
+<p>The syntax for iterators is similar to procs, but with <code>nnkIteratorDef</code> replacing <code>nnkProcDef</code>.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">iterator nonsense[T](x: seq[T]): float {.closure.} = ...</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkIteratorDef(
+  nnkIdent("nonsense"),
+  nnkEmpty(),
+  ...
+)</pre> <h3 id="statements-converter-declaration">Converter declaration</h3>
+<p>A converter is similar to a proc.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">converter toBool(x: float): bool</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkConverterDef(
+  nnkIdent("toBool"),
+  # ...
+)</pre> <h3 id="statements-template-declaration">Template declaration</h3>
+<p>Templates (as well as macros, as we'll see) have a slightly expanded AST when compared to procs and iterators. The reason for this is [term-rewriting macros](manual.html#term-rewriting-macros). Notice the <code>nnkEmpty()</code> as the second argument to <code>nnkProcDef</code> and <code>nnkIteratorDef</code> above? That's where the term-rewriting macros go.</p> <p>Concrete syntax:</p> <pre class="listing" data-language="nim">template optOpt{expr1}(a: int): int</pre>
+<p>AST:</p> <pre class="listing" data-language="nim">nnkTemplateDef(
+  nnkIdent("optOpt"),
+  nnkStmtList( # instead of nnkEmpty()
+    expr1
+  ),
+  # follows like a proc or iterator
+)</pre>
+<p>If the template does not have types for its parameters, the type identifiers inside <code>nnkFormalParams</code> just becomes <code>nnkEmpty</code>.</p> <h3 id="statements-macro-declaration">Macro declaration</h3>
+<p>Macros behave like templates, but <code>nnkTemplateDef</code> is replaced with <code>nnkMacroDef</code>.</p> <h2 id="special-node-kinds">Special node kinds</h2>
+<p>There are several node kinds that are used for semantic checking or code generation. These are accessible from this module, but should not be used. Other node kinds are especially designed to make AST manipulations easier. These are explained here.</p> <p>To be written.</p>  <h2 id="6">Imports</h2> <dl> <a href="since.html">since</a> </dl>  <h2 id="7">Types</h2> <dl>  <dt><pre id="NimNodeKind" data-language="nim">NimNodeKind = enum
+  nnkNone, nnkEmpty, nnkIdent, nnkSym, nnkType, nnkCharLit, nnkIntLit,
+  nnkInt8Lit, nnkInt16Lit, nnkInt32Lit, nnkInt64Lit, nnkUIntLit, nnkUInt8Lit,
+  nnkUInt16Lit, nnkUInt32Lit, nnkUInt64Lit, nnkFloatLit, nnkFloat32Lit,
+  nnkFloat64Lit, nnkFloat128Lit, nnkStrLit, nnkRStrLit, nnkTripleStrLit,
+  nnkNilLit, nnkComesFrom, nnkDotCall, nnkCommand, nnkCall, nnkCallStrLit,
+  nnkInfix, nnkPrefix, nnkPostfix, nnkHiddenCallConv, nnkExprEqExpr,
+  nnkExprColonExpr, nnkIdentDefs, nnkVarTuple, nnkPar, nnkObjConstr, nnkCurly,
+  nnkCurlyExpr, nnkBracket, nnkBracketExpr, nnkPragmaExpr, nnkRange, nnkDotExpr,
+  nnkCheckedFieldExpr, nnkDerefExpr, nnkIfExpr, nnkElifExpr, nnkElseExpr,
+  nnkLambda, nnkDo, nnkAccQuoted, nnkTableConstr, nnkBind, nnkClosedSymChoice,
+  nnkOpenSymChoice, nnkHiddenStdConv, nnkHiddenSubConv, nnkConv, nnkCast,
+  nnkStaticExpr, nnkAddr, nnkHiddenAddr, nnkHiddenDeref, nnkObjDownConv,
+  nnkObjUpConv, nnkChckRangeF, nnkChckRange64, nnkChckRange, nnkStringToCString,
+  nnkCStringToString, nnkAsgn, nnkFastAsgn, nnkGenericParams, nnkFormalParams,
+  nnkOfInherit, nnkImportAs, nnkProcDef, nnkMethodDef, nnkConverterDef,
+  nnkMacroDef, nnkTemplateDef, nnkIteratorDef, nnkOfBranch, nnkElifBranch,
+  nnkExceptBranch, nnkElse, nnkAsmStmt, nnkPragma, nnkPragmaBlock, nnkIfStmt,
+  nnkWhenStmt, nnkForStmt, nnkParForStmt, nnkWhileStmt, nnkCaseStmt,
+  nnkTypeSection, nnkVarSection, nnkLetSection, nnkConstSection, nnkConstDef,
+  nnkTypeDef, nnkYieldStmt, nnkDefer, nnkTryStmt, nnkFinally, nnkRaiseStmt,
+  nnkReturnStmt, nnkBreakStmt, nnkContinueStmt, nnkBlockStmt, nnkStaticStmt,
+  nnkDiscardStmt, nnkStmtList, nnkImportStmt, nnkImportExceptStmt,
+  nnkExportStmt, nnkExportExceptStmt, nnkFromStmt, nnkIncludeStmt, nnkBindStmt,
+  nnkMixinStmt, nnkUsingStmt, nnkCommentStmt, nnkStmtListExpr, nnkBlockExpr,
+  nnkStmtListType, nnkBlockType, nnkWith, nnkWithout, nnkTypeOfExpr,
+  nnkObjectTy, nnkTupleTy, nnkTupleClassTy, nnkTypeClassTy, nnkStaticTy,
+  nnkRecList, nnkRecCase, nnkRecWhen, nnkRefTy, nnkPtrTy, nnkVarTy, nnkConstTy,
+  nnkMutableTy, nnkDistinctTy, nnkProcTy, nnkIteratorTy, nnkSharedTy, nnkEnumTy,
+  nnkEnumFieldDef, nnkArglist, nnkPattern, nnkHiddenTryStmt, nnkClosure,
+  nnkGotoState, nnkState, nnkBreakState, nnkFuncDef, nnkTupleConstr</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L26" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L26" target="_blank">Edit</a> </dd>  <dt><pre id="NimNodeKinds" data-language="nim">NimNodeKinds = set[NimNodeKind]</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L90" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L90" target="_blank">Edit</a> </dd>  <dt><pre id="NimTypeKind" data-language="nim">NimTypeKind = enum
+  ntyNone, ntyBool, ntyChar, ntyEmpty, ntyAlias, ntyNil, ntyExpr, ntyStmt,
+  ntyTypeDesc, ntyGenericInvocation, ntyGenericBody, ntyGenericInst,
+  ntyGenericParam, ntyDistinct, ntyEnum, ntyOrdinal, ntyArray, ntyObject,
+  ntyTuple, ntySet, ntyRange, ntyPtr, ntyRef, ntyVar, ntySequence, ntyProc,
+  ntyPointer, ntyOpenArray, ntyString, ntyCString, ntyForward, ntyInt, ntyInt8,
+  ntyInt16, ntyInt32, ntyInt64, ntyFloat, ntyFloat32, ntyFloat64, ntyFloat128,
+  ntyUInt, ntyUInt8, ntyUInt16, ntyUInt32, ntyUInt64, ntyUnused0, ntyUnused1,
+  ntyUnused2, ntyVarargs, ntyUncheckedArray, ntyError, ntyBuiltinTypeClass,
+  ntyUserTypeClass, ntyUserTypeClassInst, ntyCompositeTypeClass, ntyInferred,
+  ntyAnd, ntyOr, ntyNot, ntyAnything, ntyStatic, ntyFromExpr, ntyOptDeprecated,
+  ntyVoid</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L91" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L91" target="_blank">Edit</a> </dd>  <dt><pre id="TNimTypeKinds" data-language="nim">TNimTypeKinds {...}{.deprecated.} = set[NimTypeKind]</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L111" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L111" target="_blank">Edit</a> </dd>  <dt><pre id="NimSymKind" data-language="nim">NimSymKind = enum
+  nskUnknown, nskConditional, nskDynLib, nskParam, nskGenericParam, nskTemp,
+  nskModule, nskType, nskVar, nskLet, nskConst, nskResult, nskProc, nskFunc,
+  nskMethod, nskIterator, nskConverter, nskMacro, nskTemplate, nskField,
+  nskEnumField, nskForVar, nskLabel, nskStub</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L112" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L112" target="_blank">Edit</a> </dd>  <dt><pre id="TNimSymKinds" data-language="nim">TNimSymKinds {...}{.deprecated.} = set[NimSymKind]</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L121" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L121" target="_blank">Edit</a> </dd>  <dt><pre id="NimIdent" data-language="nim">NimIdent {...}{.deprecated.} = object of RootObj</pre></dt> <dd> Represents a Nim identifier in the AST. <strong>Note</strong>: This is only rarely useful, for identifier construction from a string use <code>ident"abc"</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L124" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L124" target="_blank">Edit</a> </dd>  <dt><pre id="NimSym" data-language="nim">NimSym {...}{.deprecated.} = ref NimSymObj</pre></dt> <dd> Represents a Nim <em>symbol</em> in the compiler; a <em>symbol</em> is a looked-up <em>ident</em>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L130" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L130" target="_blank">Edit</a> </dd>  <dt><pre id="BindSymRule" data-language="nim">BindSymRule = enum
+  brClosed,                 ## only the symbols in current scope are bound
+  brOpen,                   ## open wrt overloaded symbols, but may be a single
+                             ## symbol if not ambiguous (the rules match that of
+                             ## binding in generics)
+  brForceOpen                ## same as brOpen, but it will always be open even
+                             ## if not ambiguous (this cannot be achieved with
+                             ## any other means in the language currently)</pre></dt> <dd> specifies how <code>bindSym</code> behaves <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L465" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L465" target="_blank">Edit</a> </dd>  <dt><pre id="LineInfo" data-language="nim">LineInfo = object
+  filename*: string
+  line*, column*: int</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L508" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L508" target="_blank">Edit</a> </dd> </dl>  <h2 id="10">Consts</h2> <dl>  <dt><pre id="nnkLiterals" data-language="nim">nnkLiterals = {nnkCharLit..nnkNilLit}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L136" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L136" target="_blank">Edit</a> </dd>  <dt><pre id="nnkCallKinds" data-language="nim">nnkCallKinds = {nnkCall, nnkInfix, nnkPrefix, nnkPostfix, nnkCommand,
+                nnkCallStrLit}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L137" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L137" target="_blank">Edit</a> </dd>  <dt><pre id="RoutineNodes" data-language="nim">RoutineNodes = {nnkProcDef, nnkFuncDef, nnkMethodDef, nnkDo, nnkLambda,
+                nnkIteratorDef, nnkTemplateDef, nnkConverterDef, nnkMacroDef}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1081" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1081" target="_blank">Edit</a> </dd>  <dt><pre id="AtomicNodes" data-language="nim">AtomicNodes = {nnkNone..nnkNilLit}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1083" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1083" target="_blank">Edit</a> </dd>  <dt><pre id="CallNodes" data-language="nim">CallNodes = {nnkCall, nnkInfix, nnkPrefix, nnkPostfix, nnkCommand,
+             nnkCallStrLit, nnkHiddenCallConv}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1084" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1084" target="_blank">Edit</a> </dd> </dl>  <h2 id="12">Procs</h2> <dl>  <dt><pre id="toNimIdent%2Cstring" data-language="nim">proc toNimIdent(s: string): NimIdent {...}{.magic: "StrToIdent", noSideEffect, deprecated: "Deprecated since version 0.18.0: Use \'ident\' or \'newIdentNode\' instead.".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since version 0.18.0: Use 'ident' or 'newIdentNode' instead. </div> Constructs an identifier from the string <code>s</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L143" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L143" target="_blank">Edit</a> </dd>  <dt><pre id="%3D%3D%2CNimIdent%2CNimIdent" data-language="nim">proc `==`(a, b: NimIdent): bool {...}{.magic: "EqIdent", noSideEffect, deprecated: "Deprecated since version 0.18.1; Use \'==\' on \'NimNode\' instead.".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since version 0.18.1; Use '==' on 'NimNode' instead. </div> Compares two Nim identifiers. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L147" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L147" target="_blank">Edit</a> </dd>  <dt><pre id="%3D%3D%2CNimNode%2CNimNode" data-language="nim">proc `==`(a, b: NimNode): bool {...}{.magic: "EqNimrodNode", noSideEffect.}</pre></dt> <dd> Compare two Nim nodes. Return true if nodes are structurally equivalent. This means two independently created nodes can be equal. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L151" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L151" target="_blank">Edit</a> </dd>  <dt><pre id="%3D%3D%2CNimSym%2CNimSym" data-language="nim">proc `==`(a, b: NimSym): bool {...}{.magic: "EqNimrodNode", noSideEffect, deprecated: "Deprecated since version 0.18.1; Use \'==(NimNode, NimNode)\' instead.".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since version 0.18.1; Use '==(NimNode, NimNode)' instead. </div> Compares two Nim symbols. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L155" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L155" target="_blank">Edit</a> </dd>  <dt><pre id="sameType%2CNimNode%2CNimNode" data-language="nim">proc sameType(a, b: NimNode): bool {...}{.magic: "SameNodeType", noSideEffect,
+                                     raises: [], tags: [].}</pre></dt> <dd> Compares two Nim nodes' types. Return true if the types are the same, e.g. true when comparing alias with original type. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L161" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L161" target="_blank">Edit</a> </dd>  <dt><pre id="len%2CNimNode" data-language="nim">proc len(n: NimNode): int {...}{.magic: "NLen", noSideEffect.}</pre></dt> <dd> Returns the number of children of <code>n</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L166" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L166" target="_blank">Edit</a> </dd>  <dt><pre id="%5B%5D%2CNimNode%2Cint" data-language="nim">proc `[]`(n: NimNode; i: int): NimNode {...}{.magic: "NChild", noSideEffect.}</pre></dt> <dd> Get <code>n</code>'s <code>i</code>'th child. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L169" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L169" target="_blank">Edit</a> </dd>  <dt><pre id="%5B%5D%2CNimNode%2CBackwardsIndex" data-language="nim">proc `[]`(n: NimNode; i: BackwardsIndex): NimNode {...}{.raises: [], tags: [].}</pre></dt> <dd> Get <code>n</code>'s <code>i</code>'th child. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L172" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L172" target="_blank">Edit</a> </dd>  <dt><pre id="%5B%5D%2CNimNode%2CHSlice%5BT%2CU%5D" data-language="nim">proc `[]`[T, U](n: NimNode; x: HSlice[T, U]): seq[NimNode]</pre></dt> <dd> Slice operation for NimNode. Returns a seq of child of <code>n</code> who inclusive range [n[x.a], n[x.b]]. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L178" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L178" target="_blank">Edit</a> </dd>  <dt><pre id="%5B%5D%3D%2CNimNode%2Cint%2CNimNode" data-language="nim">proc `[]=`(n: NimNode; i: int; child: NimNode) {...}{.magic: "NSetChild",
+    noSideEffect.}</pre></dt> <dd> Set <code>n</code>'s <code>i</code>'th child to <code>child</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L187" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L187" target="_blank">Edit</a> </dd>  <dt><pre id="%5B%5D%3D%2CNimNode%2CBackwardsIndex%2CNimNode" data-language="nim">proc `[]=`(n: NimNode; i: BackwardsIndex; child: NimNode) {...}{.raises: [], tags: [].}</pre></dt> <dd> Set <code>n</code>'s <code>i</code>'th child to <code>child</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L191" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L191" target="_blank">Edit</a> </dd>  <dt><pre id="add%2CNimNode%2CNimNode" data-language="nim">proc add(father, child: NimNode): NimNode {...}{.magic: "NAdd", discardable,
+    noSideEffect, locks: 0.}</pre></dt> <dd> Adds the <code>child</code> to the <code>father</code> node. Returns the father node so that calls can be nested. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L210" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L210" target="_blank">Edit</a> </dd>  <dt><pre id="add%2CNimNode%2Cvarargs%5BNimNode%5D" data-language="nim">proc add(father: NimNode; children: varargs[NimNode]): NimNode {...}{.
+    magic: "NAddMultiple", discardable, noSideEffect, locks: 0.}</pre></dt> <dd> Adds each child of <code>children</code> to the <code>father</code> node. Returns the <code>father</code> node so that calls can be nested. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L215" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L215" target="_blank">Edit</a> </dd>  <dt><pre id="del%2CNimNode%2Cint%2Cint" data-language="nim">proc del(father: NimNode; idx = 0; n = 1) {...}{.magic: "NDel", noSideEffect.}</pre></dt> <dd> Deletes <code>n</code> children of <code>father</code> starting at index <code>idx</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L220" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L220" target="_blank">Edit</a> </dd>  <dt><pre id="kind%2CNimNode" data-language="nim">proc kind(n: NimNode): NimNodeKind {...}{.magic: "NKind", noSideEffect.}</pre></dt> <dd> Returns the <code>kind</code> of the node <code>n</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L223" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L223" target="_blank">Edit</a> </dd>  <dt><pre id="intVal%2CNimNode" data-language="nim">proc intVal(n: NimNode): BiggestInt {...}{.magic: "NIntVal", noSideEffect.}</pre></dt> <dd> Returns an integer value from any integer literal or enum field symbol. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L226" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L226" target="_blank">Edit</a> </dd>  <dt><pre id="floatVal%2CNimNode" data-language="nim">proc floatVal(n: NimNode): BiggestFloat {...}{.magic: "NFloatVal", noSideEffect.}</pre></dt> <dd> Returns a float from any floating point literal. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L229" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L229" target="_blank">Edit</a> </dd>  <dt><pre id="ident%2CNimNode" data-language="nim">proc ident(n: NimNode): NimIdent {...}{.magic: "NIdent", noSideEffect, deprecated: "Deprecated since version 0.18.1; All functionality is defined on \'NimNode\'.".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since version 0.18.1; All functionality is defined on 'NimNode'. </div> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L234" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L234" target="_blank">Edit</a> </dd>  <dt><pre id="symbol%2CNimNode" data-language="nim">proc symbol(n: NimNode): NimSym {...}{.magic: "NSymbol", noSideEffect, deprecated: "Deprecated since version 0.18.1; All functionality is defined on \'NimNode\'.".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since version 0.18.1; All functionality is defined on 'NimNode'. </div> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L237" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L237" target="_blank">Edit</a> </dd>  <dt><pre id="getImpl%2CNimSym" data-language="nim">proc getImpl(s: NimSym): NimNode {...}{.magic: "GetImpl", noSideEffect, deprecated: "use `getImpl: NimNode -&gt; NimNode` instead".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> use `getImpl: NimNode -&gt; NimNode` instead </div> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L240" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L240" target="_blank">Edit</a> </dd>  <dt><pre id="symKind%2CNimNode" data-language="nim">proc symKind(symbol: NimNode): NimSymKind {...}{.magic: "NSymKind", noSideEffect.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L243" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L243" target="_blank">Edit</a> </dd>  <dt><pre id="getImpl%2CNimNode" data-language="nim">proc getImpl(symbol: NimNode): NimNode {...}{.magic: "GetImpl", noSideEffect.}</pre></dt> <dd> Returns a copy of the declaration of a symbol or <code>nil</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L244" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L244" target="_blank">Edit</a> </dd>  <dt><pre id="strVal%2CNimNode" data-language="nim">proc strVal(n: NimNode): string {...}{.magic: "NStrVal", noSideEffect.}</pre></dt> <dd> <p>Returns the string value of an identifier, symbol, comment, or string literal.</p> <p>See also:</p> <ul class="simple">
+<li>
+<a href="#strVal=,NimNode,string">strVal= proc</a> for setting the string value.</li> </ul> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L246" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L246" target="_blank">Edit</a> </dd>  <dt><pre id="%24%2CNimIdent" data-language="nim">proc `$`(i: NimIdent): string {...}{.magic: "NStrVal", noSideEffect, deprecated: "Deprecated since version 0.18.1; Use \'strVal\' instead.".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since version 0.18.1; Use 'strVal' instead. </div> Converts a Nim identifier to a string. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L252" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L252" target="_blank">Edit</a> </dd>  <dt><pre id="%24%2CNimSym" data-language="nim">proc `$`(s: NimSym): string {...}{.magic: "NStrVal", noSideEffect, deprecated: "Deprecated since version 0.18.1; Use \'strVal\' instead.".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since version 0.18.1; Use 'strVal' instead. </div> Converts a Nim symbol to a string. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L256" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L256" target="_blank">Edit</a> </dd>  <dt><pre id="getImplTransformed%2CNimNode" data-language="nim">proc getImplTransformed(symbol: NimNode): NimNode {...}{.magic: "GetImplTransf",
+    noSideEffect.}</pre></dt> <dd> For a typed proc returns the AST after transformation pass; this is useful for debugging how the compiler transforms code (e.g.: <code>defer</code>, <code>for</code>) but note that code transformations are implementation dependent and subject to change. See an example in <code>tests/macros/tmacros_various.nim</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L281" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L281" target="_blank">Edit</a> </dd>  <dt><pre id="owner%2CNimNode" data-language="nim">proc owner(sym: NimNode): NimNode {...}{.magic: "SymOwner", noSideEffect.}</pre></dt> <dd> <p>Accepts a node of kind <code>nnkSym</code> and returns its owner's symbol. The meaning of 'owner' depends on <code>sym</code>'s <code>NimSymKind</code> and declaration context. For top level declarations this is an <code>nskModule</code> symbol, for proc local variables an <code>nskProc</code> symbol, for enum/object fields an <code>nskType</code> symbol, etc. For symbols without an owner, <code>nil</code> is returned.</p> <p>See also:</p> <ul class="simple">
+<li>
+<a href="#symKind,NimNode">symKind proc</a> to get the kind of a symbol</li> <li>
+<a href="#getImpl,NimNode">getImpl proc</a> to get the declaration of a symbol</li> </ul> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L288" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L288" target="_blank">Edit</a> </dd>  <dt><pre id="isInstantiationOf%2CNimNode%2CNimNode" data-language="nim">proc isInstantiationOf(instanceProcSym, genProcSym: NimNode): bool {...}{.
+    magic: "SymIsInstantiationOf", noSideEffect.}</pre></dt> <dd> Checks if a proc symbol is an instance of the generic proc symbol. Useful to check proc symbols against generic symbols returned by <code>bindSym</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L300" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L300" target="_blank">Edit</a> </dd>  <dt><pre id="getType%2CNimNode" data-language="nim">proc getType(n: NimNode): NimNode {...}{.magic: "NGetType", noSideEffect.}</pre></dt> <dd> With 'getType' you can access the node's <span id="type_1">type</span>. A Nim type is mapped to a Nim AST too, so it's slightly confusing but it means the same API can be used to traverse types. Recursive types are flattened for you so there is no danger of infinite recursions during traversal. To resolve recursive types, you have to call 'getType' again. To see what kind of type it is, call <code>typeKind</code> on getType's result. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L305" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L305" target="_blank">Edit</a> </dd>  <dt><pre id="getType%2Ctypedesc" data-language="nim">proc getType(n: typedesc): NimNode {...}{.magic: "NGetType", noSideEffect.}</pre></dt> <dd> Version of <code>getType</code> which takes a <code>typedesc</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L313" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L313" target="_blank">Edit</a> </dd>  <dt><pre id="typeKind%2CNimNode" data-language="nim">proc typeKind(n: NimNode): NimTypeKind {...}{.magic: "NGetType", noSideEffect.}</pre></dt> <dd> Returns the type kind of the node 'n' that should represent a type, that means the node should have been obtained via <code>getType</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L316" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L316" target="_blank">Edit</a> </dd>  <dt><pre id="getTypeInst%2CNimNode" data-language="nim">proc getTypeInst(n: NimNode): NimNode {...}{.magic: "NGetType", noSideEffect,
+                                        raises: [], tags: [].}</pre></dt> <dd> Returns the <span id="type_2">type</span> of a node in a form matching the way the type instance was declared in the code. <p><strong class="examples_text">Example:</strong></p> <pre class="listing" data-language="nim">type
+  Vec[N: static[int], T] = object
+    arr: array[N, T]
+  Vec4[T] = Vec[4, T]
+  Vec4f = Vec4[float32]
+var a: Vec4f
+var b: Vec4[float32]
+var c: Vec[4, float32]
+macro dumpTypeInst(x: typed): untyped =
+  newLit(x.getTypeInst.repr)
+doAssert(dumpTypeInst(a) == "Vec4f")
+doAssert(dumpTypeInst(b) == "Vec4[float32]")
+doAssert(dumpTypeInst(c) == "Vec[4, float32]")</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L320" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L320" target="_blank">Edit</a> </dd>  <dt><pre id="getTypeInst%2Ctypedesc" data-language="nim">proc getTypeInst(n: typedesc): NimNode {...}{.magic: "NGetType", noSideEffect.}</pre></dt> <dd> Version of <code>getTypeInst</code> which takes a <code>typedesc</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L338" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L338" target="_blank">Edit</a> </dd>  <dt><pre id="getTypeImpl%2CNimNode" data-language="nim">proc getTypeImpl(n: NimNode): NimNode {...}{.magic: "NGetType", noSideEffect,
+                                        raises: [], tags: [].}</pre></dt> <dd> Returns the <span id="type_3">type</span> of a node in a form matching the implementation of the type. Any intermediate aliases are expanded to arrive at the final type implementation. You can instead use <code>getImpl</code> on a symbol if you want to find the intermediate aliases. <p><strong class="examples_text">Example:</strong></p> <pre class="listing" data-language="nim">type
+  Vec[N: static[int], T] = object
+    arr: array[N, T]
+  Vec4[T] = Vec[4, T]
+  Vec4f = Vec4[float32]
+var a: Vec4f
+var b: Vec4[float32]
+var c: Vec[4, float32]
+macro dumpTypeImpl(x: typed): untyped =
+  newLit(x.getTypeImpl.repr)
+let t = """
+object
+  arr: array[0 .. 3, float32]
+"""
+doAssert(dumpTypeImpl(a) == t)
+doAssert(dumpTypeImpl(b) == t)
+doAssert(dumpTypeImpl(c) == t)</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L341" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L341" target="_blank">Edit</a> </dd>  <dt><pre id="signatureHash%2CNimNode" data-language="nim">proc signatureHash(n: NimNode): string {...}{.magic: "NSigHash", noSideEffect.}</pre></dt> <dd> Returns a stable identifier derived from the signature of a symbol. The signature combines many factors such as the type of the symbol, the owning module of the symbol and others. The same identifier is used in the back-end to produce the mangled symbol name. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L366" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L366" target="_blank">Edit</a> </dd>  <dt><pre id="symBodyHash%2CNimNode" data-language="nim">proc symBodyHash(s: NimNode): string {...}{.noSideEffect, raises: [], tags: [].}</pre></dt> <dd> Returns a stable digest for symbols derived not only from type signature and owning module, but also implementation body. All procs/variables used in the implementation of this symbol are hashed recursively as well, including magics from system module. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L372" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L372" target="_blank">Edit</a> </dd>  <dt><pre id="getTypeImpl%2Ctypedesc" data-language="nim">proc getTypeImpl(n: typedesc): NimNode {...}{.magic: "NGetType", noSideEffect.}</pre></dt> <dd> Version of <code>getTypeImpl</code> which takes a <code>typedesc</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L379" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L379" target="_blank">Edit</a> </dd>  <dt><pre id="intVal%3D%2CNimNode%2CBiggestInt" data-language="nim">proc intVal=(n: NimNode; val: BiggestInt) {...}{.magic: "NSetIntVal", noSideEffect.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L382" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L382" target="_blank">Edit</a> </dd>  <dt><pre id="floatVal%3D%2CNimNode%2CBiggestFloat" data-language="nim">proc floatVal=(n: NimNode; val: BiggestFloat) {...}{.magic: "NSetFloatVal",
+    noSideEffect.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L383" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L383" target="_blank">Edit</a> </dd>  <dt><pre id="symbol%3D%2CNimNode%2CNimSym" data-language="nim">proc symbol=(n: NimNode; val: NimSym) {...}{.magic: "NSetSymbol", noSideEffect, deprecated: "Deprecated since version 0.18.1; Generate a new \'NimNode\' with \'genSym\' instead.".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since version 0.18.1; Generate a new 'NimNode' with 'genSym' instead. </div> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L387" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L387" target="_blank">Edit</a> </dd>  <dt><pre id="ident%3D%2CNimNode%2CNimIdent" data-language="nim">proc ident=(n: NimNode; val: NimIdent) {...}{.magic: "NSetIdent", noSideEffect, deprecated: "Deprecated since version 0.18.1; Generate a new \'NimNode\' with \'ident(string)\' instead.".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since version 0.18.1; Generate a new 'NimNode' with 'ident(string)' instead. </div> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L390" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L390" target="_blank">Edit</a> </dd>  <dt><pre id="strVal%3D%2CNimNode%2Cstring" data-language="nim">proc strVal=(n: NimNode; val: string) {...}{.magic: "NSetStrVal", noSideEffect.}</pre></dt> <dd> <p>Sets the string value of a string literal or comment. Setting <code>strVal</code> is disallowed for <code>nnkIdent</code> and <code>nnkSym</code> nodes; a new node must be created using <code>ident</code> or <code>bindSym</code> instead.</p> <p>See also:</p> <ul class="simple">
+<li>
+<a href="#strVal,NimNode">strVal proc</a> for getting the string value.</li> <li>
+<a href="#ident,string">ident proc</a> for creating an identifier.</li> <li>
+<a href="#bindSym%2C%2CBindSymRule">bindSym proc</a> for binding a symbol.</li> </ul> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L395" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L395" target="_blank">Edit</a> </dd>  <dt><pre id="newNimNode%2CNimNodeKind%2CNimNode" data-language="nim">proc newNimNode(kind: NimNodeKind; lineInfoFrom: NimNode = nil): NimNode {...}{.
+    magic: "NNewNimNode", noSideEffect.}</pre></dt> <dd> <p>Creates a new AST node of the specified kind.</p> <p>The <code>lineInfoFrom</code> parameter is used for line information when the produced code crashes. You should ensure that it is set to a node that you are transforming.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L405" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L405" target="_blank">Edit</a> </dd>  <dt><pre id="copyNimNode%2CNimNode" data-language="nim">proc copyNimNode(n: NimNode): NimNode {...}{.magic: "NCopyNimNode", noSideEffect.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L414" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L414" target="_blank">Edit</a> </dd>  <dt><pre id="copyNimTree%2CNimNode" data-language="nim">proc copyNimTree(n: NimNode): NimNode {...}{.magic: "NCopyNimTree", noSideEffect.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L415" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L415" target="_blank">Edit</a> </dd>  <dt><pre id="error%2Cstring%2CNimNode" data-language="nim">proc error(msg: string; n: NimNode = nil) {...}{.magic: "NError", gcsafe, locks: 0.}</pre></dt> <dd> Writes an error message at compile time. The optional <code>n: NimNode</code> parameter is used as the source for file and line number information in the compilation error message. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L417" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L417" target="_blank">Edit</a> </dd>  <dt><pre id="warning%2Cstring%2CNimNode" data-language="nim">proc warning(msg: string; n: NimNode = nil) {...}{.magic: "NWarning", gcsafe,
+    locks: 0.}</pre></dt> <dd> Writes a warning message at compile time. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L422" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L422" target="_blank">Edit</a> </dd>  <dt><pre id="hint%2Cstring%2CNimNode" data-language="nim">proc hint(msg: string; n: NimNode = nil) {...}{.magic: "NHint", gcsafe, locks: 0.}</pre></dt> <dd> Writes a hint message at compile time. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L425" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L425" target="_blank">Edit</a> </dd>  <dt><pre id="newStrLitNode%2Cstring" data-language="nim">proc newStrLitNode(s: string): NimNode {...}{.compileTime, noSideEffect, raises: [],
+    tags: [].}</pre></dt> <dd> Creates a string literal node from <code>s</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L428" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L428" target="_blank">Edit</a> </dd>  <dt><pre id="newCommentStmtNode%2Cstring" data-language="nim">proc newCommentStmtNode(s: string): NimNode {...}{.compileTime, noSideEffect,
+    raises: [], tags: [].}</pre></dt> <dd> Creates a comment statement node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L433" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L433" target="_blank">Edit</a> </dd>  <dt><pre id="newIntLitNode%2CBiggestInt" data-language="nim">proc newIntLitNode(i: BiggestInt): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Creates an int literal node from <code>i</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L438" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L438" target="_blank">Edit</a> </dd>  <dt><pre id="newFloatLitNode%2CBiggestFloat" data-language="nim">proc newFloatLitNode(f: BiggestFloat): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Creates a float literal node from <code>f</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L443" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L443" target="_blank">Edit</a> </dd>  <dt><pre id="newIdentNode%2CNimIdent" data-language="nim">proc newIdentNode(i: NimIdent): NimNode {...}{.compileTime, deprecated, raises: [],
+    tags: [].}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated</b> </div> Creates an identifier node from <code>i</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L450" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L450" target="_blank">Edit</a> </dd>  <dt><pre id="newIdentNode%2Cstring" data-language="nim">proc newIdentNode(i: string): NimNode {...}{.magic: "StrToIdent", noSideEffect.}</pre></dt> <dd> Creates an identifier node from <code>i</code>. It is simply an alias for <code>ident(string)</code>. Use that, it's shorter. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L457" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L457" target="_blank">Edit</a> </dd>  <dt><pre id="ident%2Cstring" data-language="nim">proc ident(name: string): NimNode {...}{.magic: "StrToIdent", noSideEffect.}</pre></dt> <dd> Create a new ident node from a string. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L461" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L461" target="_blank">Edit</a> </dd>  <dt><pre id="bindSym%2C%2CBindSymRule" data-language="nim">proc bindSym(ident: string | NimNode; rule: BindSymRule = brClosed): NimNode {...}{.
+    magic: "NBindSym", noSideEffect.}</pre></dt> <dd> <p>Creates a node that binds <code>ident</code> to a symbol node. The bound symbol may be an overloaded symbol. if <code>ident</code> is a NimNode, it must have <code>nnkIdent</code> kind. If <code>rule == brClosed</code> either an <code>nnkClosedSymChoice</code> tree is returned or <code>nnkSym</code> if the symbol is not ambiguous. If <code>rule == brOpen</code> either an <code>nnkOpenSymChoice</code> tree is returned or <code>nnkSym</code> if the symbol is not ambiguous. If <code>rule == brForceOpen</code> always an <code>nnkOpenSymChoice</code> tree is returned even if the symbol is not ambiguous.</p> <p>Experimental feature: use {.experimental: "dynamicBindSym".} to activate it. If called from template / regular code, <code>ident</code> and <code>rule</code> must be constant expression / literal value. If called from macros / compile time procs / static blocks, <code>ident</code> and <code>rule</code> can be VM computed value.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L474" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L474" target="_blank">Edit</a> </dd>  <dt><pre id="genSym%2CNimSymKind%2Cstring" data-language="nim">proc genSym(kind: NimSymKind = nskLet; ident = ""): NimNode {...}{.magic: "NGenSym",
+    noSideEffect.}</pre></dt> <dd> Generates a fresh symbol that is guaranteed to be unique. The symbol needs to occur in a declaration context. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L493" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L493" target="_blank">Edit</a> </dd>  <dt><pre id="callsite" data-language="nim">proc callsite(): NimNode {...}{.magic: "NCallSite", gcsafe, locks: 0, deprecated: "Deprecated since v0.18.1; use varargs[untyped] in the macro prototype instead".}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since v0.18.1; use varargs[untyped] in the macro prototype instead </div> Returns the AST of the invocation expression that invoked this macro. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L498" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L498" target="_blank">Edit</a> </dd>  <dt><pre id="toStrLit%2CNimNode" data-language="nim">proc toStrLit(n: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Converts the AST <code>n</code> to the concrete Nim code and wraps that in a string literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L502" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L502" target="_blank">Edit</a> </dd>  <dt><pre id="%24%2CLineInfo" data-language="nim">proc `$`(arg: LineInfo): string {...}{.raises: [], tags: [].}</pre></dt> <dd> Return a string representation in the form <code>filepath(line, column)</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L512" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L512" target="_blank">Edit</a> </dd>  <dt><pre id="copyLineInfo%2CNimNode%2CNimNode" data-language="nim">proc copyLineInfo(arg: NimNode; info: NimNode) {...}{.magic: "NLineInfo",
+    noSideEffect.}</pre></dt> <dd> Copy lineinfo from <code>info</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L525" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L525" target="_blank">Edit</a> </dd>  <dt><pre id="lineInfoObj%2CNimNode" data-language="nim">proc lineInfoObj(n: NimNode): LineInfo {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Returns <code>LineInfo</code> of <code>n</code>, using absolute path for <code>filename</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L528" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L528" target="_blank">Edit</a> </dd>  <dt><pre id="lineInfo%2CNimNode" data-language="nim">proc lineInfo(arg: NimNode): string {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Return line info in the form <code>filepath(line, column)</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L532" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L532" target="_blank">Edit</a> </dd>  <dt><pre id="internalErrorFlag" data-language="nim">proc internalErrorFlag(): string {...}{.magic: "NError", noSideEffect.}</pre></dt> <dd> Some builtins set an error flag. This is then turned into a proper exception. <strong>Note</strong>: Ordinary application code should not call this. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L542" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L542" target="_blank">Edit</a> </dd>  <dt><pre id="parseExpr%2Cstring" data-language="nim">proc parseExpr(s: string): NimNode {...}{.noSideEffect, compileTime,
+                                     raises: [ValueError], tags: [].}</pre></dt> <dd> Compiles the passed string to its AST representation. Expects a single expression. Raises <code>ValueError</code> for parsing errors. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L546" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L546" target="_blank">Edit</a> </dd>  <dt><pre id="parseStmt%2Cstring" data-language="nim">proc parseStmt(s: string): NimNode {...}{.noSideEffect, compileTime,
+                                     raises: [ValueError], tags: [].}</pre></dt> <dd> Compiles the passed string to its AST representation. Expects one or more statements. Raises <code>ValueError</code> for parsing errors. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L553" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L553" target="_blank">Edit</a> </dd>  <dt><pre id="getAst%2Cuntyped" data-language="nim">proc getAst(macroOrTemplate: untyped): NimNode {...}{.magic: "ExpandToAst",
+    noSideEffect.}</pre></dt> <dd> Obtains the AST nodes returned from a macro or template invocation. Example:<pre class="listing" data-language="nim">macro FooMacro() =
+  var ast = getAst(BarTemplate())</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L560" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L560" target="_blank">Edit</a> </dd>  <dt><pre id="quote%2Ctyped%2Cstring" data-language="nim">proc quote(bl: typed; op = "``"): NimNode {...}{.magic: "QuoteAst", noSideEffect.}</pre></dt> <dd> <p>Quasi-quoting operator. Accepts an expression or a block and returns the AST that represents it. Within the quoted AST, you are able to interpolate NimNode expressions from the surrounding scope. If no operator is given, quoting is done using backticks. Otherwise, the given operator must be used as a prefix operator for any interpolated expression.</p> <p>Example:</p> <pre class="listing" data-language="nim">macro check(ex: untyped) =
+  # this is a simplified version of the check macro from the
+  # unittest module.
+  
+  # If there is a failed check, we want to make it easy for
+  # the user to jump to the faulty line in the code, so we
+  # get the line info here:
+  var info = ex.lineinfo
+  
+  # We will also display the code string of the failed check:
+  var expString = ex.toStrLit
+  
+  # Finally we compose the code to implement the check:
+  result = quote do:
+    if not `ex`:
+      echo `info` &amp; ": Check failed: " &amp; `expString`</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L569" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L569" target="_blank">Edit</a> </dd>  <dt><pre id="expectKind%2CNimNode%2CNimNodeKind" data-language="nim">proc expectKind(n: NimNode; k: NimNodeKind) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Checks that <code>n</code> is of kind <code>k</code>. If this is not the case, compilation aborts with an error message. This is useful for writing macros that check the AST that is passed to them. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L598" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L598" target="_blank">Edit</a> </dd>  <dt><pre id="expectMinLen%2CNimNode%2Cint" data-language="nim">proc expectMinLen(n: NimNode; min: int) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Checks that <code>n</code> has at least <code>min</code> children. If this is not the case, compilation aborts with an error message. This is useful for writing macros that check its number of arguments. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L604" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L604" target="_blank">Edit</a> </dd>  <dt><pre id="expectLen%2CNimNode%2Cint" data-language="nim">proc expectLen(n: NimNode; len: int) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Checks that <code>n</code> has exactly <code>len</code> children. If this is not the case, compilation aborts with an error message. This is useful for writing macros that check its number of arguments. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L610" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L610" target="_blank">Edit</a> </dd>  <dt><pre id="expectLen%2CNimNode%2Cint%2Cint" data-language="nim">proc expectLen(n: NimNode; min, max: int) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Checks that <code>n</code> has a number of children in the range <code>min..max</code>. If this is not the case, compilation aborts with an error message. This is useful for writing macros that check its number of arguments. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L616" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L616" target="_blank">Edit</a> </dd>  <dt><pre id="newTree%2CNimNodeKind%2Cvarargs%5BNimNode%5D" data-language="nim">proc newTree(kind: NimNodeKind; children: varargs[NimNode]): NimNode {...}{.
+    compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new node with children. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L623" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L623" target="_blank">Edit</a> </dd>  <dt><pre id="newCall%2CNimNode%2Cvarargs%5BNimNode%5D" data-language="nim">proc newCall(theProc: NimNode; args: varargs[NimNode]): NimNode {...}{.compileTime,
+    raises: [], tags: [].}</pre></dt> <dd> Produces a new call node. <code>theProc</code> is the proc that is called with the arguments <code>args[0..]</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L629" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L629" target="_blank">Edit</a> </dd>  <dt><pre id="newCall%2CNimIdent%2Cvarargs%5BNimNode%5D" data-language="nim">proc newCall(theProc: NimIdent; args: varargs[NimNode]): NimNode {...}{.compileTime, deprecated: "Deprecated since v0.18.1; use \'newCall(string, ...)\' or \'newCall(NimNode, ...)\' instead",
+    raises: [], tags: [].}</pre></dt> <dd> <div class="deprecation-message"> <b>Deprecated:</b> Deprecated since v0.18.1; use 'newCall(string, ...)' or 'newCall(NimNode, ...)' instead </div> Produces a new call node. <code>theProc</code> is the proc that is called with the arguments <code>args[0..]</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L639" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L639" target="_blank">Edit</a> </dd>  <dt><pre id="newCall%2Cstring%2Cvarargs%5BNimNode%5D" data-language="nim">proc newCall(theProc: string; args: varargs[NimNode]): NimNode {...}{.compileTime,
+    raises: [], tags: [].}</pre></dt> <dd> Produces a new call node. <code>theProc</code> is the proc that is called with the arguments <code>args[0..]</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L649" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L649" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cchar" data-language="nim">proc newLit(c: char): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new character literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L657" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L657" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cint" data-language="nim">proc newLit(i: int): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L662" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L662" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cint8" data-language="nim">proc newLit(i: int8): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L667" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L667" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cint16" data-language="nim">proc newLit(i: int16): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L672" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L672" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cint32" data-language="nim">proc newLit(i: int32): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L677" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L677" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cint64" data-language="nim">proc newLit(i: int64): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L682" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L682" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cuint" data-language="nim">proc newLit(i: uint): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new unsigned integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L687" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L687" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cuint8" data-language="nim">proc newLit(i: uint8): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new unsigned integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L692" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L692" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cuint16" data-language="nim">proc newLit(i: uint16): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new unsigned integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L697" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L697" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cuint32" data-language="nim">proc newLit(i: uint32): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new unsigned integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L702" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L702" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cuint64" data-language="nim">proc newLit(i: uint64): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new unsigned integer literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L707" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L707" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cbool" data-language="nim">proc newLit(b: bool): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new boolean literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L712" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L712" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cstring" data-language="nim">proc newLit(s: string): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new string literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L716" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L716" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cfloat32" data-language="nim">proc newLit(f: float32): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new float literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L728" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L728" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cfloat64" data-language="nim">proc newLit(f: float64): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Produces a new float literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L733" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L733" target="_blank">Edit</a> </dd>  <dt><pre id="newLit" data-language="nim">proc newLit(arg: enum): NimNode {...}{.compileTime.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L744" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L744" target="_blank">Edit</a> </dd>  <dt><pre id="newLit_2" data-language="nim">proc newLit(arg: object): NimNode {...}{.compileTime.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L755" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L755" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cref." data-language="nim">proc newLit(arg: ref object): NimNode {...}{.compileTime.}</pre></dt> <dd> produces a new ref type literal node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L760" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L760" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Carray%5BN%2CT%5D" data-language="nim">proc newLit[N, T](arg: array[N, T]): NimNode {...}{.compileTime.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L766" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L766" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cseq%5BT%5D" data-language="nim">proc newLit[T](arg: seq[T]): NimNode {...}{.compileTime.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L771" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L771" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2Cset%5BT%5D" data-language="nim">proc newLit[T](s: set[T]): NimNode {...}{.compileTime.}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L784" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L784" target="_blank">Edit</a> </dd>  <dt><pre id="newLit%2CT" data-language="nim">proc newLit[T: tuple](arg: T): NimNode {...}{.compileTime.}</pre></dt> <dd> use -d:nimHasWorkaround14720 to restore behavior prior to PR, forcing a named tuple even when <code>arg</code> is unnamed. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L796" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L796" target="_blank">Edit</a> </dd>  <dt><pre id="nestList%2CNimNode%2CNimNode" data-language="nim">proc nestList(op: NimNode; pack: NimNode): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Nests the list <code>pack</code> into a tree of call expressions: <code>[a, b, c]</code> is transformed into <code>op(a, op(c, d))</code>. This is also known as fold expression. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L807" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L807" target="_blank">Edit</a> </dd>  <dt><pre id="nestList%2CNimNode%2CNimNode%2CNimNode" data-language="nim">proc nestList(op: NimNode; pack: NimNode; init: NimNode): NimNode {...}{.compileTime,
+    raises: [], tags: [].}</pre></dt> <dd> Nests the list <code>pack</code> into a tree of call expressions: <code>[a, b, c]</code> is transformed into <code>op(a, op(c, d))</code>. This is also known as fold expression. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L817" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L817" target="_blank">Edit</a> </dd>  <dt><pre id="treeRepr%2CNimNode" data-language="nim">proc treeRepr(n: NimNode): string {...}{.compileTime, gcsafe, locks: 0, raises: [],
+                                    tags: [].}</pre></dt> <dd> <p>Convert the AST <code>n</code> to a human-readable tree-like string.</p> <p>See also <code>repr</code>, <code>lispRepr</code>, and <code>astGenRepr</code>.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L859" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L859" target="_blank">Edit</a> </dd>  <dt><pre id="lispRepr%2CNimNode" data-language="nim">proc lispRepr(n: NimNode; indented = false): string {...}{.compileTime, gcsafe,
+    locks: 0, raises: [], tags: [].}</pre></dt> <dd> <p>Convert the AST <code>n</code> to a human-readable lisp-like string.</p> <p>See also <code>repr</code>, <code>treeRepr</code>, and <code>astGenRepr</code>.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L866" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L866" target="_blank">Edit</a> </dd>  <dt><pre id="astGenRepr%2CNimNode" data-language="nim">proc astGenRepr(n: NimNode): string {...}{.compileTime, gcsafe, locks: 0, raises: [],
+                                      tags: [].}</pre></dt> <dd> <p>Convert the AST <code>n</code> to the code required to generate that AST.</p> <p>See also <code>repr</code>, <code>treeRepr</code>, and <code>lispRepr</code>.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L873" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L873" target="_blank">Edit</a> </dd>  <dt><pre id="newEmptyNode" data-language="nim">proc newEmptyNode(): NimNode {...}{.compileTime, noSideEffect, raises: [], tags: [].}</pre></dt> <dd> Create a new empty node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L992" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L992" target="_blank">Edit</a> </dd>  <dt><pre id="newStmtList%2Cvarargs%5BNimNode%5D" data-language="nim">proc newStmtList(stmts: varargs[NimNode]): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Create a new statement list. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L996" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L996" target="_blank">Edit</a> </dd>  <dt><pre id="newPar%2Cvarargs%5BNimNode%5D" data-language="nim">proc newPar(exprs: varargs[NimNode]): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Create a new parentheses-enclosed expression. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1000" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1000" target="_blank">Edit</a> </dd>  <dt><pre id="newBlockStmt%2CNimNode%2CNimNode" data-language="nim">proc newBlockStmt(label, body: NimNode): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Create a new block statement with label. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1004" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1004" target="_blank">Edit</a> </dd>  <dt><pre id="newBlockStmt%2CNimNode" data-language="nim">proc newBlockStmt(body: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Create a new block: stmt. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1008" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1008" target="_blank">Edit</a> </dd>  <dt><pre id="newVarStmt%2CNimNode%2CNimNode" data-language="nim">proc newVarStmt(name, value: NimNode): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Create a new var stmt. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1012" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1012" target="_blank">Edit</a> </dd>  <dt><pre id="newLetStmt%2CNimNode%2CNimNode" data-language="nim">proc newLetStmt(name, value: NimNode): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Create a new let stmt. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1017" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1017" target="_blank">Edit</a> </dd>  <dt><pre id="newConstStmt%2CNimNode%2CNimNode" data-language="nim">proc newConstStmt(name, value: NimNode): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Create a new const stmt. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1022" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1022" target="_blank">Edit</a> </dd>  <dt><pre id="newAssignment%2CNimNode%2CNimNode" data-language="nim">proc newAssignment(lhs, rhs: NimNode): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1027" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1027" target="_blank">Edit</a> </dd>  <dt><pre id="newDotExpr%2CNimNode%2CNimNode" data-language="nim">proc newDotExpr(a, b: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Create new dot expression. a.dot(b) -&gt; <code>a.b</code> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1030" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1030" target="_blank">Edit</a> </dd>  <dt><pre id="newColonExpr%2CNimNode%2CNimNode" data-language="nim">proc newColonExpr(a, b: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Create new colon expression. newColonExpr(a, b) -&gt; <code>a: b</code> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1035" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1035" target="_blank">Edit</a> </dd>  <dt><pre id="newIdentDefs%2CNimNode%2CNimNode" data-language="nim">proc newIdentDefs(name, kind: NimNode; default = newEmptyNode()): NimNode {...}{.
+    compileTime, raises: [], tags: [].}</pre></dt> <dd> <p>Creates a new <code>nnkIdentDefs</code> node of a specific kind and value.</p> <p><code>nnkIdentDefs</code> need to have at least three children, but they can have more: first comes a list of identifiers followed by a type and value nodes. This helper proc creates a three node subtree, the first subnode being a single identifier name. Both the <code>kind</code> node and <code>default</code> (value) nodes may be empty depending on where the <code>nnkIdentDefs</code> appears: tuple or object definitions will have an empty <code>default</code> node, <code>let</code> or <code>var</code> blocks may have an empty <code>kind</code> node if the identifier is being assigned a value. Example:</p> <pre class="listing" data-language="nim">var varSection = newNimNode(nnkVarSection).add(
+  newIdentDefs(ident("a"), ident("string")),
+  newIdentDefs(ident("b"), newEmptyNode(), newLit(3)))
+# --&gt; var
+#       a: string
+#       b = 3</pre>
+<p>If you need to create multiple identifiers you need to use the lower level <code>newNimNode</code>:</p> <pre class="listing" data-language="nim">result = newNimNode(nnkIdentDefs).add(
+  ident("a"), ident("b"), ident("c"), ident("string"),
+    newStrLitNode("Hello"))</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1040" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1040" target="_blank">Edit</a> </dd>  <dt><pre id="newNilLit" data-language="nim">proc newNilLit(): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> New nil literal shortcut. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1072" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1072" target="_blank">Edit</a> </dd>  <dt><pre id="last%2CNimNode" data-language="nim">proc last(node: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Return the last item in nodes children. Same as <code>node[^1]</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1076" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1076" target="_blank">Edit</a> </dd>  <dt><pre id="expectKind%2CNimNode%2Cset%5BNimNodeKind%5D" data-language="nim">proc expectKind(n: NimNode; k: set[NimNodeKind]) {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Checks that <code>n</code> is of kind <code>k</code>. If this is not the case, compilation aborts with an error message. This is useful for writing macros that check the AST that is passed to them. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1087" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1087" target="_blank">Edit</a> </dd>  <dt><pre id="newProc%2CopenArray%5BNimNode%5D%2CNimNode%2CNimNode" data-language="nim">proc newProc(name = newEmptyNode();
+             params: openArray[NimNode] = [newEmptyNode()];
+             body: NimNode = newStmtList(); procType = nnkProcDef;
+             pragmas: NimNode = newEmptyNode()): NimNode {...}{.compileTime,
+    raises: [], tags: [].}</pre></dt> <dd> <p>Shortcut for creating a new proc.</p> <p>The <code>params</code> array must start with the return type of the proc, followed by a list of IdentDefs which specify the params.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1093" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1093" target="_blank">Edit</a> </dd>  <dt><pre id="newIfStmt%2Cvarargs%5Btuple%5BNimNode%2CNimNode%5D%5D" data-language="nim">proc newIfStmt(branches: varargs[tuple[cond, body: NimNode]]): NimNode {...}{.
+    compileTime, raises: [], tags: [].}</pre></dt> <dd> Constructor for <code>if</code> statements.<pre class="listing" data-language="nim">newIfStmt(
+  (Ident, StmtList),
+  ...
+)</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1114" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1114" target="_blank">Edit</a> </dd>  <dt><pre id="newEnum%2CNimNode%2CopenArray%5BNimNode%5D%2Cbool%2Cbool" data-language="nim">proc newEnum(name: NimNode; fields: openArray[NimNode]; public, pure: bool): NimNode {...}{.
+    compileTime, raises: [], tags: [].}</pre></dt> <dd> Creates a new enum. <code>name</code> must be an ident. Fields are allowed to be either idents or EnumFieldDef<pre class="listing" data-language="nim">newEnum(
+  name    = ident("Colors"),
+  fields  = [ident("Blue"), ident("Red")],
+  public  = true, pure = false)
+
+# type Colors* = Blue Red</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1131" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1131" target="_blank">Edit</a> </dd>  <dt><pre id="copyChildrenTo%2CNimNode%2CNimNode" data-language="nim">proc copyChildrenTo(src, dest: NimNode) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Copy all children from <code>src</code> to <code>dest</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1175" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1175" target="_blank">Edit</a> </dd>  <dt><pre id="name%2CNimNode" data-language="nim">proc name(someProc: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1183" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1183" target="_blank">Edit</a> </dd>  <dt><pre id="name%3D%2CNimNode%2CNimNode" data-language="nim">proc name=(someProc: NimNode; val: NimNode) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1194" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1194" target="_blank">Edit</a> </dd>  <dt><pre id="params%2CNimNode" data-language="nim">proc params(someProc: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1200" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1200" target="_blank">Edit</a> </dd>  <dt><pre id="params%3D%2CNimNode%2CNimNode" data-language="nim">proc params=(someProc: NimNode; params: NimNode) {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1203" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1203" target="_blank">Edit</a> </dd>  <dt><pre id="pragma%2CNimNode" data-language="nim">proc pragma(someProc: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Get the pragma of a proc type. These will be expanded. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1208" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1208" target="_blank">Edit</a> </dd>  <dt><pre id="pragma%3D%2CNimNode%2CNimNode" data-language="nim">proc pragma=(someProc: NimNode; val: NimNode) {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Set the pragma of a proc type. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1216" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1216" target="_blank">Edit</a> </dd>  <dt><pre id="addPragma%2CNimNode%2CNimNode" data-language="nim">proc addPragma(someProc, pragma: NimNode) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Adds pragma to routine definition. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1225" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1225" target="_blank">Edit</a> </dd>  <dt><pre id="body%2CNimNode" data-language="nim">proc body(someProc: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1237" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1237" target="_blank">Edit</a> </dd>  <dt><pre id="body%3D%2CNimNode%2CNimNode" data-language="nim">proc body=(someProc: NimNode; val: NimNode) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1248" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1248" target="_blank">Edit</a> </dd>  <dt><pre id="basename%2CNimNode" data-language="nim">proc basename(a: NimNode): NimNode {...}{.raises: [], tags: [].}</pre></dt> <dd> Pull an identifier from prefix/postfix expressions. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1259" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1259" target="_blank">Edit</a> </dd>  <dt><pre id="%24%2CNimNode" data-language="nim">proc `$`(node: NimNode): string {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Get the string of an identifier node. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1269" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1269" target="_blank">Edit</a> </dd>  <dt><pre id="insert%2CNimNode%2Cint%2CNimNode" data-language="nim">proc insert(a: NimNode; pos: int; b: NimNode) {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Insert node <code>b</code> into node <code>a</code> at <code>pos</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1312" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1312" target="_blank">Edit</a> </dd>  <dt><pre id="basename%3D%2CNimNode%2Cstring" data-language="nim">proc basename=(a: NimNode; val: string) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1327" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1327" target="_blank">Edit</a> </dd>  <dt><pre id="postfix%2CNimNode%2Cstring" data-language="nim">proc postfix(node: NimNode; op: string): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1338" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1338" target="_blank">Edit</a> </dd>  <dt><pre id="prefix%2CNimNode%2Cstring" data-language="nim">proc prefix(node: NimNode; op: string): NimNode {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1341" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1341" target="_blank">Edit</a> </dd>  <dt><pre id="infix%2CNimNode%2Cstring%2CNimNode" data-language="nim">proc infix(a: NimNode; op: string; b: NimNode): NimNode {...}{.compileTime,
+    raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1344" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1344" target="_blank">Edit</a> </dd>  <dt><pre id="unpackPostfix%2CNimNode" data-language="nim">proc unpackPostfix(node: NimNode): tuple[node: NimNode, op: string] {...}{.
+    compileTime, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1348" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1348" target="_blank">Edit</a> </dd>  <dt><pre id="unpackPrefix%2CNimNode" data-language="nim">proc unpackPrefix(node: NimNode): tuple[node: NimNode, op: string] {...}{.
+    compileTime, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1353" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1353" target="_blank">Edit</a> </dd>  <dt><pre id="unpackInfix%2CNimNode" data-language="nim">proc unpackInfix(node: NimNode): tuple[left: NimNode, op: string, right: NimNode] {...}{.
+    compileTime, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1358" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1358" target="_blank">Edit</a> </dd>  <dt><pre id="copy%2CNimNode" data-language="nim">proc copy(node: NimNode): NimNode {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> An alias for <a href="#copyNimTree,NimNode">copyNimTree</a>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1363" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1363" target="_blank">Edit</a> </dd>  <dt><pre id="eqIdent%2Cstring%2Cstring" data-language="nim">proc eqIdent(a: string; b: string): bool {...}{.magic: "EqIdent", noSideEffect.}</pre></dt> <dd> Style insensitive comparison. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1368" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1368" target="_blank">Edit</a> </dd>  <dt><pre id="eqIdent%2CNimNode%2Cstring" data-language="nim">proc eqIdent(a: NimNode; b: string): bool {...}{.magic: "EqIdent", noSideEffect.}</pre></dt> <dd> Style insensitive comparison. <code>a</code> can be an identifier or a symbol. <code>a</code> may be wrapped in an export marker (<code>nnkPostfix</code>) or quoted with backticks (<code>nnkAccQuoted</code>), these nodes will be unwrapped. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1371" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1371" target="_blank">Edit</a> </dd>  <dt><pre id="eqIdent%2Cstring%2CNimNode" data-language="nim">proc eqIdent(a: string; b: NimNode): bool {...}{.magic: "EqIdent", noSideEffect.}</pre></dt> <dd> Style insensitive comparison. <code>b</code> can be an identifier or a symbol. <code>b</code> may be wrapped in an export marker (<code>nnkPostfix</code>) or quoted with backticks (<code>nnkAccQuoted</code>), these nodes will be unwrapped. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1377" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1377" target="_blank">Edit</a> </dd>  <dt><pre id="eqIdent%2CNimNode%2CNimNode" data-language="nim">proc eqIdent(a: NimNode; b: NimNode): bool {...}{.magic: "EqIdent", noSideEffect.}</pre></dt> <dd> Style insensitive comparison. <code>a</code> and <code>b</code> can be an identifier or a symbol. Both may be wrapped in an export marker (<code>nnkPostfix</code>) or quoted with backticks (<code>nnkAccQuoted</code>), these nodes will be unwrapped. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1383" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1383" target="_blank">Edit</a> </dd>  <dt><pre id="expectIdent%2CNimNode%2Cstring" data-language="nim">proc expectIdent(n: NimNode; name: string) {...}{.compileTime, raises: [], tags: [].}</pre></dt> <dd> Check that <code>eqIdent(n,name)</code> holds true. If this is not the case, compilation aborts with an error message. This is useful for writing macros that check the AST that is passed to them. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1425" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1425" target="_blank">Edit</a> </dd>  <dt><pre id="hasArgOfName%2CNimNode%2Cstring" data-language="nim">proc hasArgOfName(params: NimNode; name: string): bool {...}{.compileTime,
+    raises: [], tags: [].}</pre></dt> <dd> Search <code>nnkFormalParams</code> for an argument. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1432" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1432" target="_blank">Edit</a> </dd>  <dt><pre id="addIdentIfAbsent%2CNimNode%2Cstring" data-language="nim">proc addIdentIfAbsent(dest: NimNode; ident: string) {...}{.compileTime, raises: [],
+    tags: [].}</pre></dt> <dd> Add <code>ident</code> to <code>dest</code> if it is not present. This is intended for use with pragmas. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1440" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1440" target="_blank">Edit</a> </dd>  <dt><pre id="boolVal%2CNimNode" data-language="nim">proc boolVal(n: NimNode): bool {...}{.compileTime, noSideEffect, raises: [], tags: [].}</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1452" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1452" target="_blank">Edit</a> </dd>  <dt><pre id="nodeID%2CNimNode" data-language="nim">proc nodeID(n: NimNode): int {...}{.magic: "NodeId".}</pre></dt> <dd> Returns the id of <code>n</code>, when the compiler has been compiled with the flag <code>-d:useNodeids</code>, otherwise returns <code>-1</code>. This proc is for the purpose to debug the compiler only. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1457" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1457" target="_blank">Edit</a> </dd>  <dt><pre id="getProjectPath" data-language="nim">proc getProjectPath(): string {...}{.raises: [], tags: [].}</pre></dt> <dd> <p>Returns the path to the currently compiling project.</p> <p>This is not to be confused with <a href="system.html#currentSourcePath.t">system.currentSourcePath</a> which returns the path of the source file containing that template call.</p> <p>For example, assume a <code>dir1/foo.nim</code> that imports a <code>dir2/bar.nim</code>, have the <code>bar.nim</code> print out both <code>getProjectPath</code> and <code>currentSourcePath</code> outputs.</p> <p>Now when <code>foo.nim</code> is compiled, the <code>getProjectPath</code> from <code>bar.nim</code> will return the <code>dir1/</code> path, while the <code>currentSourcePath</code> will return the path to the <code>bar.nim</code> source file.</p> <p>Now when <code>bar.nim</code> is compiled directly, the <code>getProjectPath</code> will now return the <code>dir2/</code> path, and the <code>currentSourcePath</code> will still return the same path, the path to the <code>bar.nim</code> source file.</p> <p>The path returned by this proc is set at compile time.</p> <p>See also:</p> <ul class="simple">
+<li><a href="os.html#getCurrentDir">getCurrentDir proc</a></li> </ul> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1618" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1618" target="_blank">Edit</a> </dd>  <dt><pre id="getSize%2CNimNode" data-language="nim">proc getSize(arg: NimNode): int {...}{.magic: "NSizeOf", noSideEffect, raises: [],
+                                  tags: [].}</pre></dt> <dd> Returns the same result as <code>system.sizeof</code> if the size is known by the Nim compiler. Returns a negative value if the Nim compiler does not know the size. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1644" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1644" target="_blank">Edit</a> </dd>  <dt><pre id="getAlign%2CNimNode" data-language="nim">proc getAlign(arg: NimNode): int {...}{.magic: "NSizeOf", noSideEffect, raises: [],
+                                   tags: [].}</pre></dt> <dd> Returns the same result as <code>system.alignof</code> if the alignment is known by the Nim compiler. It works on <code>NimNode</code> for use in macro context. Returns a negative value if the Nim compiler does not know the alignment. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1648" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1648" target="_blank">Edit</a> </dd>  <dt><pre id="getOffset%2CNimNode" data-language="nim">proc getOffset(arg: NimNode): int {...}{.magic: "NSizeOf", noSideEffect, raises: [],
+                                    tags: [].}</pre></dt> <dd> Returns the same result as <code>system.offsetof</code> if the offset is known by the Nim compiler. It expects a resolved symbol node from a field of a type. Therefore it only requires one argument instead of two. Returns a negative value if the Nim compiler does not know the offset. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1653" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1653" target="_blank">Edit</a> </dd>  <dt><pre id="isExported%2CNimNode" data-language="nim">proc isExported(n: NimNode): bool {...}{.noSideEffect, raises: [], tags: [].}</pre></dt> <dd> Returns whether the symbol is exported or not. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1660" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1660" target="_blank">Edit</a> </dd>  <dt><pre id="extractDocCommentsAndRunnables%2CNimNode" data-language="nim">proc extractDocCommentsAndRunnables(n: NimNode): NimNode {...}{.raises: [], tags: [].}</pre></dt> <dd> returns a <code>nnkStmtList</code> containing the top-level doc comments and runnableExamples in <code>a</code>, stopping at the first child that is neither. Example:<pre class="listing" data-language="nim">import macros
+macro transf(a): untyped =
+  result = quote do:
+    proc fun2*() = discard
+  let header = extractDocCommentsAndRunnables(a.body)
+  # correct usage: rest is appended
+  result.body = header
+  result.body.add quote do: discard # just an example
+  # incorrect usage: nesting inside a nnkStmtList:
+  # result.body = quote do: (`header`; discard)
+
+proc fun*() {.transf.} =
+  ## first comment
+  runnableExamples: discard
+  runnableExamples: discard
+  ## last comment
+  discard # first statement after doc comments + runnableExamples
+  ## not docgen'd</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1663" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1663" target="_blank">Edit</a> </dd> </dl>  <h2 id="15">Iterators</h2> <dl>  <dt><pre id="items.i%2CNimNode" data-language="nim">iterator items(n: NimNode): NimNode {...}{.inline, raises: [], tags: [].}</pre></dt> <dd> Iterates over the children of the NimNode <code>n</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1283" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1283" target="_blank">Edit</a> </dd>  <dt><pre id="pairs.i%2CNimNode" data-language="nim">iterator pairs(n: NimNode): (int, NimNode) {...}{.inline, raises: [], tags: [].}</pre></dt> <dd> Iterates over the children of the NimNode <code>n</code> and its indices. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1288" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1288" target="_blank">Edit</a> </dd>  <dt><pre id="children.i%2CNimNode" data-language="nim">iterator children(n: NimNode): NimNode {...}{.inline, raises: [], tags: [].}</pre></dt> <dd> Iterates over the children of the NimNode <code>n</code>. <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1293" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1293" target="_blank">Edit</a> </dd> </dl>  <h2 id="17">Macros</h2> <dl>  <dt><pre id="dumpTree.m%2Cuntyped" data-language="nim">macro dumpTree(s: untyped): untyped</pre></dt> <dd> <p>Accepts a block of nim code and prints the parsed abstract syntax tree using the <code>treeRepr</code> proc. Printing is done <em>at compile time</em>.</p> <p>You can use this as a tool to explore the Nim's abstract syntax tree and to discover what kind of nodes must be created to represent a certain expression/statement.</p> <p>For example:</p> <pre class="listing" data-language="nim">dumpTree:
+  echo "Hello, World!"</pre>
+<p>Outputs:</p> <pre class="listing" data-language="nim">StmtList
+  Command
+    Ident "echo"
+    StrLit "Hello, World!"</pre>
+<p>Also see <code>dumpAstGen</code> and <code>dumpLisp</code>.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L919" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L919" target="_blank">Edit</a> </dd>  <dt><pre id="dumpLisp.m%2Cuntyped" data-language="nim">macro dumpLisp(s: untyped): untyped</pre></dt> <dd> <p>Accepts a block of nim code and prints the parsed abstract syntax tree using the <code>lispRepr</code> proc. Printing is done <em>at compile time</em>.</p> <p>You can use this as a tool to explore the Nim's abstract syntax tree and to discover what kind of nodes must be created to represent a certain expression/statement.</p> <p>For example:</p> <pre class="listing" data-language="nim">dumpLisp:
+  echo "Hello, World!"</pre>
+<p>Outputs:</p> <pre class="listing" data-language="nim">(StmtList
+ (Command
+  (Ident "echo")
+  (StrLit "Hello, World!")))</pre>
+<p>Also see <code>dumpAstGen</code> and <code>dumpTree</code>.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L943" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L943" target="_blank">Edit</a> </dd>  <dt><pre id="dumpAstGen.m%2Cuntyped" data-language="nim">macro dumpAstGen(s: untyped): untyped</pre></dt> <dd> <p>Accepts a block of nim code and prints the parsed abstract syntax tree using the <code>astGenRepr</code> proc. Printing is done <em>at compile time</em>.</p> <p>You can use this as a tool to write macros quicker by writing example outputs and then copying the snippets into the macro for modification.</p> <p>For example:</p> <pre class="listing" data-language="nim">dumpAstGen:
+  echo "Hello, World!"</pre>
+<p>Outputs:</p> <pre class="listing" data-language="nim">nnkStmtList.newTree(
+  nnkCommand.newTree(
+    newIdentNode("echo"),
+    newLit("Hello, World!")
+  )
+)</pre>
+<p>Also see <code>dumpTree</code> and <code>dumpLisp</code>.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L967" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L967" target="_blank">Edit</a> </dd>  <dt><pre id="expandMacros.m%2Ctyped" data-language="nim">macro expandMacros(body: typed): untyped</pre></dt> <dd> <p>Expands one level of macro - useful for debugging. Can be used to inspect what happens when a macro call is expanded, without altering its result.</p> <p>For instance,</p> <pre class="listing" data-language="nim">import sugar, macros
+
+let
+  x = 10
+  y = 20
+expandMacros:
+  dump(x + y)</pre>
+<p>will actually dump <code>x + y</code>, but at the same time will print at compile time the expansion of the <code>dump</code> macro, which in this case is <code>debugEcho ["x + y", " = ", x + y]</code>.</p> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1462" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1462" target="_blank">Edit</a> </dd>  <dt><pre id="hasCustomPragma.m%2Ctyped%2C" data-language="nim">macro hasCustomPragma(n: typed; cp: typed{nkSym}): untyped</pre></dt> <dd> <p>Expands to <code>true</code> if expression <code>n</code> which is expected to be <code>nnkDotExpr</code> (if checking a field), a proc or a type has custom pragma <code>cp</code>.</p> <p>See also <code>getCustomPragmaVal</code>.</p> <pre class="listing" data-language="nim">template myAttr() {.pragma.}
+type
+  MyObj = object
+    myField {.myAttr.}: int
+
+proc myProc() {.myAttr.} = discard
+
+var o: MyObj
+assert(o.myField.hasCustomPragma(myAttr))
+assert(myProc.hasCustomPragma(myAttr))</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1557" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1557" target="_blank">Edit</a> </dd>  <dt><pre id="getCustomPragmaVal.m%2Ctyped%2C" data-language="nim">macro getCustomPragmaVal(n: typed; cp: typed{nkSym}): untyped</pre></dt> <dd> <p>Expands to value of custom pragma <code>cp</code> of expression <code>n</code> which is expected to be <code>nnkDotExpr</code>, a proc or a type.</p> <p>See also <code>hasCustomPragma</code></p> <pre class="listing" data-language="nim">template serializationKey(key: string) {.pragma.}
+type
+  MyObj {.serializationKey: "mo".} = object
+    myField {.serializationKey: "mf".}: int
+var o: MyObj
+assert(o.myField.getCustomPragmaVal(serializationKey) == "mf")
+assert(o.getCustomPragmaVal(serializationKey) == "mo")
+assert(MyObj.getCustomPragmaVal(serializationKey) == "mo")</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1581" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1581" target="_blank">Edit</a> </dd>  <dt><pre id="unpackVarargs.m%2Cuntyped%2Cvarargs%5Buntyped%5D" data-language="nim">macro unpackVarargs(callee: untyped; args: varargs[untyped]): untyped</pre></dt> <dd> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1613" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1613" target="_blank">Edit</a> </dd> </dl>  <h2 id="18">Templates</h2> <dl>  <dt><pre id="or.t%2CNimNode%2CNimNode" data-language="nim">template `or`(x, y: NimNode): NimNode</pre></dt> <dd> Evaluate <code>x</code> and when it is not an empty node, return it. Otherwise evaluate to <code>y</code>. Can be used to chain several expressions to get the first expression that is not empty.<pre class="listing" data-language="nim">let node = mightBeEmpty() or mightAlsoBeEmpty() or fallbackNode</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L195" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L195" target="_blank">Edit</a> </dd>  <dt><pre id="findChild.t%2CNimNode%2Cuntyped" data-language="nim">template findChild(n: NimNode; cond: untyped): NimNode {...}{.dirty.}</pre></dt> <dd> Find the first child node matching condition (or nil).<pre class="listing" data-language="nim">var res = findChild(n, it.kind == nnkPostfix and
+                       it.basename.ident == toNimIdent"foo")</pre> <a href="https://github.com/nim-lang/Nim/tree/version-1-4/lib/core/macros.nim#L1298" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/lib/core/macros.nim#L1298" target="_blank">Edit</a> </dd> </dl><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2006&ndash;2021 Andreas Rumpf<br>Licensed under the MIT License.<br>
+    <a href="https://nim-lang.org/docs/macros.html" class="_attribution-link">https://nim-lang.org/docs/macros.html</a>
+  </p>
+</div>
