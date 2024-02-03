@@ -1,0 +1,108 @@
+<h1 id="developing-modules-network">Developing network plugins</h1> <p id="developing-network-plugins">You can extend the existing network modules with custom plugins in your collection.</p>  <ul class="simple"> <li><a class="reference internal" href="#network-connection-plugins" id="id2">Network connection plugins</a></li> <li>
+<p><a class="reference internal" href="#developing-httpapi-plugins" id="id3">Developing httpapi plugins</a></p> <ul> <li><a class="reference internal" href="#making-requests" id="id4">Making requests</a></li> <li><a class="reference internal" href="#authenticating" id="id5">Authenticating</a></li> <li><a class="reference internal" href="#error-handling" id="id6">Error handling</a></li> </ul> </li> <li><a class="reference internal" href="#developing-netconf-plugins" id="id7">Developing NETCONF plugins</a></li> <li><a class="reference internal" href="#developing-network-cli-plugins" id="id8">Developing network_cli plugins</a></li> <li><a class="reference internal" href="#developing-cli-parser-plugins-in-a-collection" id="id9">Developing cli_parser plugins in a collection</a></li> </ul>   <h2 id="network-connection-plugins">Network connection plugins</h2> <p>Each network connection plugin has a set of its own plugins which provide a specification of the connection for a particular set of devices. The specific plugin used is selected at runtime based on the value of the <code>ansible_network_os</code> variable assigned to the host. This variable should be set to the same value as the name of the plugin to be loaded. Thus, <code>ansible_network_os=nxos</code> will try to load a plugin in a file named <code>nxos.py</code>, so it is important to name the plugin in a way that will be sensible to users.</p> <p>Public methods of these plugins may be called from a module or module_utils with the connection proxy object just as other connection methods can. The following is a very simple example of using such a call in a module_utils file so it may be shared with other modules.</p> <pre data-language="python">from ansible.module_utils.connection import Connection
+
+def get_config(module):
+    # module is your AnsibleModule instance.
+    connection = Connection(module._socket_path)
+
+    # You can now call any method (that doesn't start with '_') of the connection
+    # plugin or its platform-specific plugin
+    return connection.get_config()
+</pre>   <h2 id="developing-plugins-httpapi">Developing httpapi plugins</h2> <p id="developing-httpapi-plugins"><a class="reference internal" href="../../plugins/httpapi.html#httpapi-plugins"><span class="std std-ref">httpapi plugins</span></a> serve as adapters for various HTTP(S) APIs for use with the <code>httpapi</code> connection plugin. They should implement a minimal set of convenience methods tailored to the API you are attempting to use.</p> <p>Specifically, there are a few methods that the <code>httpapi</code> connection plugin expects to exist.</p>  <h3 id="making-requests">Making requests</h3> <p>The <code>httpapi</code> connection plugin has a <code>send()</code> method, but an httpapi plugin needs a <code>send_request(self, data, **message_kwargs)</code> method as a higher-level wrapper to <code>send()</code>. This method should prepare requests by adding fixed values like common headers or URL root paths. This method may do more complex work such as turning data into formatted payloads, or determining which path or method to request. It may then also unpack responses to be more easily consumed by the caller.</p> <pre data-language="python">from ansible.module_utils.six.moves.urllib.error import HTTPError
+
+def send_request(self, data, path, method='POST'):
+    # Fixed headers for requests
+    headers = {'Content-Type': 'application/json'}
+    try:
+        response, response_content = self.connection.send(path, data, method=method, headers=headers)
+    except HTTPError as exc:
+        return exc.code, exc.read()
+
+    # handle_response (defined separately) will take the format returned by the device
+    # and transform it into something more suitable for use by modules.
+    # This may be JSON text to Python dictionaries, for example.
+    return handle_response(response_content)
+</pre>   <h3 id="authenticating">Authenticating</h3> <p>By default, all requests will authenticate with HTTP Basic authentication. If a request can return some kind of token to stand in place of HTTP Basic, the <code>update_auth(self, response, response_text)</code> method should be implemented to inspect responses for such tokens. If the token is meant to be included with the headers of each request, it is sufficient to return a dictionary which will be merged with the computed headers for each request. The default implementation of this method does exactly this for cookies. If the token is used in another way, say in a query string, you should instead save that token to an instance variable, where the <code>send_request()</code> method (above) can add it to each request</p> <pre data-language="python">def update_auth(self, response, response_text):
+    cookie = response.info().get('Set-Cookie')
+    if cookie:
+        return {'Cookie': cookie}
+
+    return None
+</pre> <p>If instead an explicit login endpoint needs to be requested to receive an authentication token, the <code>login(self, username, password)</code> method can be implemented to call that endpoint. If implemented, this method will be called once before requesting any other resources of the server. By default, it will also be attempted once when a HTTP 401 is returned from a request.</p> <pre data-language="python">def login(self, username, password):
+    login_path = '/my/login/path'
+    data = {'user': username, 'password': password}
+
+    response = self.send_request(data, path=login_path)
+    try:
+        # This is still sent as an HTTP header, so we can set our connection's _auth
+        # variable manually. If the token is returned to the device in another way,
+        # you will have to keep track of it another way and make sure that it is sent
+        # with the rest of the request from send_request()
+        self.connection._auth = {'X-api-token': response['token']}
+    except KeyError:
+        raise AnsibleAuthenticationFailure(message="Failed to acquire login token.")
+</pre> <p>Similarly, <code>logout(self)</code> can be implemented to call an endpoint to invalidate and/or release the current token, if such an endpoint exists. This will be automatically called when the connection is closed (and, by extension, when reset).</p> <pre data-language="python">def logout(self):
+    logout_path = '/my/logout/path'
+    self.send_request(None, path=logout_path)
+
+    # Clean up tokens
+    self.connection._auth = None
+</pre>   <h3 id="error-handling">Error handling</h3> <p>The <code>handle_httperror(self, exception)</code> method can deal with status codes returned by the server. The return value indicates how the plugin will continue with the request:</p> <ul class="simple"> <li>A value of <code>true</code> means that the request can be retried. This my be used to indicate a transient error, or one that has been resolved. For example, the default implementation will try to call <code>login()</code> when presented with a 401, and return <code>true</code> if successful.</li> <li>A value of <code>false</code> means that the plugin is unable to recover from this response. The status code will be raised as an exception to the calling module.</li> <li>Any other value will be taken as a nonfatal response from the request. This may be useful if the server returns error messages in the body of the response. Returning the original exception is usually sufficient in this case, as HTTPError objects have the same interface as a successful response.</li> </ul> <p>For example httpapi plugins, see the <a class="reference external" href="https://github.com/ansible/ansible/tree/devel/lib/ansible/plugins/httpapi">source code for the httpapi plugins</a> included with Ansible Core.</p>    <h2 id="developing-netconf-plugins">Developing NETCONF plugins</h2> <p>The <a class="reference external" href="https://docs.ansible.com/ansible/2.9/plugins/connection/netconf.html#netconf-connection" title="(in Ansible v2.9)"><span class="xref std std-ref">netconf</span></a> connection plugin provides a connection to remote devices over the <code>SSH NETCONF</code> subsystem. Network devices typically use this connection plugin to send and receive <code>RPC</code> calls over <code>NETCONF</code>.</p> <p>The <code>netconf</code> connection plugin uses the <code>ncclient</code> Python library under the hood to initiate a NETCONF session with a NETCONF-enabled remote network device. <code>ncclient</code> also executes NETCONF RPC requests and receives responses. You must install the <code>ncclient</code> on the local Ansible controller.</p> <p>To use the <code>netconf</code> connection plugin for network devices that support standard NETCONF (<a class="rfc reference external" href="https://tools.ietf.org/html/rfc6241.html" id="index-0"><strong>RFC 6241</strong></a>) operations such as <code>get</code>, <code>get-config</code>, <code>edit-config</code>, set <code>ansible_network_os=default</code>. You can use <a class="reference external" href="https://docs.ansible.com/ansible/2.9/modules/netconf_get_module.html#netconf-get-module" title="(in Ansible v2.9)"><span class="xref std std-ref">netconf_get</span></a>, <a class="reference external" href="https://docs.ansible.com/ansible/2.9/modules/netconf_config_module.html#netconf-config-module" title="(in Ansible v2.9)"><span class="xref std std-ref">netconf_config</span></a> and <a class="reference external" href="https://docs.ansible.com/ansible/2.9/modules/netconf_rpc_module.html#netconf-rpc-module" title="(in Ansible v2.9)"><span class="xref std std-ref">netconf_rpc</span></a> modules to talk to a NETCONF enabled remote host.</p> <p>As a contributor and user, you should be able to use all the methods under the <code>NetconfBase</code> class if your device supports standard NETCONF. You can contribute a new plugin if the device you are working with has a vendor specific NETCONF RPC. To support a vendor specific NETCONF RPC, add the implementation in the network OS specific NETCONF plugin.</p> <p>For Junos for example:</p> <ul class="simple"> <li>See the vendor-specific Junos RPC methods implemented in <code>plugins/netconf/junos.py</code>.</li> <li>Set the value of <code>ansible_network_os</code> to the name of the netconf plugin file, that is <code>junos</code> in this case.</li> </ul>   <h2 id="developing-plugins-network-cli">Developing network_cli plugins</h2> <p id="developing-network-cli-plugins">The <a class="reference external" href="https://docs.ansible.com/ansible/2.9/plugins/connection/network_cli.html#network-cli-connection" title="(in Ansible v2.9)"><span class="xref std std-ref">network_cli</span></a> connection type uses <code>paramiko_ssh</code> under the hood which creates a pseudo terminal to send commands and receive responses. <code>network_cli</code> loads two platform specific plugins based on the value of <code>ansible_network_os</code>:</p> <ul class="simple"> <li>Terminal plugin (for example <code>plugins/terminal/ios.py</code>) - Controls the parameters related to terminal, such as setting terminal length and width, page disabling and privilege escalation. Also defines regex to identify the command prompt and error prompts.</li> <li>
+<a class="reference internal" href="../../plugins/cliconf.html#cliconf-plugins"><span class="std std-ref">Cliconf Plugins</span></a> (for example, <a class="reference external" href="https://docs.ansible.com/ansible/2.9/plugins/cliconf/ios.html#ios-cliconf" title="(in Ansible v2.9)"><span class="xref std std-ref">ios cliconf</span></a>) - Provides an abstraction layer for low level send and receive operations. For example, the <code>edit_config()</code> method ensures that the prompt is in <code>config</code> mode before executing configuration commands.</li> </ul> <p>To contribute a new network operating system to work with the <code>network_cli</code> connection, implement the <code>cliconf</code> and <code>terminal</code> plugins for that network OS.</p> <p>The plugins can reside in:</p> <ul> <li>
+<p>Adjacent to playbook in folders</p> <pre data-language="bash">cliconf_plugins/
+terminal_plugins/
+</pre> </li> <li>
+<p>Roles</p> <pre data-language="bash">myrole/cliconf_plugins/
+myrole/terminal_plugins/
+</pre> </li> <li>
+<p>Collections</p> <pre data-language="bash">myorg/mycollection/plugins/terminal/
+myorg/mycollection/plugins/cliconf/
+</pre> </li> </ul> <p>The user can also set the <a class="reference internal" href="../../reference_appendices/config.html#default-cliconf-plugin-path"><span class="std std-ref">DEFAULT_CLICONF_PLUGIN_PATH</span></a> to configure the <code>cliconf</code> plugin path.</p> <p>After adding the <code>cliconf</code> and <code>terminal</code> plugins in the expected locations, users can:</p> <ul class="simple"> <li>Use the <a class="reference external" href="https://docs.ansible.com/ansible/2.9/modules/cli_command_module.html#cli-command-module" title="(in Ansible v2.9)"><span class="xref std std-ref">cli_command</span></a> to run an arbitrary command on the network device.</li> <li>Use the <a class="reference external" href="https://docs.ansible.com/ansible/2.9/modules/cli_config_module.html#cli-config-module" title="(in Ansible v2.9)"><span class="xref std std-ref">cli_config</span></a> to implement configuration changes on the remote hosts without platform-specific modules.</li> </ul>   <h2 id="develop-cli-parse-plugins">Developing cli_parser plugins in a collection</h2> <p id="developing-cli-parser-plugins-in-a-collection">You can use <code>cli_parse</code> as an entry point for a cli_parser plugin in your own collection.</p> <p>The following sample shows the start of a custom cli_parser plugin:</p> <pre data-language="python">from ansible_collections.ansible.netcommon.plugins.module_utils.cli_parser.cli_parserbase import (
+    CliParserBase,
+)
+
+class CliParser(CliParserBase):
+    """ Sample cli_parser plugin
+    """
+
+    # Use the follow extention when loading a template
+    DEFAULT_TEMPLATE_EXTENSION = "txt"
+    # Provide the contents of the template to the parse function
+    PROVIDE_TEMPLATE_CONTENTS = True
+
+    def myparser(text, template_contents):
+      # parse the text using the template contents
+      return {...}
+
+    def parse(self, *_args, **kwargs):
+        """ Standard entry point for a cli_parse parse execution
+
+        :return: Errors or parsed text as structured data
+        :rtype: dict
+
+        :example:
+
+        The parse function of a parser should return a dict:
+        {"errors": [a list of errors]}
+        or
+        {"parsed": obj}
+        """
+        template_contents = kwargs["template_contents"]
+        text = self._task_args.get("text")
+        try:
+            parsed = myparser(text, template_contents)
+        except Exception as exc:
+            msg = "Custom parser returned an error while parsing. Error: {err}"
+            return {"errors": [msg.format(err=to_native(exc))]}
+        return {"parsed": parsed}
+</pre> <p>The following task uses this custom cli_parser plugin:</p> <pre data-language="yaml">- name: Use a custom cli_parser
+  ansible.netcommon.cli_parse:
+    command: ls -l
+    parser:
+      name: my_organiztion.my_collection.custom_parser
+</pre> <p>To develop a custom plugin: - Each cli_parser plugin requires a <code>CliParser</code> class. - Each cli_parser plugin requires a <code>parse</code> function. - Always return a dictionary with <code>errors</code> or <code>parsed</code>. - Place the custom cli_parser in plugins/cli_parsers directory of the collection. - See the <a class="reference external" href="https://github.com/ansible-collections/ansible.netcommon/tree/main/plugins/cli_parsers">current cli_parsers</a> for examples to follow.</p> <div class="admonition seealso"> <p class="admonition-title">See also</p> <ul class="simple"> <li><a class="reference internal" href="../user_guide/cli_parsing.html#cli-parsing"><span class="std std-ref">Parsing semi-structured text with Ansible</span></a></li> </ul> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012&ndash;2018 Michael DeHaan<br>&copy; 2018&ndash;2021 Red Hat, Inc.<br>Licensed under the GNU General Public License version 3.<br>
+    <a href="https://docs.ansible.com/ansible/latest/network/dev_guide/developing_plugins_network.html" class="_attribution-link">https://docs.ansible.com/ansible/latest/network/dev_guide/developing_plugins_network.html</a>
+  </p>
+</div>
