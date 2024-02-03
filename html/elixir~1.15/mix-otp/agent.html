@@ -1,0 +1,104 @@
+<div class="getting-started-title"> <small>Mix and OTP</small> <h1>Agent</h1> </div>  <blockquote> <p>This chapter is part of the <i>Mix and OTP guide</i> and it depends on previous chapters in this guide. For more information, <a href="introduction-to-mix.html">read the introduction guide</a> or check out the chapter index in the sidebar.</p> </blockquote> <p>In this chapter, we will learn how to keep and share state between multiple entities. If you have previous programming experience, you may think of globally shared variables, but the model we will learn here is quite different. The next chapters will generalize the concepts introduced here.</p> <p>If you have skipped the Getting Started guide or read it long ago, be sure to re-read the <a href="../processes.html">Processes</a> chapter. We will use it as a starting point.</p> <h2 id="the-trouble-with-state">The trouble with state</h2> <p>Elixir is an immutable language where nothing is shared by default. If we want to share information, which can be read and modified from multiple places, we have two main options in Elixir:</p> <ul> <li>Using Processes and message passing</li> <li><a href="http://www.erlang.org/doc/man/ets.html">ETS (Erlang Term Storage)</a></li> </ul> <p>We covered processes in the Getting Started guide. <abbr title="Erlang Term Storage">ETS</abbr> is a new topic that we will explore in later chapters. When it comes to processes though, we rarely hand-roll our own, instead we use the abstractions available in Elixir and <abbr title="Open Telecom Platform">OTP</abbr>:</p> <ul> <li>
+<a href="https://hexdocs.pm/elixir/Agent.html">Agent</a> - Simple wrappers around state.</li> <li>
+<a href="https://hexdocs.pm/elixir/GenServer.html">GenServer</a> - “Generic servers” (processes) that encapsulate state, provide sync and async calls, support code reloading, and more.</li> <li>
+<a href="https://hexdocs.pm/elixir/Task.html">Task</a> - Asynchronous units of computation that allow spawning a process and potentially retrieving its result at a later time.</li> </ul> <p>We will explore most of these abstractions in this guide. Keep in mind that they are all implemented on top of processes using the basic features provided by the <abbr title="Virtual Machine">VM</abbr>, like <code class="language-plaintext highlighter-rouge">send</code>, <code class="language-plaintext highlighter-rouge">receive</code>, <code class="language-plaintext highlighter-rouge">spawn</code> and <code class="language-plaintext highlighter-rouge">link</code>.</p> <p>Here we will use Agents, and create a module named <code class="language-plaintext highlighter-rouge">KV.Bucket</code>, responsible for storing our key-value entries in a way that allows them to be read and modified by other processes.</p> <h2 id="agents">Agents</h2> <p><a href="https://hexdocs.pm/elixir/Agent.html">Agents</a> are simple wrappers around state. If all you want from a process is to keep state, agents are a great fit. Let’s start an <code class="language-plaintext highlighter-rouge">iex</code> session inside the project with:</p> <div class="language-console highlighter-rouge"><pre class="highlight" data-language="">$ iex -S mix
+</pre></div> <p>And play a bit with agents:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">iex&gt; {:ok, agent} = Agent.start_link fn -&gt; [] end
+{:ok, #PID&lt;0.57.0&gt;}
+iex&gt; Agent.update(agent, fn list -&gt; ["eggs" | list] end)
+:ok
+iex&gt; Agent.get(agent, fn list -&gt; list end)
+["eggs"]
+iex&gt; Agent.stop(agent)
+:ok
+</pre></div> <p>We started an agent with an initial state of an empty list. We updated the agent’s state, adding our new item to the head of the list. The second argument of <a href="https://hexdocs.pm/elixir/Agent.html#update/3"><code class="language-plaintext highlighter-rouge">Agent.update/3</code></a> is a function that takes the agent’s current state as input and returns its desired new state. Finally, we retrieved the whole list. The second argument of <a href="https://hexdocs.pm/elixir/Agent.html#get/3"><code class="language-plaintext highlighter-rouge">Agent.get/3</code></a> is a function that takes the state as input and returns the value that <a href="https://hexdocs.pm/elixir/Agent.html#get/3"><code class="language-plaintext highlighter-rouge">Agent.get/3</code></a> itself will return. Once we are done with the agent, we can call <a href="https://hexdocs.pm/elixir/Agent.html#stop/3"><code class="language-plaintext highlighter-rouge">Agent.stop/3</code></a> to terminate the agent process.</p> <p>The <code class="language-plaintext highlighter-rouge">Agent.update/3</code> function accepts as a second argument any function that receives one argument and returns a value:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">iex&gt; {:ok, agent} = Agent.start_link fn -&gt; [] end
+{:ok, #PID&lt;0.338.0&gt;}
+iex&gt; Agent.update(agent, fn _list -&gt; 123 end)
+:ok
+iex&gt; Agent.update(agent, fn content -&gt; %{a: content} end)
+:ok
+iex&gt; Agent.update(agent, fn content -&gt; [12 | [content]] end)
+:ok
+iex&gt; Agent.update(agent, fn list -&gt; [:nop | list] end)
+:ok
+iex&gt; Agent.get(agent, fn content -&gt; content end)
+[:nop, 12, %{a: 123}]
+</pre></div> <p>As you can see, we can modify the agent state in any way we want. Therefore, we most likely don’t want to access the Agent API throughout many different places in our code. Instead, we want to encapsulate all Agent-related functionality in a single module, which we will call <code class="language-plaintext highlighter-rouge">KV.Bucket</code>. Before we implement it, let’s write some tests which will outline the API exposed by our module.</p> <p>Create a file at <code class="language-plaintext highlighter-rouge">test/kv/bucket_test.exs</code> (remember the <code class="language-plaintext highlighter-rouge">.exs</code> extension) with the following:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">defmodule KV.BucketTest do
+  use ExUnit.Case, async: true
+
+  test "stores values by key" do
+    {:ok, bucket} = KV.Bucket.start_link([])
+    assert KV.Bucket.get(bucket, "milk") == nil
+
+    KV.Bucket.put(bucket, "milk", 3)
+    assert KV.Bucket.get(bucket, "milk") == 3
+  end
+end
+</pre></div> <p><code class="language-plaintext highlighter-rouge">use ExUnit.Case</code> is responsible for setting up our module for testing and imports many test-related functionality, such as the <code class="language-plaintext highlighter-rouge">test/2</code> macro.</p> <p>Our first test starts a new <code class="language-plaintext highlighter-rouge">KV.Bucket</code> by calling the <code class="language-plaintext highlighter-rouge">start_link/1</code> and passing an empty list of options. Then we perform some <code class="language-plaintext highlighter-rouge">get/2</code> and <code class="language-plaintext highlighter-rouge">put/3</code> operations on it, asserting the result.</p> <p>Also note the <code class="language-plaintext highlighter-rouge">async: true</code> option passed to <code class="language-plaintext highlighter-rouge">ExUnit.Case</code>. This option makes the test case run in parallel with other <code class="language-plaintext highlighter-rouge">:async</code> test cases by using multiple cores in our machine. This is extremely useful to speed up our test suite. However, <code class="language-plaintext highlighter-rouge">:async</code> must <em>only</em> be set if the test case does not rely on or change any global values. For example, if the test requires writing to the filesystem or access a database, keep it synchronous (omit the <code class="language-plaintext highlighter-rouge">:async</code> option) to avoid race conditions between tests.</p> <p>Async or not, our new test should obviously fail, as none of the functionality is implemented in the module being tested:</p> <div class="language-plaintext highlighter-rouge"><pre class="highlight" data-language="">** (UndefinedFunctionError) function KV.Bucket.start_link/1 is undefined (module KV.Bucket is not available)
+</pre></div> <p>In order to fix the failing test, let’s create a file at <code class="language-plaintext highlighter-rouge">lib/kv/bucket.ex</code> with the contents below. Feel free to give a try at implementing the <code class="language-plaintext highlighter-rouge">KV.Bucket</code> module yourself using agents before peeking at the implementation below.</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">defmodule KV.Bucket do
+  use Agent
+
+  @doc """
+  Starts a new bucket.
+  """
+  def start_link(_opts) do
+    Agent.start_link(fn -&gt; %{} end)
+  end
+
+  @doc """
+  Gets a value from the `bucket` by `key`.
+  """
+  def get(bucket, key) do
+    Agent.get(bucket, &amp;Map.get(&amp;1, key))
+  end
+
+  @doc """
+  Puts the `value` for the given `key` in the `bucket`.
+  """
+  def put(bucket, key, value) do
+    Agent.update(bucket, &amp;Map.put(&amp;1, key, value))
+  end
+end
+</pre></div> <p>The first step in our implementation is to call <code class="language-plaintext highlighter-rouge">use Agent</code>. Most of the functionality we will learn in this guide, such as <code class="language-plaintext highlighter-rouge">GenServer</code> and <code class="language-plaintext highlighter-rouge">Supervisor</code>, follow this pattern. For all of them, calling <code class="language-plaintext highlighter-rouge">use</code> generates a <code class="language-plaintext highlighter-rouge">child_spec</code> function with default configuration, which will be handy when we start supervising processes in chapter 4.</p> <p>Then we define a <code class="language-plaintext highlighter-rouge">start_link/1</code> function, which will effectively start the agent. It is a convention to define a <code class="language-plaintext highlighter-rouge">start_link/1</code> function that always accepts a list of options. We don’t plan on using any options right now, but we might later on. We then proceed to call <code class="language-plaintext highlighter-rouge">Agent.start_link/1</code>, which receives an anonymous function that returns the Agent’s initial state.</p> <p>We are keeping a map inside the agent to store our keys and values. Getting and putting values on the map is done with the Agent API and the capture operator <code class="language-plaintext highlighter-rouge">&amp;</code>, introduced in <a href="../modules-and-functions.html#function-capturing">the Getting Started guide</a>. The agent passes its state to the anonymous function via the <code class="language-plaintext highlighter-rouge">&amp;1</code> argument when <code class="language-plaintext highlighter-rouge">Agent.get/2</code> and <code class="language-plaintext highlighter-rouge">Agent.update/2</code> are called.</p> <p>Now that the <code class="language-plaintext highlighter-rouge">KV.Bucket</code> module has been defined, our test should pass! You can try it yourself by running: <code class="language-plaintext highlighter-rouge">mix test</code>.</p> <h2 id="test-setup-with-exunit-callbacks">Test setup with ExUnit callbacks</h2> <p>Before moving on and adding more features to <code class="language-plaintext highlighter-rouge">KV.Bucket</code>, let’s talk about ExUnit callbacks. As you may expect, all <code class="language-plaintext highlighter-rouge">KV.Bucket</code> tests will require a bucket agent to be up and running. Luckily, ExUnit supports callbacks that allow us to skip such repetitive tasks.</p> <p>Let’s rewrite the test case to use callbacks:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">defmodule KV.BucketTest do
+  use ExUnit.Case, async: true
+
+  setup do
+    {:ok, bucket} = KV.Bucket.start_link([])
+    %{bucket: bucket}
+  end
+
+  test "stores values by key", %{bucket: bucket} do
+    assert KV.Bucket.get(bucket, "milk") == nil
+
+    KV.Bucket.put(bucket, "milk", 3)
+    assert KV.Bucket.get(bucket, "milk") == 3
+  end
+end
+</pre></div> <p>We have first defined a setup callback with the help of the <code class="language-plaintext highlighter-rouge">setup/1</code> macro. The <code class="language-plaintext highlighter-rouge">setup/1</code> macro defines a callback that is run before every test, in the same process as the test itself.</p> <p>Note that we need a mechanism to pass the <code class="language-plaintext highlighter-rouge">bucket</code> pid from the callback to the test. We do so by using the <em>test context</em>. When we return <code class="language-plaintext highlighter-rouge">%{bucket: bucket}</code> from the callback, ExUnit will merge this map into the test context. Since the test context is a map itself, we can pattern match the bucket out of it, providing access to the bucket inside the test:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">test "stores values by key", %{bucket: bucket} do
+  # `bucket` is now the bucket from the setup block
+end
+</pre></div> <p>You can read more about ExUnit cases in the <a href="https://hexdocs.pm/ex_unit/ExUnit.Case.html"><code class="language-plaintext highlighter-rouge">ExUnit.Case</code> module documentation</a> and more about callbacks in <a href="https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html"><code class="language-plaintext highlighter-rouge">ExUnit.Callbacks</code> docs</a>.</p> <h2 id="other-agent-actions">Other agent actions</h2> <p>Besides getting a value and updating the agent state, agents allow us to get a value and update the agent state in one function call via <code class="language-plaintext highlighter-rouge">Agent.get_and_update/2</code>. Let’s implement a <code class="language-plaintext highlighter-rouge">KV.Bucket.delete/2</code> function that deletes a key from the bucket, returning its current value:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">@doc """
+Deletes `key` from `bucket`.
+
+Returns the current value of `key`, if `key` exists.
+"""
+def delete(bucket, key) do
+  Agent.get_and_update(bucket, &amp;Map.pop(&amp;1, key))
+end
+</pre></div> <p>Now it is your turn to write a test for the functionality above! Also, be sure to explore <a href="https://hexdocs.pm/elixir/Agent.html">the documentation for the <code class="language-plaintext highlighter-rouge">Agent</code> module</a> to learn more about them.</p> <h2 id="clientserver-in-agents">Client/Server in agents</h2> <p>Before we move on to the next chapter, let’s discuss the client/server dichotomy in agents. Let’s expand the <code class="language-plaintext highlighter-rouge">delete/2</code> function we have just implemented:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">def delete(bucket, key) do
+  Agent.get_and_update(bucket, fn dict -&gt;
+    Map.pop(dict, key)
+  end)
+end
+</pre></div> <p>Everything that is inside the function we passed to the agent happens in the agent process. In this case, since the agent process is the one receiving and responding to our messages, we say the agent process is the server. Everything outside the function is happening in the client.</p> <p>This distinction is important. If there are expensive actions to be done, you must consider if it will be better to perform these actions on the client or on the server. For example:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">def delete(bucket, key) do
+  Process.sleep(1000) # puts client to sleep
+  Agent.get_and_update(bucket, fn dict -&gt;
+    Process.sleep(1000) # puts server to sleep
+    Map.pop(dict, key)
+  end)
+end
+</pre></div> <p>When a long action is performed on the server, all other requests to that particular server will wait until the action is done, which may cause some clients to timeout.</p> <p>In the next chapter, we will explore GenServers, where the segregation between clients and servers is made more apparent.</p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012 Plataformatec<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://elixir-lang.org/getting-started/mix-otp/agent.html" class="_attribution-link">https://elixir-lang.org/getting-started/mix-otp/agent.html</a>
+  </p>
+</div>

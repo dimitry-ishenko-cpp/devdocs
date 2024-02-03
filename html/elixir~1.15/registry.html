@@ -1,0 +1,405 @@
+<h1>   <span translate="no">Registry</span>  </h1> <section id="moduledoc"> <p>A local, decentralized and scalable key-value process storage.</p>
+<p>It allows developers to lookup one or more processes with a given key. If the registry has <code class="inline">:unique</code> keys, a key points to 0 or 1 process. If the registry allows <code class="inline">:duplicate</code> keys, a single key may point to any number of processes. In both cases, different keys could identify the same process.</p>
+<p>Each entry in the registry is associated to the process that has registered the key. If the process crashes, the keys associated to that process are automatically removed. All key comparisons in the registry are done using the match operation (<a href="kernel.html#===/2"><code class="inline">===/2</code></a>).</p>
+<p>The registry can be used for different purposes, such as name lookups (using the <code class="inline">:via</code> option), storing properties, custom dispatching rules, or a pubsub implementation. We explore some of those use cases below.</p>
+<p>The registry may also be transparently partitioned, which provides more scalable behaviour for running registries on highly concurrent environments with thousands or millions of entries.</p>
+<h2 id="module-using-in-via" class="section-heading"> <a href="#module-using-in-via">  Using in <code class="inline">:via</code> </a> </h2> <p>Once the registry is started with a given name using <a href="#start_link/1"><code class="inline">Registry.start_link/1</code></a>, it can be used to register and access named processes using the <code class="inline">{:via, Registry, {registry, key}}</code> tuple:</p>
+<pre data-language="elixir">{:ok, _} = Registry.start_link(keys: :unique, name: Registry.ViaTest)
+name = {:via, Registry, {Registry.ViaTest, "agent"}}
+{:ok, _} = Agent.start_link(fn -&gt; 0 end, name: name)
+Agent.get(name, &amp; &amp;1)
+#=&gt; 0
+Agent.update(name, &amp;(&amp;1 + 1))
+Agent.get(name, &amp; &amp;1)
+#=&gt; 1</pre>
+<p>In the previous example, we were not interested in associating a value to the process:</p>
+<pre data-language="elixir">Registry.lookup(Registry.ViaTest, "agent")
+#=&gt; [{self(), nil}]</pre>
+<p>However, in some cases it may be desired to associate a value to the process using the alternate <code class="inline">{:via, Registry, {registry, key, value}}</code> tuple:</p>
+<pre data-language="elixir">{:ok, _} = Registry.start_link(keys: :unique, name: Registry.ViaTest)
+name = {:via, Registry, {Registry.ViaTest, "agent", :hello}}
+{:ok, agent_pid} = Agent.start_link(fn -&gt; 0 end, name: name)
+Registry.lookup(Registry.ViaTest, "agent")
+#=&gt; [{agent_pid, :hello}]</pre>
+<p>To this point, we have been starting <a href="registry.html#content"><code class="inline">Registry</code></a> using <a href="#start_link/1"><code class="inline">start_link/1</code></a>. Typically the registry is started as part of a supervision tree though:</p>
+<pre data-language="elixir">{Registry, keys: :unique, name: Registry.ViaTest}</pre>
+<p>Only registries with unique keys can be used in <code class="inline">:via</code>. If the name is already taken, the case-specific <code class="inline">start_link</code> function (<a href="agent.html#start_link/2"><code class="inline">Agent.start_link/2</code></a> in the example above) will return <code class="inline">{:error, {:already_started, current_pid}}</code>.</p>
+<h2 id="module-using-as-a-dispatcher" class="section-heading"> <a href="#module-using-as-a-dispatcher">  Using as a dispatcher </a> </h2> <p><a href="registry.html#content"><code class="inline">Registry</code></a> has a dispatch mechanism that allows developers to implement custom dispatch logic triggered from the caller. For example, let's say we have a duplicate registry started as so:</p>
+<pre data-language="elixir">{:ok, _} = Registry.start_link(keys: :duplicate, name: Registry.DispatcherTest)</pre>
+<p>By calling <a href="#register/3"><code class="inline">register/3</code></a>, different processes can register under a given key and associate any value under that key. In this case, let's register the current process under the key <code class="inline">"hello"</code> and attach the <code class="inline">{IO, :inspect}</code> tuple to it:</p>
+<pre data-language="elixir">{:ok, _} = Registry.register(Registry.DispatcherTest, "hello", {IO, :inspect})</pre>
+<p>Now, an entity interested in dispatching events for a given key may call <a href="#dispatch/3"><code class="inline">dispatch/3</code></a> passing in the key and a callback. This callback will be invoked with a list of all the values registered under the requested key, alongside the PID of the process that registered each value, in the form of <code class="inline">{pid, value}</code> tuples. In our example, <code class="inline">value</code> will be the <code class="inline">{module, function}</code> tuple in the code above:</p>
+<pre data-language="elixir">Registry.dispatch(Registry.DispatcherTest, "hello", fn entries -&gt;
+  for {pid, {module, function}} &lt;- entries, do: apply(module, function, [pid])
+end)
+# Prints #PID&lt;...&gt; where the PID is for the process that called register/3 above
+#=&gt; :ok</pre>
+<p>Dispatching happens in the process that calls <a href="#dispatch/3"><code class="inline">dispatch/3</code></a> either serially or concurrently in case of multiple partitions (via spawned tasks). The registered processes are not involved in dispatching unless involving them is done explicitly (for example, by sending them a message in the callback).</p>
+<p>Furthermore, if there is a failure when dispatching, due to a bad registration, dispatching will always fail and the registered process will not be notified. Therefore let's make sure we at least wrap and report those errors:</p>
+<pre data-language="elixir">require Logger
+
+Registry.dispatch(Registry.DispatcherTest, "hello", fn entries -&gt;
+  for {pid, {module, function}} &lt;- entries do
+    try do
+      apply(module, function, [pid])
+    catch
+      kind, reason -&gt;
+        formatted = Exception.format(kind, reason, __STACKTRACE__)
+        Logger.error("Registry.dispatch/3 failed with #{formatted}")
+    end
+  end
+end)
+# Prints #PID&lt;...&gt;
+#=&gt; :ok</pre>
+<p>You could also replace the whole <code class="inline">apply</code> system by explicitly sending messages. That's the example we will see next.</p>
+<h2 id="module-using-as-a-pubsub" class="section-heading"> <a href="#module-using-as-a-pubsub">  Using as a PubSub </a> </h2> <p>Registries can also be used to implement a local, non-distributed, scalable PubSub by relying on the <a href="#dispatch/3"><code class="inline">dispatch/3</code></a> function, similarly to the previous section: in this case, however, we will send messages to each associated process, instead of invoking a given module-function.</p>
+<p>In this example, we will also set the number of partitions to the number of schedulers online, which will make the registry more performant on highly concurrent environments:</p>
+<pre data-language="elixir">{:ok, _} =
+  Registry.start_link(
+    keys: :duplicate,
+    name: Registry.PubSubTest,
+    partitions: System.schedulers_online()
+  )
+
+{:ok, _} = Registry.register(Registry.PubSubTest, "hello", [])
+
+Registry.dispatch(Registry.PubSubTest, "hello", fn entries -&gt;
+  for {pid, _} &lt;- entries, do: send(pid, {:broadcast, "world"})
+end)
+#=&gt; :ok</pre>
+<p>The example above broadcasted the message <code class="inline">{:broadcast, "world"}</code> to all processes registered under the "topic" (or "key" as we called it until now) <code class="inline">"hello"</code>.</p>
+<p>The third argument given to <a href="#register/3"><code class="inline">register/3</code></a> is a value associated to the current process. While in the previous section we used it when dispatching, in this particular example we are not interested in it, so we have set it to an empty list. You could store a more meaningful value if necessary.</p>
+<h2 id="module-registrations" class="section-heading"> <a href="#module-registrations">  Registrations </a> </h2> <p>Looking up, dispatching and registering are efficient and immediate at the cost of delayed unsubscription. For example, if a process crashes, its keys are automatically removed from the registry but the change may not propagate immediately. This means certain operations may return processes that are already dead. When such may happen, it will be explicitly stated in the function documentation.</p>
+<p>However, keep in mind those cases are typically not an issue. After all, a process referenced by a PID may crash at any time, including between getting the value from the registry and sending it a message. Many parts of the standard library are designed to cope with that, such as <a href="process.html#monitor/1"><code class="inline">Process.monitor/1</code></a> which will deliver the <code class="inline">:DOWN</code> message immediately if the monitored process is already dead and <a href="kernel.html#send/2"><code class="inline">send/2</code></a> which acts as a no-op for dead processes.</p>
+<h2 id="module-ets" class="section-heading"> <a href="#module-ets">  ETS </a> </h2> <p>Note that the registry uses one ETS table plus two ETS tables per partition.</p> </section> <section id="summary" class="details-list">  <h2> Types </h2>
+<dl class="summary-types summary">  <div class="summary-row"> <dt class="summary-signature"> <a href="#t:body/0" translate="no">body()</a> </dt> <dd class="summary-synopsis"><p>A pattern used to representing the output format part of a match spec</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:guard/0" translate="no">guard()</a> </dt> <dd class="summary-synopsis"><p>A guard to be evaluated when matching on objects in a registry</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:guards/0" translate="no">guards()</a> </dt> <dd class="summary-synopsis"><p>A list of guards to be evaluated when matching on objects in a registry</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:key/0" translate="no">key()</a> </dt> <dd class="summary-synopsis"><p>The type of keys allowed on registration</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:keys/0" translate="no">keys()</a> </dt> <dd class="summary-synopsis"><p>The type of the registry</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:listener_message/0" translate="no">listener_message()</a> </dt> <dd class="summary-synopsis"><p>The message that the registry sends to listeners when a process registers or unregisters.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:match_pattern/0" translate="no">match_pattern()</a> </dt> <dd class="summary-synopsis"><p>A pattern to match on objects in a registry</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:meta_key/0" translate="no">meta_key()</a> </dt> <dd class="summary-synopsis"><p>The type of registry metadata keys</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:meta_value/0" translate="no">meta_value()</a> </dt> <dd class="summary-synopsis"><p>The type of registry metadata values</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:registry/0" translate="no">registry()</a> </dt> <dd class="summary-synopsis"><p>The registry identifier</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:spec/0" translate="no">spec()</a> </dt> <dd class="summary-synopsis"><p>A full match spec used when selecting objects in the registry</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:start_option/0" translate="no">start_option()</a> </dt> <dd class="summary-synopsis"><p>Options used for <a href="#child_spec/1"><code class="inline">child_spec/1</code></a> and <a href="#start_link/1"><code class="inline">start_link/1</code></a></p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#t:value/0" translate="no">value()</a> </dt> <dd class="summary-synopsis"><p>The type of values allowed on registration</p></dd> </div> </dl> <h2> Functions </h2>
+<dl class="summary-functions summary">  <div class="summary-row"> <dt class="summary-signature"> <a href="#child_spec/1" translate="no">child_spec(options)</a> </dt> <dd class="summary-synopsis"><p>Returns a specification to start a registry under a supervisor.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#count/1" translate="no">count(registry)</a> </dt> <dd class="summary-synopsis"><p>Returns the number of registered keys in a registry. It runs in constant time.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#count_match/4" translate="no">count_match(registry, key, pattern, guards \\ [])</a> </dt> <dd class="summary-synopsis"><p>Returns the number of <code class="inline">{pid, value}</code> pairs under the given <code class="inline">key</code> in <code class="inline">registry</code> that match <code class="inline">pattern</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#count_select/2" translate="no">count_select(registry, spec)</a> </dt> <dd class="summary-synopsis"><p>Works like <a href="#select/2"><code class="inline">select/2</code></a>, but only returns the number of matching records.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#delete_meta/2" translate="no">delete_meta(registry, key)</a> </dt> <dd class="summary-synopsis"><p>Deletes registry metadata for the given <code class="inline">key</code> in <code class="inline">registry</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#dispatch/4" translate="no">dispatch(registry, key, mfa_or_fun, opts \\ [])</a> </dt> <dd class="summary-synopsis"><p>Invokes the callback with all entries under <code class="inline">key</code> in each partition for the given <code class="inline">registry</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#keys/2" translate="no">keys(registry, pid)</a> </dt> <dd class="summary-synopsis"><p>Returns the known keys for the given <code class="inline">pid</code> in <code class="inline">registry</code> in no particular order.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#lookup/2" translate="no">lookup(registry, key)</a> </dt> <dd class="summary-synopsis"><p>Finds the <code class="inline">{pid, value}</code> pair for the given <code class="inline">key</code> in <code class="inline">registry</code> in no particular order.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#match/4" translate="no">match(registry, key, pattern, guards \\ [])</a> </dt> <dd class="summary-synopsis"><p>Returns <code class="inline">{pid, value}</code> pairs under the given <code class="inline">key</code> in <code class="inline">registry</code> that match <code class="inline">pattern</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#meta/2" translate="no">meta(registry, key)</a> </dt> <dd class="summary-synopsis"><p>Reads registry metadata given on <a href="#start_link/1"><code class="inline">start_link/1</code></a>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#put_meta/3" translate="no">put_meta(registry, key, value)</a> </dt> <dd class="summary-synopsis"><p>Stores registry metadata.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#register/3" translate="no">register(registry, key, value)</a> </dt> <dd class="summary-synopsis"><p>Registers the current process under the given <code class="inline">key</code> in <code class="inline">registry</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#select/2" translate="no">select(registry, spec)</a> </dt> <dd class="summary-synopsis"><p>Select key, pid, and values registered using full match specs.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#start_link/1" translate="no">start_link(options)</a> </dt> <dd class="summary-synopsis"><p>Starts the registry as a supervisor process.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#unregister/2" translate="no">unregister(registry, key)</a> </dt> <dd class="summary-synopsis"><p>Unregisters all entries for the given <code class="inline">key</code> associated to the current process in <code class="inline">registry</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#unregister_match/4" translate="no">unregister_match(registry, key, pattern, guards \\ [])</a> </dt> <dd class="summary-synopsis"><p>Unregisters entries for keys matching a pattern associated to the current process in <code class="inline">registry</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#update_value/3" translate="no">update_value(registry, key, callback)</a> </dt> <dd class="summary-synopsis"><p>Updates the value for <code class="inline">key</code> for the current process in the unique <code class="inline">registry</code>.</p></dd> </div> <div class="summary-row"> <dt class="summary-signature"> <a href="#values/3" translate="no">values(registry, key, pid)</a> </dt> <dd class="summary-synopsis"><p>Reads the values for the given <code class="inline">key</code> for <code class="inline">pid</code> in <code class="inline">registry</code>.</p></dd> </div> </dl> </section> <section id="types" class="details-list">  <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:body/0">body()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L207" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type body() :: [term()]</pre> </div> <p>A pattern used to representing the output format part of a match spec</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:guard/0">guard()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L201" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type guard() :: atom() | tuple()</pre> </div> <p>A guard to be evaluated when matching on objects in a registry</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:guards/0">guards()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L204" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type guards() :: [guard()]</pre> </div> <p>A list of guards to be evaluated when matching on objects in a registry</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:key/0">key()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L186" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type key() :: term()</pre> </div> <p>The type of keys allowed on registration</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:keys/0">keys()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L183" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type keys() :: :unique | :duplicate</pre> </div> <p>The type of the registry</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:listener_message/0">listener_message()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L226" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type listener_message() ::
+  {:register, registry(), key(), registry_partition :: pid(), value()}
+  | {:unregister, registry(), key(), registry_partition :: pid()}</pre> </div> <p>The message that the registry sends to listeners when a process registers or unregisters.</p>
+<p>See the <code class="inline">:listeners</code> option in <a href="#start_link/1"><code class="inline">start_link/1</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:match_pattern/0">match_pattern()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L198" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type match_pattern() :: atom() | term()</pre> </div> <p>A pattern to match on objects in a registry</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:meta_key/0">meta_key()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L192" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type meta_key() :: atom() | tuple()</pre> </div> <p>The type of registry metadata keys</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:meta_value/0">meta_value()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L195" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type meta_value() :: term()</pre> </div> <p>The type of registry metadata values</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:registry/0">registry()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L180" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type registry() :: atom()</pre> </div> <p>The registry identifier</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:spec/0">spec()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L210" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type spec() :: [{match_pattern(), guards(), body()}]</pre> </div> <p>A full match spec used when selecting objects in the registry</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:start_option/0">start_option()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L213" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type start_option() ::
+  {:keys, keys()}
+  | {:name, registry()}
+  | {:partitions, pos_integer()}
+  | {:listeners, [atom()]}
+  | {:meta, [{meta_key(), meta_value()}]}</pre> </div> <p>Options used for <a href="#child_spec/1"><code class="inline">child_spec/1</code></a> and <a href="#start_link/1"><code class="inline">start_link/1</code></a></p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:value/0">value()<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L189" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@type value() :: term()</pre> </div> <p>The type of values allowed on registration</p> </section> </section> </div> </section> <section id="functions" class="details-list">  <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="child_spec/1">child_spec(options)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L400" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec child_spec([start_option()]) :: Supervisor.child_spec()</pre> </div> <p>Returns a specification to start a registry under a supervisor.</p>
+<p>See <a href="supervisor.html"><code class="inline">Supervisor</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="count/1">count(registry)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L1182" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec count(registry()) :: non_neg_integer()</pre> </div> <p>Returns the number of registered keys in a registry. It runs in constant time.</p>
+<h4 id="count/1-examples" class="section-heading"> <a href="#count/1-examples">  Examples </a> </h4> <p>In the example below we register the current process and ask for the number of keys in the registry:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.UniqueCountTest)
+iex&gt; Registry.count(Registry.UniqueCountTest)
+0
+iex&gt; {:ok, _} = Registry.register(Registry.UniqueCountTest, "hello", :world)
+iex&gt; {:ok, _} = Registry.register(Registry.UniqueCountTest, "world", :world)
+iex&gt; Registry.count(Registry.UniqueCountTest)
+2</pre>
+<p>The same applies to duplicate registries:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :duplicate, name: Registry.DuplicateCountTest)
+iex&gt; Registry.count(Registry.DuplicateCountTest)
+0
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateCountTest, "hello", :world)
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateCountTest, "hello", :world)
+iex&gt; Registry.count(Registry.DuplicateCountTest)
+2</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="count_match/4">count_match(registry, key, pattern, guards \\ [])<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L1247" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec count_match(registry(), key(), match_pattern(), guards()) :: non_neg_integer()</pre> </div> <p>Returns the number of <code class="inline">{pid, value}</code> pairs under the given <code class="inline">key</code> in <code class="inline">registry</code> that match <code class="inline">pattern</code>.</p>
+<p>Pattern must be an atom or a tuple that will match the structure of the value stored in the registry. The atom <code class="inline">:_</code> can be used to ignore a given value or tuple element, while the atom <code class="inline">:"$1"</code> can be used to temporarily assign part of pattern to a variable for a subsequent comparison.</p>
+<p>Optionally, it is possible to pass a list of guard conditions for more precise matching. Each guard is a tuple, which describes checks that should be passed by assigned part of pattern. For example the <code class="inline">$1 &gt; 1</code> guard condition would be expressed as the <code class="inline">{:&gt;, :"$1", 1}</code> tuple. Please note that guard conditions will work only for assigned variables like <code class="inline">:"$1"</code>, <code class="inline">:"$2"</code>, and so forth. Avoid usage of special match variables <code class="inline">:"$_"</code> and <code class="inline">:"$$"</code>, because it might not work as expected.</p>
+<p>Zero will be returned if there is no match.</p>
+<p>For unique registries, a single partition lookup is necessary. For duplicate registries, all partitions must be looked up.</p>
+<h4 id="count_match/4-examples" class="section-heading"> <a href="#count_match/4-examples">  Examples </a> </h4> <p>In the example below we register the current process under the same key in a duplicate registry but with different values:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :duplicate, name: Registry.CountMatchTest)
+iex&gt; {:ok, _} = Registry.register(Registry.CountMatchTest, "hello", {1, :atom, 1})
+iex&gt; {:ok, _} = Registry.register(Registry.CountMatchTest, "hello", {2, :atom, 2})
+iex&gt; Registry.count_match(Registry.CountMatchTest, "hello", {1, :_, :_})
+1
+iex&gt; Registry.count_match(Registry.CountMatchTest, "hello", {2, :_, :_})
+1
+iex&gt; Registry.count_match(Registry.CountMatchTest, "hello", {:_, :atom, :_})
+2
+iex&gt; Registry.count_match(Registry.CountMatchTest, "hello", {:"$1", :_, :"$1"})
+2
+iex&gt; Registry.count_match(Registry.CountMatchTest, "hello", {:_, :_, :"$1"}, [{:&gt;, :"$1", 1}])
+1
+iex&gt; Registry.count_match(Registry.CountMatchTest, "hello", {:_, :"$1", :_}, [{:is_atom, :"$1"}])
+2</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="count_select/2">count_select(registry, spec)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L1349" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec count_select(registry(), spec()) :: non_neg_integer()</pre> </div> <p>Works like <a href="#select/2"><code class="inline">select/2</code></a>, but only returns the number of matching records.</p>
+<h4 id="count_select/2-examples" class="section-heading"> <a href="#count_select/2-examples">  Examples </a> </h4> <p>In the example below we register the current process under different keys in a unique registry but with the same value:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.CountSelectTest)
+iex&gt; {:ok, _} = Registry.register(Registry.CountSelectTest, "hello", :value)
+iex&gt; {:ok, _} = Registry.register(Registry.CountSelectTest, "world", :value)
+iex&gt; Registry.count_select(Registry.CountSelectTest, [{{:_, :_, :value}, [], [true]}])
+2</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="delete_meta/2">delete_meta(registry, key)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L1143" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec delete_meta(registry(), meta_key()) :: :ok</pre> </div> <p>Deletes registry metadata for the given <code class="inline">key</code> in <code class="inline">registry</code>.</p>
+<h4 id="delete_meta/2-examples" class="section-heading"> <a href="#delete_meta/2-examples">  Examples </a> </h4> <pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.DeleteMetaTest)
+iex&gt; Registry.put_meta(Registry.DeleteMetaTest, :custom_key, "custom_value")
+:ok
+iex&gt; Registry.meta(Registry.DeleteMetaTest, :custom_key)
+{:ok, "custom_value"}
+iex&gt; Registry.delete_meta(Registry.DeleteMetaTest, :custom_key)
+:ok
+iex&gt; Registry.meta(Registry.DeleteMetaTest, :custom_key)
+:error</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="dispatch/4">dispatch(registry, key, mfa_or_fun, opts \\ [])<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L475" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec dispatch(registry(), key(), dispatcher, keyword()) :: :ok
+when dispatcher:
+       (entries :: [{pid(), value()}] -&gt; term()) | {module(), atom(), [any()]}</pre> </div> <p>Invokes the callback with all entries under <code class="inline">key</code> in each partition for the given <code class="inline">registry</code>.</p>
+<p>The list of <code class="inline">entries</code> is a non-empty list of two-element tuples where the first element is the PID and the second element is the value associated to the PID. If there are no entries for the given key, the callback is never invoked.</p>
+<p>If the registry is partitioned, the callback is invoked multiple times per partition. If the registry is partitioned and <code class="inline">parallel: true</code> is given as an option, the dispatching happens in parallel. In both cases, the callback is only invoked if there are entries for that partition.</p>
+<p>See the module documentation for examples of using the <a href="#dispatch/3"><code class="inline">dispatch/3</code></a> function for building custom dispatching or a pubsub system.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="keys/2">keys(registry, pid)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L711" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec keys(registry(), pid()) :: [key()]</pre> </div> <p>Returns the known keys for the given <code class="inline">pid</code> in <code class="inline">registry</code> in no particular order.</p>
+<p>If the registry is unique, the keys are unique. Otherwise they may contain duplicates if the process was registered under the same key multiple times. The list will be empty if the process is dead or it has no keys in this registry.</p>
+<h4 id="keys/2-examples" class="section-heading"> <a href="#keys/2-examples">  Examples </a> </h4> <p>Registering under a unique registry does not allow multiple entries:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.UniqueKeysTest)
+iex&gt; Registry.keys(Registry.UniqueKeysTest, self())
+[]
+iex&gt; {:ok, _} = Registry.register(Registry.UniqueKeysTest, "hello", :world)
+iex&gt; Registry.register(Registry.UniqueKeysTest, "hello", :later) # registry is :unique
+{:error, {:already_registered, self()}}
+iex&gt; Registry.keys(Registry.UniqueKeysTest, self())
+["hello"]</pre>
+<p>Such is possible for duplicate registries though:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :duplicate, name: Registry.DuplicateKeysTest)
+iex&gt; Registry.keys(Registry.DuplicateKeysTest, self())
+[]
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateKeysTest, "hello", :world)
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateKeysTest, "hello", :world)
+iex&gt; Registry.keys(Registry.DuplicateKeysTest, self())
+["hello", "hello"]</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="lookup/2">lookup(registry, key)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L589" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec lookup(registry(), key()) :: [{pid(), value()}]</pre> </div> <p>Finds the <code class="inline">{pid, value}</code> pair for the given <code class="inline">key</code> in <code class="inline">registry</code> in no particular order.</p>
+<p>An empty list if there is no match.</p>
+<p>For unique registries, a single partition lookup is necessary. For duplicate registries, all partitions must be looked up.</p>
+<h4 id="lookup/2-examples" class="section-heading"> <a href="#lookup/2-examples">  Examples </a> </h4> <p>In the example below we register the current process and look it up both from itself and other processes:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.UniqueLookupTest)
+iex&gt; Registry.lookup(Registry.UniqueLookupTest, "hello")
+[]
+iex&gt; {:ok, _} = Registry.register(Registry.UniqueLookupTest, "hello", :world)
+iex&gt; Registry.lookup(Registry.UniqueLookupTest, "hello")
+[{self(), :world}]
+iex&gt; Task.async(fn -&gt; Registry.lookup(Registry.UniqueLookupTest, "hello") end) |&gt; Task.await()
+[{self(), :world}]</pre>
+<p>The same applies to duplicate registries:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :duplicate, name: Registry.DuplicateLookupTest)
+iex&gt; Registry.lookup(Registry.DuplicateLookupTest, "hello")
+[]
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateLookupTest, "hello", :world)
+iex&gt; Registry.lookup(Registry.DuplicateLookupTest, "hello")
+[{self(), :world}]
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateLookupTest, "hello", :another)
+iex&gt; Enum.sort(Registry.lookup(Registry.DuplicateLookupTest, "hello"))
+[{self(), :another}, {self(), :world}]</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="match/4">match(registry, key, pattern, guards \\ [])<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L658" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec match(registry(), key(), match_pattern(), guards()) :: [{pid(), term()}]</pre> </div> <p>Returns <code class="inline">{pid, value}</code> pairs under the given <code class="inline">key</code> in <code class="inline">registry</code> that match <code class="inline">pattern</code>.</p>
+<p>Pattern must be an atom or a tuple that will match the structure of the value stored in the registry. The atom <code class="inline">:_</code> can be used to ignore a given value or tuple element, while the atom <code class="inline">:"$1"</code> can be used to temporarily assign part of pattern to a variable for a subsequent comparison.</p>
+<p>Optionally, it is possible to pass a list of guard conditions for more precise matching. Each guard is a tuple, which describes checks that should be passed by assigned part of pattern. For example the <code class="inline">$1 &gt; 1</code> guard condition would be expressed as the <code class="inline">{:&gt;, :"$1", 1}</code> tuple. Please note that guard conditions will work only for assigned variables like <code class="inline">:"$1"</code>, <code class="inline">:"$2"</code>, and so forth. Avoid usage of special match variables <code class="inline">:"$_"</code> and <code class="inline">:"$$"</code>, because it might not work as expected.</p>
+<p>An empty list will be returned if there is no match.</p>
+<p>For unique registries, a single partition lookup is necessary. For duplicate registries, all partitions must be looked up.</p>
+<h4 id="match/4-examples" class="section-heading"> <a href="#match/4-examples">  Examples </a> </h4> <p>In the example below we register the current process under the same key in a duplicate registry but with different values:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :duplicate, name: Registry.MatchTest)
+iex&gt; {:ok, _} = Registry.register(Registry.MatchTest, "hello", {1, :atom, 1})
+iex&gt; {:ok, _} = Registry.register(Registry.MatchTest, "hello", {2, :atom, 2})
+iex&gt; Registry.match(Registry.MatchTest, "hello", {1, :_, :_})
+[{self(), {1, :atom, 1}}]
+iex&gt; Registry.match(Registry.MatchTest, "hello", {2, :_, :_})
+[{self(), {2, :atom, 2}}]
+iex&gt; Registry.match(Registry.MatchTest, "hello", {:_, :atom, :_}) |&gt; Enum.sort()
+[{self(), {1, :atom, 1}}, {self(), {2, :atom, 2}}]
+iex&gt; Registry.match(Registry.MatchTest, "hello", {:"$1", :_, :"$1"}) |&gt; Enum.sort()
+[{self(), {1, :atom, 1}}, {self(), {2, :atom, 2}}]
+iex&gt; guards = [{:&gt;, :"$1", 1}]
+iex&gt; Registry.match(Registry.MatchTest, "hello", {:_, :_, :"$1"}, guards)
+[{self(), {2, :atom, 2}}]
+iex&gt; guards = [{:is_atom, :"$1"}]
+iex&gt; Registry.match(Registry.MatchTest, "hello", {:_, :"$1", :_}, guards) |&gt; Enum.sort()
+[{self(), {1, :atom, 1}}, {self(), {2, :atom, 2}}]</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="meta/2">meta(registry, key)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L1081" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec meta(registry(), meta_key()) :: {:ok, meta_value()} | :error</pre> </div> <p>Reads registry metadata given on <a href="#start_link/1"><code class="inline">start_link/1</code></a>.</p>
+<p>Atoms and tuples are allowed as keys.</p>
+<h4 id="meta/2-examples" class="section-heading"> <a href="#meta/2-examples">  Examples </a> </h4> <pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.MetaTest, meta: [custom_key: "custom_value"])
+iex&gt; Registry.meta(Registry.MetaTest, :custom_key)
+{:ok, "custom_value"}
+iex&gt; Registry.meta(Registry.MetaTest, :unknown_key)
+:error</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="put_meta/3">put_meta(registry, key, value)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L1115" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec put_meta(registry(), meta_key(), meta_value()) :: :ok</pre> </div> <p>Stores registry metadata.</p>
+<p>Atoms and tuples are allowed as keys.</p>
+<h4 id="put_meta/3-examples" class="section-heading"> <a href="#put_meta/3-examples">  Examples </a> </h4> <pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.PutMetaTest)
+iex&gt; Registry.put_meta(Registry.PutMetaTest, :custom_key, "custom_value")
+:ok
+iex&gt; Registry.meta(Registry.PutMetaTest, :custom_key)
+{:ok, "custom_value"}
+iex&gt; Registry.put_meta(Registry.PutMetaTest, {:tuple, :key}, "tuple_value")
+:ok
+iex&gt; Registry.meta(Registry.PutMetaTest, {:tuple, :key})
+{:ok, "tuple_value"}</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="register/3">register(registry, key, value)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L1005" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec register(registry(), key(), value()) ::
+  {:ok, pid()} | {:error, {:already_registered, pid()}}</pre> </div> <p>Registers the current process under the given <code class="inline">key</code> in <code class="inline">registry</code>.</p>
+<p>A value to be associated with this registration must also be given. This value will be retrieved whenever dispatching or doing a key lookup.</p>
+<p>This function returns <code class="inline">{:ok, owner}</code> or <code class="inline">{:error, reason}</code>. The <code class="inline">owner</code> is the PID in the registry partition responsible for the PID. The owner is automatically linked to the caller.</p>
+<p>If the registry has unique keys, it will return <code class="inline">{:ok, owner}</code> unless the key is already associated to a PID, in which case it returns <code class="inline">{:error, {:already_registered, pid}}</code>.</p>
+<p>If the registry has duplicate keys, multiple registrations from the current process under the same key are allowed.</p>
+<p>If the registry has listeners specified via the <code class="inline">:listeners</code> option in <a href="#start_link/1"><code class="inline">start_link/1</code></a>, those listeners will be notified of the registration and will receive a message of type <a href="#t:listener_message/0"><code class="inline">listener_message/0</code></a>.</p>
+<h4 id="register/3-examples" class="section-heading"> <a href="#register/3-examples">  Examples </a> </h4> <p>Registering under a unique registry does not allow multiple entries:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.UniqueRegisterTest)
+iex&gt; {:ok, _} = Registry.register(Registry.UniqueRegisterTest, "hello", :world)
+iex&gt; Registry.register(Registry.UniqueRegisterTest, "hello", :later)
+{:error, {:already_registered, self()}}
+iex&gt; Registry.keys(Registry.UniqueRegisterTest, self())
+["hello"]</pre>
+<p>Such is possible for duplicate registries though:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :duplicate, name: Registry.DuplicateRegisterTest)
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateRegisterTest, "hello", :world)
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateRegisterTest, "hello", :world)
+iex&gt; Registry.keys(Registry.DuplicateRegisterTest, self())
+["hello", "hello"]</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="select/2">select(registry, spec)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L1318" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec select(registry(), spec()) :: [term()]</pre> </div> <p>Select key, pid, and values registered using full match specs.</p>
+<p>The <code class="inline">spec</code> consists of a list of three part tuples, in the shape of <code class="inline">[{match_pattern, guards, body}]</code>.</p>
+<p>The first part, the match pattern, must be a tuple that will match the structure of the the data stored in the registry, which is <code class="inline">{key, pid, value}</code>. The atom <code class="inline">:_</code> can be used to ignore a given value or tuple element, while the atom <code class="inline">:"$1"</code> can be used to temporarily assign part of pattern to a variable for a subsequent comparison. This can be combined like <code class="inline">{:"$1", :_, :_}</code>.</p>
+<p>The second part, the guards, is a list of conditions that allow filtering the results. Each guard is a tuple, which describes checks that should be passed by assigned part of pattern. For example the <code class="inline">$1 &gt; 1</code> guard condition would be expressed as the <code class="inline">{:&gt;, :"$1", 1}</code> tuple. Please note that guard conditions will work only for assigned variables like <code class="inline">:"$1"</code>, <code class="inline">:"$2"</code>, and so forth.</p>
+<p>The third part, the body, is a list of shapes of the returned entries. Like guards, you have access to assigned variables like <code class="inline">:"$1"</code>, which you can combine with hardcoded values to freely shape entries Note that tuples have to be wrapped in an additional tuple. To get a result format like <code class="inline">%{key: key, pid: pid, value: value}</code>, assuming you bound those variables in order in the match part, you would provide a body like <code class="inline">[%{key: :"$1", pid: :"$2", value: :"$3"}]</code>. Like guards, you can use some operations like <code class="inline">:element</code> to modify the output format.</p>
+<p>Do not use special match variables <code class="inline">:"$_"</code> and <code class="inline">:"$$"</code>, because they might not work as expected.</p>
+<p>Note that for large registries with many partitions this will be costly as it builds the result by concatenating all the partitions.</p>
+<h4 id="select/2-examples" class="section-heading"> <a href="#select/2-examples">  Examples </a> </h4> <p>This example shows how to get everything from the registry:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.SelectAllTest)
+iex&gt; {:ok, _} = Registry.register(Registry.SelectAllTest, "hello", :value)
+iex&gt; {:ok, _} = Registry.register(Registry.SelectAllTest, "world", :value)
+iex&gt; Registry.select(Registry.SelectAllTest, [{{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}])
+[{"world", self(), :value}, {"hello", self(), :value}]</pre>
+<p>Get all keys in the registry:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.SelectAllTest)
+iex&gt; {:ok, _} = Registry.register(Registry.SelectAllTest, "hello", :value)
+iex&gt; {:ok, _} = Registry.register(Registry.SelectAllTest, "world", :value)
+iex&gt; Registry.select(Registry.SelectAllTest, [{{:"$1", :_, :_}, [], [:"$1"]}])
+["world", "hello"]</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_link/1">start_link(options)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L331" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec start_link([start_option()]) :: {:ok, pid()} | {:error, term()}</pre> </div> <p>Starts the registry as a supervisor process.</p>
+<p>Manually it can be started as:</p>
+<pre data-language="elixir">Registry.start_link(keys: :unique, name: MyApp.Registry)</pre>
+<p>In your supervisor tree, you would write:</p>
+<pre data-language="elixir">Supervisor.start_link([
+  {Registry, keys: :unique, name: MyApp.Registry}
+], strategy: :one_for_one)</pre>
+<p>For intensive workloads, the registry may also be partitioned (by specifying the <code class="inline">:partitions</code> option). If partitioning is required then a good default is to set the number of partitions to the number of schedulers available:</p>
+<pre data-language="elixir">Registry.start_link(
+  keys: :unique,
+  name: MyApp.Registry,
+  partitions: System.schedulers_online()
+)</pre>
+<p>or:</p>
+<pre data-language="elixir">Supervisor.start_link([
+  {Registry, keys: :unique, name: MyApp.Registry, partitions: System.schedulers_online()}
+], strategy: :one_for_one)</pre>
+<h4 id="start_link/1-options" class="section-heading"> <a href="#start_link/1-options">  Options </a> </h4> <p>The registry requires the following keys:</p>
+<ul>
+<li>
+<code class="inline">:keys</code> - chooses if keys are <code class="inline">:unique</code> or <code class="inline">:duplicate</code>
+</li>
+<li>
+<code class="inline">:name</code> - the name of the registry and its tables</li>
+</ul>
+<p>The following keys are optional:</p>
+<ul>
+<li>
+<code class="inline">:partitions</code> - the number of partitions in the registry. Defaults to <code class="inline">1</code>.</li>
+<li>
+<code class="inline">:listeners</code> - a list of named processes which are notified of register and unregister events. The registered process must be monitored by the listener if the listener wants to be notified if the registered process crashes. Messages sent to listeners are of type <a href="#t:listener_message/0"><code class="inline">listener_message/0</code></a>.</li>
+<li>
+<code class="inline">:meta</code> - a keyword list of metadata to be attached to the registry.</li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="unregister/2">unregister(registry, key)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L846" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec unregister(registry(), key()) :: :ok</pre> </div> <p>Unregisters all entries for the given <code class="inline">key</code> associated to the current process in <code class="inline">registry</code>.</p>
+<p>Always returns <code class="inline">:ok</code> and automatically unlinks the current process from the owner if there are no more keys associated to the current process. See also <a href="#register/3"><code class="inline">register/3</code></a> to read more about the "owner".</p>
+<p>If the registry has listeners specified via the <code class="inline">:listeners</code> option in <a href="#start_link/1"><code class="inline">start_link/1</code></a>, those listeners will be notified of the unregistration and will receive a message of type <a href="#t:listener_message/0"><code class="inline">listener_message/0</code></a>.</p>
+<h4 id="unregister/2-examples" class="section-heading"> <a href="#unregister/2-examples">  Examples </a> </h4> <p>For unique registries:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.UniqueUnregisterTest)
+iex&gt; Registry.register(Registry.UniqueUnregisterTest, "hello", :world)
+iex&gt; Registry.keys(Registry.UniqueUnregisterTest, self())
+["hello"]
+iex&gt; Registry.unregister(Registry.UniqueUnregisterTest, "hello")
+:ok
+iex&gt; Registry.keys(Registry.UniqueUnregisterTest, self())
+[]</pre>
+<p>For duplicate registries:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :duplicate, name: Registry.DuplicateUnregisterTest)
+iex&gt; Registry.register(Registry.DuplicateUnregisterTest, "hello", :world)
+iex&gt; Registry.register(Registry.DuplicateUnregisterTest, "hello", :world)
+iex&gt; Registry.keys(Registry.DuplicateUnregisterTest, self())
+["hello", "hello"]
+iex&gt; Registry.unregister(Registry.DuplicateUnregisterTest, "hello")
+:ok
+iex&gt; Registry.keys(Registry.DuplicateUnregisterTest, self())
+[]</pre> </section> </section> <section class="detail">  <h3 class="detail-header" id="unregister_match/4">unregister_match(registry, key, pattern, guards \\ [])<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L908" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec unregister_match(registry(), key(), match_pattern(), guards()) :: :ok</pre> </div> <p>Unregisters entries for keys matching a pattern associated to the current process in <code class="inline">registry</code>.</p>
+<h4 id="unregister_match/4-examples" class="section-heading"> <a href="#unregister_match/4-examples">  Examples </a> </h4> <p>For unique registries it can be used to conditionally unregister a key on the basis of whether or not it matches a particular value.</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.UniqueUnregisterMatchTest)
+iex&gt; Registry.register(Registry.UniqueUnregisterMatchTest, "hello", :world)
+iex&gt; Registry.keys(Registry.UniqueUnregisterMatchTest, self())
+["hello"]
+iex&gt; Registry.unregister_match(Registry.UniqueUnregisterMatchTest, "hello", :foo)
+:ok
+iex&gt; Registry.keys(Registry.UniqueUnregisterMatchTest, self())
+["hello"]
+iex&gt; Registry.unregister_match(Registry.UniqueUnregisterMatchTest, "hello", :world)
+:ok
+iex&gt; Registry.keys(Registry.UniqueUnregisterMatchTest, self())
+[]</pre>
+<p>For duplicate registries:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :duplicate, name: Registry.DuplicateUnregisterMatchTest)
+iex&gt; Registry.register(Registry.DuplicateUnregisterMatchTest, "hello", :world_a)
+iex&gt; Registry.register(Registry.DuplicateUnregisterMatchTest, "hello", :world_b)
+iex&gt; Registry.register(Registry.DuplicateUnregisterMatchTest, "hello", :world_c)
+iex&gt; Registry.keys(Registry.DuplicateUnregisterMatchTest, self())
+["hello", "hello", "hello"]
+iex&gt; Registry.unregister_match(Registry.DuplicateUnregisterMatchTest, "hello", :world_a)
+:ok
+iex&gt; Registry.keys(Registry.DuplicateUnregisterMatchTest, self())
+["hello", "hello"]
+iex&gt; Registry.lookup(Registry.DuplicateUnregisterMatchTest, "hello")
+[{self(), :world_b}, {self(), :world_c}]</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="update_value/3">update_value(registry, key, callback)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L431" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec update_value(registry(), key(), (value() -&gt; value())) ::
+  {new_value :: term(), old_value :: term()} | :error</pre> </div> <p>Updates the value for <code class="inline">key</code> for the current process in the unique <code class="inline">registry</code>.</p>
+<p>Returns a <code class="inline">{new_value, old_value}</code> tuple or <code class="inline">:error</code> if there is no such key assigned to the current process.</p>
+<p>If a non-unique registry is given, an error is raised.</p>
+<h4 id="update_value/3-examples" class="section-heading"> <a href="#update_value/3-examples">  Examples </a> </h4> <pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.UpdateTest)
+iex&gt; {:ok, _} = Registry.register(Registry.UpdateTest, "hello", 1)
+iex&gt; Registry.lookup(Registry.UpdateTest, "hello")
+[{self(), 1}]
+iex&gt; Registry.update_value(Registry.UpdateTest, "hello", &amp;(&amp;1 + 1))
+{2, 1}
+iex&gt; Registry.lookup(Registry.UpdateTest, "hello")
+[{self(), 2}]</pre> </section> </section> <section class="detail"> <h3 class="detail-header" id="values/3">values(registry, key, pid)<a href="https://github.com/elixir-lang/elixir/blob/v1.15.4/lib/elixir/lib/registry.ex#L787" class="source">Source</a>
+</h3> <section class="docstring"> <div class="specs"> <pre translate="no" data-language="elixir">@spec values(registry(), key(), pid()) :: [value()]</pre> </div> <p>Reads the values for the given <code class="inline">key</code> for <code class="inline">pid</code> in <code class="inline">registry</code>.</p>
+<p>For unique registries, it is either an empty list or a list with a single element. For duplicate registries, it is a list with zero, one, or multiple elements.</p>
+<h4 id="values/3-examples" class="section-heading"> <a href="#values/3-examples">  Examples </a> </h4> <p>In the example below we register the current process and look it up both from itself and other processes:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :unique, name: Registry.UniqueLookupTest)
+iex&gt; Registry.values(Registry.UniqueLookupTest, "hello", self())
+[]
+iex&gt; {:ok, _} = Registry.register(Registry.UniqueLookupTest, "hello", :world)
+iex&gt; Registry.values(Registry.UniqueLookupTest, "hello", self())
+[:world]
+iex&gt; Task.async(fn -&gt; Registry.values(Registry.UniqueLookupTest, "hello", self()) end) |&gt; Task.await()
+[]
+iex&gt; parent = self()
+iex&gt; Task.async(fn -&gt; Registry.values(Registry.UniqueLookupTest, "hello", parent) end) |&gt; Task.await()
+[:world]</pre>
+<p>The same applies to duplicate registries:</p>
+<pre data-language="elixir">iex&gt; Registry.start_link(keys: :duplicate, name: Registry.DuplicateLookupTest)
+iex&gt; Registry.values(Registry.DuplicateLookupTest, "hello", self())
+[]
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateLookupTest, "hello", :world)
+iex&gt; Registry.values(Registry.DuplicateLookupTest, "hello", self())
+[:world]
+iex&gt; {:ok, _} = Registry.register(Registry.DuplicateLookupTest, "hello", :another)
+iex&gt; Enum.sort(Registry.values(Registry.DuplicateLookupTest, "hello", self()))
+[:another, :world]</pre> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012 Plataformatec<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/elixir/1.15.4/Registry.html" class="_attribution-link">https://hexdocs.pm/elixir/1.15.4/Registry.html</a>
+  </p>
+</div>

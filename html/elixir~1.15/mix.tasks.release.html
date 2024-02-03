@@ -1,0 +1,436 @@
+<h1>   <span translate="no">mix release</span>  </h1> <section id="moduledoc"> <p>Assembles a self-contained release for the current project:</p>
+<pre data-language="elixir">$ MIX_ENV=prod mix release
+$ MIX_ENV=prod mix release NAME
+</pre>
+<p>Once a release is assembled, it can be packaged and deployed to a target, as long as the target runs on the same operating system (OS) distribution and version as the machine running the <a href="mix.tasks.release.html#content"><code class="inline">mix release</code></a> command.</p>
+<p>A release can be configured in your <code class="inline">mix.exs</code> file under the <code class="inline">:releases</code> key inside <code class="inline">def project</code>:</p>
+<pre data-language="elixir">def project do
+  [
+    releases: [
+      demo: [
+        include_executables_for: [:unix],
+        applications: [runtime_tools: :permanent]
+      ],
+
+      ...
+    ]
+  ]
+end</pre>
+<p>You can specify multiple releases where the key is the release name and the value is a keyword list with the release configuration. Releasing a certain name is done with:</p>
+<pre data-language="elixir">$ MIX_ENV=prod mix release demo
+</pre>
+<p>If the given name does not exist, an error is raised.</p>
+<p>If <a href="mix.tasks.release.html#content"><code class="inline">mix release</code></a> is invoked, without specifying a release name, and there are multiple releases configured, an error will be raised unless you set <code class="inline">default_release: NAME</code> at the root of your project configuration.</p>
+<p>If <a href="mix.tasks.release.html#content"><code class="inline">mix release</code></a> is invoked and there are no releases configured, a release is assembled using the application name and default values.</p>
+<h2 id="module-why-releases" class="section-heading"> <a href="#module-why-releases">  Why releases? </a> </h2> <p>Releases allow developers to precompile and package all of their code and the runtime into a single unit. The benefits of releases are:</p>
+<ul>
+<li><p>Code preloading. The VM has two mechanisms for loading code: interactive and embedded. By default, it runs in the interactive mode which dynamically loads modules when they are used for the first time. The first time your application calls <a href="https://hexdocs.pm/elixir/1.15/Enum.html#map/2"><code class="inline">Enum.map/2</code></a>, the VM will find the <a href="https://hexdocs.pm/elixir/1.15/Enum.html"><code class="inline">Enum</code></a> module and load it. There's a downside: when you start a new server in production, it may need to load many other modules, causing the first requests to have an unusual spike in response time. With releases, the system preloads all modules and guarantees your system is ready to handle requests after booting.</p></li>
+<li><p>Configuration and customization. Releases give developers fine grained control over system configuration and the VM flags used to start the system.</p></li>
+<li><p>Self-contained. A release does not require the source code to be included in your production artifacts. All of the code is precompiled and packaged. Releases do not even require Erlang or Elixir in your servers, as it includes the Erlang VM and its runtime by default. Furthermore, both Erlang and Elixir standard libraries are stripped to bring only the parts you are actually using.</p></li>
+<li><p>Multiple releases. You can assemble different releases with different configuration per application or even with different applications altogether.</p></li>
+<li><p>Management scripts. Releases come with scripts to start, restart, connect to the running system remotely, execute RPC calls, run as daemon, run as a Windows service, and more.</p></li>
+</ul>
+<h2 id="module-running-the-release" class="section-heading"> <a href="#module-running-the-release">  Running the release </a> </h2> <p>Once a release is assembled, you can start it by calling <code class="inline">bin/RELEASE_NAME start</code> inside the release. In production, you would do:</p>
+<pre data-language="elixir">$ MIX_ENV=prod mix release
+$ _build/prod/rel/my_app/bin/my_app start
+</pre>
+<p><code class="inline">bin/my_app start</code> will start the system connected to the current standard input/output, where logs are also written to by default. This is the preferred way to run the system. Many tools, such as <code class="inline">systemd</code>, platforms as a service, such as Heroku, and many containers platforms, such as Docker, are capable of processing the standard input/output and redirecting the log contents elsewhere. Those tools and platforms also take care of restarting the system in case it crashes.</p>
+<p>You can also execute one-off commands, run the release as a daemon on Unix-like system, or install it as a service on Windows. We will take a look at those next. You can also list all available commands by invoking <code class="inline">bin/RELEASE_NAME</code>.</p>
+<h3 id="module-one-off-commands-eval-and-rpc" class="section-heading"> <a href="#module-one-off-commands-eval-and-rpc">  One-off commands (eval and rpc) </a> </h3> <p>If you want to invoke specific modules and functions in your release, you can do so in two ways: using <code class="inline">eval</code> or <code class="inline">rpc</code>.</p>
+<pre data-language="elixir">$ bin/RELEASE_NAME eval "IO.puts(:hello)"
+$ bin/RELEASE_NAME rpc "IO.puts(:hello)"
+</pre>
+<p>The <code class="inline">eval</code> command starts its own instance of the VM but without starting any of the applications in the release and without starting distribution. For example, if you need to do some prep work before running the actual system, like migrating your database, <code class="inline">eval</code> can be a good fit. Just keep in mind any application you may use during eval has to be explicitly loaded and/or started.</p>
+<p>You can start an application by calling <a href="https://hexdocs.pm/elixir/1.15/Application.html#ensure_all_started/1"><code class="inline">Application.ensure_all_started/1</code></a>. However, if for some reason you cannot start an application, maybe because it will run other services you do not want, you must at least load the application by calling <a href="https://hexdocs.pm/elixir/1.15/Application.html#load/1"><code class="inline">Application.load/1</code></a>. If you don't load the application, any attempt at reading its environment or configuration may fail. Note that if you start an application, it is automatically loaded before started.</p>
+<p>Another way to run commands is with <code class="inline">rpc</code>, which will connect to the system currently running and instruct it to execute the given expression. This means you need to guarantee the system was already started and be careful with the instructions you are executing. You can also use <code class="inline">remote</code> to connect a remote IEx session to the system.</p>
+<h4>Helper module</h4>
+<p>As you operate your system, you may find yourself running some piece of code as a one-off command quite often. You may consider creating a module to group these tasks:</p>
+<pre data-language="elixir"># lib/my_app/release_tasks.ex
+defmodule MyApp.ReleaseTasks do
+  def eval_purge_stale_data() do
+    # Eval commands needs to start the app before
+    # Or Application.load(:my_app) if you can't start it
+    Application.ensure_all_started(:my_app)
+
+    # Code that purges stale data
+    ...
+  end
+
+  def rpc_print_connected_users() do
+    # Code that print users connected to the current running system
+    ...
+  end
+end</pre>
+<p>In the example above, we prefixed the function names with the command name used to execute them, but that is entirely optional.</p>
+<p>And to run them:</p>
+<pre data-language="elixir">$ bin/RELEASE_NAME eval "MyApp.ReleaseTasks.eval_purge_stale_data()"
+$ bin/RELEASE_NAME rpc "MyApp.ReleaseTasks.rpc_print_connected_users()"
+</pre>
+<h3 id="module-daemon-mode-unix-like" class="section-heading"> <a href="#module-daemon-mode-unix-like">  Daemon mode (Unix-like) </a> </h3> <p>You can run the release in daemon mode with the command:</p>
+<pre data-language="elixir">$ bin/RELEASE_NAME daemon
+</pre>
+<p>In daemon mode, the system is started on the background via <a href="https://www.erlang.org/doc/man/run_erl.html"><code class="inline">run_erl</code></a>. You may also want to enable <a href="https://www.erlang.org/doc/man/heart.html"><code class="inline">heart</code></a> in daemon mode so it automatically restarts the system in case of crashes. See the generated <code class="inline">releases/RELEASE_VSN/env.sh</code> file.</p>
+<p>The daemon will write all of its standard output to the "tmp/log/" directory in the release root. You can watch the log file by doing <code class="inline">tail -f tmp/log/erlang.log.1</code> or similar. Once files get too large, the index suffix will be incremented. A developer can also attach to the standard input of the daemon by invoking "to_erl tmp/pipe/" from the release root. However, note that attaching to the system should be done with extreme care, since the usual commands for exiting an Elixir system, such as hitting Ctrl+C twice or Ctrl+\, will actually shut down the daemon. Therefore, using <code class="inline">bin/RELEASE_NAME remote</code> should be preferred, even in daemon mode.</p>
+<p>You can customize the tmp directory used both for logging and for piping in daemon mode by setting the <code class="inline">RELEASE_TMP</code> environment variable. See the "Customization" section.</p>
+<h3 id="module-services-mode-windows" class="section-heading"> <a href="#module-services-mode-windows">  Services mode (Windows) </a> </h3> <p>While daemons are not available on Windows, it is possible to install a released system as a service on Windows with the help of <a href="https://www.erlang.org/doc/man/erlsrv.html"><code class="inline">erlsrv</code></a>. This can be done by running:</p>
+<pre data-language="elixir">$ bin/RELEASE_NAME install
+</pre>
+<p>Once installed, the service must be explicitly managed via the <code class="inline">erlsrv</code> executable, which is included in the <code class="inline">erts-VSN/bin</code> directory. The service is not started automatically after installing.</p>
+<p>For example, if you have a release named <code class="inline">demo</code>, you can install the service and then start it from the release root as follows:</p>
+<pre data-language="elixir">$ bin/demo install
+$ erts-VSN/bin/erlsrv.exe start demo_demo
+</pre>
+<p>The name of the service is <code class="inline">demo_demo</code> because the name is built by concatenating the node name with the release name. Since Elixir automatically uses the same name for both, the service will be referenced as <code class="inline">demo_demo</code>.</p>
+<p>The <code class="inline">install</code> command must be executed as an administrator.</p>
+<h3 id="module-bin-release_name-commands" class="section-heading"> <a href="#module-bin-release_name-commands">  <code class="inline">bin/RELEASE_NAME</code> commands </a> </h3> <p>The following commands are supported by <code class="inline">bin/RELEASE_NAME</code>:</p>
+<pre data-language="elixir">start        Starts the system
+start_iex    Starts the system with IEx attached
+daemon       Starts the system as a daemon (Unix-like only)
+daemon_iex   Starts the system as a daemon with IEx attached (Unix-like only)
+install      Installs this system as a Windows service (Windows only)
+eval "EXPR"  Executes the given expression on a new, non-booted system
+rpc "EXPR"   Executes the given expression remotely on the running system
+remote       Connects to the running system via a remote shell
+restart      Restarts the running system via a remote command
+stop         Stops the running system via a remote command
+pid          Prints the operating system PID of the running system via a remote command
+version      Prints the release name and version to be booted</pre>
+<h2 id="module-deployments" class="section-heading"> <a href="#module-deployments">  Deployments </a> </h2> <h3 id="module-requirements" class="section-heading"> <a href="#module-requirements">  Requirements </a> </h3> <p>A release is built on a <strong>host</strong>, a machine which contains Erlang, Elixir, and any other dependencies needed to compile your application. A release is then deployed to a <strong>target</strong>, potentially the same machine as the host, but usually separate, and often there are many targets (either multiple instances, or the release is deployed to heterogeneous environments).</p>
+<p>To deploy straight from a host to a separate target without cross-compilation, the following must be the same between the host and the target:</p>
+<ul>
+<li>Target architecture (for example, x86_64 or ARM)</li>
+<li>Target vendor + operating system (for example, Windows, Linux, or Darwin/macOS)</li>
+<li>Target ABI (for example, musl or gnu)</li>
+</ul>
+<p>This is often represented in the form of target triples, for example, <code class="inline">x86_64-unknown-linux-gnu</code>, <code class="inline">x86_64-unknown-linux-musl</code>, <code class="inline">x86_64-apple-darwin</code>.</p>
+<p>So to be more precise, to deploy straight from a host to a separate target, the Erlang Runtime System (ERTS), and any native dependencies (NIFs), must be compiled for the same target triple. If you are building on a MacBook (<code class="inline">x86_64-apple-darwin</code>) and trying to deploy to a typical Ubuntu machine (<code class="inline">x86_64-unknown-linux-gnu</code>), the release will not work. Instead you should build the release on a <code class="inline">x86_64-unknown-linux-gnu</code> host. As we will see, this can be done in multiple ways, such as releasing on the target itself, or by using virtual machines or containers, usually as part of your release pipeline.</p>
+<p>In addition to matching the target triple, it is also important that the target has all of the system packages that your application will need at runtime. A common one is the need for OpenSSL when building an application that uses <code class="inline">:crypto</code> or <code class="inline">:ssl</code>, which is dynamically linked to ERTS. The other common source for native dependencies like this comes from dependencies containing NIFs (natively-implemented functions) which may expect to dynamically link to libraries they use.</p>
+<p>Of course, some operating systems and package managers can differ between versions, so if your goal is to have full compatibility between host and target, it is best to ensure the operating system and system package manager have the same versions on host and target. This may even be a requirement in some systems, especially so with package managers that try to create fully reproducible environments (Nix, Guix).</p>
+<p>Similarly, when creating a stand-alone package and release for Windows, note the Erlang Runtime System has a dependency to some Microsoft libraries (Visual C++ Redistributable Packages for Visual Studio 2013). These libraries are installed (if not present before) when Erlang is installed but it is not part of the standard Windows environment. Deploying a stand-alone release on a computer without these libraries will result in a failure when trying to run the release. One way to solve this is to download and install these Microsoft libraries the first time a release is deployed (the Erlang installer version 10.6 ships with “Microsoft Visual C++ 2013 Redistributable - 12.0.30501”).</p>
+<p>Alternatively, you can also bundle the compiled object files in the release, as long as they were compiled for the same target. If doing so, you need to update <code class="inline">LD_LIBRARY_PATH</code> environment variable with the paths containing the bundled objects on Unix-like systems or the <code class="inline">$PATH</code> environment variable on Windows systems.</p>
+<p>Currently, there is no official way to cross-compile a release from one target triple to another, due to the complexities involved in the process.</p>
+<h3 id="module-techniques" class="section-heading"> <a href="#module-techniques">  Techniques </a> </h3> <p>There are a couple of ways to guarantee that a release is built on a host with the same properties as the target. A simple option is to fetch the source, compile the code and assemble the release on the target itself. It would be something like this:</p>
+<pre data-language="elixir">$ git clone remote://path/to/my_app.git my_app_source
+$ cd my_app_source
+$ mix deps.get --only prod
+$ MIX_ENV=prod mix release
+$ _build/prod/rel/my_app/bin/my_app start
+</pre>
+<p>If you prefer, you can also compile the release to a separate directory, so you can erase all source after the release is assembled:</p>
+<pre data-language="elixir">$ git clone remote://path/to/my_app.git my_app_source
+$ cd my_app_source
+$ mix deps.get --only prod
+$ MIX_ENV=prod mix release --path ../my_app_release
+$ cd ../my_app_release
+$ rm -rf ../my_app_source
+$ bin/my_app start
+</pre>
+<p>However, this option can be expensive if you have multiple production nodes or if the release assembling process is a long one, as each node needs to individually assemble the release.</p>
+<p>You can automate this process in a couple different ways. One option is to make it part of your Continuous Integration (CI) / Continuous Deployment (CD) pipeline. When you have a CI/CD pipeline, it is common that the machines in your CI/CD pipeline run on the exact same target triple as your production servers (if they don't, they should). In this case, you can assemble the release at the end of your CI/CD pipeline by calling <code class="inline">MIX_ENV=prod mix release</code> and push the artifact to S3 or any other network storage. To perform the deployment, your production machines can fetch the deployment from the network storage and run <code class="inline">bin/my_app start</code>.</p>
+<p>Another mechanism to automate deployments is to use images, such as Amazon Machine Images, or container platforms, such as Docker. For instance, you can use Docker to run locally a system with the exact same target triple as your production servers. Inside the container, you can invoke <code class="inline">MIX_ENV=prod mix release</code> and build a complete image and/or container with the operating system, all dependencies as well as the releases.</p>
+<p>In other words, there are multiple ways systems can be deployed and releases can be automated and incorporated into all of them as long as you remember to build the system in the same target triple.</p>
+<p>Once a system is deployed, shutting down the system can be done by sending SIGINT/SIGTERM to the system, which is what most containers, platforms and tools do, or by explicitly invoking <code class="inline">bin/RELEASE_NAME stop</code>. Once the system receives the shutdown request, each application and their respective supervision trees will stop, one by one, in the opposite order that they were started.</p>
+<h2 id="module-customization" class="section-heading"> <a href="#module-customization">  Customization </a> </h2> <p>There are a couple ways in which developers can customize the generated artifacts inside a release.</p>
+<h3 id="module-options" class="section-heading"> <a href="#module-options">  Options </a> </h3> <p>The following options can be set inside your <code class="inline">mix.exs</code> on each release definition:</p>
+<ul>
+<li>
+<p><code class="inline">:applications</code> - a keyword list with application names as keys and their mode as value. By default <code class="inline">:applications</code> includes the current application and all applications the current application depends on, recursively. You can include new applications or change the mode of existing ones by listing them here.</p>
+<p>The order of the applications given will be preserved as much as possible, with only <code class="inline">:kernel</code>, <code class="inline">:stdlib</code>, <code class="inline">:sasl</code>, and <code class="inline">:elixir</code> listed before the given application list. The supported values are:</p>
+<ul>
+<li>
+<code class="inline">:permanent</code> (default) - the application is started and the node shuts down if the application terminates, regardless of reason</li>
+<li>
+<code class="inline">:transient</code> - the application is started and the node shuts down if the application terminates abnormally</li>
+<li>
+<code class="inline">:temporary</code> - the application is started and the node does not shut down if the application terminates</li>
+<li>
+<code class="inline">:load</code> - the application is only loaded</li>
+<li>
+<code class="inline">:none</code> - the application is part of the release but it is neither loaded nor started</li>
+</ul>
+<p>If you change the mode of an application, the mode will apply to all its child applications. However, if an application has two parents, the mode of the parent with highest priority wins (where <code class="inline">:permanent</code> has the highest priority, according to the list above).</p>
+</li>
+<li><p><code class="inline">:strip_beams</code> - controls if BEAM files should have their debug information, documentation chunks, and other non-essential metadata removed. Defaults to <code class="inline">true</code>. May be set to <code class="inline">false</code> to disable stripping. Also accepts <code class="inline">[keep: ["Docs", "Dbgi"]]</code> to keep certain chunks that are usually stripped. You can also set the <code class="inline">:compress</code> option to true to enable individual compression of BEAM files, although it is typically preferred to compress the whole release instead.</p></li>
+<li>
+<p><code class="inline">:cookie</code> - a string representing the Erlang Distribution cookie. If this option is not set, a random cookie is written to the <code class="inline">releases/COOKIE</code> file when the first release is assembled. At runtime, we will first attempt to fetch the cookie from the <code class="inline">RELEASE_COOKIE</code> environment variable and then we'll read the <code class="inline">releases/COOKIE</code> file.</p>
+<p>If you are setting this option manually, we recommend the cookie option to be a long and randomly generated string, such as: <code class="inline">Base.url_encode64(:crypto.strong_rand_bytes(40))</code>. We also recommend to restrict the characters in the cookie to the subset returned by <a href="https://hexdocs.pm/elixir/1.15/Base.html#url_encode64/1"><code class="inline">Base.url_encode64/1</code></a>.</p>
+</li>
+<li><p><code class="inline">:validate_compile_env</code> - by default a release will match all runtime configuration against any configuration that was marked at compile time in your application of its dependencies via the <a href="https://hexdocs.pm/elixir/1.15/Application.html#compile_env/3"><code class="inline">Application.compile_env/3</code></a> function. If there is a mismatch between those, it means your system is misconfigured and unable to boot. You can disable this check by setting this option to false.</p></li>
+<li><p><code class="inline">:path</code> - the path the release should be installed to. Defaults to <code class="inline">"_build/MIX_ENV/rel/RELEASE_NAME"</code>.</p></li>
+<li><p><code class="inline">:version</code> - the release version as a string or <code class="inline">{:from_app, app_name}</code>. Defaults to the current application version. The <code class="inline">{:from_app, app_name}</code> format can be used to easily reference the application version from another application. This is particularly useful in umbrella applications.</p></li>
+<li><p><code class="inline">:quiet</code> - a boolean that controls if releases should write steps to the standard output. Defaults to <code class="inline">false</code>.</p></li>
+<li>
+<p><code class="inline">:include_erts</code> - a boolean, string, or anonymous function of arity zero. If a boolean, it indicates whether the Erlang Runtime System (ERTS), which includes the Erlang VM, should be included in the release. The default is <code class="inline">true</code>, which is also the recommended value. If a string, it represents the path to an existing ERTS installation. If an anonymous function of arity zero, it's a function that returns any of the above (boolean or string).</p>
+<p>You may also set this option to <code class="inline">false</code> if you desire to use the ERTS version installed on the target. Note, however, that the ERTS version on the target must have <strong>the exact version</strong> as the ERTS version used when the release is assembled. Setting it to <code class="inline">false</code> also disables hot code upgrades. Therefore, <code class="inline">:include_erts</code> should be set to <code class="inline">false</code> with caution and only if you are assembling the release on the same server that runs it.</p>
+</li>
+<li>
+<p><code class="inline">:include_executables_for</code> - a list of atoms detailing for which Operating Systems executable files should be generated for. By default, it is set to <code class="inline">[:unix, :windows]</code>. You can customize those as follows:</p>
+<pre data-language="elixir">releases: [
+  demo: [
+    include_executables_for: [:unix] # Or [:windows] or []
+  ]
+]</pre>
+</li>
+<li><p><code class="inline">:rel_templates_path</code> - the path to find template files that are copied to the release, such as "vm.args.eex", "remote.vm.args.eex", "env.sh.eex" (or "env.bat.eex"), and "overlays". Defaults to "rel" in the project root.</p></li>
+<li><p><code class="inline">:overlays</code> - a list of directories with extra files to be copied as is to the release. The "overlays" directory at <code class="inline">:rel_templates_path</code> is always included in this list by default (typically at "rel/overlays"). See the "Overlays" section for more information.</p></li>
+<li><p><code class="inline">:steps</code> - a list of steps to execute when assembling the release. See the "Steps" section for more information.</p></li>
+<li><p><code class="inline">:skip_mode_validation_for</code> - a list of application names (atoms) specifying applications to skip strict validation of "unsafe" modes. An "unsafe" case is when a parent application mode is <code class="inline">:permanent</code> but one of the applications it depends on is set to <code class="inline">:load</code>. Use this with care, as a release with invalid modes may no longer boot without additional tweaks. Defaults to <code class="inline">[]</code>.</p></li>
+</ul>
+<p>Note each release definition can be given as an anonymous function. This is useful if some release attributes are expensive to compute:</p>
+<pre data-language="elixir">releases: [
+  demo: fn -&gt;
+    [version: @version &lt;&gt; "+" &lt;&gt; git_ref()]
+  end
+]</pre>
+<p>Besides the options above, it is possible to customize the generated release with custom files, by tweaking the release steps or by running custom options and commands on boot. We will detail both approaches next.</p>
+<h3 id="module-overlays" class="section-heading"> <a href="#module-overlays">  Overlays </a> </h3> <p>Often it is necessary to copy extra files to the release root after the release is assembled. This can be easily done by placing such files in the <code class="inline">rel/overlays</code> directory. Any file in there is copied as is to the release root. For example, if you have placed a "rel/overlays/Dockerfile" file, the "Dockerfile" will be copied as is to the release root.</p>
+<p>If you want to specify extra overlay directories, you can do so with the <code class="inline">:overlays</code> option. If you need to copy files dynamically, see the "Steps" section.</p>
+<h3 id="module-steps" class="section-heading"> <a href="#module-steps">  Steps </a> </h3> <p>It is possible to add one or more steps before and after the release is assembled. This can be done with the <code class="inline">:steps</code> option:</p>
+<pre data-language="elixir">releases: [
+  demo: [
+    steps: [&amp;set_configs/1, :assemble, &amp;copy_extra_files/1]
+  ]
+]</pre>
+<p>The <code class="inline">:steps</code> option must be a list and it must always include the atom <code class="inline">:assemble</code>, which does most of the release assembling. You can pass anonymous functions before and after the <code class="inline">:assemble</code> to customize your release assembling pipeline. Those anonymous functions will receive a <a href="mix.release.html"><code class="inline">Mix.Release</code></a> struct and must return the same or an updated <a href="mix.release.html"><code class="inline">Mix.Release</code></a> struct. It is also possible to build a tarball of the release by passing the <code class="inline">:tar</code> step anywhere after <code class="inline">:assemble</code>. If the release <code class="inline">:path</code> is not configured, the tarball is created in <code class="inline">_build/MIX_ENV/RELEASE_NAME-RELEASE_VSN.tar.gz</code> Otherwise it is created inside the configured <code class="inline">:path</code>.</p>
+<p>See <a href="mix.release.html"><code class="inline">Mix.Release</code></a> for more documentation on the struct and which fields can be modified. Note that the <code class="inline">:steps</code> field itself can be modified and it is updated every time a step is called. Therefore, if you need to execute a command before and after assembling the release, you only need to declare the first steps in your pipeline and then inject the last step into the release struct. The steps field can also be used to verify if the step was set before or after assembling the release.</p>
+<h3 id="module-vm-args-and-env-sh-env-bat" class="section-heading"> <a href="#module-vm-args-and-env-sh-env-bat">  vm.args and env.sh (env.bat) </a> </h3> <p>Developers may want to customize the VM flags and environment variables given when the release starts. The simplest way to customize those files is by running <a href="mix.tasks.release.init.html"><code class="inline">mix release.init</code></a>. The Mix task will copy custom <code class="inline">rel/vm.args.eex</code>, <code class="inline">rel/remote.vm.args.eex</code>, <code class="inline">rel/env.sh.eex</code>, and <code class="inline">rel/env.bat.eex</code> files to your project root. You can modify those files and they will be evaluated every time you perform a new release. Those files are regular EEx templates and they have a single assign, called <code class="inline">@release</code>, with the <a href="mix.release.html"><code class="inline">Mix.Release</code></a> struct.</p>
+<p>The <code class="inline">vm.args</code> and <code class="inline">remote.vm.args</code> files may contain any of the VM flags accepted by the <a href="https://www.erlang.org/doc/man/erl.html"><code class="inline">erl</code> command</a>.</p>
+<p>The <code class="inline">env.sh</code> and <code class="inline">env.bat</code> is used to set environment variables. In there, you can set vars such as <code class="inline">RELEASE_NODE</code>, <code class="inline">RELEASE_COOKIE</code>, and <code class="inline">RELEASE_TMP</code> to customize your node name, cookie and tmp directory respectively. Whenever <code class="inline">env.sh</code> or <code class="inline">env.bat</code> is invoked, the variables <code class="inline">RELEASE_ROOT</code>, <code class="inline">RELEASE_NAME</code>, <code class="inline">RELEASE_VSN</code>, and <code class="inline">RELEASE_COMMAND</code> have already been set, so you can rely on them. See the section on environment variables for more information.</p>
+<p>Furthermore, while the <code class="inline">vm.args</code> files are static, you can use <code class="inline">env.sh</code> and <code class="inline">env.bat</code> to dynamically set VM options. For example, if you want to make sure the Erlang Distribution listens only on a given port known at runtime, you can set the following:</p>
+<pre data-language="elixir">case $RELEASE_COMMAND in
+  start*|daemon*)
+    ELIXIR_ERL_OPTIONS="-kernel inet_dist_listen_min $BEAM_PORT inet_dist_listen_max $BEAM_PORT"
+    export ELIXIR_ERL_OPTIONS
+    ;;
+  *)
+    ;;
+esac
+</pre>
+<p>Note we only set the port on start/daemon commands. If you also limit the port on other commands, such as <code class="inline">rpc</code>, then you will be unable to establish a remote connection as the port will already be in use by the node.</p>
+<p>On Windows, your <code class="inline">env.bat</code> would look like this:</p>
+<pre data-language="elixir">IF NOT %RELEASE_COMMAND:start=%==%RELEASE_COMMAND% (
+  set ELIXIR_ERL_OPTIONS="-kernel inet_dist_listen_min %BEAM_PORT% inet_dist_listen_max %BEAM_PORT%"
+)
+</pre>
+<h2 id="module-application-configuration" class="section-heading"> <a href="#module-application-configuration">  Application configuration </a> </h2> <p>Mix provides two mechanisms for configuring the application environment of your application and your dependencies: build-time and runtime. On this section, we will learn how those mechanisms apply to releases. An introduction to this topic can be found in the "Configuration" section of the <a href="mix.html"><code class="inline">Mix</code></a> module.</p>
+<h3 id="module-build-time-configuration" class="section-heading"> <a href="#module-build-time-configuration">  Build-time configuration </a> </h3> <p>Whenever you invoke a <code class="inline">mix</code> command, Mix loads the configuration in <code class="inline">config/config.exs</code>, if said file exists. We say that this configuration is a build-time configuration as it is evaluated whenever you compile your code or whenever you assemble the release.</p>
+<p>In other words, if your configuration does something like:</p>
+<pre data-language="elixir">import Config
+config :my_app, :secret_key, System.fetch_env!("MY_APP_SECRET_KEY")</pre>
+<p>The <code class="inline">:secret_key</code> key under <code class="inline">:my_app</code> will be computed on the host machine, whenever the release is built. Therefore if the machine assembling the release not have access to all environment variables used to run your code, loading the configuration will fail as the environment variable is missing. Luckily, Mix also provides runtime configuration, which should be preferred and we will see next.</p>
+<h3 id="module-runtime-configuration" class="section-heading"> <a href="#module-runtime-configuration">  Runtime configuration </a> </h3> <p>To enable runtime configuration in your release, all you need to do is to create a file named <code class="inline">config/runtime.exs</code>:</p>
+<pre data-language="elixir">import Config
+config :my_app, :secret_key, System.fetch_env!("MY_APP_SECRET_KEY")</pre>
+<p>This file will be executed whenever your Mix project or your release starts.</p>
+<p>Your <code class="inline">config/runtime.exs</code> file needs to follow three important rules:</p>
+<ul>
+<li>It MUST <code class="inline">import Config</code> at the top instead of the deprecated <code class="inline">use Mix.Config</code>
+</li>
+<li>It MUST NOT import any other configuration file via <code class="inline">import_config</code>
+</li>
+<li>It MUST NOT access <a href="mix.html"><code class="inline">Mix</code></a> in any way, as <a href="mix.html"><code class="inline">Mix</code></a> is a build tool and it is not available inside releases</li>
+</ul>
+<p>If a <code class="inline">config/runtime.exs</code> exists, it will be copied to your release and executed early in the boot process, when only Elixir and Erlang's main applications have been started.</p>
+<p>You can change the path to the runtime configuration file by setting <code class="inline">:runtime_config_path</code> inside each release configuration. This path is resolved at build time as the given configuration file is always copied to inside the release:</p>
+<pre data-language="elixir">releases: [
+  demo: [
+    runtime_config_path: ...
+  ]
+]</pre>
+<p>By setting <code class="inline">:runtime_config_path</code> to <code class="inline">false</code> it can be used to prevent a runtime configuration file to be included in the release.</p>
+<h3 id="module-config-providers" class="section-heading"> <a href="#module-config-providers">  Config providers </a> </h3> <p>Releases also supports custom mechanisms, called config providers, to load any sort of runtime configuration to the system while it boots. For instance, if you need to access a vault or load configuration from a JSON file, it can be achieved with config providers. The runtime configuration outlined in the previous section is handled by the <a href="https://hexdocs.pm/elixir/1.15/Config.Reader.html"><code class="inline">Config.Reader</code></a> provider. See the <a href="https://hexdocs.pm/elixir/1.15/Config.Provider.html"><code class="inline">Config.Provider</code></a> module for more information and more examples.</p>
+<p>The following options can be set inside your releases key in your <code class="inline">mix.exs</code> to control how config providers work:</p>
+<ul>
+<li><p><code class="inline">:reboot_system_after_config</code> - reboot the system after configuration so you can configure system applications, such as <code class="inline">:kernel</code> and <code class="inline">:stdlib</code>, in your <code class="inline">config/runtime.exs</code>. Generally speaking, it is best to configure <code class="inline">:kernel</code> and <code class="inline">:stdlib</code> using the <code class="inline">vm.args</code> file but this option is available for those who need more complex configuration. When set to <code class="inline">true</code>, the release will first boot in interactive mode to compute a config file and write it to the "tmp" directory. Then it reboots in the configured <code class="inline">RELEASE_MODE</code>. You can configure the "tmp" directory by setting the <code class="inline">RELEASE_TMP</code> environment variable, either explicitly or inside your <code class="inline">releases/RELEASE_VSN/env.sh</code> (or <code class="inline">env.bat</code> on Windows). Defaults to <code class="inline">true</code> if using the deprecated <code class="inline">config/releases.exs</code>, <code class="inline">false</code> otherwise.</p></li>
+<li><p><code class="inline">:prune_runtime_sys_config_after_boot</code> - if <code class="inline">:reboot_system_after_config</code> is set, every time your system boots, the release will write a config file to your tmp directory. These configuration files are generally small. But if you are concerned with disk space or if you have other restrictions, you can ask the system to remove said config files after boot. The downside is that you will no longer be able to restart the system internally (neither via <a href="https://hexdocs.pm/elixir/1.15/System.html#restart/0"><code class="inline">System.restart/0</code></a> nor <code class="inline">bin/RELEASE_NAME restart</code>). If you need a restart, you will have to terminate the Operating System process and start a new one. Defaults to <code class="inline">false</code>.</p></li>
+<li><p><code class="inline">:start_distribution_during_config</code> - if <code class="inline">:reboot_system_after_config</code> is set, releases only start the Erlang VM distribution features after the config files are evaluated. You can set it to <code class="inline">true</code> if you need distribution during configuration. Defaults to <code class="inline">false</code>.</p></li>
+<li><p><code class="inline">:config_providers</code> - a list of tuples with custom config providers. See <a href="https://hexdocs.pm/elixir/1.15/Config.Provider.html"><code class="inline">Config.Provider</code></a> for more information. Defaults to <code class="inline">[]</code>.</p></li>
+</ul>
+<h3 id="module-customization-and-configuration-summary" class="section-heading"> <a href="#module-customization-and-configuration-summary">  Customization and configuration summary </a> </h3> <p>Generally speaking, the following files are available for customizing and configuring the running system:</p>
+<ul>
+<li><p><code class="inline">config/config.exs</code> (and <code class="inline">config/prod.exs</code>) - provides build-time application configuration, which are executed when the release is assembled</p></li>
+<li><p><code class="inline">config/runtime.exs</code> - provides runtime application configuration. It is executed every time your Mix project or your release boots and is further extensible via config providers. If you want to detect you are inside a release, you can check for release specific environment variables, such as <code class="inline">RELEASE_NODE</code> or <code class="inline">RELEASE_MODE</code></p></li>
+<li><p><code class="inline">rel/vm.args.eex</code> and <code class="inline">rel/remote.vm.args.eex</code> - template files that are copied into every release and provides static configuration of the Erlang Virtual Machine and other runtime flags. <code class="inline">vm.args</code> runs on <code class="inline">start</code>, <code class="inline">daemon</code>, and <code class="inline">eval</code> commands. <code class="inline">remote.vm.args</code> configures the VM for <code class="inline">remote</code> and <code class="inline">rpc</code> commands</p></li>
+<li><p><code class="inline">rel/env.sh.eex</code> and <code class="inline">rel/env.bat.eex</code> - template files that are copied into every release and are executed on every command to set up environment variables, including specific ones to the VM, and the general environment</p></li>
+</ul>
+<h2 id="module-directory-structure" class="section-heading"> <a href="#module-directory-structure">  Directory structure </a> </h2> <p>A release is organized as follows:</p>
+<pre data-language="elixir">bin/
+  RELEASE_NAME
+erts-ERTS_VSN/
+lib/
+  APP_NAME-APP_VSN/
+    ebin/
+    include/
+    priv/
+releases/
+  RELEASE_VSN/
+    consolidated/
+    elixir
+    elixir.bat
+    env.bat
+    env.sh
+    iex
+    iex.bat
+    remote.vm.args
+    runtime.exs
+    start.boot
+    start.script
+    start_clean.boot
+    start_clean.script
+    sys.config
+    vm.args
+  COOKIE
+  start_erl.data
+tmp/</pre>
+<p>We document this structure for completeness. In practice, developers should not modify any of those files after the release is assembled. Instead use env scripts, custom config provider, overlays, and all other mechanisms described in this guide to configure how your release works.</p>
+<h2 id="module-environment-variables" class="section-heading"> <a href="#module-environment-variables">  Environment variables </a> </h2> <p>The system sets different environment variables. The following variables are set early on and can only be read by <code class="inline">env.sh</code> and <code class="inline">env.bat</code>:</p>
+<ul>
+<li><p><code class="inline">RELEASE_ROOT</code> - points to the root of the release. If the system includes ERTS, then it is the same as <a href="https://www.erlang.org/doc/man/code.html#root_dir-0"><code class="inline">:code.root_dir/0</code></a>. This variable is always computed and it cannot be set to a custom value</p></li>
+<li><p><code class="inline">RELEASE_COMMAND</code> - the command given to the release, such as <code class="inline">"start"</code>, <code class="inline">"remote"</code>, <code class="inline">"eval"</code>, and so on. This is typically accessed inside <code class="inline">env.sh</code> and <code class="inline">env.bat</code> to set different environment variables under different conditions. Note, however, that <code class="inline">RELEASE_COMMAND</code> has not been validated by the time <code class="inline">env.sh</code> and <code class="inline">env.bat</code> are called, so it may be empty or contain invalid values. This variable is always computed and it cannot be set to a custom value</p></li>
+<li><p><code class="inline">RELEASE_NAME</code> - the name of the release. It can be set to a custom value when invoking the release</p></li>
+<li><p><code class="inline">RELEASE_VSN</code> - the version of the release, otherwise the latest version is used. It can be set to a custom value when invoking the release. The custom value must be an existing release version in the <code class="inline">releases/</code> directory</p></li>
+<li><p><code class="inline">RELEASE_PROG</code> - the command line executable used to start the release</p></li>
+</ul>
+<p>The following variables can be set before you invoke the release or inside <code class="inline">env.sh</code> and <code class="inline">env.bat</code>:</p>
+<ul>
+<li><p><code class="inline">RELEASE_COOKIE</code> - the release cookie. By default uses the value in <code class="inline">releases/COOKIE</code>. It can be set to a custom value</p></li>
+<li><p><code class="inline">RELEASE_NODE</code> - the release node name, in the format <code class="inline">name</code> or optionally <code class="inline">name@host</code> if running in distributed mode. It can be set to a custom value. The name part must be made only of letters, digits, underscores, and hyphens</p></li>
+<li><p><code class="inline">RELEASE_SYS_CONFIG</code> - the location of the sys.config file. It can be set to a custom path and it must not include the <code class="inline">.config</code> extension</p></li>
+<li><p><code class="inline">RELEASE_VM_ARGS</code> - the location of the vm.args file. It can be set to a custom path</p></li>
+<li><p><code class="inline">RELEASE_REMOTE_VM_ARGS</code> - the location of the remote.vm.args file. It can be set to a custom path</p></li>
+<li><p><code class="inline">RELEASE_TMP</code> - the directory in the release to write temporary files to. It can be set to a custom directory. It defaults to <code class="inline">$RELEASE_ROOT/tmp</code></p></li>
+<li><p><code class="inline">RELEASE_MODE</code> - if the release should load code on demand (interactive) or preload it (embedded). Defaults to "embedded", which increases boot time but it means the runtime will respond faster as it doesn't have to load code. Choose interactive if you need to decrease boot time and reduce memory usage on boot. It applies only to start/daemon/install commands</p></li>
+<li><p><code class="inline">RELEASE_DISTRIBUTION</code> - how do we want to run the distribution. May be <code class="inline">name</code> (long names), <code class="inline">sname</code> (short names) or <code class="inline">none</code> (distribution is not started automatically). Defaults to <code class="inline">sname</code> which allows access only within the current system. <code class="inline">name</code> allows external connections</p></li>
+<li><p><code class="inline">RELEASE_BOOT_SCRIPT</code> - the name of the boot script to use when starting the release. This script is used when running commands such as <code class="inline">start</code> and <code class="inline">daemon</code>. The boot script is expected to be located at the path <code class="inline">releases/RELEASE_VSN/RELEASE_BOOT_SCRIPT.boot</code>. Defaults to <code class="inline">start</code></p></li>
+<li><p><code class="inline">RELEASE_BOOT_SCRIPT_CLEAN</code> - the name of the boot script used when starting the release clean, without your application or its dependencies. This script is used by commands such as <code class="inline">eval</code>, <code class="inline">rpc</code>, and <code class="inline">remote</code>. The boot script is expected to be located at the path <code class="inline">releases/RELEASE_VSN/RELEASE_BOOT_SCRIPT_CLEAN.boot</code>. Defaults to <code class="inline">start_clean</code></p></li>
+</ul>
+<h2 id="module-umbrellas" class="section-heading"> <a href="#module-umbrellas">  Umbrellas </a> </h2> <p>Releases are well integrated with umbrella projects, allowing you to release one or more subsets of your umbrella children. The only difference between performing a release in the umbrella project compared to a regular application is that umbrellas require you to explicitly list your release and the starting point for each release. For example, imagine this umbrella applications:</p>
+<pre data-language="elixir">my_app_umbrella/
+  apps/
+    my_app_core/
+    my_app_event_processing/
+    my_app_web/</pre>
+<p>where both <code class="inline">my_app_event_processing</code> and <code class="inline">my_app_web</code> depend on <code class="inline">my_app_core</code> but they do not depend on each other.</p>
+<p>Inside your umbrella, you can define multiple releases:</p>
+<pre data-language="elixir">releases: [
+  web_and_event_processing: [
+    applications: [
+      my_app_event_processing: :permanent,
+      my_app_web: :permanent
+    ]
+  ],
+
+  web_only: [
+    applications: [my_app_web: :permanent]
+  ],
+
+  event_processing_only: [
+    applications: [my_app_event_processing: :permanent]
+  ]
+]</pre>
+<p>Note you don't need to define all applications in <code class="inline">:applications</code>, only the entry points. Also remember that the recommended mode for all applications in the system is <code class="inline">:permanent</code>.</p>
+<p>Finally, keep in mind it is not required for you to assemble the release from the umbrella root. You can also assemble the release from each child application individually. Doing it from the root, however, allows you to include two applications that do not depend on each other as part of the same release.</p>
+<h2 id="module-hot-code-upgrades" class="section-heading"> <a href="#module-hot-code-upgrades">  Hot Code Upgrades </a> </h2> <p>Erlang and Elixir are sometimes known for the capability of upgrading a node that is running in production without shutting down that node. However, this feature is not supported out of the box by Elixir releases.</p>
+<p>The reason we don't provide hot code upgrades is because they are very complicated to perform in practice, as they require careful coding of your processes and applications as well as extensive testing. Given most teams can use other techniques that are language agnostic to upgrade their systems, such as Blue/Green deployments, Canary deployments, Rolling deployments, and others, hot upgrades are rarely a viable option. Let's understand why.</p>
+<p>In a hot code upgrade, you want to update a node from version A to version B. To do so, the first step is to write recipes for every application that changed between those two releases, telling exactly how the application changed between versions, those recipes are called <code class="inline">.appup</code> files. While some of the steps in building <code class="inline">.appup</code> files can be automated, not all of them can. Furthermore, each process in the application needs to be explicitly coded with hot code upgrades in mind. Let's see an example. Imagine your application has a counter process as a GenServer:</p>
+<pre data-language="elixir">defmodule Counter do
+  use GenServer
+
+  def start_link(_) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  def bump do
+    GenServer.call(__MODULE__, :bump)
+  end
+
+  ## Callbacks
+
+  def init(:ok) do
+    {:ok, 0}
+  end
+
+  def handle_call(:bump, counter) do
+    {:reply, :ok, counter + 1}
+  end
+end</pre>
+<p>You add this process as part of your supervision tree and ship version 0.1.0 of your system. Now let's imagine that on version 0.2.0 you added two changes: instead of <code class="inline">bump/0</code>, that always increments the counter by one, you introduce <code class="inline">bump/1</code> that passes the exact value to bump the counter. You also change the state, because you want to store the maximum bump value:</p>
+<pre data-language="elixir">defmodule Counter do
+  use GenServer
+
+  def start_link(_) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  def bump(by) do
+    GenServer.call(__MODULE__, {:bump, by})
+  end
+
+  ## Callbacks
+
+  def init(:ok) do
+    {:ok, {0, 0}}
+  end
+
+  def handle_call({:bump, by}, {counter, max}) do
+    {:reply, :ok, {counter + by, max(max, by)}}
+  end
+end</pre>
+<p>If you were to perform a hot code upgrade in such an application, it would crash, because in the initial version the state was just a counter but in the new version the state is a tuple. Furthermore, you changed the format of the <code class="inline">call</code> message from <code class="inline">:bump</code> to <code class="inline">{:bump, by}</code> and the process may have both old and new messages temporarily mixed, so we need to handle both. The final version would be:</p>
+<pre data-language="elixir">defmodule Counter do
+  use GenServer
+
+  def start_link(_) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  def bump(by) do
+    GenServer.call(__MODULE__, {:bump, by})
+  end
+
+  ## Callbacks
+
+  def init(:ok) do
+    {:ok, {0, 0}}
+  end
+
+  def handle_call(:bump, {counter, max}) do
+    {:reply, :ok, {counter + 1, max(max, 1)}}
+  end
+
+  def handle_call({:bump, by}, {counter, max}) do
+    {:reply, :ok, {counter + by, max(max, by)}}
+  end
+
+  def code_change(_, counter, _) do
+    {:ok, {counter, 0}}
+  end
+end</pre>
+<p>Now you can proceed to list this process in the <code class="inline">.appup</code> file and hot code upgrade it. This is one of the many steps necessary to perform hot code upgrades and it must be taken into account by every process and application being upgraded in the system. The <a href="https://www.erlang.org/doc/design_principles/appup_cookbook.html"><code class="inline">.appup</code> cookbook</a> provides a good reference and more examples.</p>
+<p>Once <code class="inline">.appup</code>s are created, the next step is to create a <code class="inline">.relup</code> file with all instructions necessary to update the release itself. Erlang documentation does provide a chapter on <a href="https://www.erlang.org/doc/system_principles/create_target.html">Creating and upgrading a target system</a>. <a href="https://learnyousomeerlang.com/relups">Learn You Some Erlang has a chapter on hot code upgrades</a>.</p>
+<p>Overall, there are many steps, complexities and assumptions made during hot code upgrades, which is ultimately why they are not provided by Elixir out of the box. However, hot code upgrades can still be achieved by teams who desire to implement those steps on top of <a href="mix.tasks.release.html#content"><code class="inline">mix release</code></a> in their projects or as separate libraries.</p>
+<h2 id="module-command-line-options" class="section-heading"> <a href="#module-command-line-options">  Command line options </a> </h2> <ul>
+<li>
+<code class="inline">--force</code> - forces recompilation</li>
+<li>
+<code class="inline">--no-archives-check</code> - does not check archive</li>
+<li>
+<code class="inline">--no-deps-check</code> - does not check dependencies</li>
+<li>
+<code class="inline">--no-elixir-version-check</code> - does not check Elixir version</li>
+<li>
+<code class="inline">--no-compile</code> - does not compile before assembling the release</li>
+<li>
+<code class="inline">--overwrite</code> - if there is an existing release version, overwrite it</li>
+<li>
+<code class="inline">--path</code> - the path of the release</li>
+<li>
+<code class="inline">--quiet</code> - does not write progress to the standard output</li>
+<li>
+<code class="inline">--version</code> - the version of the release</li>
+</ul> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012 Plataformatec<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/mix/1.15.4/Mix.Tasks.Release.html" class="_attribution-link">https://hexdocs.pm/mix/1.15.4/Mix.Tasks.Release.html</a>
+  </p>
+</div>

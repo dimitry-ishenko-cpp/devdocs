@@ -1,0 +1,164 @@
+<div class="getting-started-title"> <small>Mix and OTP</small> <h1>Task and gen_tcp</h1> </div>  <blockquote> <p>This chapter is part of the <i>Mix and OTP guide</i> and it depends on previous chapters in this guide. For more information, <a href="introduction-to-mix.html">read the introduction guide</a> or check out the chapter index in the sidebar.</p> </blockquote> <p>In this chapter, we are going to learn how to use <a href="http://www.erlang.org/doc/man/gen_tcp.html">Erlang’s <code class="language-plaintext highlighter-rouge">:gen_tcp</code> module</a> to serve requests. This provides a great opportunity to explore Elixir’s <code class="language-plaintext highlighter-rouge">Task</code> module. In future chapters, we will expand our server so it can actually serve the commands.</p> <h2 id="echo-server">Echo server</h2> <p>We will start our TCP server by first implementing an echo server. It will send a response with the text it received in the request. We will slowly improve our server until it is supervised and ready to handle multiple connections.</p> <p>A TCP server, in broad strokes, performs the following steps:</p> <ol> <li>Listens to a port until the port is available and it gets hold of the socket</li> <li>Waits for a client connection on that port and accepts it</li> <li>Reads the client request and writes a response back</li> </ol> <p>Let’s implement those steps. Move to the <code class="language-plaintext highlighter-rouge">apps/kv_server</code> application, open up <code class="language-plaintext highlighter-rouge">lib/kv_server.ex</code>, and add the following functions:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">defmodule KVServer do
+  require Logger
+
+  def accept(port) do
+    # The options below mean:
+    #
+    # 1. `:binary` - receives data as binaries (instead of lists)
+    # 2. `packet: :line` - receives data line by line
+    # 3. `active: false` - blocks on `:gen_tcp.recv/2` until data is available
+    # 4. `reuseaddr: true` - allows us to reuse the address if the listener crashes
+    #
+    {:ok, socket} =
+      :gen_tcp.listen(port, [:binary, packet: :line, active: false, reuseaddr: true])
+    Logger.info("Accepting connections on port #{port}")
+    loop_acceptor(socket)
+  end
+
+  defp loop_acceptor(socket) do
+    {:ok, client} = :gen_tcp.accept(socket)
+    serve(client)
+    loop_acceptor(socket)
+  end
+
+  defp serve(socket) do
+    socket
+    |&gt; read_line()
+    |&gt; write_line(socket)
+
+    serve(socket)
+  end
+
+  defp read_line(socket) do
+    {:ok, data} = :gen_tcp.recv(socket, 0)
+    data
+  end
+
+  defp write_line(line, socket) do
+    :gen_tcp.send(socket, line)
+  end
+end
+</pre></div> <p>We are going to start our server by calling <code class="language-plaintext highlighter-rouge">KVServer.accept(4040)</code>, where 4040 is the port. The first step in <code class="language-plaintext highlighter-rouge">accept/1</code> is to listen to the port until the socket becomes available and then call <code class="language-plaintext highlighter-rouge">loop_acceptor/1</code>. <code class="language-plaintext highlighter-rouge">loop_acceptor/1</code> is a loop accepting client connections. For each accepted connection, we call <code class="language-plaintext highlighter-rouge">serve/1</code>.</p> <p><code class="language-plaintext highlighter-rouge">serve/1</code> is another loop that reads a line from the socket and writes those lines back to the socket. Note that the <code class="language-plaintext highlighter-rouge">serve/1</code> function uses <a href="https://hexdocs.pm/elixir/Kernel.html#%7C%3E/2">the pipe operator <code class="language-plaintext highlighter-rouge">|&gt;</code></a> to express this flow of operations. The pipe operator evaluates the left side and passes its result as the first argument to the function on the right side. The example above:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">socket |&gt; read_line() |&gt; write_line(socket)
+</pre></div> <p>is equivalent to:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">write_line(read_line(socket), socket)
+</pre></div> <p>The <code class="language-plaintext highlighter-rouge">read_line/1</code> implementation receives data from the socket using <code class="language-plaintext highlighter-rouge">:gen_tcp.recv/2</code> and <code class="language-plaintext highlighter-rouge">write_line/2</code> writes to the socket using <code class="language-plaintext highlighter-rouge">:gen_tcp.send/2</code>.</p> <p>Note that <code class="language-plaintext highlighter-rouge">serve/1</code> is an infinite loop called sequentially inside <code class="language-plaintext highlighter-rouge">loop_acceptor/1</code>, so the tail call to <code class="language-plaintext highlighter-rouge">loop_acceptor/1</code> is never reached and could be avoided. However, as we shall see, we will need to execute <code class="language-plaintext highlighter-rouge">serve/1</code> in a separate process, so we will need that tail call soon.</p> <p>This is pretty much all we need to implement our echo server. Let’s give it a try!</p> <p>Start an IEx session inside the <code class="language-plaintext highlighter-rouge">kv_server</code> application with <code class="language-plaintext highlighter-rouge">iex -S mix</code>. Inside IEx, run:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">iex&gt; KVServer.accept(4040)
+</pre></div> <p>The server is now running, and you will even notice the console is blocked. Let’s use <a href="https://en.wikipedia.org/wiki/Telnet">a <code class="language-plaintext highlighter-rouge">telnet</code> client</a> to access our server. There are clients available on most operating systems, and their command lines are generally similar:</p> <div class="language-console highlighter-rouge"><pre class="highlight" data-language="">$ telnet 127.0.0.1 4040
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+hello
+hello
+is it me
+is it me
+you are looking for?
+you are looking for?
+</pre></div> <p>Type “hello”, press enter, and you will get “hello” back. Excellent!</p> <p>My particular telnet client can be exited by typing <code class="language-plaintext highlighter-rouge">ctrl + ]</code>, typing <code class="language-plaintext highlighter-rouge">quit</code>, and pressing <code class="language-plaintext highlighter-rouge">&lt;Enter&gt;</code>, but your client may require different steps.</p> <p>Once you exit the telnet client, you will likely see an error in the IEx session:</p> <div class="language-plaintext highlighter-rouge"><pre class="highlight" data-language="">** (MatchError) no match of right hand side value: {:error, :closed}
+    (kv_server) lib/kv_server.ex:45: KVServer.read_line/1
+    (kv_server) lib/kv_server.ex:37: KVServer.serve/1
+    (kv_server) lib/kv_server.ex:30: KVServer.loop_acceptor/1
+</pre></div> <p>That’s because we were expecting data from <code class="language-plaintext highlighter-rouge">:gen_tcp.recv/2</code> but the client closed the connection. We need to handle such cases better in future revisions of our server.</p> <p>For now, there is a more important bug we need to fix: what happens if our TCP acceptor crashes? Since there is no supervision, the server dies and we won’t be able to serve more requests, because it won’t be restarted. That’s why we must move our server to a supervision tree.</p> <h2 id="tasks">Tasks</h2> <p>We have learned about agents, generic servers, and supervisors. They are all meant to work with multiple messages or manage state. But what do we use when we only need to execute some task and that is it?</p> <p><a href="https://hexdocs.pm/elixir/Task.html">The Task module</a> provides this functionality exactly. For example, it has a <code class="language-plaintext highlighter-rouge">start_link/1</code> function that receives an anonymous function and executes it inside a new process that will be part of a supervision tree.</p> <p>Let’s give it a try. Open up <code class="language-plaintext highlighter-rouge">lib/kv_server/application.ex</code>, and let’s change the supervisor in the <code class="language-plaintext highlighter-rouge">start/2</code> function to the following:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">  def start(_type, _args) do
+    children = [
+      {Task, fn -&gt; KVServer.accept(4040) end}
+    ]
+
+    opts = [strategy: :one_for_one, name: KVServer.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+</pre></div> <p>As usual, we’ve passed a two-element tuple as a child specification, which in turn will invoke <code class="language-plaintext highlighter-rouge">Task.start_link/1</code>.</p> <p>With this change, we are saying that we want to run <code class="language-plaintext highlighter-rouge">KVServer.accept(4040)</code> as a task. We are hardcoding the port for now but this could be changed in a few ways, for example, by reading the port out of the system environment when starting the application:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">port = String.to_integer(System.get_env("PORT") || "4040")
+# ...
+{Task, fn -&gt; KVServer.accept(port) end}
+</pre></div> <p>Insert these changes in your code and now you may start your application using the following command <code class="language-plaintext highlighter-rouge">PORT=4321 mix run --no-halt</code>, notice how we are passing the port as a variable, but still defaults to 4040 if none is given.</p> <p>Now that the server is part of the supervision tree, it should start automatically when we run the application. Start your server, now passing the port, and once again use the <code class="language-plaintext highlighter-rouge">telnet</code> client to make sure that everything still works:</p> <div class="language-console highlighter-rouge"><pre class="highlight" data-language="">$ telnet 127.0.0.1 4321
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+say you
+say you
+say me
+say me
+</pre></div> <p>Yes, it works! However, does it <em>scale</em>?</p> <p>Try to connect two telnet clients at the same time. When you do so, you will notice that the second client doesn’t echo:</p> <div class="language-console highlighter-rouge"><pre class="highlight" data-language="">$ telnet 127.0.0.1 4321
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+hello
+hello?
+HELLOOOOOO?
+</pre></div> <p>It doesn’t seem to work at all. That’s because we are serving requests in the same process that are accepting connections. When one client is connected, we can’t accept another client.</p> <h2 id="task-supervisor">Task supervisor</h2> <p>In order to make our server handle simultaneous connections, we need to have one process working as an acceptor that spawns other processes to serve requests. One solution would be to change:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">defp loop_acceptor(socket) do
+  {:ok, client} = :gen_tcp.accept(socket)
+  serve(client)
+  loop_acceptor(socket)
+end
+</pre></div> <p>to also use <code class="language-plaintext highlighter-rouge">Task.start_link/1</code>:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">defp loop_acceptor(socket) do
+  {:ok, client} = :gen_tcp.accept(socket)
+  Task.start_link(fn -&gt; serve(client) end)
+  loop_acceptor(socket)
+end
+</pre></div> <p>We are starting a linked Task directly from the acceptor process. But we’ve already made this mistake once. Do you remember?</p> <p>This is similar to the mistake we made when we called <code class="language-plaintext highlighter-rouge">KV.Bucket.start_link/1</code> straight from the registry. That meant a failure in any bucket would bring the whole registry down.</p> <p>The code above would have the same flaw: if we link the <code class="language-plaintext highlighter-rouge">serve(client)</code> task to the acceptor, a crash when serving a request would bring the acceptor, and consequently all other connections, down.</p> <p>We fixed the issue for the registry by using a simple one for one supervisor. We are going to use the same tactic here, except that this pattern is so common with tasks that <code class="language-plaintext highlighter-rouge">Task</code> already comes with a solution: a simple one for one supervisor that starts temporary tasks as part of our supervision tree.</p> <p>Let’s change <code class="language-plaintext highlighter-rouge">start/2</code> once again, to add a supervisor to our tree:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">  def start(_type, _args) do
+    port = String.to_integer(System.get_env("PORT") || "4040")
+
+    children = [
+      {Task.Supervisor, name: KVServer.TaskSupervisor},
+      {Task, fn -&gt; KVServer.accept(port) end}
+    ]
+
+    opts = [strategy: :one_for_one, name: KVServer.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+</pre></div> <p>We’ll now start a <a href="https://hexdocs.pm/elixir/Task.Supervisor.html"><code class="language-plaintext highlighter-rouge">Task.Supervisor</code></a> process with name <code class="language-plaintext highlighter-rouge">KVServer.TaskSupervisor</code>. Remember, since the acceptor task depends on this supervisor, the supervisor must be started first.</p> <p>Now we need to change <code class="language-plaintext highlighter-rouge">loop_acceptor/1</code> to use <code class="language-plaintext highlighter-rouge">Task.Supervisor</code> to serve each request:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">defp loop_acceptor(socket) do
+  {:ok, client} = :gen_tcp.accept(socket)
+  {:ok, pid} = Task.Supervisor.start_child(KVServer.TaskSupervisor, fn -&gt; serve(client) end)
+  :ok = :gen_tcp.controlling_process(client, pid)
+  loop_acceptor(socket)
+end
+</pre></div> <p>You might notice that we added a line, <code class="language-plaintext highlighter-rouge">:ok = :gen_tcp.controlling_process(client, pid)</code>. This makes the child process the “controlling process” of the <code class="language-plaintext highlighter-rouge">client</code> socket. If we didn’t do this, the acceptor would bring down all the clients if it crashed because sockets would be tied to the process that accepted them (which is the default behaviour).</p> <p>Start a new server with <code class="language-plaintext highlighter-rouge">PORT=4040 mix run --no-halt</code> and we can now open up many concurrent telnet clients. You will also notice that quitting a client does not bring the acceptor down. Excellent!</p> <p>Here is the full echo server implementation:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">defmodule KVServer do
+  require Logger
+
+  @doc """
+  Starts accepting connections on the given `port`.
+  """
+  def accept(port) do
+    {:ok, socket} = :gen_tcp.listen(port,
+                      [:binary, packet: :line, active: false, reuseaddr: true])
+    Logger.info "Accepting connections on port #{port}"
+    loop_acceptor(socket)
+  end
+
+  defp loop_acceptor(socket) do
+    {:ok, client} = :gen_tcp.accept(socket)
+    {:ok, pid} = Task.Supervisor.start_child(KVServer.TaskSupervisor, fn -&gt; serve(client) end)
+    :ok = :gen_tcp.controlling_process(client, pid)
+    loop_acceptor(socket)
+  end
+
+  defp serve(socket) do
+    socket
+    |&gt; read_line()
+    |&gt; write_line(socket)
+
+    serve(socket)
+  end
+
+  defp read_line(socket) do
+    {:ok, data} = :gen_tcp.recv(socket, 0)
+    data
+  end
+
+  defp write_line(line, socket) do
+    :gen_tcp.send(socket, line)
+  end
+end
+</pre></div> <p>Since we have changed the supervisor specification, we need to ask: is our supervision strategy still correct?</p> <p>In this case, the answer is yes: if the acceptor crashes, there is no need to crash the existing connections. On the other hand, if the task supervisor crashes, there is no need to crash the acceptor too.</p> <p>However, there is still one concern left, which are the restart strategies. Tasks, by default, have the <code class="language-plaintext highlighter-rouge">:restart</code> value set to <code class="language-plaintext highlighter-rouge">:temporary</code>, which means they are not restarted. This is an excellent default for the connections started via the <code class="language-plaintext highlighter-rouge">Task.Supervisor</code>, as it makes no sense to restart a failed connection, but it is a bad choice for the acceptor. If the acceptor crashes, we want to bring the acceptor up and running again.</p> <p>We could fix this by defining our own module that calls <code class="language-plaintext highlighter-rouge">use Task, restart: :permanent</code> and invokes a <code class="language-plaintext highlighter-rouge">start_link</code> function responsible for restarting the task, quite similar to <code class="language-plaintext highlighter-rouge">Agent</code> and <code class="language-plaintext highlighter-rouge">GenServer</code>. However, let’s take a different approach here. When integrating with someone else’s library, we won’t be able to change how their agents, tasks, and servers are defined. Instead, we need to be able to customize their child specification dynamically. This can be done by using <code class="language-plaintext highlighter-rouge">Supervisor.child_spec/2</code>, a function that we happen to know from previous chapters. Let’s rewrite <code class="language-plaintext highlighter-rouge">start/2</code> in <code class="language-plaintext highlighter-rouge">KVServer.Application</code> once more:</p> <div class="language-elixir highlighter-rouge"><pre class="highlight" data-language="">  def start(_type, _args) do
+    port = String.to_integer(System.get_env("PORT") || "4040")
+
+    children = [
+      {Task.Supervisor, name: KVServer.TaskSupervisor},
+      Supervisor.child_spec({Task, fn -&gt; KVServer.accept(port) end}, restart: :permanent)
+    ]
+
+    opts = [strategy: :one_for_one, name: KVServer.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+</pre></div> <p><code class="language-plaintext highlighter-rouge">Supervisor.child_spec/2</code> is capable of building a child specification from a given module and/or tuple, and it also accepts values that override the underlying child specification. Now we have an always running acceptor that starts temporary task processes under an always running task supervisor.</p> <p>In the next chapter, we will start parsing the client requests and sending responses, finishing our server.</p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012 Plataformatec<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://elixir-lang.org/getting-started/mix-otp/task-and-gen-tcp.html" class="_attribution-link">https://elixir-lang.org/getting-started/mix-otp/task-and-gen-tcp.html</a>
+  </p>
+</div>
