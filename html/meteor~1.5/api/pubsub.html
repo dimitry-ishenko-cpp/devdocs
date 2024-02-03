@@ -1,0 +1,131 @@
+<h1 class="title-page">Publish and subscribe</h1> <div class="subtitle-page">Documentation of Meteor's publication and subscription API.</div>    <p>These functions control how Meteor servers publish sets of records and how clients can subscribe to those sets.</p>  <h2 class="api-heading" id="Meteor-publish"> <div class="locus"> Server </div> <code>Meteor.publish(name, func)</code> <div class="subtext-api"> <code>import { Meteor } from 'meteor/meteor'</code> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L1513" target="_blank"> (ddp-server/livedata_server.js, line 1513) </a> </div> </h2>   <p>Publish a record set.</p>  <h4 class="subheading">Arguments</h4> <dl class="args"> <dt> <code>name</code> <span class="type">String or Object</span> </dt> <dd> <p>If String, name of the record set. If Object, publications Dictionary of publish functions by name. If <code>null</code>, the set has no name, and the record set is automatically sent to all connected clients.</p> </dd> <dt> <code>func</code> <span class="type">Function</span> </dt> <dd> <p>Function called on the server each time a client subscribes. Inside the function, <code>this</code> is the publish handler object, described below. If the client passed arguments to <code>subscribe</code>, the function is called with the same arguments.</p> </dd> </dl>   <p>To publish records to clients, call <code>Meteor.publish</code> on the server with two parameters: the name of the record set, and a <em>publish function</em> that Meteor will call each time a client subscribes to the name.</p> <p>Publish functions can return a <a href="#mongo_cursor"><code>Collection.Cursor</code></a>, in which case Meteor will publish that cursor’s documents to each subscribed client. You can also return an array of <code>Collection.Cursor</code>s, in which case Meteor will publish all of the cursors.</p> <blockquote class="pullquote warning">
+<p>If you return multiple cursors in an array, they currently must all be from different collections. We hope to lift this restriction in a future release.</p> </blockquote> <p>A client will see a document if the document is currently in the published record set of any of its subscriptions. If multiple publications publish a document with the same <code>_id</code> to the same collection the documents will be merged for the client. If the values of any of the top level fields conflict, the resulting value will be one of the published values, chosen arbitrarily.</p> <pre class="highlight js" data-language="js">// Server: Publish the `Rooms` collection, minus secret info...
+Meteor.publish('rooms', function () {
+  return Rooms.find({}, {
+    fields: { secretInfo: 0 }
+  });
+});
+
+// ...and publish secret info for rooms where the logged-in user is an admin. If
+// the client subscribes to both publications, the records are merged together
+// into the same documents in the `Rooms` collection. Note that currently object
+// values are not recursively merged, so the fields that differ must be top
+// level fields.
+Meteor.publish('adminSecretInfo', function () {
+  return Rooms.find({ admin: this.userId }, {
+    fields: { secretInfo: 1 }
+  });
+});
+
+// Publish dependent documents and simulate joins.
+Meteor.publish('roomAndMessages', function (roomId) {
+  check(roomId, String);
+
+  return [
+    Rooms.find({ _id: roomId }, {
+      fields: { secretInfo: 0 }
+    }),
+    Messages.find({ roomId })
+  ];
+});</pre> <p>Alternatively, a publish function can directly control its published record set by calling the functions <a href="#publish_added"><code>added</code></a> (to add a new document to the published record set), <a href="#publish_changed"><code>changed</code></a> (to change or clear some fields on a document already in the published record set), and <a href="#publish_removed"><code>removed</code></a> (to remove documents from the published record set). These methods are provided by <code>this</code> in your publish function.</p> <p>If a publish function does not return a cursor or array of cursors, it is assumed to be using the low-level <code>added</code>/<code>changed</code>/<code>removed</code> interface, and it <strong>must also call <a href="#publish_ready"><code>ready</code></a> once the initial record set is complete</strong>.</p> <p>Example (server):</p> <pre class="highlight js" data-language="js">// Publish the current size of a collection.
+Meteor.publish('countsByRoom', function (roomId) {
+  check(roomId, String);
+
+  let count = 0;
+  let initializing = true;
+
+  // `observeChanges` only returns after the initial `added` callbacks have run.
+
+  // Until then, we don't want to send a lot of `changed` messages—hence
+
+  // tracking the `initializing` state.
+
+  const handle = Messages.find({ roomId }).observeChanges({
+    added: (id) =&gt; {
+      count += 1;
+
+      if (!initializing) {
+        this.changed('counts', roomId, { count });
+      }
+    },
+
+    removed: (id) =&gt; {
+      count -= 1;
+      this.changed('counts', roomId, { count });
+    }
+
+    // We don't care about `changed` events.
+
+  });
+
+  // Instead, we'll send one `added` message right after `observeChanges` has
+
+  // returned, and mark the subscription as ready.
+
+  initializing = false;
+  this.added('counts', roomId, { count });
+  this.ready();
+
+  // Stop observing the cursor when the client unsubscribes. Stopping a
+
+  // subscription automatically takes care of sending the client any `removed`
+
+  // messages.
+
+  this.onStop(() =&gt; handle.stop());
+});
+
+// Sometimes publish a query, sometimes publish nothing.
+Meteor.publish('secretData', function () {
+  if (this.userId === 'superuser') {
+    return SecretData.find();
+  } else {
+    // Declare that no data is being published. If you leave this line out,
+
+    // Meteor will never consider the subscription ready because it thinks
+
+    // you're using the `added/changed/removed` interface where you have to
+
+    // explicitly call `this.ready`.
+
+    return [];
+  }
+});</pre> <p>Example (client):</p> <pre class="highlight js" data-language="js">// Declare a collection to hold the count object.
+
+const Counts = new Mongo.Collection('counts');
+
+// Subscribe to the count for the current room.
+Tracker.autorun(() =&gt; {
+  Meteor.subscribe('countsByRoom', Session.get('roomId'));
+});
+
+// Use the new collection.
+
+const roomCount = Counts.findOne(Session.get('roomId')).count;
+
+console.log(`Current room has ${roomCount} messages.`);</pre> <blockquote class="pullquote warning">
+<p>Meteor will emit a warning message if you call <code>Meteor.publish</code> in a project that includes the <code>autopublish</code> package. Your publish function will still work.</p> </blockquote> <p>Read more about publications and how to use them in the <a href="http://guide.meteor.com/data-loading.html" target="_blank" rel="external">Data Loading</a> article in the Meteor Guide.</p>  <h3 class="api-heading" id="Subscription-userId"> <div class="locus"> Server </div> <code>this.userId</code> <div class="subtext-api"> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L1003" target="_blank"> (ddp-server/livedata_server.js, line 1003) </a> </div> </h3>   <p>Access inside the publish function. The id of the logged-in user, or <code>null</code> if no user is logged in.</p>    <p>This is constant. However, if the logged-in user changes, the publish function is rerun with the new value.</p>  <h3 class="api-heading" id="Subscription-added"> <div class="locus"> Server </div> <code>this.added(collection, id, fields)</code> <div class="subtext-api"> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L1250" target="_blank"> (ddp-server/livedata_server.js, line 1250) </a> </div> </h3>   <p>Call inside the publish function. Informs the subscriber that a document has been added to the record set.</p>  <h4 class="subheading">Arguments</h4> <dl class="args"> <dt> <code>collection</code> <span class="type">String</span> </dt> <dd> <p>The name of the collection that contains the new document.</p> </dd> <dt> <code>id</code> <span class="type">String</span> </dt> <dd> <p>The new document's ID.</p> </dd> <dt> <code>fields</code> <span class="type">Object</span> </dt> <dd> <p>The fields in the new document. If <code>_id</code> is present it is ignored.</p> </dd> </dl>    <h3 class="api-heading" id="Subscription-changed"> <div class="locus"> Server </div> <code>this.changed(collection, id, fields)</code> <div class="subtext-api"> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L1268" target="_blank"> (ddp-server/livedata_server.js, line 1268) </a> </div> </h3>   <p>Call inside the publish function. Informs the subscriber that a document in the record set has been modified.</p>  <h4 class="subheading">Arguments</h4> <dl class="args"> <dt> <code>collection</code> <span class="type">String</span> </dt> <dd> <p>The name of the collection that contains the changed document.</p> </dd> <dt> <code>id</code> <span class="type">String</span> </dt> <dd> <p>The changed document's ID.</p> </dd> <dt> <code>fields</code> <span class="type">Object</span> </dt> <dd> <p>The fields in the document that have changed, together with their new values. If a field is not present in <code>fields</code> it was left unchanged; if it is present in <code>fields</code> and has a value of <code>undefined</code> it was removed from the document. If <code>_id</code> is present it is ignored.</p> </dd> </dl>    <h3 class="api-heading" id="Subscription-removed"> <div class="locus"> Server </div> <code>this.removed(collection, id)</code> <div class="subtext-api"> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L1284" target="_blank"> (ddp-server/livedata_server.js, line 1284) </a> </div> </h3>   <p>Call inside the publish function. Informs the subscriber that a document has been removed from the record set.</p>  <h4 class="subheading">Arguments</h4> <dl class="args"> <dt> <code>collection</code> <span class="type">String</span> </dt> <dd> <p>The name of the collection that the document has been removed from.</p> </dd> <dt> <code>id</code> <span class="type">String</span> </dt> <dd> <p>The ID of the document that has been removed.</p> </dd> </dl>    <h3 class="api-heading" id="Subscription-ready"> <div class="locus"> Server </div> <code>this.ready()</code> <div class="subtext-api"> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L1301" target="_blank"> (ddp-server/livedata_server.js, line 1301) </a> </div> </h3>   <p>Call inside the publish function. Informs the subscriber that an initial, complete snapshot of the record set has been sent. This will trigger a call on the client to the <code>onReady</code> callback passed to <a href="#meteor_subscribe"><code>Meteor.subscribe</code></a>, if any.</p>     <h3 class="api-heading" id="Subscription-onStop"> <div class="locus"> Server </div> <code>this.onStop(func)</code> <div class="subtext-api"> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L1224" target="_blank"> (ddp-server/livedata_server.js, line 1224) </a> </div> </h3>   <p>Call inside the publish function. Registers a callback function to run when the subscription is stopped.</p>  <h4 class="subheading">Arguments</h4> <dl class="args"> <dt> <code>func</code> <span class="type">Function</span> </dt> <dd> <p>The callback function</p> </dd> </dl>   <p>If you call <a href="#observe"><code>observe</code></a> or <a href="#observe_changes"><code>observeChanges</code></a> in your publish handler, this is the place to stop the observes.</p>  <h3 class="api-heading" id="Subscription-error"> <div class="locus"> Server </div> <code>this.error(error)</code> <div class="subtext-api"> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L1192" target="_blank"> (ddp-server/livedata_server.js, line 1192) </a> </div> </h3>   <p>Call inside the publish function. Stops this client's subscription, triggering a call on the client to the <code>onStop</code> callback passed to <a href="#meteor_subscribe"><code>Meteor.subscribe</code></a>, if any. If <code>error</code> is not a <a href="#meteor_error"><code>Meteor.Error</code></a>, it will be <a href="#meteor_error">sanitized</a>.</p>  <h4 class="subheading">Arguments</h4> <dl class="args"> <dt> <code>error</code> <span class="type">Error</span> </dt> <dd> <p>The error to pass to the client.</p> </dd> </dl>    <h3 class="api-heading" id="Subscription-stop"> <div class="locus"> Server </div> <code>this.stop()</code> <div class="subtext-api"> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L1210" target="_blank"> (ddp-server/livedata_server.js, line 1210) </a> </div> </h3>   <p>Call inside the publish function. Stops this client's subscription and invokes the client's <code>onStop</code> callback with no error.</p>     <h3 class="api-heading" id="Subscription-connection"> <div class="locus"> Server </div> <code>this.connection</code> <div class="subtext-api"> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-server/livedata_server.js#L961" target="_blank"> (ddp-server/livedata_server.js, line 961) </a> </div> </h3>   <p>Access inside the publish function. The incoming <a href="#meteor_onconnection">connection</a> for this subscription.</p>     <h2 class="api-heading" id="Meteor-subscribe"> <div class="locus"> Client </div> <code>Meteor.subscribe(name, [arg1, arg2...], [callbacks])</code> <div class="subtext-api"> <code>import { Meteor } from 'meteor/meteor'</code> <a class="src-code link secondary" href="https://github.com/meteor/meteor/blob/master/packages/ddp-client/livedata_connection.js#L531" target="_blank"> (ddp-client/livedata_connection.js, line 531) </a> </div> </h2>   <p>Subscribe to a record set. Returns a handle that provides <code>stop()</code> and <code>ready()</code> methods.</p>  <h4 class="subheading">Arguments</h4> <dl class="args"> <dt> <code>name</code> <span class="type">String</span> </dt> <dd> <p>Name of the subscription. Matches the name of the server's <code>publish()</code> call.</p> </dd> <dt> <code>arg1, arg2...</code> <span class="type"><a href="#ejson">EJSON-able Object</a></span> </dt> <dd> <p>Optional arguments passed to publisher function on server.</p> </dd> <dt> <code>callbacks</code> <span class="type">Function or Object</span> </dt> <dd> <p>Optional. May include <code>onStop</code> and <code>onReady</code> callbacks. If there is an error, it is passed as an argument to <code>onStop</code>. If a function is passed instead of an object, it is interpreted as an <code>onReady</code> callback.</p> </dd> </dl>   <p>When you subscribe to a record set, it tells the server to send records to the client. The client stores these records in local <a href="#mongo_collection">Minimongo collections</a>, with the same name as the <code>collection</code> argument used in the publish handler’s <a href="#publish_added"><code>added</code></a>, <a href="#publish_changed"><code>changed</code></a>, and <a href="#publish_removed"><code>removed</code></a> callbacks. Meteor will queue incoming records until you declare the <a href="#mongo_collection"><code>Mongo.Collection</code></a> on the client with the matching collection name.</p> <pre class="highlight js" data-language="js">// It's okay to subscribe (and possibly receive data) before declaring the
+// client collection that will hold it. Assume 'allPlayers' publishes data from
+// the server's 'players' collection.
+Meteor.subscribe('allPlayers');
+...
+
+// The client queues incoming 'players' records until the collection is created:
+
+const Players = new Mongo.Collection('players');</pre> <p>The client will see a document if the document is currently in the published record set of any of its subscriptions. If multiple publications publish a document with the same <code>_id</code> for the same collection the documents are merged for the client. If the values of any of the top level fields conflict, the resulting value will be one of the published values, chosen arbitrarily.</p> <blockquote class="pullquote warning">
+<p>Currently, when multiple subscriptions publish the same document <em>only the top level fields</em> are compared during the merge. This means that if the documents include different sub-fields of the same top level field, not all of them will be available on the client. We hope to lift this restriction in a future release.</p> </blockquote> <p>The <code>onReady</code> callback is called with no arguments when the server <a href="#publish_ready">marks the subscription as ready</a>. The <code>onStop</code> callback is called with a <a href="#meteor_error"><code>Meteor.Error</code></a> if the subscription fails or is terminated by the server. If the subscription is stopped by calling <code>stop</code> on the subscription handle or inside the publication, <code>onStop</code> is called with no arguments.</p> <p><code>Meteor.subscribe</code> returns a subscription handle, which is an object with the following properties:</p> <dl class="callbacks"> <dt><span class="name">stop()</span></dt>
+<dd>
+<p>Cancel the subscription. This will typically result in the server directing the client to remove the subscription’s data from the client’s cache.</p> </dd> <dt><span class="name">ready()</span></dt>
+<dd>
+<p>True if the server has <a href="#publish_ready">marked the subscription as ready</a>. A reactive data source.</p> </dd> <dt><span class="name">subscriptionId</span></dt>
+<dd>
+<p>The <code>id</code> of the subscription this handle is for. When you run <code>Meteor.subscribe</code> inside of <code>Tracker.autorun</code>, the handles you get will always have the same <code>subscriptionId</code> field. You can use this to deduplicate subscription handles if you are storing them in some data structure.</p> </dd> </dl> <p>If you call <code>Meteor.subscribe</code> within a <a href="#reactivity">reactive computation</a>, for example using <a href="#tracker_autorun"><code>Tracker.autorun</code></a>, the subscription will automatically be cancelled when the computation is invalidated or stopped; it is not necessary to call <code>stop</code> on subscriptions made from inside <code>autorun</code>. However, if the next iteration of your run function subscribes to the same record set (same name and parameters), Meteor is smart enough to skip a wasteful unsubscribe/resubscribe. For example:</p> <pre class="highlight js" data-language="js">Tracker.autorun(() =&gt; {
+  Meteor.subscribe('chat', { room: Session.get('currentRoom') });
+  Meteor.subscribe('privateMessages');
+});</pre> <p>This subscribes you to the chat messages in the current room and to your private messages. When you change rooms by calling <code>Session.set('currentRoom',
+'newRoom')</code>, Meteor will subscribe to the new room’s chat messages, unsubscribe from the original room’s chat messages, and continue to stay subscribed to your private messages.</p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2011&ndash;2017 Meteor Development Group, Inc.<br>Licensed under the MIT License.<br>
+    <a href="https://docs.meteor.com/api/pubsub.html" class="_attribution-link">https://docs.meteor.com/api/pubsub.html</a>
+  </p>
+</div>
