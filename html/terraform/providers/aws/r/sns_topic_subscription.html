@@ -1,0 +1,224 @@
+<h1 id="aws_sns_topic_subscription">  aws_sns_topic_subscription </h1> <p>Provides a resource for subscribing to SNS topics. Requires that an SNS topic exist for the subscription to attach to. This resource allows you to automatically place messages sent to SNS topics in SQS queues, send them as HTTP(S) POST requests to a given endpoint, send SMS messages, or notify devices / applications. The most likely use case for Terraform users will probably be SQS queues.</p> <blockquote class="alert alert-warning" role="alert"> <p><strong>NOTE:</strong> If the SNS topic and SQS queue are in different AWS regions, it is important for the "aws_sns_topic_subscription" to use an AWS provider that is in the same region of the SNS topic. If the "aws_sns_topic_subscription" is using a provider with a different region than the SNS topic, terraform will fail to create the subscription.</p> </blockquote> <blockquote class="alert alert-warning" role="alert"> <p><strong>NOTE:</strong> Setup of cross-account subscriptions from SNS topics to SQS queues requires Terraform to have access to BOTH accounts.</p> </blockquote> <blockquote class="alert alert-warning" role="alert"> <p><strong>NOTE:</strong> If SNS topic and SQS queue are in different AWS accounts but the same region it is important for the "aws_sns_topic_subscription" to use the AWS provider of the account with the SQS queue. If "aws_sns_topic_subscription" is using a Provider with a different account than the SNS topic, terraform creates the subscriptions but does not keep state and tries to re-create the subscription at every apply.</p> </blockquote> <blockquote class="alert alert-warning" role="alert"> <p><strong>NOTE:</strong> If SNS topic and SQS queue are in different AWS accounts and different AWS regions it is important to recognize that the subscription needs to be initiated from the account with the SQS queue but in the region of the SNS topic.</p> </blockquote> <h2 id="example-usage">  Example Usage </h2> <p>You can directly supply a topic and ARN by hand in the <code>topic_arn</code> property along with the queue ARN:</p> <pre data-language="ruby">resource "aws_sns_topic_subscription" "user_updates_sqs_target" {
+  topic_arn = "arn:aws:sns:us-west-2:432981146916:user-updates-topic"
+  protocol  = "sqs"
+  endpoint  = "arn:aws:sqs:us-west-2:432981146916:terraform-queue-too"
+}
+</pre>
+<p>Alternatively you can use the ARN properties of a managed SNS topic and SQS queue:</p> <pre data-language="ruby">resource "aws_sns_topic" "user_updates" {
+  name = "user-updates-topic"
+}
+
+resource "aws_sqs_queue" "user_updates_queue" {
+  name = "user-updates-queue"
+}
+
+resource "aws_sns_topic_subscription" "user_updates_sqs_target" {
+  topic_arn = "${aws_sns_topic.user_updates.arn}"
+  protocol  = "sqs"
+  endpoint  = "${aws_sqs_queue.user_updates_queue.arn}"
+}
+</pre>
+<p>You can subscribe SNS topics to SQS queues in different Amazon accounts and regions:</p> <pre data-language="ruby">/*
+#
+# Variables
+#
+*/
+variable "sns" {
+  default = {
+    account-id    = "111111111111"
+    role-name     = "service/service-hashicorp-terraform"
+    name          = "example-sns-topic"
+    display_name  = "example"
+    region        = "us-west-1"
+  }
+}
+
+variable "sqs" {
+  default = {
+    account-id    = "222222222222"
+    role-name     = "service/service-hashicorp-terraform"
+    name          = "example-sqs-queue"
+    region        = "us-east-1"
+  }
+}
+
+data "aws_iam_policy_document" "sns-topic-policy" {
+  policy_id = "__default_policy_ID"
+
+  statement {
+    actions = [
+      "SNS:Subscribe",
+      "SNS:SetTopicAttributes",
+      "SNS:RemovePermission",
+      "SNS:Receive",
+      "SNS:Publish",
+      "SNS:ListSubscriptionsByTopic",
+      "SNS:GetTopicAttributes",
+      "SNS:DeleteTopic",
+      "SNS:AddPermission",
+    ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceOwner"
+
+      values = [
+        "${var.sns["account-id"]}",
+      ]
+    }
+
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    resources = [
+      "arn:aws:sns:${var.sns["region"]}:${var.sns["account-id"]}:${var.sns["name"]}",
+    ]
+
+    sid = "__default_statement_ID"
+  }
+
+  statement {
+    actions = [
+      "SNS:Subscribe",
+      "SNS:Receive",
+    ]
+
+    condition {
+      test     = "StringLike"
+      variable = "SNS:Endpoint"
+
+      values = [
+        "arn:aws:sqs:${var.sqs["region"]}:${var.sqs["account-id"]}:${var.sqs["name"]}",
+      ]
+    }
+
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    resources = [
+      "arn:aws:sns:${var.sns["region"]}:${var.sns["account-id"]}:${var.sns["name"]}",
+    ]
+
+    sid = "__console_sub_0"
+  }
+}
+
+data "aws_iam_policy_document" "sqs-queue-policy" {
+  policy_id = "arn:aws:sqs:${var.sqs["region"]}:${var.sqs["account-id"]}:${var.sqs["name"]}/SQSDefaultPolicy"
+
+  statement {
+    sid    = "example-sns-topic"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "SQS:SendMessage",
+    ]
+
+    resources = [
+      "arn:aws:sqs:${var.sqs["region"]}:${var.sqs["account-id"]}:${var.sqs["name"]}",
+    ]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+
+      values = [
+        "arn:aws:sns:${var.sns["region"]}:${var.sns["account-id"]}:${var.sns["name"]}",
+      ]
+    }
+  }
+}
+
+# provider to manage SNS topics
+provider "aws" {
+  alias  = "sns"
+  region = "${var.sns["region"]}"
+
+  assume_role {
+    role_arn     = "arn:aws:iam::${var.sns["account-id"]}:role/${var.sns["role-name"]}"
+    session_name = "sns-${var.sns["region"]}"
+  }
+}
+
+# provider to manage SQS queues
+provider "aws" {
+  alias  = "sqs"
+  region = "${var.sqs["region"]}"
+
+  assume_role {
+    role_arn     = "arn:aws:iam::${var.sqs["account-id"]}:role/${var.sqs["role-name"]}"
+    session_name = "sqs-${var.sqs["region"]}"
+  }
+}
+
+# provider to subscribe SQS to SNS (using the SQS account but the SNS region)
+provider "aws" {
+  alias  = "sns2sqs"
+  region = "${var.sns["region"]}"
+
+  assume_role {
+    role_arn     = "arn:aws:iam::${var.sqs["account-id"]}:role/${var.sqs["role-name"]}"
+    session_name = "sns2sqs-${var.sns["region"]}"
+  }
+}
+
+resource "aws_sns_topic" "sns-topic" {
+  provider     = "aws.sns"
+  name         = "${var.sns["name"]}"
+  display_name = "${var.sns["display_name"]}"
+  policy       = "${data.aws_iam_policy_document.sns-topic-policy.json}"
+}
+
+resource "aws_sqs_queue" "sqs-queue" {
+  provider = "aws.sqs"
+  name     = "${var.sqs["name"]}"
+  policy   = "${data.aws_iam_policy_document.sqs-queue-policy.json}"
+}
+
+resource "aws_sns_topic_subscription" "sns-topic" {
+  provider  = "aws.sns2sqs"
+  topic_arn = "${aws_sns_topic.sns-topic.arn}"
+  protocol  = "sqs"
+  endpoint  = "${aws_sqs_queue.sqs-queue.arn}"
+}
+</pre>
+<h2 id="argument-reference">  Argument Reference </h2> <p>The following arguments are supported:</p> <ul> <li>
+<a href="#topic_arn"><code>topic_arn</code></a> - (Required) The ARN of the SNS topic to subscribe to </li> <li>
+<a href="#protocol"><code>protocol</code></a> - (Required) The protocol to use. The possible values for this are: <code>sqs</code>, <code>sms</code>, <code>lambda</code>, <code>application</code>. (<code>http</code> or <code>https</code> are partially supported, see below) (<code>email</code> is option but unsupported, see below). </li> <li>
+<a href="#endpoint"><code>endpoint</code></a> - (Required) The endpoint to send data to, the contents will vary with the protocol. (see below for more information) </li> <li>
+<a href="#endpoint_auto_confirms"><code>endpoint_auto_confirms</code></a> - (Optional) Boolean indicating whether the end point is capable of <a href="http://docs.aws.amazon.com/sns/latest/dg/SendMessageToHttp.html#SendMessageToHttp.prepare">auto confirming subscription</a> e.g., PagerDuty (default is false) </li> <li>
+<a href="#confirmation_timeout_in_minutes"><code>confirmation_timeout_in_minutes</code></a> - (Optional) Integer indicating number of minutes to wait in retying mode for fetching subscription arn before marking it as failure. Only applicable for http and https protocols (default is 1 minute). </li> <li>
+<a href="#raw_message_delivery"><code>raw_message_delivery</code></a> - (Optional) Boolean indicating whether or not to enable raw message delivery (the original message is directly passed, not wrapped in JSON with the original message in the message property) (default is false). </li> <li>
+<a href="#filter_policy"><code>filter_policy</code></a> - (Optional) The text of a filter policy to the topic subscription. </li> </ul> <h3 id="protocols-supported">  Protocols supported </h3> <p>Supported SNS protocols include:</p> <ul> <li>
+<a href="#lambda"><code>lambda</code></a> -- delivery of JSON-encoded message to a lambda function </li> <li>
+<a href="#sqs"><code>sqs</code></a> -- delivery of JSON-encoded message to an Amazon SQS queue </li> <li>
+<a href="#application"><code>application</code></a> -- delivery of JSON-encoded message to an EndpointArn for a mobile app and device </li> <li>
+<a href="#sms"><code>sms</code></a> -- delivery text message </li> </ul> <p>Partially supported SNS protocols include:</p> <ul> <li>
+<a href="#http"><code>http</code></a> -- delivery of JSON-encoded messages via HTTP. Supported only for the end points that auto confirms the subscription. </li> <li>
+<a href="#https"><code>https</code></a> -- delivery of JSON-encoded messages via HTTPS. Supported only for the end points that auto confirms the subscription. </li> </ul> <p>Unsupported protocols include the following:</p> <ul> <li>
+<a href="#email"><code>email</code></a> -- delivery of message via SMTP </li> <li>
+<a href="#email-json"><code>email-json</code></a> -- delivery of JSON-encoded message via SMTP </li> </ul> <p>These are unsupported because the endpoint needs to be authorized and does not generate an ARN until the target email address has been validated. This breaks the Terraform model and as a result are not currently supported.</p> <h3 id="specifying-endpoints">  Specifying endpoints </h3> <p>Endpoints have different format requirements according to the protocol that is chosen.</p> <ul> <li>SQS endpoints come in the form of the SQS queue's ARN (not the URL of the queue) e.g: <code>arn:aws:sqs:us-west-2:432981146916:terraform-queue-too</code> </li> <li>Application endpoints are also the endpoint ARN for the mobile app and device. </li> </ul> <h2 id="attributes-reference">  Attributes Reference </h2> <p>In addition to all arguments above, the following attributes are exported:</p> <ul> <li>
+<a href="#id"><code>id</code></a> - The ARN of the subscription </li> <li>
+<a href="#topic_arn-1"><code>topic_arn</code></a> - The ARN of the topic the subscription belongs to </li> <li>
+<a href="#protocol-1"><code>protocol</code></a> - The protocol being used </li> <li>
+<a href="#endpoint-1"><code>endpoint</code></a> - The full endpoint to send data to (SQS ARN, HTTP(S) URL, Application ARN, SMS number, etc.) </li> <li>
+<a href="#arn"><code>arn</code></a> - The ARN of the subscription stored as a more user-friendly property </li> </ul> <h2 id="import">  Import </h2> <p>SNS Topic Subscriptions can be imported using the <code>subscription arn</code>, e.g.</p> <pre>$ terraform import aws_sns_topic_subscription.user_updates_sqs_target arn:aws:sns:us-west-2:0123456789012:my-topic:8a21d249-4329-4871-acc6-7be709c6ea7f
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2018 HashiCorp</br>Licensed under the MPL 2.0 License.<br>
+    <a href="https://www.terraform.io/docs/providers/aws/r/sns_topic_subscription.html" class="_attribution-link">https://www.terraform.io/docs/providers/aws/r/sns_topic_subscription.html</a>
+  </p>
+</div>

@@ -1,0 +1,240 @@
+<h1 id="aws_cloudwatch_event_target">  aws_cloudwatch_event_target </h1> <p>Provides a CloudWatch Event Target resource.</p> <h2 id="example-usage">  Example Usage </h2> <pre data-language="ruby">resource "aws_cloudwatch_event_target" "yada" {
+  target_id = "Yada"
+  rule      = "${aws_cloudwatch_event_rule.console.name}"
+  arn       = "${aws_kinesis_stream.test_stream.arn}"
+
+  run_command_targets {
+    key = "tag:Name"
+    values = ["FooBar"]
+  }
+
+  run_command_targets {
+    key = "InstanceIds"
+    values = ["i-162058cd308bffec2"]
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "console" {
+  name        = "capture-ec2-scaling-events"
+  description = "Capture all EC2 scaling events"
+
+  event_pattern = &lt;&lt;PATTERN
+{
+  "source": [
+    "aws.autoscaling"
+  ],
+  "detail-type": [
+    "EC2 Instance Launch Successful",
+    "EC2 Instance Terminate Successful",
+    "EC2 Instance Launch Unsuccessful",
+    "EC2 Instance Terminate Unsuccessful"
+  ]
+}
+PATTERN
+}
+
+resource "aws_kinesis_stream" "test_stream" {
+  name        = "terraform-kinesis-test"
+  shard_count = 1
+}
+</pre>
+<h2 id="example-ssm-document-usage">  Example SSM Document Usage </h2> <pre>data "aws_iam_policy_document" "ssm_lifecycle_trust" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "ssm_lifecycle" {
+  statement {
+    effect    = "Allow"
+    actions   = ["ssm:SendCommand"]
+    resources = ["arn:aws:ec2:eu-west-1:1234567890:instance/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Terminate"
+      values   = ["*"]
+    }
+  }
+
+  statement {
+    effect    = "Allow"
+    actions   = ["ssm:SendCommand"]
+    resources = ["${aws_ssm_document.stop_instance.arn}"]
+  }
+}
+
+resource "aws_iam_role" "ssm_lifecycle" {
+  name               = "SSMLifecycle"
+  assume_role_policy = "${data.aws_iam_policy_document.ssm_lifecycle_trust.json}"
+}
+
+resource "aws_iam_policy" "ssm_lifecycle" {
+  name   = "SSMLifecycle"
+  policy = "${data.aws_iam_policy_document.ssm_lifecycle.json}"
+}
+
+resource "aws_ssm_document" "stop_instance" {
+  name          = "stop_instance"
+  document_type = "Command"
+
+  content = &lt;&lt;DOC
+  {
+    "schemaVersion": "1.2",
+    "description": "Stop an instance",
+    "parameters": {
+
+    },
+    "runtimeConfig": {
+      "aws:runShellScript": {
+        "properties": [
+          {
+            "id": "0.aws:runShellScript",
+            "runCommand": ["halt"]
+          }
+        ]
+      }
+    }
+  }
+DOC
+}
+
+resource "aws_cloudwatch_event_rule" "stop_instances" {
+  name                = "StopInstance"
+  description         = "Stop instances nightly"
+  schedule_expression = "cron(0 0 * * ? *)"
+}
+
+resource "aws_cloudwatch_event_target" "stop_instances" {
+  target_id = "StopInstance"
+  arn       = "${aws_ssm_document.stop_instance.arn}"
+  rule      = "${aws_cloudwatch_event_rule.stop_instances.name}"
+  role_arn  = "${aws_iam_role.ssm_lifecycle.arn}"
+
+  run_command_targets {
+    key    = "tag:Terminate"
+    values = ["midnight"]
+  }
+}
+
+</pre>
+<h2 id="example-runcommand-usage">  Example RunCommand Usage </h2> <pre>
+resource "aws_cloudwatch_event_rule" "stop_instances" {
+  name                = "StopInstance"
+  description         = "Stop instances nightly"
+  schedule_expression = "cron(0 0 * * ? *)"
+}
+
+resource "aws_cloudwatch_event_target" "stop_instances" {
+  target_id = "StopInstance"
+  arn       = "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript"
+  input     = "{\"commands\":[\"halt\"]}"
+  rule      = "${aws_cloudwatch_event_rule.stop_instances.name}"
+  role_arn  = "${aws_iam_role.ssm_lifecycle.arn}"
+
+  run_command_targets {
+    key    = "tag:Terminate"
+    values = ["midnight"]
+  }
+}
+
+</pre>
+<h2 id="example-ecs-run-task-with-role-and-task-override-usage">  Example ECS Run Task with Role and Task Override Usage </h2> <pre>resource "aws_iam_role" "ecs_events" {
+  name = "ecs_events"
+  assume_role_policy = &lt;&lt;DOC
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "events.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+DOC
+}
+
+resource "aws_iam_role_policy" "ecs_events_run_task_with_any_role" {
+  name = "ecs_events_run_task_with_any_role"
+  role = "${aws_iam_role.ecs_events.id}"
+  policy = &lt;&lt;DOC
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": "iam:PassRole",
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": "ecs:RunTask",
+            "Resource": "${replace(aws_ecs_task_definition.task_name.arn, "/:\\d+$/", ":*")}"
+        }
+    ]
+}
+DOC
+}
+
+resource "aws_cloudwatch_event_target" "ecs_scheduled_task" {
+  target_id = "run-scheduled-task-every-hour"
+  arn       = "${aws_ecs_cluster.cluster_name.arn}"
+  rule      = "${aws_cloudwatch_event_rule.every_hour.name}"
+  role_arn  = "${aws_iam_role.ecs_events.arn}"
+
+  ecs_target = {
+    task_count = 1
+    task_definition_arn = "${aws_ecs_task_definition.task_name.arn}"
+  }
+
+  input = &lt;&lt;DOC
+{
+  "containerOverrides": [
+    {
+      "name": "name-of-container-to-override",
+      "command": ["bin/console", "scheduled-task"]
+    }
+  ]
+}
+DOC
+}
+</pre>
+<h2 id="argument-reference">  Argument Reference </h2> <blockquote class="alert alert-info" role="alert"> <p><strong>Note:</strong> <code>input</code> and <code>input_path</code> are mutually exclusive options.</p> </blockquote> <blockquote class="alert alert-info" role="alert"> <p><strong>Note:</strong> In order to be able to have your AWS Lambda function or SNS topic invoked by a CloudWatch Events rule, you must setup the right permissions using <a href="lambda_permission.html"><code>aws_lambda_permission</code></a> or <a href="sns_topic.html#policy"><code>aws_sns_topic.policy</code></a>. More info <a href="http://docs.aws.amazon.com/AmazonCloudWatch/latest/DeveloperGuide/EventsResourceBasedPermissions.html">here</a>.</p> </blockquote> <p>The following arguments are supported:</p> <ul> <li>
+<a href="#rule"><code>rule</code></a> - (Required) The name of the rule you want to add targets to. </li> <li>
+<a href="#target_id"><code>target_id</code></a> - (Optional) The unique target assignment ID. If missing, will generate a random, unique id. </li> <li>
+<a href="#arn"><code>arn</code></a> - (Required) The Amazon Resource Name (ARN) associated of the target. </li> <li>
+<a href="#input"><code>input</code></a> - (Optional) Valid JSON text passed to the target. </li> <li>
+<a href="#input_path"><code>input_path</code></a> - (Optional) The value of the <a href="http://goessner.net/articles/JsonPath/">JSONPath</a> that is used for extracting part of the matched event when passing it to the target. </li> <li>
+<a href="#role_arn"><code>role_arn</code></a> - (Optional) The Amazon Resource Name (ARN) of the IAM role to be used for this target when the rule is triggered. Required if <code>ecs_target</code> is used. </li> <li>
+<a href="#run_command_targets"><code>run_command_targets</code></a> - (Optional) Parameters used when you are using the rule to invoke Amazon EC2 Run Command. Documented below. A maximum of 5 are allowed. </li> <li>
+<a href="#ecs_target"><code>ecs_target</code></a> - (Optional) Parameters used when you are using the rule to invoke Amazon ECS Task. Documented below. A maximum of 1 are allowed. </li> <li>
+<a href="#batch_target"><code>batch_target</code></a> - (Optional) Parameters used when you are using the rule to invoke an Amazon Batch Job. Documented below. A maximum of 1 are allowed. </li> <li>
+<a href="#kinesis_target"><code>kinesis_target</code></a> - (Optional) Parameters used when you are using the rule to invoke an Amazon Kinesis Stream. Documented below. A maximum of 1 are allowed. </li> <li>
+<a href="#sqs_target"><code>sqs_target</code></a> - (Optional) Parameters used when you are using the rule to invoke an Amazon SQS Queue. Documented below. A maximum of 1 are allowed. </li> <li>
+<a href="#input_transformer"><code>input_transformer</code></a> - (Optional) Parameters used when you are providing a custom input to a target based on certain event data. </li> </ul> <p><code>run_command_targets</code> support the following:</p> <ul> <li>
+<a href="#key"><code>key</code></a> - (Required) Can be either <code>tag:tag-key</code> or <code>InstanceIds</code>. </li> <li>
+<a href="#values"><code>values</code></a> - (Required) If Key is <code>tag:tag-key</code>, Values is a list of tag values. If Key is <code>InstanceIds</code>, Values is a list of Amazon EC2 instance IDs. </li> </ul> <p><code>ecs_target</code> support the following:</p> <ul> <li>
+<a href="#task_count"><code>task_count</code></a> - (Optional) The number of tasks to create based on the TaskDefinition. The default is 1. </li> <li>
+<a href="#task_definition_arn"><code>task_definition_arn</code></a> - (Required) The ARN of the task definition to use if the event target is an Amazon ECS cluster. </li> </ul> <p><code>batch_target</code> support the following:</p> <ul> <li>
+<a href="#job_definition"><code>job_definition</code></a> - (Required) The ARN or name of the job definition to use if the event target is an AWS Batch job. This job definition must already exist. </li> <li>
+<a href="#job_name"><code>job_name</code></a> - (Required) The name to use for this execution of the job, if the target is an AWS Batch job. </li> <li>
+<a href="#array_size"><code>array_size</code></a> - (Optional) The size of the array, if this is an array batch job. Valid values are integers between 2 and 10,000. </li> <li>
+<a href="#job_attempts"><code>job_attempts</code></a> - (Optional) The number of times to attempt to retry, if the job fails. Valid values are 1 to 10. </li> </ul> <p><code>kinesis_target</code> support the following:</p> <ul> <li>
+<a href="#partition_key_path"><code>partition_key_path</code></a> - (Optional) The JSON path to be extracted from the event and used as the partition key. </li> </ul> <p><code>sqs_target</code> support the following:</p> <ul> <li>
+<a href="#message_group_id"><code>message_group_id</code></a> - (Optional) The FIFO message group ID to use as the target. </li> </ul> <p><code>input_transformer</code> support the following:</p> <ul> <li>
+<a href="#input_paths"><code>input_paths</code></a> - (Optional) Key value pairs specified in the form of JSONPath (for example, time = $.time) </li> <li>
+<a href="#input_template"><code>input_template</code></a> - (Required) Structure containing the template body. </li> </ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2018 HashiCorp</br>Licensed under the MPL 2.0 License.<br>
+    <a href="https://www.terraform.io/docs/providers/aws/r/cloudwatch_event_target.html" class="_attribution-link">https://www.terraform.io/docs/providers/aws/r/cloudwatch_event_target.html</a>
+  </p>
+</div>
