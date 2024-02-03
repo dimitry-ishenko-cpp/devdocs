@@ -1,0 +1,1133 @@
+<h1> Package sql  </h1>     <ul id="short-nav">
+<li><code>import "database/sql"</code></li>
+<li><a href="#pkg-overview" class="overviewLink">Overview</a></li>
+<li><a href="#pkg-index" class="indexLink">Index</a></li>
+<li><a href="#pkg-examples" class="examplesLink">Examples</a></li>
+<li><a href="#pkg-subdirectories">Subdirectories</a></li>
+</ul>     <h2 id="pkg-overview">Overview </h2> <p>Package sql provides a generic interface around SQL (or SQL-like) databases. </p>
+<p>The sql package must be used in conjunction with a database driver. See <a href="https://golang.org/s/sqldrivers">https://golang.org/s/sqldrivers</a> for a list of drivers. </p>
+<p>Drivers that do not support context cancellation will not return until after the query is completed. </p>
+<p>For usage examples, see the wiki page at <a href="https://golang.org/s/sqlwiki">https://golang.org/s/sqlwiki</a>. </p>   <h4 id="example__openDBCLI"> <span class="text">Example (OpenDBCLI)</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">package sql_test
+
+import (
+    "context"
+    "database/sql"
+    "flag"
+    "log"
+    "os"
+    "os/signal"
+    "time"
+)
+
+var pool *sql.DB // Database connection pool.
+
+func Example_openDBCLI() {
+    id := flag.Int64("id", 0, "person ID to find")
+    dsn := flag.String("dsn", os.Getenv("DSN"), "connection data source name")
+    flag.Parse()
+
+    if len(*dsn) == 0 {
+        log.Fatal("missing dsn flag")
+    }
+    if *id == 0 {
+        log.Fatal("missing person ID")
+    }
+    var err error
+
+    // Opening a driver typically will not attempt to connect to the database.
+    pool, err = sql.Open("driver-name", *dsn)
+    if err != nil {
+        // This will not be a connection error, but a DSN parse error or
+        // another initialization error.
+        log.Fatal("unable to use data source name", err)
+    }
+    defer pool.Close()
+
+    pool.SetConnMaxLifetime(0)
+    pool.SetMaxIdleConns(3)
+    pool.SetMaxOpenConns(3)
+
+    ctx, stop := context.WithCancel(context.Background())
+    defer stop()
+
+    appSignal := make(chan os.Signal, 3)
+    signal.Notify(appSignal, os.Interrupt)
+
+    go func() {
+        &lt;-appSignal
+        stop()
+    }()
+
+    Ping(ctx)
+
+    Query(ctx, *id)
+}
+
+// Ping the database to verify DSN provided by the user is valid and the
+// server accessible. If the ping fails exit the program with an error.
+func Ping(ctx context.Context) {
+    ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+    defer cancel()
+
+    if err := pool.PingContext(ctx); err != nil {
+        log.Fatalf("unable to connect to database: %v", err)
+    }
+}
+
+// Query the database for the information requested and prints the results.
+// If the query fails exit the program with an error.
+func Query(ctx context.Context, id int64) {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+
+    var name string
+    err := pool.QueryRowContext(ctx, "select p.name from people as p where p.id = :id;", sql.Named("id", id)).Scan(&amp;name)
+    if err != nil {
+        log.Fatal("unable to execute search query", err)
+    }
+    log.Println("name=", name)
+}
+</pre>      <h4 id="example__openDBService"> <span class="text">Example (OpenDBService)</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">package sql_test
+
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "io"
+    "log"
+    "net/http"
+    "time"
+)
+
+func Example_openDBService() {
+    // Opening a driver typically will not attempt to connect to the database.
+    db, err := sql.Open("driver-name", "database=test1")
+    if err != nil {
+        // This will not be a connection error, but a DSN parse error or
+        // another initialization error.
+        log.Fatal(err)
+    }
+    db.SetConnMaxLifetime(0)
+    db.SetMaxIdleConns(50)
+    db.SetMaxOpenConns(50)
+
+    s := &amp;Service{db: db}
+
+    http.ListenAndServe(":8080", s)
+}
+
+type Service struct {
+    db *sql.DB
+}
+
+func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    db := s.db
+    switch r.URL.Path {
+    default:
+        http.Error(w, "not found", http.StatusNotFound)
+        return
+    case "/healthz":
+        ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+        defer cancel()
+
+        err := s.db.PingContext(ctx)
+        if err != nil {
+            http.Error(w, fmt.Sprintf("db down: %v", err), http.StatusFailedDependency)
+            return
+        }
+        w.WriteHeader(http.StatusOK)
+        return
+    case "/quick-action":
+        // This is a short SELECT. Use the request context as the base of
+        // the context timeout.
+        ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+        defer cancel()
+
+        id := 5
+        org := 10
+        var name string
+        err := db.QueryRowContext(ctx, `
+select
+    p.name
+from
+    people as p
+    join organization as o on p.organization = o.id
+where
+    p.id = :id
+    and o.id = :org
+;`,
+            sql.Named("id", id),
+            sql.Named("org", org),
+        ).Scan(&amp;name)
+        if err != nil {
+            if err == sql.ErrNoRows {
+                http.Error(w, "not found", http.StatusNotFound)
+                return
+            }
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        io.WriteString(w, name)
+        return
+    case "/long-action":
+        // This is a long SELECT. Use the request context as the base of
+        // the context timeout, but give it some time to finish. If
+        // the client cancels before the query is done the query will also
+        // be canceled.
+        ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+        defer cancel()
+
+        var names []string
+        rows, err := db.QueryContext(ctx, "select p.name from people as p where p.active = true;")
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+
+        for rows.Next() {
+            var name string
+            err = rows.Scan(&amp;name)
+            if err != nil {
+                break
+            }
+            names = append(names, name)
+        }
+        // Check for errors during rows "Close".
+        // This may be more important if multiple statements are executed
+        // in a single batch and rows were written as well as read.
+        if closeErr := rows.Close(); closeErr != nil {
+            http.Error(w, closeErr.Error(), http.StatusInternalServerError)
+            return
+        }
+
+        // Check for row scan error.
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+
+        // Check for errors during row iteration.
+        if err = rows.Err(); err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+
+        json.NewEncoder(w).Encode(names)
+        return
+    case "/async-action":
+        // This action has side effects that we want to preserve
+        // even if the client cancels the HTTP request part way through.
+        // For this we do not use the http request context as a base for
+        // the timeout.
+        ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        defer cancel()
+
+        var orderRef = "ABC123"
+        tx, err := db.BeginTx(ctx, &amp;sql.TxOptions{Isolation: sql.LevelSerializable})
+        _, err = tx.ExecContext(ctx, "stored_proc_name", orderRef)
+
+        if err != nil {
+            tx.Rollback()
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        err = tx.Commit()
+        if err != nil {
+            http.Error(w, "action in unknown state, check state before attempting again", http.StatusInternalServerError)
+            return
+        }
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+}
+</pre>        <h2 id="pkg-index">Index </h2>  <ul id="manual-nav">
+<li><a href="#pkg-variables">Variables</a></li>
+<li><a href="#Drivers">func Drivers() []string</a></li>
+<li><a href="#Register">func Register(name string, driver driver.Driver)</a></li>
+<li><a href="#ColumnType">type ColumnType</a></li>
+<li> <a href="#ColumnType.DatabaseTypeName">func (ci *ColumnType) DatabaseTypeName() string</a>
+</li>
+<li> <a href="#ColumnType.DecimalSize">func (ci *ColumnType) DecimalSize() (precision, scale int64, ok bool)</a>
+</li>
+<li> <a href="#ColumnType.Length">func (ci *ColumnType) Length() (length int64, ok bool)</a>
+</li>
+<li> <a href="#ColumnType.Name">func (ci *ColumnType) Name() string</a>
+</li>
+<li> <a href="#ColumnType.Nullable">func (ci *ColumnType) Nullable() (nullable, ok bool)</a>
+</li>
+<li> <a href="#ColumnType.ScanType">func (ci *ColumnType) ScanType() reflect.Type</a>
+</li>
+<li><a href="#Conn">type Conn</a></li>
+<li> <a href="#Conn.BeginTx">func (c *Conn) BeginTx(ctx context.Context, opts *TxOptions) (*Tx, error)</a>
+</li>
+<li> <a href="#Conn.Close">func (c *Conn) Close() error</a>
+</li>
+<li> <a href="#Conn.ExecContext">func (c *Conn) ExecContext(ctx context.Context, query string, args ...any) (Result, error)</a>
+</li>
+<li> <a href="#Conn.PingContext">func (c *Conn) PingContext(ctx context.Context) error</a>
+</li>
+<li> <a href="#Conn.PrepareContext">func (c *Conn) PrepareContext(ctx context.Context, query string) (*Stmt, error)</a>
+</li>
+<li> <a href="#Conn.QueryContext">func (c *Conn) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error)</a>
+</li>
+<li> <a href="#Conn.QueryRowContext">func (c *Conn) QueryRowContext(ctx context.Context, query string, args ...any) *Row</a>
+</li>
+<li> <a href="#Conn.Raw">func (c *Conn) Raw(f func(driverConn any) error) (err error)</a>
+</li>
+<li><a href="#DB">type DB</a></li>
+<li> <a href="#Open">func Open(driverName, dataSourceName string) (*DB, error)</a>
+</li>
+<li> <a href="#OpenDB">func OpenDB(c driver.Connector) *DB</a>
+</li>
+<li> <a href="#DB.Begin">func (db *DB) Begin() (*Tx, error)</a>
+</li>
+<li> <a href="#DB.BeginTx">func (db *DB) BeginTx(ctx context.Context, opts *TxOptions) (*Tx, error)</a>
+</li>
+<li> <a href="#DB.Close">func (db *DB) Close() error</a>
+</li>
+<li> <a href="#DB.Conn">func (db *DB) Conn(ctx context.Context) (*Conn, error)</a>
+</li>
+<li> <a href="#DB.Driver">func (db *DB) Driver() driver.Driver</a>
+</li>
+<li> <a href="#DB.Exec">func (db *DB) Exec(query string, args ...any) (Result, error)</a>
+</li>
+<li> <a href="#DB.ExecContext">func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (Result, error)</a>
+</li>
+<li> <a href="#DB.Ping">func (db *DB) Ping() error</a>
+</li>
+<li> <a href="#DB.PingContext">func (db *DB) PingContext(ctx context.Context) error</a>
+</li>
+<li> <a href="#DB.Prepare">func (db *DB) Prepare(query string) (*Stmt, error)</a>
+</li>
+<li> <a href="#DB.PrepareContext">func (db *DB) PrepareContext(ctx context.Context, query string) (*Stmt, error)</a>
+</li>
+<li> <a href="#DB.Query">func (db *DB) Query(query string, args ...any) (*Rows, error)</a>
+</li>
+<li> <a href="#DB.QueryContext">func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error)</a>
+</li>
+<li> <a href="#DB.QueryRow">func (db *DB) QueryRow(query string, args ...any) *Row</a>
+</li>
+<li> <a href="#DB.QueryRowContext">func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row</a>
+</li>
+<li> <a href="#DB.SetConnMaxIdleTime">func (db *DB) SetConnMaxIdleTime(d time.Duration)</a>
+</li>
+<li> <a href="#DB.SetConnMaxLifetime">func (db *DB) SetConnMaxLifetime(d time.Duration)</a>
+</li>
+<li> <a href="#DB.SetMaxIdleConns">func (db *DB) SetMaxIdleConns(n int)</a>
+</li>
+<li> <a href="#DB.SetMaxOpenConns">func (db *DB) SetMaxOpenConns(n int)</a>
+</li>
+<li> <a href="#DB.Stats">func (db *DB) Stats() DBStats</a>
+</li>
+<li><a href="#DBStats">type DBStats</a></li>
+<li><a href="#IsolationLevel">type IsolationLevel</a></li>
+<li> <a href="#IsolationLevel.String">func (i IsolationLevel) String() string</a>
+</li>
+<li><a href="#NamedArg">type NamedArg</a></li>
+<li> <a href="#Named">func Named(name string, value any) NamedArg</a>
+</li>
+<li><a href="#NullBool">type NullBool</a></li>
+<li> <a href="#NullBool.Scan">func (n *NullBool) Scan(value any) error</a>
+</li>
+<li> <a href="#NullBool.Value">func (n NullBool) Value() (driver.Value, error)</a>
+</li>
+<li><a href="#NullByte">type NullByte</a></li>
+<li> <a href="#NullByte.Scan">func (n *NullByte) Scan(value any) error</a>
+</li>
+<li> <a href="#NullByte.Value">func (n NullByte) Value() (driver.Value, error)</a>
+</li>
+<li><a href="#NullFloat64">type NullFloat64</a></li>
+<li> <a href="#NullFloat64.Scan">func (n *NullFloat64) Scan(value any) error</a>
+</li>
+<li> <a href="#NullFloat64.Value">func (n NullFloat64) Value() (driver.Value, error)</a>
+</li>
+<li><a href="#NullInt16">type NullInt16</a></li>
+<li> <a href="#NullInt16.Scan">func (n *NullInt16) Scan(value any) error</a>
+</li>
+<li> <a href="#NullInt16.Value">func (n NullInt16) Value() (driver.Value, error)</a>
+</li>
+<li><a href="#NullInt32">type NullInt32</a></li>
+<li> <a href="#NullInt32.Scan">func (n *NullInt32) Scan(value any) error</a>
+</li>
+<li> <a href="#NullInt32.Value">func (n NullInt32) Value() (driver.Value, error)</a>
+</li>
+<li><a href="#NullInt64">type NullInt64</a></li>
+<li> <a href="#NullInt64.Scan">func (n *NullInt64) Scan(value any) error</a>
+</li>
+<li> <a href="#NullInt64.Value">func (n NullInt64) Value() (driver.Value, error)</a>
+</li>
+<li><a href="#NullString">type NullString</a></li>
+<li> <a href="#NullString.Scan">func (ns *NullString) Scan(value any) error</a>
+</li>
+<li> <a href="#NullString.Value">func (ns NullString) Value() (driver.Value, error)</a>
+</li>
+<li><a href="#NullTime">type NullTime</a></li>
+<li> <a href="#NullTime.Scan">func (n *NullTime) Scan(value any) error</a>
+</li>
+<li> <a href="#NullTime.Value">func (n NullTime) Value() (driver.Value, error)</a>
+</li>
+<li><a href="#Out">type Out</a></li>
+<li><a href="#RawBytes">type RawBytes</a></li>
+<li><a href="#Result">type Result</a></li>
+<li><a href="#Row">type Row</a></li>
+<li> <a href="#Row.Err">func (r *Row) Err() error</a>
+</li>
+<li> <a href="#Row.Scan">func (r *Row) Scan(dest ...any) error</a>
+</li>
+<li><a href="#Rows">type Rows</a></li>
+<li> <a href="#Rows.Close">func (rs *Rows) Close() error</a>
+</li>
+<li> <a href="#Rows.ColumnTypes">func (rs *Rows) ColumnTypes() ([]*ColumnType, error)</a>
+</li>
+<li> <a href="#Rows.Columns">func (rs *Rows) Columns() ([]string, error)</a>
+</li>
+<li> <a href="#Rows.Err">func (rs *Rows) Err() error</a>
+</li>
+<li> <a href="#Rows.Next">func (rs *Rows) Next() bool</a>
+</li>
+<li> <a href="#Rows.NextResultSet">func (rs *Rows) NextResultSet() bool</a>
+</li>
+<li> <a href="#Rows.Scan">func (rs *Rows) Scan(dest ...any) error</a>
+</li>
+<li><a href="#Scanner">type Scanner</a></li>
+<li><a href="#Stmt">type Stmt</a></li>
+<li> <a href="#Stmt.Close">func (s *Stmt) Close() error</a>
+</li>
+<li> <a href="#Stmt.Exec">func (s *Stmt) Exec(args ...any) (Result, error)</a>
+</li>
+<li> <a href="#Stmt.ExecContext">func (s *Stmt) ExecContext(ctx context.Context, args ...any) (Result, error)</a>
+</li>
+<li> <a href="#Stmt.Query">func (s *Stmt) Query(args ...any) (*Rows, error)</a>
+</li>
+<li> <a href="#Stmt.QueryContext">func (s *Stmt) QueryContext(ctx context.Context, args ...any) (*Rows, error)</a>
+</li>
+<li> <a href="#Stmt.QueryRow">func (s *Stmt) QueryRow(args ...any) *Row</a>
+</li>
+<li> <a href="#Stmt.QueryRowContext">func (s *Stmt) QueryRowContext(ctx context.Context, args ...any) *Row</a>
+</li>
+<li><a href="#Tx">type Tx</a></li>
+<li> <a href="#Tx.Commit">func (tx *Tx) Commit() error</a>
+</li>
+<li> <a href="#Tx.Exec">func (tx *Tx) Exec(query string, args ...any) (Result, error)</a>
+</li>
+<li> <a href="#Tx.ExecContext">func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error)</a>
+</li>
+<li> <a href="#Tx.Prepare">func (tx *Tx) Prepare(query string) (*Stmt, error)</a>
+</li>
+<li> <a href="#Tx.PrepareContext">func (tx *Tx) PrepareContext(ctx context.Context, query string) (*Stmt, error)</a>
+</li>
+<li> <a href="#Tx.Query">func (tx *Tx) Query(query string, args ...any) (*Rows, error)</a>
+</li>
+<li> <a href="#Tx.QueryContext">func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error)</a>
+</li>
+<li> <a href="#Tx.QueryRow">func (tx *Tx) QueryRow(query string, args ...any) *Row</a>
+</li>
+<li> <a href="#Tx.QueryRowContext">func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *Row</a>
+</li>
+<li> <a href="#Tx.Rollback">func (tx *Tx) Rollback() error</a>
+</li>
+<li> <a href="#Tx.Stmt">func (tx *Tx) Stmt(stmt *Stmt) *Stmt</a>
+</li>
+<li> <a href="#Tx.StmtContext">func (tx *Tx) StmtContext(ctx context.Context, stmt *Stmt) *Stmt</a>
+</li>
+<li><a href="#TxOptions">type TxOptions</a></li>
+</ul> <div id="pkg-examples"> <h3>Examples</h3>  <dl> <dd><a class="exampleLink" href="#example_Conn_ExecContext">Conn.ExecContext</a></dd> <dd><a class="exampleLink" href="#example_DB_BeginTx">DB.BeginTx</a></dd> <dd><a class="exampleLink" href="#example_DB_ExecContext">DB.ExecContext</a></dd> <dd><a class="exampleLink" href="#example_DB_PingContext">DB.PingContext</a></dd> <dd><a class="exampleLink" href="#example_DB_Prepare">DB.Prepare</a></dd> <dd><a class="exampleLink" href="#example_DB_QueryContext">DB.QueryContext</a></dd> <dd><a class="exampleLink" href="#example_DB_QueryRowContext">DB.QueryRowContext</a></dd> <dd><a class="exampleLink" href="#example_DB_Query_multipleResultSets">DB.Query (MultipleResultSets)</a></dd> <dd><a class="exampleLink" href="#example_Rows">Rows</a></dd> <dd><a class="exampleLink" href="#example_Stmt">Stmt</a></dd> <dd><a class="exampleLink" href="#example_Stmt_QueryRowContext">Stmt.QueryRowContext</a></dd> <dd><a class="exampleLink" href="#example_Tx_ExecContext">Tx.ExecContext</a></dd> <dd><a class="exampleLink" href="#example_Tx_Prepare">Tx.Prepare</a></dd> <dd><a class="exampleLink" href="#example_Tx_Rollback">Tx.Rollback</a></dd> <dd><a class="exampleLink" href="#example__openDBCLI">Package (OpenDBCLI)</a></dd> <dd><a class="exampleLink" href="#example__openDBService">Package (OpenDBService)</a></dd> </dl> </div> <h3>Package files</h3> <p>  <span>convert.go</span> <span>ctxutil.go</span> <span>sql.go</span>  </p>   <h2 id="pkg-variables">Variables</h2> <p>ErrConnDone is returned by any operation that is performed on a connection that has already been returned to the connection pool. </p>
+<pre data-language="go">var ErrConnDone = errors.New("sql: connection is already closed")</pre> <p>ErrNoRows is returned by Scan when QueryRow doesn't return a row. In such a case, QueryRow returns a placeholder *Row value that defers this error until a Scan. </p>
+<pre data-language="go">var ErrNoRows = errors.New("sql: no rows in result set")</pre> <p>ErrTxDone is returned by any operation that is performed on a transaction that has already been committed or rolled back. </p>
+<pre data-language="go">var ErrTxDone = errors.New("sql: transaction has already been committed or rolled back")</pre> <h2 id="Drivers">func <span>Drivers</span>  <span title="Added in Go 1.4">1.4</span> </h2> <pre data-language="go">func Drivers() []string</pre> <p>Drivers returns a sorted list of the names of the registered drivers. </p>
+<h2 id="Register">func <span>Register</span>  </h2> <pre data-language="go">func Register(name string, driver driver.Driver)</pre> <p>Register makes a database driver available by the provided name. If Register is called twice with the same name or if driver is nil, it panics. </p>
+<h2 id="ColumnType">type <span>ColumnType</span>  <span title="Added in Go 1.8">1.8</span> </h2> <p>ColumnType contains the name and type of a column. </p>
+<pre data-language="go">type ColumnType struct {
+    // contains filtered or unexported fields
+}
+</pre> <h3 id="ColumnType.DatabaseTypeName">func (*ColumnType) <span>DatabaseTypeName</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (ci *ColumnType) DatabaseTypeName() string</pre> <p>DatabaseTypeName returns the database system name of the column type. If an empty string is returned, then the driver type name is not supported. Consult your driver documentation for a list of driver data types. Length specifiers are not included. Common type names include "VARCHAR", "TEXT", "NVARCHAR", "DECIMAL", "BOOL", "INT", and "BIGINT". </p>
+<h3 id="ColumnType.DecimalSize">func (*ColumnType) <span>DecimalSize</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (ci *ColumnType) DecimalSize() (precision, scale int64, ok bool)</pre> <p>DecimalSize returns the scale and precision of a decimal type. If not applicable or if not supported ok is false. </p>
+<h3 id="ColumnType.Length">func (*ColumnType) <span>Length</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (ci *ColumnType) Length() (length int64, ok bool)</pre> <p>Length returns the column type length for variable length column types such as text and binary field types. If the type length is unbounded the value will be math.MaxInt64 (any database limits will still apply). If the column type is not variable length, such as an int, or if not supported by the driver ok is false. </p>
+<h3 id="ColumnType.Name">func (*ColumnType) <span>Name</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (ci *ColumnType) Name() string</pre> <p>Name returns the name or alias of the column. </p>
+<h3 id="ColumnType.Nullable">func (*ColumnType) <span>Nullable</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (ci *ColumnType) Nullable() (nullable, ok bool)</pre> <p>Nullable reports whether the column may be null. If a driver does not support this property ok will be false. </p>
+<h3 id="ColumnType.ScanType">func (*ColumnType) <span>ScanType</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (ci *ColumnType) ScanType() reflect.Type</pre> <p>ScanType returns a Go type suitable for scanning into using Rows.Scan. If a driver does not support this property ScanType will return the type of an empty interface. </p>
+<h2 id="Conn">type <span>Conn</span>  <span title="Added in Go 1.9">1.9</span> </h2> <p>Conn represents a single database connection rather than a pool of database connections. Prefer running queries from DB unless there is a specific need for a continuous single database connection. </p>
+<p>A Conn must call Close to return the connection to the database pool and may do so concurrently with a running query. </p>
+<p>After a call to Close, all operations on the connection fail with ErrConnDone. </p>
+<pre data-language="go">type Conn struct {
+    // contains filtered or unexported fields
+}
+</pre> <h3 id="Conn.BeginTx">func (*Conn) <span>BeginTx</span>  <span title="Added in Go 1.9">1.9</span> </h3> <pre data-language="go">func (c *Conn) BeginTx(ctx context.Context, opts *TxOptions) (*Tx, error)</pre> <p>BeginTx starts a transaction. </p>
+<p>The provided context is used until the transaction is committed or rolled back. If the context is canceled, the sql package will roll back the transaction. Tx.Commit will return an error if the context provided to BeginTx is canceled. </p>
+<p>The provided TxOptions is optional and may be nil if defaults should be used. If a non-default isolation level is used that the driver doesn't support, an error will be returned. </p>
+<h3 id="Conn.Close">func (*Conn) <span>Close</span>  <span title="Added in Go 1.9">1.9</span> </h3> <pre data-language="go">func (c *Conn) Close() error</pre> <p>Close returns the connection to the connection pool. All operations after a Close will return with ErrConnDone. Close is safe to call concurrently with other operations and will block until all other operations finish. It may be useful to first cancel any used context and then call close directly after. </p>
+<h3 id="Conn.ExecContext">func (*Conn) <span>ExecContext</span>  <span title="Added in Go 1.9">1.9</span> </h3> <pre data-language="go">func (c *Conn) ExecContext(ctx context.Context, query string, args ...any) (Result, error)</pre> <p>ExecContext executes a query without returning any rows. The args are for any placeholder parameters in the query. </p>   <h4 id="example_Conn_ExecContext"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+// A *DB is a pool of connections. Call Conn to reserve a connection for
+// exclusive use.
+conn, err := db.Conn(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+defer conn.Close() // Return the connection to the pool.
+id := 41
+result, err := conn.ExecContext(ctx, `UPDATE balances SET balance = balance + 10 WHERE user_id = ?;`, id)
+if err != nil {
+    log.Fatal(err)
+}
+rows, err := result.RowsAffected()
+if err != nil {
+    log.Fatal(err)
+}
+if rows != 1 {
+    log.Fatalf("expected single row affected, got %d rows affected", rows)
+}
+</pre>   <h3 id="Conn.PingContext">func (*Conn) <span>PingContext</span>  <span title="Added in Go 1.9">1.9</span> </h3> <pre data-language="go">func (c *Conn) PingContext(ctx context.Context) error</pre> <p>PingContext verifies the connection to the database is still alive. </p>
+<h3 id="Conn.PrepareContext">func (*Conn) <span>PrepareContext</span>  <span title="Added in Go 1.9">1.9</span> </h3> <pre data-language="go">func (c *Conn) PrepareContext(ctx context.Context, query string) (*Stmt, error)</pre> <p>PrepareContext creates a prepared statement for later queries or executions. Multiple queries or executions may be run concurrently from the returned statement. The caller must call the statement's Close method when the statement is no longer needed. </p>
+<p>The provided context is used for the preparation of the statement, not for the execution of the statement. </p>
+<h3 id="Conn.QueryContext">func (*Conn) <span>QueryContext</span>  <span title="Added in Go 1.9">1.9</span> </h3> <pre data-language="go">func (c *Conn) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error)</pre> <p>QueryContext executes a query that returns rows, typically a SELECT. The args are for any placeholder parameters in the query. </p>
+<h3 id="Conn.QueryRowContext">func (*Conn) <span>QueryRowContext</span>  <span title="Added in Go 1.9">1.9</span> </h3> <pre data-language="go">func (c *Conn) QueryRowContext(ctx context.Context, query string, args ...any) *Row</pre> <p>QueryRowContext executes a query that is expected to return at most one row. QueryRowContext always returns a non-nil value. Errors are deferred until Row's Scan method is called. If the query selects no rows, the *Row's Scan will return ErrNoRows. Otherwise, the *Row's Scan scans the first selected row and discards the rest. </p>
+<h3 id="Conn.Raw">func (*Conn) <span>Raw</span>  <span title="Added in Go 1.13">1.13</span> </h3> <pre data-language="go">func (c *Conn) Raw(f func(driverConn any) error) (err error)</pre> <p>Raw executes f exposing the underlying driver connection for the duration of f. The driverConn must not be used outside of f. </p>
+<p>Once f returns and err is not driver.ErrBadConn, the Conn will continue to be usable until Conn.Close is called. </p>
+<h2 id="DB">type <span>DB</span>  </h2> <p>DB is a database handle representing a pool of zero or more underlying connections. It's safe for concurrent use by multiple goroutines. </p>
+<p>The sql package creates and frees connections automatically; it also maintains a free pool of idle connections. If the database has a concept of per-connection state, such state can be reliably observed within a transaction (Tx) or connection (Conn). Once DB.Begin is called, the returned Tx is bound to a single connection. Once Commit or Rollback is called on the transaction, that transaction's connection is returned to DB's idle connection pool. The pool size can be controlled with SetMaxIdleConns. </p>
+<pre data-language="go">type DB struct {
+    // contains filtered or unexported fields
+}
+</pre> <h3 id="Open">func <span>Open</span>  </h3> <pre data-language="go">func Open(driverName, dataSourceName string) (*DB, error)</pre> <p>Open opens a database specified by its database driver name and a driver-specific data source name, usually consisting of at least a database name and connection information. </p>
+<p>Most users will open a database via a driver-specific connection helper function that returns a *DB. No database drivers are included in the Go standard library. See <a href="https://golang.org/s/sqldrivers">https://golang.org/s/sqldrivers</a> for a list of third-party drivers. </p>
+<p>Open may just validate its arguments without creating a connection to the database. To verify that the data source name is valid, call Ping. </p>
+<p>The returned DB is safe for concurrent use by multiple goroutines and maintains its own pool of idle connections. Thus, the Open function should be called just once. It is rarely necessary to close a DB. </p>
+<h3 id="OpenDB">func <span>OpenDB</span>  <span title="Added in Go 1.10">1.10</span> </h3> <pre data-language="go">func OpenDB(c driver.Connector) *DB</pre> <p>OpenDB opens a database using a Connector, allowing drivers to bypass a string based data source name. </p>
+<p>Most users will open a database via a driver-specific connection helper function that returns a *DB. No database drivers are included in the Go standard library. See <a href="https://golang.org/s/sqldrivers">https://golang.org/s/sqldrivers</a> for a list of third-party drivers. </p>
+<p>OpenDB may just validate its arguments without creating a connection to the database. To verify that the data source name is valid, call Ping. </p>
+<p>The returned DB is safe for concurrent use by multiple goroutines and maintains its own pool of idle connections. Thus, the OpenDB function should be called just once. It is rarely necessary to close a DB. </p>
+<h3 id="DB.Begin">func (*DB) <span>Begin</span>  </h3> <pre data-language="go">func (db *DB) Begin() (*Tx, error)</pre> <p>Begin starts a transaction. The default isolation level is dependent on the driver. </p>
+<p>Begin uses context.Background internally; to specify the context, use BeginTx. </p>
+<h3 id="DB.BeginTx">func (*DB) <span>BeginTx</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (db *DB) BeginTx(ctx context.Context, opts *TxOptions) (*Tx, error)</pre> <p>BeginTx starts a transaction. </p>
+<p>The provided context is used until the transaction is committed or rolled back. If the context is canceled, the sql package will roll back the transaction. Tx.Commit will return an error if the context provided to BeginTx is canceled. </p>
+<p>The provided TxOptions is optional and may be nil if defaults should be used. If a non-default isolation level is used that the driver doesn't support, an error will be returned. </p>   <h4 id="example_DB_BeginTx"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+tx, err := db.BeginTx(ctx, &amp;sql.TxOptions{Isolation: sql.LevelSerializable})
+if err != nil {
+    log.Fatal(err)
+}
+id := 37
+_, execErr := tx.Exec(`UPDATE users SET status = ? WHERE id = ?`, "paid", id)
+if execErr != nil {
+    _ = tx.Rollback()
+    log.Fatal(execErr)
+}
+if err := tx.Commit(); err != nil {
+    log.Fatal(err)
+}
+</pre>   <h3 id="DB.Close">func (*DB) <span>Close</span>  </h3> <pre data-language="go">func (db *DB) Close() error</pre> <p>Close closes the database and prevents new queries from starting. Close then waits for all queries that have started processing on the server to finish. </p>
+<p>It is rare to Close a DB, as the DB handle is meant to be long-lived and shared between many goroutines. </p>
+<h3 id="DB.Conn">func (*DB) <span>Conn</span>  <span title="Added in Go 1.9">1.9</span> </h3> <pre data-language="go">func (db *DB) Conn(ctx context.Context) (*Conn, error)</pre> <p>Conn returns a single connection by either opening a new connection or returning an existing connection from the connection pool. Conn will block until either a connection is returned or ctx is canceled. Queries run on the same Conn will be run in the same database session. </p>
+<p>Every Conn must be returned to the database pool after use by calling Conn.Close. </p>
+<h3 id="DB.Driver">func (*DB) <span>Driver</span>  </h3> <pre data-language="go">func (db *DB) Driver() driver.Driver</pre> <p>Driver returns the database's underlying driver. </p>
+<h3 id="DB.Exec">func (*DB) <span>Exec</span>  </h3> <pre data-language="go">func (db *DB) Exec(query string, args ...any) (Result, error)</pre> <p>Exec executes a query without returning any rows. The args are for any placeholder parameters in the query. </p>
+<p>Exec uses context.Background internally; to specify the context, use ExecContext. </p>
+<h3 id="DB.ExecContext">func (*DB) <span>ExecContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (Result, error)</pre> <p>ExecContext executes a query without returning any rows. The args are for any placeholder parameters in the query. </p>   <h4 id="example_DB_ExecContext"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+id := 47
+result, err := db.ExecContext(ctx, "UPDATE balances SET balance = balance + 10 WHERE user_id = ?", id)
+if err != nil {
+    log.Fatal(err)
+}
+rows, err := result.RowsAffected()
+if err != nil {
+    log.Fatal(err)
+}
+if rows != 1 {
+    log.Fatalf("expected to affect 1 row, affected %d", rows)
+}
+</pre>   <h3 id="DB.Ping">func (*DB) <span>Ping</span>  <span title="Added in Go 1.1">1.1</span> </h3> <pre data-language="go">func (db *DB) Ping() error</pre> <p>Ping verifies a connection to the database is still alive, establishing a connection if necessary. </p>
+<p>Ping uses context.Background internally; to specify the context, use PingContext. </p>
+<h3 id="DB.PingContext">func (*DB) <span>PingContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (db *DB) PingContext(ctx context.Context) error</pre> <p>PingContext verifies a connection to the database is still alive, establishing a connection if necessary. </p>   <h4 id="example_DB_PingContext"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+// Ping and PingContext may be used to determine if communication with
+// the database server is still possible.
+//
+// When used in a command line application Ping may be used to establish
+// that further queries are possible; that the provided DSN is valid.
+//
+// When used in long running service Ping may be part of the health
+// checking system.
+
+ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+defer cancel()
+
+status := "up"
+if err := db.PingContext(ctx); err != nil {
+    status = "down"
+}
+log.Println(status)
+</pre>   <h3 id="DB.Prepare">func (*DB) <span>Prepare</span>  </h3> <pre data-language="go">func (db *DB) Prepare(query string) (*Stmt, error)</pre> <p>Prepare creates a prepared statement for later queries or executions. Multiple queries or executions may be run concurrently from the returned statement. The caller must call the statement's Close method when the statement is no longer needed. </p>
+<p>Prepare uses context.Background internally; to specify the context, use PrepareContext. </p>   <h4 id="example_DB_Prepare"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+projects := []struct {
+    mascot  string
+    release int
+}{
+    {"tux", 1991},
+    {"duke", 1996},
+    {"gopher", 2009},
+    {"moby dock", 2013},
+}
+
+stmt, err := db.Prepare("INSERT INTO projects(id, mascot, release, category) VALUES( ?, ?, ?, ? )")
+if err != nil {
+    log.Fatal(err)
+}
+defer stmt.Close() // Prepared statements take up server resources and should be closed after use.
+
+for id, project := range projects {
+    if _, err := stmt.Exec(id+1, project.mascot, project.release, "open source"); err != nil {
+        log.Fatal(err)
+    }
+}
+</pre>   <h3 id="DB.PrepareContext">func (*DB) <span>PrepareContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (db *DB) PrepareContext(ctx context.Context, query string) (*Stmt, error)</pre> <p>PrepareContext creates a prepared statement for later queries or executions. Multiple queries or executions may be run concurrently from the returned statement. The caller must call the statement's Close method when the statement is no longer needed. </p>
+<p>The provided context is used for the preparation of the statement, not for the execution of the statement. </p>
+<h3 id="DB.Query">func (*DB) <span>Query</span>  </h3> <pre data-language="go">func (db *DB) Query(query string, args ...any) (*Rows, error)</pre> <p>Query executes a query that returns rows, typically a SELECT. The args are for any placeholder parameters in the query. </p>
+<p>Query uses context.Background internally; to specify the context, use QueryContext. </p>   <h4 id="example_DB_Query_multipleResultSets"> <span class="text">Example (MultipleResultSets)</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+age := 27
+q := `
+create temp table uid (id bigint); -- Create temp table for queries.
+insert into uid
+select id from users where age &lt; ?; -- Populate temp table.
+
+-- First result set.
+select
+    users.id, name
+from
+    users
+    join uid on users.id = uid.id
+;
+
+-- Second result set.
+select 
+    ur.user, ur.role
+from
+    user_roles as ur
+    join uid on uid.id = ur.user
+;
+    `
+rows, err := db.Query(q, age)
+if err != nil {
+    log.Fatal(err)
+}
+defer rows.Close()
+
+for rows.Next() {
+    var (
+        id   int64
+        name string
+    )
+    if err := rows.Scan(&amp;id, &amp;name); err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("id %d name is %s\n", id, name)
+}
+if !rows.NextResultSet() {
+    log.Fatalf("expected more result sets: %v", rows.Err())
+}
+var roleMap = map[int64]string{
+    1: "user",
+    2: "admin",
+    3: "gopher",
+}
+for rows.Next() {
+    var (
+        id   int64
+        role int64
+    )
+    if err := rows.Scan(&amp;id, &amp;role); err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("id %d has role %s\n", id, roleMap[role])
+}
+if err := rows.Err(); err != nil {
+    log.Fatal(err)
+}
+</pre>   <h3 id="DB.QueryContext">func (*DB) <span>QueryContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error)</pre> <p>QueryContext executes a query that returns rows, typically a SELECT. The args are for any placeholder parameters in the query. </p>   <h4 id="example_DB_QueryContext"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+age := 27
+rows, err := db.QueryContext(ctx, "SELECT name FROM users WHERE age=?", age)
+if err != nil {
+    log.Fatal(err)
+}
+defer rows.Close()
+names := make([]string, 0)
+
+for rows.Next() {
+    var name string
+    if err := rows.Scan(&amp;name); err != nil {
+        // Check for a scan error.
+        // Query rows will be closed with defer.
+        log.Fatal(err)
+    }
+    names = append(names, name)
+}
+// If the database is being written to ensure to check for Close
+// errors that may be returned from the driver. The query may
+// encounter an auto-commit error and be forced to rollback changes.
+rerr := rows.Close()
+if rerr != nil {
+    log.Fatal(rerr)
+}
+
+// Rows.Err will report the last error encountered by Rows.Scan.
+if err := rows.Err(); err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("%s are %d years old", strings.Join(names, ", "), age)
+</pre>   <h3 id="DB.QueryRow">func (*DB) <span>QueryRow</span>  </h3> <pre data-language="go">func (db *DB) QueryRow(query string, args ...any) *Row</pre> <p>QueryRow executes a query that is expected to return at most one row. QueryRow always returns a non-nil value. Errors are deferred until Row's Scan method is called. If the query selects no rows, the *Row's Scan will return ErrNoRows. Otherwise, the *Row's Scan scans the first selected row and discards the rest. </p>
+<p>QueryRow uses context.Background internally; to specify the context, use QueryRowContext. </p>
+<h3 id="DB.QueryRowContext">func (*DB) <span>QueryRowContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row</pre> <p>QueryRowContext executes a query that is expected to return at most one row. QueryRowContext always returns a non-nil value. Errors are deferred until Row's Scan method is called. If the query selects no rows, the *Row's Scan will return ErrNoRows. Otherwise, the *Row's Scan scans the first selected row and discards the rest. </p>   <h4 id="example_DB_QueryRowContext"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+id := 123
+var username string
+var created time.Time
+err := db.QueryRowContext(ctx, "SELECT username, created_at FROM users WHERE id=?", id).Scan(&amp;username, &amp;created)
+switch {
+case err == sql.ErrNoRows:
+    log.Printf("no user with id %d\n", id)
+case err != nil:
+    log.Fatalf("query error: %v\n", err)
+default:
+    log.Printf("username is %q, account created on %s\n", username, created)
+}
+</pre>   <h3 id="DB.SetConnMaxIdleTime">func (*DB) <span>SetConnMaxIdleTime</span>  <span title="Added in Go 1.15">1.15</span> </h3> <pre data-language="go">func (db *DB) SetConnMaxIdleTime(d time.Duration)</pre> <p>SetConnMaxIdleTime sets the maximum amount of time a connection may be idle. </p>
+<p>Expired connections may be closed lazily before reuse. </p>
+<p>If d &lt;= 0, connections are not closed due to a connection's idle time. </p>
+<h3 id="DB.SetConnMaxLifetime">func (*DB) <span>SetConnMaxLifetime</span>  <span title="Added in Go 1.6">1.6</span> </h3> <pre data-language="go">func (db *DB) SetConnMaxLifetime(d time.Duration)</pre> <p>SetConnMaxLifetime sets the maximum amount of time a connection may be reused. </p>
+<p>Expired connections may be closed lazily before reuse. </p>
+<p>If d &lt;= 0, connections are not closed due to a connection's age. </p>
+<h3 id="DB.SetMaxIdleConns">func (*DB) <span>SetMaxIdleConns</span>  <span title="Added in Go 1.1">1.1</span> </h3> <pre data-language="go">func (db *DB) SetMaxIdleConns(n int)</pre> <p>SetMaxIdleConns sets the maximum number of connections in the idle connection pool. </p>
+<p>If MaxOpenConns is greater than 0 but less than the new MaxIdleConns, then the new MaxIdleConns will be reduced to match the MaxOpenConns limit. </p>
+<p>If n &lt;= 0, no idle connections are retained. </p>
+<p>The default max idle connections is currently 2. This may change in a future release. </p>
+<h3 id="DB.SetMaxOpenConns">func (*DB) <span>SetMaxOpenConns</span>  <span title="Added in Go 1.2">1.2</span> </h3> <pre data-language="go">func (db *DB) SetMaxOpenConns(n int)</pre> <p>SetMaxOpenConns sets the maximum number of open connections to the database. </p>
+<p>If MaxIdleConns is greater than 0 and the new MaxOpenConns is less than MaxIdleConns, then MaxIdleConns will be reduced to match the new MaxOpenConns limit. </p>
+<p>If n &lt;= 0, then there is no limit on the number of open connections. The default is 0 (unlimited). </p>
+<h3 id="DB.Stats">func (*DB) <span>Stats</span>  <span title="Added in Go 1.5">1.5</span> </h3> <pre data-language="go">func (db *DB) Stats() DBStats</pre> <p>Stats returns database statistics. </p>
+<h2 id="DBStats">type <span>DBStats</span>  <span title="Added in Go 1.5">1.5</span> </h2> <p>DBStats contains database statistics. </p>
+<pre data-language="go">type DBStats struct {
+    MaxOpenConnections int // Maximum number of open connections to the database; added in Go 1.11
+
+    // Pool Status
+    OpenConnections int // The number of established connections both in use and idle.
+    InUse           int // The number of connections currently in use; added in Go 1.11
+    Idle            int // The number of idle connections; added in Go 1.11
+
+    // Counters
+    WaitCount         int64         // The total number of connections waited for; added in Go 1.11
+    WaitDuration      time.Duration // The total time blocked waiting for a new connection; added in Go 1.11
+    MaxIdleClosed     int64         // The total number of connections closed due to SetMaxIdleConns; added in Go 1.11
+    MaxIdleTimeClosed int64         // The total number of connections closed due to SetConnMaxIdleTime; added in Go 1.15
+    MaxLifetimeClosed int64         // The total number of connections closed due to SetConnMaxLifetime; added in Go 1.11
+}
+</pre> <h2 id="IsolationLevel">type <span>IsolationLevel</span>  <span title="Added in Go 1.8">1.8</span> </h2> <p>IsolationLevel is the transaction isolation level used in TxOptions. </p>
+<pre data-language="go">type IsolationLevel int</pre> <p>Various isolation levels that drivers may support in BeginTx. If a driver does not support a given isolation level an error may be returned. </p>
+<p>See <a href="https://en.wikipedia.org/wiki/Isolation_(database_systems)#Isolation_levels">https://en.wikipedia.org/wiki/Isolation_(database_systems)#Isolation_levels</a>. </p>
+<pre data-language="go">const (
+    LevelDefault IsolationLevel = iota
+    LevelReadUncommitted
+    LevelReadCommitted
+    LevelWriteCommitted
+    LevelRepeatableRead
+    LevelSnapshot
+    LevelSerializable
+    LevelLinearizable
+)</pre> <h3 id="IsolationLevel.String">func (IsolationLevel) <span>String</span>  <span title="Added in Go 1.11">1.11</span> </h3> <pre data-language="go">func (i IsolationLevel) String() string</pre> <p>String returns the name of the transaction isolation level. </p>
+<h2 id="NamedArg">type <span>NamedArg</span>  <span title="Added in Go 1.8">1.8</span> </h2> <p>A NamedArg is a named argument. NamedArg values may be used as arguments to Query or Exec and bind to the corresponding named parameter in the SQL statement. </p>
+<p>For a more concise way to create NamedArg values, see the Named function. </p>
+<pre data-language="go">type NamedArg struct {
+
+    // Name is the name of the parameter placeholder.
+    //
+    // If empty, the ordinal position in the argument list will be
+    // used.
+    //
+    // Name must omit any symbol prefix.
+    Name string
+
+    // Value is the value of the parameter.
+    // It may be assigned the same value types as the query
+    // arguments.
+    Value any
+    // contains filtered or unexported fields
+}
+</pre> <h3 id="Named">func <span>Named</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func Named(name string, value any) NamedArg</pre> <p>Named provides a more concise way to create NamedArg values. </p>
+<p>Example usage: </p>
+<pre data-language="go">db.ExecContext(ctx, `
+    delete from Invoice
+    where
+        TimeCreated &lt; @end
+        and TimeCreated &gt;= @start;`,
+    sql.Named("start", startTime),
+    sql.Named("end", endTime),
+)
+</pre> <h2 id="NullBool">type <span>NullBool</span>  </h2> <p>NullBool represents a bool that may be null. NullBool implements the Scanner interface so it can be used as a scan destination, similar to NullString. </p>
+<pre data-language="go">type NullBool struct {
+    Bool  bool
+    Valid bool // Valid is true if Bool is not NULL
+}
+</pre> <h3 id="NullBool.Scan">func (*NullBool) <span>Scan</span>  </h3> <pre data-language="go">func (n *NullBool) Scan(value any) error</pre> <p>Scan implements the Scanner interface. </p>
+<h3 id="NullBool.Value">func (NullBool) <span>Value</span>  </h3> <pre data-language="go">func (n NullBool) Value() (driver.Value, error)</pre> <p>Value implements the driver Valuer interface. </p>
+<h2 id="NullByte">type <span>NullByte</span>  <span title="Added in Go 1.17">1.17</span> </h2> <p>NullByte represents a byte that may be null. NullByte implements the Scanner interface so it can be used as a scan destination, similar to NullString. </p>
+<pre data-language="go">type NullByte struct {
+    Byte  byte
+    Valid bool // Valid is true if Byte is not NULL
+}
+</pre> <h3 id="NullByte.Scan">func (*NullByte) <span>Scan</span>  <span title="Added in Go 1.17">1.17</span> </h3> <pre data-language="go">func (n *NullByte) Scan(value any) error</pre> <p>Scan implements the Scanner interface. </p>
+<h3 id="NullByte.Value">func (NullByte) <span>Value</span>  <span title="Added in Go 1.17">1.17</span> </h3> <pre data-language="go">func (n NullByte) Value() (driver.Value, error)</pre> <p>Value implements the driver Valuer interface. </p>
+<h2 id="NullFloat64">type <span>NullFloat64</span>  </h2> <p>NullFloat64 represents a float64 that may be null. NullFloat64 implements the Scanner interface so it can be used as a scan destination, similar to NullString. </p>
+<pre data-language="go">type NullFloat64 struct {
+    Float64 float64
+    Valid   bool // Valid is true if Float64 is not NULL
+}
+</pre> <h3 id="NullFloat64.Scan">func (*NullFloat64) <span>Scan</span>  </h3> <pre data-language="go">func (n *NullFloat64) Scan(value any) error</pre> <p>Scan implements the Scanner interface. </p>
+<h3 id="NullFloat64.Value">func (NullFloat64) <span>Value</span>  </h3> <pre data-language="go">func (n NullFloat64) Value() (driver.Value, error)</pre> <p>Value implements the driver Valuer interface. </p>
+<h2 id="NullInt16">type <span>NullInt16</span>  <span title="Added in Go 1.17">1.17</span> </h2> <p>NullInt16 represents an int16 that may be null. NullInt16 implements the Scanner interface so it can be used as a scan destination, similar to NullString. </p>
+<pre data-language="go">type NullInt16 struct {
+    Int16 int16
+    Valid bool // Valid is true if Int16 is not NULL
+}
+</pre> <h3 id="NullInt16.Scan">func (*NullInt16) <span>Scan</span>  <span title="Added in Go 1.17">1.17</span> </h3> <pre data-language="go">func (n *NullInt16) Scan(value any) error</pre> <p>Scan implements the Scanner interface. </p>
+<h3 id="NullInt16.Value">func (NullInt16) <span>Value</span>  <span title="Added in Go 1.17">1.17</span> </h3> <pre data-language="go">func (n NullInt16) Value() (driver.Value, error)</pre> <p>Value implements the driver Valuer interface. </p>
+<h2 id="NullInt32">type <span>NullInt32</span>  <span title="Added in Go 1.13">1.13</span> </h2> <p>NullInt32 represents an int32 that may be null. NullInt32 implements the Scanner interface so it can be used as a scan destination, similar to NullString. </p>
+<pre data-language="go">type NullInt32 struct {
+    Int32 int32
+    Valid bool // Valid is true if Int32 is not NULL
+}
+</pre> <h3 id="NullInt32.Scan">func (*NullInt32) <span>Scan</span>  <span title="Added in Go 1.13">1.13</span> </h3> <pre data-language="go">func (n *NullInt32) Scan(value any) error</pre> <p>Scan implements the Scanner interface. </p>
+<h3 id="NullInt32.Value">func (NullInt32) <span>Value</span>  <span title="Added in Go 1.13">1.13</span> </h3> <pre data-language="go">func (n NullInt32) Value() (driver.Value, error)</pre> <p>Value implements the driver Valuer interface. </p>
+<h2 id="NullInt64">type <span>NullInt64</span>  </h2> <p>NullInt64 represents an int64 that may be null. NullInt64 implements the Scanner interface so it can be used as a scan destination, similar to NullString. </p>
+<pre data-language="go">type NullInt64 struct {
+    Int64 int64
+    Valid bool // Valid is true if Int64 is not NULL
+}
+</pre> <h3 id="NullInt64.Scan">func (*NullInt64) <span>Scan</span>  </h3> <pre data-language="go">func (n *NullInt64) Scan(value any) error</pre> <p>Scan implements the Scanner interface. </p>
+<h3 id="NullInt64.Value">func (NullInt64) <span>Value</span>  </h3> <pre data-language="go">func (n NullInt64) Value() (driver.Value, error)</pre> <p>Value implements the driver Valuer interface. </p>
+<h2 id="NullString">type <span>NullString</span>  </h2> <p>NullString represents a string that may be null. NullString implements the Scanner interface so it can be used as a scan destination: </p>
+<pre data-language="go">var s NullString
+err := db.QueryRow("SELECT name FROM foo WHERE id=?", id).Scan(&amp;s)
+...
+if s.Valid {
+   // use s.String
+} else {
+   // NULL value
+}
+</pre> <pre data-language="go">type NullString struct {
+    String string
+    Valid  bool // Valid is true if String is not NULL
+}
+</pre> <h3 id="NullString.Scan">func (*NullString) <span>Scan</span>  </h3> <pre data-language="go">func (ns *NullString) Scan(value any) error</pre> <p>Scan implements the Scanner interface. </p>
+<h3 id="NullString.Value">func (NullString) <span>Value</span>  </h3> <pre data-language="go">func (ns NullString) Value() (driver.Value, error)</pre> <p>Value implements the driver Valuer interface. </p>
+<h2 id="NullTime">type <span>NullTime</span>  <span title="Added in Go 1.13">1.13</span> </h2> <p>NullTime represents a time.Time that may be null. NullTime implements the Scanner interface so it can be used as a scan destination, similar to NullString. </p>
+<pre data-language="go">type NullTime struct {
+    Time  time.Time
+    Valid bool // Valid is true if Time is not NULL
+}
+</pre> <h3 id="NullTime.Scan">func (*NullTime) <span>Scan</span>  <span title="Added in Go 1.13">1.13</span> </h3> <pre data-language="go">func (n *NullTime) Scan(value any) error</pre> <p>Scan implements the Scanner interface. </p>
+<h3 id="NullTime.Value">func (NullTime) <span>Value</span>  <span title="Added in Go 1.13">1.13</span> </h3> <pre data-language="go">func (n NullTime) Value() (driver.Value, error)</pre> <p>Value implements the driver Valuer interface. </p>
+<h2 id="Out">type <span>Out</span>  <span title="Added in Go 1.9">1.9</span> </h2> <p>Out may be used to retrieve OUTPUT value parameters from stored procedures. </p>
+<p>Not all drivers and databases support OUTPUT value parameters. </p>
+<p>Example usage: </p>
+<pre data-language="go">var outArg string
+_, err := db.ExecContext(ctx, "ProcName", sql.Named("Arg1", sql.Out{Dest: &amp;outArg}))
+</pre> <pre data-language="go">type Out struct {
+
+    // Dest is a pointer to the value that will be set to the result of the
+    // stored procedure's OUTPUT parameter.
+    Dest any
+
+    // In is whether the parameter is an INOUT parameter. If so, the input value to the stored
+    // procedure is the dereferenced value of Dest's pointer, which is then replaced with
+    // the output value.
+    In bool
+    // contains filtered or unexported fields
+}
+</pre> <h2 id="RawBytes">type <span>RawBytes</span>  </h2> <p>RawBytes is a byte slice that holds a reference to memory owned by the database itself. After a Scan into a RawBytes, the slice is only valid until the next call to Next, Scan, or Close. </p>
+<pre data-language="go">type RawBytes []byte</pre> <h2 id="Result">type <span>Result</span>  </h2> <p>A Result summarizes an executed SQL command. </p>
+<pre data-language="go">type Result interface {
+    // LastInsertId returns the integer generated by the database
+    // in response to a command. Typically this will be from an
+    // "auto increment" column when inserting a new row. Not all
+    // databases support this feature, and the syntax of such
+    // statements varies.
+    LastInsertId() (int64, error)
+
+    // RowsAffected returns the number of rows affected by an
+    // update, insert, or delete. Not every database or database
+    // driver may support this.
+    RowsAffected() (int64, error)
+}</pre> <h2 id="Row">type <span>Row</span>  </h2> <p>Row is the result of calling QueryRow to select a single row. </p>
+<pre data-language="go">type Row struct {
+    // contains filtered or unexported fields
+}
+</pre> <h3 id="Row.Err">func (*Row) <span>Err</span>  <span title="Added in Go 1.15">1.15</span> </h3> <pre data-language="go">func (r *Row) Err() error</pre> <p>Err provides a way for wrapping packages to check for query errors without calling Scan. Err returns the error, if any, that was encountered while running the query. If this error is not nil, this error will also be returned from Scan. </p>
+<h3 id="Row.Scan">func (*Row) <span>Scan</span>  </h3> <pre data-language="go">func (r *Row) Scan(dest ...any) error</pre> <p>Scan copies the columns from the matched row into the values pointed at by dest. See the documentation on Rows.Scan for details. If more than one row matches the query, Scan uses the first row and discards the rest. If no row matches the query, Scan returns ErrNoRows. </p>
+<h2 id="Rows">type <span>Rows</span>  </h2> <p>Rows is the result of a query. Its cursor starts before the first row of the result set. Use Next to advance from row to row. </p>
+<pre data-language="go">type Rows struct {
+    // contains filtered or unexported fields
+}
+</pre>    <h4 id="example_Rows"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+age := 27
+rows, err := db.QueryContext(ctx, "SELECT name FROM users WHERE age=?", age)
+if err != nil {
+    log.Fatal(err)
+}
+defer rows.Close()
+
+names := make([]string, 0)
+for rows.Next() {
+    var name string
+    if err := rows.Scan(&amp;name); err != nil {
+        log.Fatal(err)
+    }
+    names = append(names, name)
+}
+// Check for errors from iterating over rows.
+if err := rows.Err(); err != nil {
+    log.Fatal(err)
+}
+log.Printf("%s are %d years old", strings.Join(names, ", "), age)
+</pre>   <h3 id="Rows.Close">func (*Rows) <span>Close</span>  </h3> <pre data-language="go">func (rs *Rows) Close() error</pre> <p>Close closes the Rows, preventing further enumeration. If Next is called and returns false and there are no further result sets, the Rows are closed automatically and it will suffice to check the result of Err. Close is idempotent and does not affect the result of Err. </p>
+<h3 id="Rows.ColumnTypes">func (*Rows) <span>ColumnTypes</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (rs *Rows) ColumnTypes() ([]*ColumnType, error)</pre> <p>ColumnTypes returns column information such as column type, length, and nullable. Some information may not be available from some drivers. </p>
+<h3 id="Rows.Columns">func (*Rows) <span>Columns</span>  </h3> <pre data-language="go">func (rs *Rows) Columns() ([]string, error)</pre> <p>Columns returns the column names. Columns returns an error if the rows are closed. </p>
+<h3 id="Rows.Err">func (*Rows) <span>Err</span>  </h3> <pre data-language="go">func (rs *Rows) Err() error</pre> <p>Err returns the error, if any, that was encountered during iteration. Err may be called after an explicit or implicit Close. </p>
+<h3 id="Rows.Next">func (*Rows) <span>Next</span>  </h3> <pre data-language="go">func (rs *Rows) Next() bool</pre> <p>Next prepares the next result row for reading with the Scan method. It returns true on success, or false if there is no next result row or an error happened while preparing it. Err should be consulted to distinguish between the two cases. </p>
+<p>Every call to Scan, even the first one, must be preceded by a call to Next. </p>
+<h3 id="Rows.NextResultSet">func (*Rows) <span>NextResultSet</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (rs *Rows) NextResultSet() bool</pre> <p>NextResultSet prepares the next result set for reading. It reports whether there is further result sets, or false if there is no further result set or if there is an error advancing to it. The Err method should be consulted to distinguish between the two cases. </p>
+<p>After calling NextResultSet, the Next method should always be called before scanning. If there are further result sets they may not have rows in the result set. </p>
+<h3 id="Rows.Scan">func (*Rows) <span>Scan</span>  </h3> <pre data-language="go">func (rs *Rows) Scan(dest ...any) error</pre> <p>Scan copies the columns in the current row into the values pointed at by dest. The number of values in dest must be the same as the number of columns in Rows. </p>
+<p>Scan converts columns read from the database into the following common Go types and special types provided by the sql package: </p>
+<pre data-language="go">*string
+*[]byte
+*int, *int8, *int16, *int32, *int64
+*uint, *uint8, *uint16, *uint32, *uint64
+*bool
+*float32, *float64
+*interface{}
+*RawBytes
+*Rows (cursor value)
+any type implementing Scanner (see Scanner docs)
+</pre> <p>In the most simple case, if the type of the value from the source column is an integer, bool or string type T and dest is of type *T, Scan simply assigns the value through the pointer. </p>
+<p>Scan also converts between string and numeric types, as long as no information would be lost. While Scan stringifies all numbers scanned from numeric database columns into *string, scans into numeric types are checked for overflow. For example, a float64 with value 300 or a string with value "300" can scan into a uint16, but not into a uint8, though float64(255) or "255" can scan into a uint8. One exception is that scans of some float64 numbers to strings may lose information when stringifying. In general, scan floating point columns into *float64. </p>
+<p>If a dest argument has type *[]byte, Scan saves in that argument a copy of the corresponding data. The copy is owned by the caller and can be modified and held indefinitely. The copy can be avoided by using an argument of type *RawBytes instead; see the documentation for RawBytes for restrictions on its use. </p>
+<p>If an argument has type *interface{}, Scan copies the value provided by the underlying driver without conversion. When scanning from a source value of type []byte to *interface{}, a copy of the slice is made and the caller owns the result. </p>
+<p>Source values of type time.Time may be scanned into values of type *time.Time, *interface{}, *string, or *[]byte. When converting to the latter two, time.RFC3339Nano is used. </p>
+<p>Source values of type bool may be scanned into types *bool, *interface{}, *string, *[]byte, or *RawBytes. </p>
+<p>For scanning into *bool, the source may be true, false, 1, 0, or string inputs parseable by strconv.ParseBool. </p>
+<p>Scan can also convert a cursor returned from a query, such as "select cursor(select * from my_table) from dual", into a *Rows value that can itself be scanned from. The parent select query will close any cursor *Rows if the parent *Rows is closed. </p>
+<p>If any of the first arguments implementing Scanner returns an error, that error will be wrapped in the returned error. </p>
+<h2 id="Scanner">type <span>Scanner</span>  </h2> <p>Scanner is an interface used by Scan. </p>
+<pre data-language="go">type Scanner interface {
+    // Scan assigns a value from a database driver.
+    //
+    // The src value will be of one of the following types:
+    //
+    //    int64
+    //    float64
+    //    bool
+    //    []byte
+    //    string
+    //    time.Time
+    //    nil - for NULL values
+    //
+    // An error should be returned if the value cannot be stored
+    // without loss of information.
+    //
+    // Reference types such as []byte are only valid until the next call to Scan
+    // and should not be retained. Their underlying memory is owned by the driver.
+    // If retention is necessary, copy their values before the next call to Scan.
+    Scan(src any) error
+}</pre> <h2 id="Stmt">type <span>Stmt</span>  </h2> <p>Stmt is a prepared statement. A Stmt is safe for concurrent use by multiple goroutines. </p>
+<p>If a Stmt is prepared on a Tx or Conn, it will be bound to a single underlying connection forever. If the Tx or Conn closes, the Stmt will become unusable and all operations will return an error. If a Stmt is prepared on a DB, it will remain usable for the lifetime of the DB. When the Stmt needs to execute on a new underlying connection, it will prepare itself on the new connection automatically. </p>
+<pre data-language="go">type Stmt struct {
+    // contains filtered or unexported fields
+}
+</pre>    <h4 id="example_Stmt"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+// In normal use, create one Stmt when your process starts.
+stmt, err := db.PrepareContext(ctx, "SELECT username FROM users WHERE id = ?")
+if err != nil {
+    log.Fatal(err)
+}
+defer stmt.Close()
+
+// Then reuse it each time you need to issue the query.
+id := 43
+var username string
+err = stmt.QueryRowContext(ctx, id).Scan(&amp;username)
+switch {
+case err == sql.ErrNoRows:
+    log.Fatalf("no user with id %d", id)
+case err != nil:
+    log.Fatal(err)
+default:
+    log.Printf("username is %s\n", username)
+}
+</pre>   <h3 id="Stmt.Close">func (*Stmt) <span>Close</span>  </h3> <pre data-language="go">func (s *Stmt) Close() error</pre> <p>Close closes the statement. </p>
+<h3 id="Stmt.Exec">func (*Stmt) <span>Exec</span>  </h3> <pre data-language="go">func (s *Stmt) Exec(args ...any) (Result, error)</pre> <p>Exec executes a prepared statement with the given arguments and returns a Result summarizing the effect of the statement. </p>
+<p>Exec uses context.Background internally; to specify the context, use ExecContext. </p>
+<h3 id="Stmt.ExecContext">func (*Stmt) <span>ExecContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (s *Stmt) ExecContext(ctx context.Context, args ...any) (Result, error)</pre> <p>ExecContext executes a prepared statement with the given arguments and returns a Result summarizing the effect of the statement. </p>
+<h3 id="Stmt.Query">func (*Stmt) <span>Query</span>  </h3> <pre data-language="go">func (s *Stmt) Query(args ...any) (*Rows, error)</pre> <p>Query executes a prepared query statement with the given arguments and returns the query results as a *Rows. </p>
+<p>Query uses context.Background internally; to specify the context, use QueryContext. </p>
+<h3 id="Stmt.QueryContext">func (*Stmt) <span>QueryContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (s *Stmt) QueryContext(ctx context.Context, args ...any) (*Rows, error)</pre> <p>QueryContext executes a prepared query statement with the given arguments and returns the query results as a *Rows. </p>
+<h3 id="Stmt.QueryRow">func (*Stmt) <span>QueryRow</span>  </h3> <pre data-language="go">func (s *Stmt) QueryRow(args ...any) *Row</pre> <p>QueryRow executes a prepared query statement with the given arguments. If an error occurs during the execution of the statement, that error will be returned by a call to Scan on the returned *Row, which is always non-nil. If the query selects no rows, the *Row's Scan will return ErrNoRows. Otherwise, the *Row's Scan scans the first selected row and discards the rest. </p>
+<p>Example usage: </p>
+<pre data-language="go">var name string
+err := nameByUseridStmt.QueryRow(id).Scan(&amp;name)
+</pre> <p>QueryRow uses context.Background internally; to specify the context, use QueryRowContext. </p>
+<h3 id="Stmt.QueryRowContext">func (*Stmt) <span>QueryRowContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (s *Stmt) QueryRowContext(ctx context.Context, args ...any) *Row</pre> <p>QueryRowContext executes a prepared query statement with the given arguments. If an error occurs during the execution of the statement, that error will be returned by a call to Scan on the returned *Row, which is always non-nil. If the query selects no rows, the *Row's Scan will return ErrNoRows. Otherwise, the *Row's Scan scans the first selected row and discards the rest. </p>   <h4 id="example_Stmt_QueryRowContext"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+// In normal use, create one Stmt when your process starts.
+stmt, err := db.PrepareContext(ctx, "SELECT username FROM users WHERE id = ?")
+if err != nil {
+    log.Fatal(err)
+}
+defer stmt.Close()
+
+// Then reuse it each time you need to issue the query.
+id := 43
+var username string
+err = stmt.QueryRowContext(ctx, id).Scan(&amp;username)
+switch {
+case err == sql.ErrNoRows:
+    log.Fatalf("no user with id %d", id)
+case err != nil:
+    log.Fatal(err)
+default:
+    log.Printf("username is %s\n", username)
+}
+</pre>   <h2 id="Tx">type <span>Tx</span>  </h2> <p>Tx is an in-progress database transaction. </p>
+<p>A transaction must end with a call to Commit or Rollback. </p>
+<p>After a call to Commit or Rollback, all operations on the transaction fail with ErrTxDone. </p>
+<p>The statements prepared for a transaction by calling the transaction's Prepare or Stmt methods are closed by the call to Commit or Rollback. </p>
+<pre data-language="go">type Tx struct {
+    // contains filtered or unexported fields
+}
+</pre> <h3 id="Tx.Commit">func (*Tx) <span>Commit</span>  </h3> <pre data-language="go">func (tx *Tx) Commit() error</pre> <p>Commit commits the transaction. </p>
+<h3 id="Tx.Exec">func (*Tx) <span>Exec</span>  </h3> <pre data-language="go">func (tx *Tx) Exec(query string, args ...any) (Result, error)</pre> <p>Exec executes a query that doesn't return rows. For example: an INSERT and UPDATE. </p>
+<p>Exec uses context.Background internally; to specify the context, use ExecContext. </p>
+<h3 id="Tx.ExecContext">func (*Tx) <span>ExecContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error)</pre> <p>ExecContext executes a query that doesn't return rows. For example: an INSERT and UPDATE. </p>   <h4 id="example_Tx_ExecContext"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+tx, err := db.BeginTx(ctx, &amp;sql.TxOptions{Isolation: sql.LevelSerializable})
+if err != nil {
+    log.Fatal(err)
+}
+id := 37
+_, execErr := tx.ExecContext(ctx, "UPDATE users SET status = ? WHERE id = ?", "paid", id)
+if execErr != nil {
+    if rollbackErr := tx.Rollback(); rollbackErr != nil {
+        log.Fatalf("update failed: %v, unable to rollback: %v\n", execErr, rollbackErr)
+    }
+    log.Fatalf("update failed: %v", execErr)
+}
+if err := tx.Commit(); err != nil {
+    log.Fatal(err)
+}
+</pre>   <h3 id="Tx.Prepare">func (*Tx) <span>Prepare</span>  </h3> <pre data-language="go">func (tx *Tx) Prepare(query string) (*Stmt, error)</pre> <p>Prepare creates a prepared statement for use within a transaction. </p>
+<p>The returned statement operates within the transaction and will be closed when the transaction has been committed or rolled back. </p>
+<p>To use an existing prepared statement on this transaction, see Tx.Stmt. </p>
+<p>Prepare uses context.Background internally; to specify the context, use PrepareContext. </p>   <h4 id="example_Tx_Prepare"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+projects := []struct {
+    mascot  string
+    release int
+}{
+    {"tux", 1991},
+    {"duke", 1996},
+    {"gopher", 2009},
+    {"moby dock", 2013},
+}
+
+tx, err := db.Begin()
+if err != nil {
+    log.Fatal(err)
+}
+defer tx.Rollback() // The rollback will be ignored if the tx has been committed later in the function.
+
+stmt, err := tx.Prepare("INSERT INTO projects(id, mascot, release, category) VALUES( ?, ?, ?, ? )")
+if err != nil {
+    log.Fatal(err)
+}
+defer stmt.Close() // Prepared statements take up server resources and should be closed after use.
+
+for id, project := range projects {
+    if _, err := stmt.Exec(id+1, project.mascot, project.release, "open source"); err != nil {
+        log.Fatal(err)
+    }
+}
+if err := tx.Commit(); err != nil {
+    log.Fatal(err)
+}
+</pre>   <h3 id="Tx.PrepareContext">func (*Tx) <span>PrepareContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (tx *Tx) PrepareContext(ctx context.Context, query string) (*Stmt, error)</pre> <p>PrepareContext creates a prepared statement for use within a transaction. </p>
+<p>The returned statement operates within the transaction and will be closed when the transaction has been committed or rolled back. </p>
+<p>To use an existing prepared statement on this transaction, see Tx.Stmt. </p>
+<p>The provided context will be used for the preparation of the context, not for the execution of the returned statement. The returned statement will run in the transaction context. </p>
+<h3 id="Tx.Query">func (*Tx) <span>Query</span>  </h3> <pre data-language="go">func (tx *Tx) Query(query string, args ...any) (*Rows, error)</pre> <p>Query executes a query that returns rows, typically a SELECT. </p>
+<p>Query uses context.Background internally; to specify the context, use QueryContext. </p>
+<h3 id="Tx.QueryContext">func (*Tx) <span>QueryContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error)</pre> <p>QueryContext executes a query that returns rows, typically a SELECT. </p>
+<h3 id="Tx.QueryRow">func (*Tx) <span>QueryRow</span>  </h3> <pre data-language="go">func (tx *Tx) QueryRow(query string, args ...any) *Row</pre> <p>QueryRow executes a query that is expected to return at most one row. QueryRow always returns a non-nil value. Errors are deferred until Row's Scan method is called. If the query selects no rows, the *Row's Scan will return ErrNoRows. Otherwise, the *Row's Scan scans the first selected row and discards the rest. </p>
+<p>QueryRow uses context.Background internally; to specify the context, use QueryRowContext. </p>
+<h3 id="Tx.QueryRowContext">func (*Tx) <span>QueryRowContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *Row</pre> <p>QueryRowContext executes a query that is expected to return at most one row. QueryRowContext always returns a non-nil value. Errors are deferred until Row's Scan method is called. If the query selects no rows, the *Row's Scan will return ErrNoRows. Otherwise, the *Row's Scan scans the first selected row and discards the rest. </p>
+<h3 id="Tx.Rollback">func (*Tx) <span>Rollback</span>  </h3> <pre data-language="go">func (tx *Tx) Rollback() error</pre> <p>Rollback aborts the transaction. </p>   <h4 id="example_Tx_Rollback"> <span class="text">Example</span>
+</h4> <p>Code:</p> <pre class="code" data-language="go">
+tx, err := db.BeginTx(ctx, &amp;sql.TxOptions{Isolation: sql.LevelSerializable})
+if err != nil {
+    log.Fatal(err)
+}
+id := 53
+_, err = tx.ExecContext(ctx, "UPDATE drivers SET status = ? WHERE id = ?;", "assigned", id)
+if err != nil {
+    if rollbackErr := tx.Rollback(); rollbackErr != nil {
+        log.Fatalf("update drivers: unable to rollback: %v", rollbackErr)
+    }
+    log.Fatal(err)
+}
+_, err = tx.ExecContext(ctx, "UPDATE pickups SET driver_id = $1;", id)
+if err != nil {
+    if rollbackErr := tx.Rollback(); rollbackErr != nil {
+        log.Fatalf("update failed: %v, unable to back: %v", err, rollbackErr)
+    }
+    log.Fatal(err)
+}
+if err := tx.Commit(); err != nil {
+    log.Fatal(err)
+}
+</pre>   <h3 id="Tx.Stmt">func (*Tx) <span>Stmt</span>  </h3> <pre data-language="go">func (tx *Tx) Stmt(stmt *Stmt) *Stmt</pre> <p>Stmt returns a transaction-specific prepared statement from an existing statement. </p>
+<p>Example: </p>
+<pre data-language="go">updateMoney, err := db.Prepare("UPDATE balance SET money=money+? WHERE id=?")
+...
+tx, err := db.Begin()
+...
+res, err := tx.Stmt(updateMoney).Exec(123.45, 98293203)
+</pre> <p>The returned statement operates within the transaction and will be closed when the transaction has been committed or rolled back. </p>
+<p>Stmt uses context.Background internally; to specify the context, use StmtContext. </p>
+<h3 id="Tx.StmtContext">func (*Tx) <span>StmtContext</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (tx *Tx) StmtContext(ctx context.Context, stmt *Stmt) *Stmt</pre> <p>StmtContext returns a transaction-specific prepared statement from an existing statement. </p>
+<p>Example: </p>
+<pre data-language="go">updateMoney, err := db.Prepare("UPDATE balance SET money=money+? WHERE id=?")
+...
+tx, err := db.Begin()
+...
+res, err := tx.StmtContext(ctx, updateMoney).Exec(123.45, 98293203)
+</pre> <p>The provided context is used for the preparation of the statement, not for the execution of the statement. </p>
+<p>The returned statement operates within the transaction and will be closed when the transaction has been committed or rolled back. </p>
+<h2 id="TxOptions">type <span>TxOptions</span>  <span title="Added in Go 1.8">1.8</span> </h2> <p>TxOptions holds the transaction options to be used in DB.BeginTx. </p>
+<pre data-language="go">type TxOptions struct {
+    // Isolation is the transaction isolation level.
+    // If zero, the driver or database's default level is used.
+    Isolation IsolationLevel
+    ReadOnly  bool
+}
+</pre> <h2 id="pkg-subdirectories">Subdirectories</h2> <div class="pkg-dir"> <table> <tr> <th class="pkg-name">Name</th> <th class="pkg-synopsis">Synopsis</th> </tr> <tr> <td colspan="2"><a href="../index.html">..</a></td> </tr> <tr> <td class="pkg-name"> <a href="driver/index.html">driver</a> </td> <td class="pkg-synopsis"> Package driver defines interfaces to be implemented by database drivers as used by package sql. </td> </tr> </table> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Google, Inc.<br>Licensed under the Creative Commons Attribution License 3.0.<br>
+    <a href="http://golang.org/pkg/database/sql/" class="_attribution-link">http://golang.org/pkg/database/sql/</a>
+  </p>
+</div>
