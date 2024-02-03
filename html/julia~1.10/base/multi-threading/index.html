@@ -1,0 +1,516 @@
+<h1 id="lib-multithreading">Multi-Threading</h1>
+<h3 id="Base.Threads.@threads">
+<code>Base.Threads.@threads</code><span class="docstring-category">Macro</span>
+</h3>
+<section><pre data-language="julia">Threads.@threads [schedule] for ... end</pre>
+<p>A macro to execute a <code>for</code> loop in parallel. The iteration space is distributed to coarse-grained tasks. This policy can be specified by the <code>schedule</code> argument. The execution of the loop waits for the evaluation of all iterations.</p>
+<p>See also: <a href="#Base.Threads.@spawn"><code>@spawn</code></a> and <code>pmap</code> in <a href="../../stdlib/distributed/index.html#man-distributed"><code>Distributed</code></a>.</p>
+<p><strong>Extended help</strong></p>
+<p><strong>Semantics</strong></p>
+<p>Unless stronger guarantees are specified by the scheduling option, the loop executed by <code>@threads</code> macro have the following semantics.</p>
+<p>The <code>@threads</code> macro executes the loop body in an unspecified order and potentially concurrently. It does not specify the exact assignments of the tasks and the worker threads. The assignments can be different for each execution. The loop body code (including any code transitively called from it) must not make any assumptions about the distribution of iterations to tasks or the worker thread in which they are executed. The loop body for each iteration must be able to make forward progress independent of other iterations and be free from data races. As such, invalid synchronizations across iterations may deadlock while unsynchronized memory accesses may result in undefined behavior.</p>
+<p>For example, the above conditions imply that:</p>
+<ul>
+<li>A lock taken in an iteration <em>must</em> be released within the same iteration.</li>
+<li>Communicating between iterations using blocking primitives like <code>Channel</code>s is incorrect.</li>
+<li>Write only to locations not shared across iterations (unless a lock or atomic operation is used).</li>
+<li>Unless the <code>:static</code> schedule is used, the value of <a href="#Base.Threads.threadid"><code>threadid()</code></a> may change even within a single iteration. See <a href="../../manual/multi-threading/index.html#man-task-migration"><code>Task Migration</code></a>.</li>
+</ul>
+<p><strong>Schedulers</strong></p>
+<p>Without the scheduler argument, the exact scheduling is unspecified and varies across Julia releases. Currently, <code>:dynamic</code> is used when the scheduler is not specified.</p>
+<div class="admonition is-compat">
+
+<div class="admonition-body"><p>The <code>schedule</code> argument is available as of Julia 1.5.</p></div>
+</div>
+<p><strong><code>:dynamic</code> (default)</strong></p>
+<p><code>:dynamic</code> scheduler executes iterations dynamically to available worker threads. Current implementation assumes that the workload for each iteration is uniform. However, this assumption may be removed in the future.</p>
+<p>This scheduling option is merely a hint to the underlying execution mechanism. However, a few properties can be expected. The number of <code>Task</code>s used by <code>:dynamic</code> scheduler is bounded by a small constant multiple of the number of available worker threads (<a href="#Base.Threads.threadpoolsize"><code>Threads.threadpoolsize()</code></a>). Each task processes contiguous regions of the iteration space. Thus, <code>@threads :dynamic for x in xs; f(x); end</code> is typically more efficient than <code>@sync for x in xs; @spawn f(x); end</code> if <code>length(xs)</code> is significantly larger than the number of the worker threads and the run-time of <code>f(x)</code> is relatively smaller than the cost of spawning and synchronizing a task (typically less than 10 microseconds).</p>
+<div class="admonition is-compat">
+
+<div class="admonition-body"><p>The <code>:dynamic</code> option for the <code>schedule</code> argument is available and the default as of Julia 1.8.</p></div>
+</div>
+<p><strong><code>:static</code></strong></p>
+<p><code>:static</code> scheduler creates one task per thread and divides the iterations equally among them, assigning each task specifically to each thread. In particular, the value of <a href="#Base.Threads.threadid"><code>threadid()</code></a> is guaranteed to be constant within one iteration. Specifying <code>:static</code> is an error if used from inside another <code>@threads</code> loop or from a thread other than 1.</p>
+<div class="admonition is-info">
+
+<div class="admonition-body"><p><code>:static</code> scheduling exists for supporting transition of code written before Julia 1.3. In newly written library functions, <code>:static</code> scheduling is discouraged because the functions using this option cannot be called from arbitrary worker threads.</p></div>
+</div>
+<p><strong>Example</strong></p>
+<p>To illustrate of the different scheduling strategies, consider the following function <code>busywait</code> containing a non-yielding timed loop that runs for a given number of seconds.</p>
+<pre data-language="julia">julia&gt; function busywait(seconds)
+            tstart = time_ns()
+            while (time_ns() - tstart) / 1e9 &lt; seconds
+            end
+        end
+
+julia&gt; @time begin
+            Threads.@spawn busywait(5)
+            Threads.@threads :static for i in 1:Threads.threadpoolsize()
+                busywait(1)
+            end
+        end
+6.003001 seconds (16.33 k allocations: 899.255 KiB, 0.25% compilation time)
+
+julia&gt; @time begin
+            Threads.@spawn busywait(5)
+            Threads.@threads :dynamic for i in 1:Threads.threadpoolsize()
+                busywait(1)
+            end
+        end
+2.012056 seconds (16.05 k allocations: 883.919 KiB, 0.66% compilation time)</pre>
+<p>The <code>:dynamic</code> example takes 2 seconds since one of the non-occupied threads is able to run two of the 1-second iterations to complete the for loop.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadingconstructs.jl#L229-L335">source</a></section><h3 id="Base.Threads.foreach">
+<code>Base.Threads.foreach</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.foreach(f, channel::Channel;
+                schedule::Threads.AbstractSchedule=Threads.FairSchedule(),
+                ntasks=Threads.threadpoolsize())</pre>
+<p>Similar to <code>foreach(f, channel)</code>, but iteration over <code>channel</code> and calls to <code>f</code> are split across <code>ntasks</code> tasks spawned by <code>Threads.@spawn</code>. This function will wait for all internally spawned tasks to complete before returning.</p>
+<p>If <code>schedule isa FairSchedule</code>, <code>Threads.foreach</code> will attempt to spawn tasks in a manner that enables Julia's scheduler to more freely load-balance work items across threads. This approach generally has higher per-item overhead, but may perform better than <code>StaticSchedule</code> in concurrence with other multithreaded workloads.</p>
+<p>If <code>schedule isa StaticSchedule</code>, <code>Threads.foreach</code> will spawn tasks in a manner that incurs lower per-item overhead than <code>FairSchedule</code>, but is less amenable to load-balancing. This approach thus may be more suitable for fine-grained, uniform workloads, but may perform worse than <code>FairSchedule</code> in concurrence with other multithreaded workloads.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; n = 20
+
+julia&gt; c = Channel{Int}(ch -&gt; foreach(i -&gt; put!(ch, i), 1:n), 1)
+
+julia&gt; d = Channel{Int}(n) do ch
+           f = i -&gt; put!(ch, i^2)
+           Threads.foreach(f, c)
+       end
+
+julia&gt; collect(d)
+collect(d) = [1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 225, 256, 289, 324, 361, 400]</pre>
+<div class="admonition is-compat">
+
+<div class="admonition-body"><p>This function requires Julia 1.6 or later.</p></div>
+</div>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threads_overloads.jl#L3-L40">source</a></section><h3 id="Base.Threads.@spawn">
+<code>Base.Threads.@spawn</code><span class="docstring-category">Macro</span>
+</h3>
+<section><pre data-language="julia">Threads.@spawn [:default|:interactive] expr</pre>
+<p>Create a <a href="../parallel/index.html#Core.Task"><code>Task</code></a> and <a href="../parallel/index.html#Base.schedule"><code>schedule</code></a> it to run on any available thread in the specified threadpool (<code>:default</code> if unspecified). The task is allocated to a thread once one becomes available. To wait for the task to finish, call <a href="../parallel/index.html#Base.wait"><code>wait</code></a> on the result of this macro, or call <a href="#"><code>fetch</code></a> to wait and then obtain its return value.</p>
+<p>Values can be interpolated into <code>@spawn</code> via <code>$</code>, which copies the value directly into the constructed underlying closure. This allows you to insert the <em>value</em> of a variable, isolating the asynchronous code from changes to the variable's value in the current task.</p>
+<div class="admonition is-info">
+
+<div class="admonition-body"><p>The thread that the task runs on may change if the task yields, therefore <code>threadid()</code> should not be treated as constant for a task. See <a href="../../manual/multi-threading/index.html#man-task-migration"><code>Task Migration</code></a>, and the broader <a href="../../manual/multi-threading/index.html#man-multithreading">multi-threading</a> manual for further important caveats. See also the chapter on <a href="../../manual/multi-threading/index.html#man-threadpools">threadpools</a>.</p></div>
+</div>
+<div class="admonition is-compat">
+
+<div class="admonition-body"><p>This macro is available as of Julia 1.3.</p></div>
+</div>
+<div class="admonition is-compat">
+
+<div class="admonition-body"><p>Interpolating values via <code>$</code> is available as of Julia 1.4.</p></div>
+</div>
+<div class="admonition is-compat">
+
+<div class="admonition-body"><p>A threadpool may be specified as of Julia 1.9.</p></div>
+</div>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; t() = println("Hello from ", Threads.threadid());
+
+julia&gt; tasks = fetch.([Threads.@spawn t() for i in 1:4]);
+Hello from 1
+Hello from 1
+Hello from 3
+Hello from 4</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadingconstructs.jl#L373-L412">source</a></section><h3 id="Base.Threads.threadid">
+<code>Base.Threads.threadid</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.threadid() -&gt; Int</pre>
+<p>Get the ID number of the current thread of execution. The master thread has ID <code>1</code>.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; Threads.threadid()
+1
+
+julia&gt; Threads.@threads for i in 1:4
+          println(Threads.threadid())
+       end
+4
+2
+5
+4</pre>
+<div class="admonition is-info">
+
+<div class="admonition-body"><p>The thread that a task runs on may change if the task yields, which is known as <a href="../../manual/multi-threading/index.html#man-task-migration"><code>Task Migration</code></a>. For this reason in most cases it is not safe to use <code>threadid()</code> to index into, say, a vector of buffer or stateful objects.</p></div>
+</div>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadingconstructs.jl#L6-L30">source</a></section><h3 id="Base.Threads.maxthreadid">
+<code>Base.Threads.maxthreadid</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.maxthreadid() -&gt; Int</pre>
+<p>Get a lower bound on the number of threads (across all thread pools) available to the Julia process, with atomic-acquire semantics. The result will always be greater than or equal to <a href="#Base.Threads.threadid"><code>threadid()</code></a> as well as <code>threadid(task)</code> for any task you were able to observe before calling <code>maxthreadid</code>.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadingconstructs.jl#L34-L41">source</a></section><h3 id="Base.Threads.nthreads">
+<code>Base.Threads.nthreads</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.nthreads(:default | :interactive) -&gt; Int</pre>
+<p>Get the current number of threads within the specified thread pool. The threads in default have id numbers <code>1:nthreads(:default)</code>.</p>
+<p>See also <code>BLAS.get_num_threads</code> and <code>BLAS.set_num_threads</code> in the <a href="../../stdlib/linearalgebra/index.html#man-linalg"><code>LinearAlgebra</code></a> standard library, and <code>nprocs()</code> in the <a href="../../stdlib/distributed/index.html#man-distributed"><code>Distributed</code></a> standard library and <a href="#Base.Threads.maxthreadid"><code>Threads.maxthreadid()</code></a>.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadingconstructs.jl#L44-L53">source</a></section><h3 id="Base.Threads.threadpool">
+<code>Base.Threads.threadpool</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.threadpool(tid = threadid()) -&gt; Symbol</pre>
+<p>Returns the specified thread's threadpool; either <code>:default</code>, <code>:interactive</code>, or <code>:foreign</code>.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadingconstructs.jl#L85-L89">source</a></section><h3 id="Base.Threads.nthreadpools">
+<code>Base.Threads.nthreadpools</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.nthreadpools() -&gt; Int</pre>
+<p>Returns the number of threadpools currently configured.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadingconstructs.jl#L95-L99">source</a></section><h3 id="Base.Threads.threadpoolsize">
+<code>Base.Threads.threadpoolsize</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.threadpoolsize(pool::Symbol = :default) -&gt; Int</pre>
+<p>Get the number of threads available to the default thread pool (or to the specified thread pool).</p>
+<p>See also: <code>BLAS.get_num_threads</code> and <code>BLAS.set_num_threads</code> in the <a href="../../stdlib/linearalgebra/index.html#man-linalg"><code>LinearAlgebra</code></a> standard library, and <code>nprocs()</code> in the <a href="../../stdlib/distributed/index.html#man-distributed"><code>Distributed</code></a> standard library.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadingconstructs.jl#L102-L111">source</a></section><h3 id="Base.Threads.ngcthreads">
+<code>Base.Threads.ngcthreads</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.ngcthreads() -&gt; Int</pre>
+<p>Returns the number of GC threads currently configured. This includes both mark threads and concurrent sweep threads.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadingconstructs.jl#L139-L144">source</a></section><p>See also <a href="../../manual/multi-threading/index.html#man-multithreading">Multi-Threading</a>.</p>
+<h2 id="Atomic-operations">
+<a class="docs-heading-anchor" href="#Atomic-operations">Atomic operations</a>
+</h2>
+<h3 id="atomic">
+<code>atomic</code><span class="docstring-category">Keyword</span>
+</h3>
+<section><p>Unsafe pointer operations are compatible with loading and storing pointers declared with <code>_Atomic</code> and <code>std::atomic</code> type in C11 and C++23 respectively. An error may be thrown if there is not support for atomically loading the Julia type <code>T</code>.</p>
+<p>See also: <a href="../c/index.html#Base.unsafe_load"><code>unsafe_load</code></a>, <a href="../c/index.html#Base.unsafe_modify!"><code>unsafe_modify!</code></a>, <a href="../c/index.html#Base.unsafe_replace!"><code>unsafe_replace!</code></a>, <a href="../c/index.html#Base.unsafe_store!"><code>unsafe_store!</code></a>, <a href="../c/index.html#Base.unsafe_swap!"><code>unsafe_swap!</code></a></p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/docs/basedocs.jl#L3236-L3242">source</a></section><h3 id="Base.@atomic">
+<code>Base.@atomic</code><span class="docstring-category">Macro</span>
+</h3>
+<section><pre data-language="julia">@atomic var
+@atomic order ex</pre>
+<p>Mark <code>var</code> or <code>ex</code> as being performed atomically, if <code>ex</code> is a supported expression. If no <code>order</code> is specified it defaults to :sequentially_consistent.</p>
+<pre data-language="julia">@atomic a.b.x = new
+@atomic a.b.x += addend
+@atomic :release a.b.x = new
+@atomic :acquire_release a.b.x += addend</pre>
+<p>Perform the store operation expressed on the right atomically and return the new value.</p>
+<p>With <code>=</code>, this operation translates to a <code>setproperty!(a.b, :x, new)</code> call. With any operator also, this operation translates to a <code>modifyproperty!(a.b, :x, +, addend)[2]</code> call.</p>
+<pre data-language="julia">@atomic a.b.x max arg2
+@atomic a.b.x + arg2
+@atomic max(a.b.x, arg2)
+@atomic :acquire_release max(a.b.x, arg2)
+@atomic :acquire_release a.b.x + arg2
+@atomic :acquire_release a.b.x max arg2</pre>
+<p>Perform the binary operation expressed on the right atomically. Store the result into the field in the first argument and return the values <code>(old, new)</code>.</p>
+<p>This operation translates to a <code>modifyproperty!(a.b, :x, func, arg2)</code> call.</p>
+<p>See <a href="../../manual/multi-threading/index.html#man-atomics">Per-field atomics</a> section in the manual for more details.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; mutable struct Atomic{T}; @atomic x::T; end
+
+julia&gt; a = Atomic(1)
+Atomic{Int64}(1)
+
+julia&gt; @atomic a.x # fetch field x of a, with sequential consistency
+1
+
+julia&gt; @atomic :sequentially_consistent a.x = 2 # set field x of a, with sequential consistency
+2
+
+julia&gt; @atomic a.x += 1 # increment field x of a, with sequential consistency
+3
+
+julia&gt; @atomic a.x + 1 # increment field x of a, with sequential consistency
+3 =&gt; 4
+
+julia&gt; @atomic a.x # fetch field x of a, with sequential consistency
+4
+
+julia&gt; @atomic max(a.x, 10) # change field x of a to the max value, with sequential consistency
+4 =&gt; 10
+
+julia&gt; @atomic a.x max 5 # again change field x of a to the max value, with sequential consistency
+10 =&gt; 10</pre>
+<div class="admonition is-compat">
+
+<div class="admonition-body"><p>This functionality requires at least Julia 1.7.</p></div>
+</div>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/expr.jl#L1042-L1107">source</a></section><h3 id="Base.@atomicswap">
+<code>Base.@atomicswap</code><span class="docstring-category">Macro</span>
+</h3>
+<section><pre data-language="julia">@atomicswap a.b.x = new
+@atomicswap :sequentially_consistent a.b.x = new</pre>
+<p>Stores <code>new</code> into <code>a.b.x</code> and returns the old value of <code>a.b.x</code>.</p>
+<p>This operation translates to a <code>swapproperty!(a.b, :x, new)</code> call.</p>
+<p>See <a href="../../manual/multi-threading/index.html#man-atomics">Per-field atomics</a> section in the manual for more details.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; mutable struct Atomic{T}; @atomic x::T; end
+
+julia&gt; a = Atomic(1)
+Atomic{Int64}(1)
+
+julia&gt; @atomicswap a.x = 2+2 # replace field x of a with 4, with sequential consistency
+1
+
+julia&gt; @atomic a.x # fetch field x of a, with sequential consistency
+4</pre>
+<div class="admonition is-compat">
+
+<div class="admonition-body"><p>This functionality requires at least Julia 1.7.</p></div>
+</div>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/expr.jl#L1166-L1192">source</a></section><h3 id="Base.@atomicreplace">
+<code>Base.@atomicreplace</code><span class="docstring-category">Macro</span>
+</h3>
+<section><pre data-language="julia">@atomicreplace a.b.x expected =&gt; desired
+@atomicreplace :sequentially_consistent a.b.x expected =&gt; desired
+@atomicreplace :sequentially_consistent :monotonic a.b.x expected =&gt; desired</pre>
+<p>Perform the conditional replacement expressed by the pair atomically, returning the values <code>(old, success::Bool)</code>. Where <code>success</code> indicates whether the replacement was completed.</p>
+<p>This operation translates to a <code>replaceproperty!(a.b, :x, expected, desired)</code> call.</p>
+<p>See <a href="../../manual/multi-threading/index.html#man-atomics">Per-field atomics</a> section in the manual for more details.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; mutable struct Atomic{T}; @atomic x::T; end
+
+julia&gt; a = Atomic(1)
+Atomic{Int64}(1)
+
+julia&gt; @atomicreplace a.x 1 =&gt; 2 # replace field x of a with 2 if it was 1, with sequential consistency
+(old = 1, success = true)
+
+julia&gt; @atomic a.x # fetch field x of a, with sequential consistency
+2
+
+julia&gt; @atomicreplace a.x 1 =&gt; 2 # replace field x of a with 2 if it was 1, with sequential consistency
+(old = 2, success = false)
+
+julia&gt; xchg = 2 =&gt; 0; # replace field x of a with 0 if it was 2, with sequential consistency
+
+julia&gt; @atomicreplace a.x xchg
+(old = 2, success = true)
+
+julia&gt; @atomic a.x # fetch field x of a, with sequential consistency
+0</pre>
+<div class="admonition is-compat">
+
+<div class="admonition-body"><p>This functionality requires at least Julia 1.7.</p></div>
+</div>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/expr.jl#L1210-L1250">source</a></section><div class="admonition is-info">
+
+<div class="admonition-body"><p>The following APIs are fairly primitive, and will likely be exposed through an <code>unsafe_*</code>-like wrapper.</p></div>
+</div>
+<pre data-language="julia">Core.Intrinsics.atomic_pointerref(pointer::Ptr{T}, order::Symbol) --&gt; T
+Core.Intrinsics.atomic_pointerset(pointer::Ptr{T}, new::T, order::Symbol) --&gt; pointer
+Core.Intrinsics.atomic_pointerswap(pointer::Ptr{T}, new::T, order::Symbol) --&gt; old
+Core.Intrinsics.atomic_pointermodify(pointer::Ptr{T}, function::(old::T,arg::S)-&gt;T, arg::S, order::Symbol) --&gt; old
+Core.Intrinsics.atomic_pointerreplace(pointer::Ptr{T}, expected::Any, new::T, success_order::Symbol, failure_order::Symbol) --&gt; (old, cmp)</pre>
+<div class="admonition is-warning">
+
+<div class="admonition-body"><p>The following APIs are deprecated, though support for them is likely to remain for several releases.</p></div>
+</div>
+<h3 id="Base.Threads.Atomic">
+<code>Base.Threads.Atomic</code><span class="docstring-category">Type</span>
+</h3>
+<section><pre data-language="julia">Threads.Atomic{T}</pre>
+<p>Holds a reference to an object of type <code>T</code>, ensuring that it is only accessed atomically, i.e. in a thread-safe manner.</p>
+<p>Only certain "simple" types can be used atomically, namely the primitive boolean, integer, and float-point types. These are <code>Bool</code>, <code>Int8</code>...<code>Int128</code>, <code>UInt8</code>...<code>UInt128</code>, and <code>Float16</code>...<code>Float64</code>.</p>
+<p>New atomic objects can be created from a non-atomic values; if none is specified, the atomic object is initialized with zero.</p>
+<p>Atomic objects can be accessed using the <code>[]</code> notation:</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(3)
+Base.Threads.Atomic{Int64}(3)
+
+julia&gt; x[] = 1
+1
+
+julia&gt; x[]
+1</pre>
+<p>Atomic operations use an <code>atomic_</code> prefix, such as <a href="#Base.Threads.atomic_add!"><code>atomic_add!</code></a>, <a href="#Base.Threads.atomic_xchg!"><code>atomic_xchg!</code></a>, etc.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L45-L74">source</a></section><h3 id="Base.Threads.atomic_cas!">
+<code>Base.Threads.atomic_cas!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_cas!(x::Atomic{T}, cmp::T, newval::T) where T</pre>
+<p>Atomically compare-and-set <code>x</code></p>
+<p>Atomically compares the value in <code>x</code> with <code>cmp</code>. If equal, write <code>newval</code> to <code>x</code>. Otherwise, leaves <code>x</code> unmodified. Returns the old value in <code>x</code>. By comparing the returned value to <code>cmp</code> (via <code>===</code>) one knows whether <code>x</code> was modified and now holds the new value <code>newval</code>.</p>
+<p>For further details, see LLVM's <code>cmpxchg</code> instruction.</p>
+<p>This function can be used to implement transactional semantics. Before the transaction, one records the value in <code>x</code>. After the transaction, the new value is stored only if <code>x</code> has not been modified in the mean time.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(3)
+Base.Threads.Atomic{Int64}(3)
+
+julia&gt; Threads.atomic_cas!(x, 4, 2);
+
+julia&gt; x
+Base.Threads.Atomic{Int64}(3)
+
+julia&gt; Threads.atomic_cas!(x, 3, 2);
+
+julia&gt; x
+Base.Threads.Atomic{Int64}(2)</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L83-L115">source</a></section><h3 id="Base.Threads.atomic_xchg!">
+<code>Base.Threads.atomic_xchg!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_xchg!(x::Atomic{T}, newval::T) where T</pre>
+<p>Atomically exchange the value in <code>x</code></p>
+<p>Atomically exchanges the value in <code>x</code> with <code>newval</code>. Returns the <strong>old</strong> value.</p>
+<p>For further details, see LLVM's <code>atomicrmw xchg</code> instruction.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(3)
+Base.Threads.Atomic{Int64}(3)
+
+julia&gt; Threads.atomic_xchg!(x, 2)
+3
+
+julia&gt; x[]
+2</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L118-L139">source</a></section><h3 id="Base.Threads.atomic_add!">
+<code>Base.Threads.atomic_add!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_add!(x::Atomic{T}, val::T) where T &lt;: ArithmeticTypes</pre>
+<p>Atomically add <code>val</code> to <code>x</code></p>
+<p>Performs <code>x[] += val</code> atomically. Returns the <strong>old</strong> value. Not defined for <code>Atomic{Bool}</code>.</p>
+<p>For further details, see LLVM's <code>atomicrmw add</code> instruction.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(3)
+Base.Threads.Atomic{Int64}(3)
+
+julia&gt; Threads.atomic_add!(x, 2)
+3
+
+julia&gt; x[]
+5</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L142-L163">source</a></section><h3 id="Base.Threads.atomic_sub!">
+<code>Base.Threads.atomic_sub!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_sub!(x::Atomic{T}, val::T) where T &lt;: ArithmeticTypes</pre>
+<p>Atomically subtract <code>val</code> from <code>x</code></p>
+<p>Performs <code>x[] -= val</code> atomically. Returns the <strong>old</strong> value. Not defined for <code>Atomic{Bool}</code>.</p>
+<p>For further details, see LLVM's <code>atomicrmw sub</code> instruction.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(3)
+Base.Threads.Atomic{Int64}(3)
+
+julia&gt; Threads.atomic_sub!(x, 2)
+3
+
+julia&gt; x[]
+1</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L166-L187">source</a></section><h3 id="Base.Threads.atomic_and!">
+<code>Base.Threads.atomic_and!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_and!(x::Atomic{T}, val::T) where T</pre>
+<p>Atomically bitwise-and <code>x</code> with <code>val</code></p>
+<p>Performs <code>x[] &amp;= val</code> atomically. Returns the <strong>old</strong> value.</p>
+<p>For further details, see LLVM's <code>atomicrmw and</code> instruction.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(3)
+Base.Threads.Atomic{Int64}(3)
+
+julia&gt; Threads.atomic_and!(x, 2)
+3
+
+julia&gt; x[]
+2</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L190-L210">source</a></section><h3 id="Base.Threads.atomic_nand!">
+<code>Base.Threads.atomic_nand!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_nand!(x::Atomic{T}, val::T) where T</pre>
+<p>Atomically bitwise-nand (not-and) <code>x</code> with <code>val</code></p>
+<p>Performs <code>x[] = ~(x[] &amp; val)</code> atomically. Returns the <strong>old</strong> value.</p>
+<p>For further details, see LLVM's <code>atomicrmw nand</code> instruction.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(3)
+Base.Threads.Atomic{Int64}(3)
+
+julia&gt; Threads.atomic_nand!(x, 2)
+3
+
+julia&gt; x[]
+-3</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L213-L233">source</a></section><h3 id="Base.Threads.atomic_or!">
+<code>Base.Threads.atomic_or!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_or!(x::Atomic{T}, val::T) where T</pre>
+<p>Atomically bitwise-or <code>x</code> with <code>val</code></p>
+<p>Performs <code>x[] |= val</code> atomically. Returns the <strong>old</strong> value.</p>
+<p>For further details, see LLVM's <code>atomicrmw or</code> instruction.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(5)
+Base.Threads.Atomic{Int64}(5)
+
+julia&gt; Threads.atomic_or!(x, 7)
+5
+
+julia&gt; x[]
+7</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L236-L256">source</a></section><h3 id="Base.Threads.atomic_xor!">
+<code>Base.Threads.atomic_xor!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_xor!(x::Atomic{T}, val::T) where T</pre>
+<p>Atomically bitwise-xor (exclusive-or) <code>x</code> with <code>val</code></p>
+<p>Performs <code>x[] $= val</code> atomically. Returns the <strong>old</strong> value.</p>
+<p>For further details, see LLVM's <code>atomicrmw xor</code> instruction.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(5)
+Base.Threads.Atomic{Int64}(5)
+
+julia&gt; Threads.atomic_xor!(x, 7)
+5
+
+julia&gt; x[]
+2</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L259-L279">source</a></section><h3 id="Base.Threads.atomic_max!">
+<code>Base.Threads.atomic_max!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_max!(x::Atomic{T}, val::T) where T</pre>
+<p>Atomically store the maximum of <code>x</code> and <code>val</code> in <code>x</code></p>
+<p>Performs <code>x[] = max(x[], val)</code> atomically. Returns the <strong>old</strong> value.</p>
+<p>For further details, see LLVM's <code>atomicrmw max</code> instruction.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(5)
+Base.Threads.Atomic{Int64}(5)
+
+julia&gt; Threads.atomic_max!(x, 7)
+5
+
+julia&gt; x[]
+7</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L282-L302">source</a></section><h3 id="Base.Threads.atomic_min!">
+<code>Base.Threads.atomic_min!</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_min!(x::Atomic{T}, val::T) where T</pre>
+<p>Atomically store the minimum of <code>x</code> and <code>val</code> in <code>x</code></p>
+<p>Performs <code>x[] = min(x[], val)</code> atomically. Returns the <strong>old</strong> value.</p>
+<p>For further details, see LLVM's <code>atomicrmw min</code> instruction.</p>
+<p><strong>Examples</strong></p>
+<pre data-language="julia">julia&gt; x = Threads.Atomic{Int}(7)
+Base.Threads.Atomic{Int64}(7)
+
+julia&gt; Threads.atomic_min!(x, 5)
+7
+
+julia&gt; x[]
+5</pre>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L305-L325">source</a></section><h3 id="Base.Threads.atomic_fence">
+<code>Base.Threads.atomic_fence</code><span class="docstring-category">Function</span>
+</h3>
+<section><pre data-language="julia">Threads.atomic_fence()</pre>
+<p>Insert a sequential-consistency memory fence</p>
+<p>Inserts a memory fence with sequentially-consistent ordering semantics. There are algorithms where this is needed, i.e. where an acquire/release ordering is insufficient.</p>
+<p>This is likely a very expensive operation. Given that all other atomic operations in Julia already have acquire/release semantics, explicit fences should not be necessary in most cases.</p>
+<p>For further details, see LLVM's <code>fence</code> instruction.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/atomics.jl#L443-L457">source</a></section><h2 id="ccall-using-a-libuv-threadpool-(Experimental)">
+<a class="docs-heading-anchor" href="#ccall-using-a-libuv-threadpool-(Experimental)">ccall using a libuv threadpool (Experimental)</a>
+</h2>
+<h3 id="Base.@threadcall">
+<code>Base.@threadcall</code><span class="docstring-category">Macro</span>
+</h3>
+<section><pre data-language="julia">@threadcall((cfunc, clib), rettype, (argtypes...), argvals...)</pre>
+<p>The <code>@threadcall</code> macro is called in the same way as <a href="../c/index.html#ccall"><code>ccall</code></a> but does the work in a different thread. This is useful when you want to call a blocking C function without causing the current <code>julia</code> thread to become blocked. Concurrency is limited by size of the libuv thread pool, which defaults to 4 threads but can be increased by setting the <code>UV_THREADPOOL_SIZE</code> environment variable and restarting the <code>julia</code> process.</p>
+<p>Note that the called function should never call back into Julia.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/threadcall.jl#L7-L18">source</a></section><h2 id="Low-level-synchronization-primitives">
+<a class="docs-heading-anchor" href="#Low-level-synchronization-primitives">Low-level synchronization primitives</a>
+</h2>
+<p>These building blocks are used to create the regular synchronization objects.</p>
+<h3 id="Base.Threads.SpinLock">
+<code>Base.Threads.SpinLock</code><span class="docstring-category">Type</span>
+</h3>
+<section><pre data-language="julia">SpinLock()</pre>
+<p>Create a non-reentrant, test-and-test-and-set spin lock. Recursive use will result in a deadlock. This kind of lock should only be used around code that takes little time to execute and does not block (e.g. perform I/O). In general, <a href="../parallel/index.html#Base.ReentrantLock"><code>ReentrantLock</code></a> should be used instead.</p>
+<p>Each <a href="../parallel/index.html#Base.lock"><code>lock</code></a> must be matched with an <a href="../parallel/index.html#Base.unlock"><code>unlock</code></a>. If <a href="../parallel/index.html#Base.islocked"><code>!islocked(lck::SpinLock)</code></a> holds, <a href="../parallel/index.html#Base.trylock"><code>trylock(lck)</code></a> succeeds unless there are other tasks attempting to hold the lock "at the same time."</p>
+<p>Test-and-test-and-set spin locks are quickest up to about 30ish contending threads. If you have more contention than that, different synchronization approaches should be considered.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/3120989f39bb7ef7863c4aab8ab1227cf71eec66/base/locks-mt.jl#L14-L30">source</a></section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2009&ndash;2023 Jeff Bezanson, Stefan Karpinski, Viral B. Shah, and other contributors<br>Licensed under the MIT License.<br>
+    <a href="https://docs.julialang.org/en/v1.10/base/multi-threading/" class="_attribution-link">https://docs.julialang.org/en/v1.10/base/multi-threading/</a>
+  </p>
+</div>
