@@ -1,0 +1,92 @@
+<h1 class="main-heading">Macro std::pin::pin</h1>
+<pre class="rust item-decl" data-language="rust">pub macro pin($value:expr $(,)?) {
+    ...
+}</pre>
+<p>Constructs a <code><a href="struct.pin.html" title="struct std::pin::Pin">Pin</a>&lt;<a href="../primitive.reference.html" title="primitive reference">&amp;mut</a> T&gt;</code>, by pinning a <code>value: T</code> locally.</p> <p>Unlike <a href="../boxed/struct.box.html#method.pin"><code>Box::pin</code></a>, this does not create a new heap allocation. As explained below, the element might still end up on the heap however.</p> <p>The local pinning performed by this macro is usually dubbed “stack”-pinning. Outside of <code>async</code> contexts locals do indeed get stored on the stack. In <code>async</code> functions or blocks however, any locals crossing an <code>.await</code> point are part of the state captured by the <code>Future</code>, and will use the storage of those. That storage can either be on the heap or on the stack. Therefore, local pinning is a more accurate term.</p> <p>If the type of the given value does not implement <a href="../marker/trait.unpin.html" title="trait std::marker::Unpin"><code>Unpin</code></a>, then this macro pins the value in memory in a way that prevents moves. On the other hand, if the type does implement <a href="../marker/trait.unpin.html" title="trait std::marker::Unpin"><code>Unpin</code></a>, <code><a href="struct.pin.html" title="struct std::pin::Pin">Pin</a>&lt;<a href="../primitive.reference.html" title="primitive reference">&amp;mut</a> T&gt;</code> behaves like <code><a href="../primitive.reference.html" title="primitive reference">&amp;mut</a> T</code>, and operations such as <a href="../mem/fn.replace.html" title="fn std::mem::replace"><code>mem::replace()</code></a> or <a href="../mem/fn.take.html" title="fn std::mem::take"><code>mem::take()</code></a> will allow moves of the value. See <a href="index.html#unpin" title="mod std::pin">the <code>Unpin</code> section of the <code>pin</code> module</a> for details.</p> <h3 id="examples">Examples</h3>
+<h4 id="basic-usage">Basic usage</h4> <div class="example-wrap"><pre class="rust rust-example-rendered" data-language="rust">use core::pin::{pin, Pin};
+
+fn stuff(foo: Pin&lt;&amp;mut Foo&gt;) {
+    // …
+}
+
+let pinned_foo = pin!(Foo { /* … */ });
+stuff(pinned_foo);
+// or, directly:
+stuff(pin!(Foo { /* … */ }));</pre></div> <h4 id="manually-polling-a-future-without-unpin-bounds">Manually polling a <code>Future</code> (without <code>Unpin</code> bounds)</h4> <div class="example-wrap"><pre class="rust rust-example-rendered" data-language="rust">use std::{
+    future::Future,
+    pin::pin,
+    task::{Context, Poll},
+    thread,
+};
+
+/// Runs a future to completion.
+fn block_on&lt;Fut: Future&gt;(fut: Fut) -&gt; Fut::Output {
+    let waker_that_unparks_thread = // …
+    let mut cx = Context::from_waker(&amp;waker_that_unparks_thread);
+    // Pin the future so it can be polled.
+    let mut pinned_fut = pin!(fut);
+    loop {
+        match pinned_fut.as_mut().poll(&amp;mut cx) {
+            Poll::Pending =&gt; thread::park(),
+            Poll::Ready(res) =&gt; return res,
+        }
+    }
+}</pre></div> <h4 id="with-coroutines">With <code>Coroutine</code>s</h4> <div class="example-wrap"><pre class="rust rust-example-rendered" data-language="rust">#![cfg_attr(bootstrap, feature(generators))]
+#![cfg_attr(not(bootstrap), feature(coroutines))]
+#![feature(coroutine_trait)]
+use core::{
+    ops::{Coroutine, CoroutineState},
+    pin::pin,
+};
+
+fn coroutine_fn() -&gt; impl Coroutine&lt;Yield = usize, Return = ()&gt; /* not Unpin */ {
+ // Allow coroutine to be self-referential (not `Unpin`)
+ // vvvvvv        so that locals can cross yield points.
+    static || {
+        let foo = String::from("foo");
+        let foo_ref = &amp;foo; // ------+
+        yield 0;                  // | &lt;- crosses yield point!
+        println!("{foo_ref}"); // &lt;--+
+        yield foo.len();
+    }
+}
+
+fn main() {
+    let mut coroutine = pin!(coroutine_fn());
+    match coroutine.as_mut().resume(()) {
+        CoroutineState::Yielded(0) =&gt; {},
+        _ =&gt; unreachable!(),
+    }
+    match coroutine.as_mut().resume(()) {
+        CoroutineState::Yielded(3) =&gt; {},
+        _ =&gt; unreachable!(),
+    }
+    match coroutine.resume(()) {
+        CoroutineState::Yielded(_) =&gt; unreachable!(),
+        CoroutineState::Complete(()) =&gt; {},
+    }
+}</pre></div> <h3 id="remarks">Remarks</h3> <p>Precisely because a value is pinned to local storage, the resulting <code><a href="struct.pin.html" title="struct std::pin::Pin">Pin</a>&lt;<a href="../primitive.reference.html" title="primitive reference">&amp;mut</a> T&gt;</code> reference ends up borrowing a local tied to that block: it can’t escape it.</p> <p>The following, for instance, fails to compile:</p> <div class="example-wrap compile_fail">ⓘ<pre class="rust rust-example-rendered" data-language="rust">use core::pin::{pin, Pin};
+
+let x: Pin&lt;&amp;mut Foo&gt; = {
+    let x: Pin&lt;&amp;mut Foo&gt; = pin!(Foo { /* … */ });
+    x
+}; // &lt;- Foo is dropped
+stuff(x); // Error: use of dropped value</pre>
+</div> <summary>Error message</summary> <div class="example-wrap"><pre class="language-console">error[E0716]: temporary value dropped while borrowed
+  --&gt; src/main.rs:9:28
+   |
+8  | let x: Pin&lt;&amp;mut Foo&gt; = {
+   |     - borrow later stored here
+9  |     let x: Pin&lt;&amp;mut Foo&gt; = pin!(Foo { /* … */ });
+   |                            ^^^^^^^^^^^^^^^^^^^^^ creates a temporary value which is freed while still in use
+10 |     x
+11 | }; // &lt;- Foo is dropped
+   | - temporary value is freed at the end of this statement
+   |
+   = note: consider using a `let` binding to create a longer lived value
+</pre></div> <p>This makes <a href="macro.pin.html" title="macro std::pin::pin"><code>pin!</code></a> <strong>unsuitable to pin values when intending to <em>return</em> them</strong>. Instead, the value is expected to be passed around <em>unpinned</em> until the point where it is to be consumed, where it is then useful and even sensible to pin the value locally using <a href="macro.pin.html" title="macro std::pin::pin"><code>pin!</code></a>.</p> <p>If you really need to return a pinned value, consider using <a href="../boxed/struct.box.html#method.pin"><code>Box::pin</code></a> instead.</p> <p>On the other hand, local pinning using <a href="macro.pin.html" title="macro std::pin::pin"><code>pin!</code></a> is likely to be cheaper than pinning into a fresh heap allocation using <a href="../boxed/struct.box.html#method.pin"><code>Box::pin</code></a>. Moreover, by virtue of not requiring an allocator, <a href="macro.pin.html" title="macro std::pin::pin"><code>pin!</code></a> is the main non-<code>unsafe</code> <code>#![no_std]</code>-compatible <a href="struct.pin.html" title="struct std::pin::Pin"><code>Pin</code></a> constructor.</p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010 The Rust Project Developers<br>Licensed under the Apache License, Version 2.0 or the MIT license, at your option.<br>
+    <a href="https://doc.rust-lang.org/std/pin/macro.pin.html" class="_attribution-link">https://doc.rust-lang.org/std/pin/macro.pin.html</a>
+  </p>
+</div>
