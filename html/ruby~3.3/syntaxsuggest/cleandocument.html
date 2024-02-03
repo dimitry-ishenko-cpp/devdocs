@@ -1,0 +1,190 @@
+<h1 id="class-SyntaxSuggest::CleanDocument" class="class"> class SyntaxSuggest::CleanDocument </h1>
+<dl class="meta">
+<dt>Parent:</dt>
+<dd class="meta-parent"><a href="../object.html">Object</a></dd>
+</dl> <section class="description"> <p>Parses and sanitizes source into a lexically aware document</p> <p>Internally the document is represented by an array with each index containing a <a href="codeline.html"><code>CodeLine</code></a> correlating to a line from the source code.</p> <p>There are three main phases in the algorithm:</p> <ol>
+<li> <p>Sanitize/format input source</p> </li>
+<li> <p>Search for invalid blocks</p> </li>
+<li> <p>Format invalid blocks into something meaninful</p> </li>
+</ol> <p>This class handles the first part.</p> <p>The reason this class exists is to format input source for better/easier/cleaner exploration.</p> <p>The <a href="codesearch.html"><code>CodeSearch</code></a> class operates at the line level so we must be careful to not introduce lines that look valid by themselves, but when removed will trigger syntax errors or strange behavior.</p> <p>## Join Trailing slashes</p> <p>Code with a trailing slash is logically treated as a single line:</p> <pre>1 it "code can be split" \
+2    "across multiple lines" do</pre> <p>In this case removing line 2 would add a syntax error. We get around this by internally joining the two lines into a single “line” object</p> <p>## Logically Consecutive lines</p> <p>Code that can be broken over multiple lines such as method calls are on different lines:</p> <pre>1 User.
+2   where(name: "schneems").
+3   first</pre> <p>Removing line 2 can introduce a syntax error. To fix this, all lines are joined into one.</p> <p>## Heredocs</p> <p>A heredoc is an way of defining a multi-line string. They can cause many problems. If left as a single line, the parser would try to parse the contents as ruby code rather than as a string. Even without this problem, we still hit an issue with indentation:</p> <pre>1 foo = &lt;&lt;~HEREDOC
+2  "Be yourself; everyone else is already taken.""
+3    ― Oscar Wilde
+4      puts "I look like ruby code" # but i'm still a heredoc
+5 HEREDOC</pre> <p>If we didn’t join these lines then our algorithm would think that line 4 is separate from the rest, has a higher indentation, then look at it first and remove it.</p> <p>If the code evaluates line 5 by itself it will think line 5 is a constant, remove it, and introduce a syntax errror.</p> <p>All of these problems are fixed by joining the whole heredoc into a single line.</p> <p>## Comments and whitespace</p> <p>Comments can throw off the way the lexer tells us that the line logically belongs with the next line. This is valid ruby but results in a different lex output than before:</p> <pre>1 User.
+2   where(name: "schneems").
+3   # Comment here
+4   first</pre> <p>To handle this we can replace comment lines with empty lines and then re-lex the source. This removal and re-lexing preserves line index and document size, but generates an easier to work with document.</p> </section> <section id="5Buntitled-5D" class="documentation-section"> <section id="public-class-5Buntitled-5D-method-details" class="method-section"> <header> <h3>Public Class Methods</h3> </header> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-c-new"> <span class="method-name">new</span><span class="method-args">(source:)</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="new-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 87
+def initialize(source:)
+  lines = clean_sweep(source: source)
+  @document = CodeLine.from_source(lines.join, lines: lines)
+end</pre> </div>  </div> </div> </section> <section id="public-instance-5Buntitled-5D-method-details" class="method-section"> <header> <h3>Public Instance Methods</h3> </header> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-call"> <span class="method-name">call</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="call-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 94
+def call
+  join_trailing_slash!
+  join_consecutive!
+  join_heredoc!
+
+  self
+end</pre> </div> <p>Call all of the document “cleaners” and return self</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-clean_sweep"> <span class="method-name">clean_sweep</span><span class="method-args">(source:)</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="clean_sweep-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 157
+def clean_sweep(source:)
+  # Match comments, but not HEREDOC strings with #{variable} interpolation
+  # https://rubular.com/r/HPwtW9OYxKUHXQ
+  source.lines.map do |line|
+    if line.match?(/^\s*#([^{].*|)$/)
+      $/
+    else
+      line
+    end
+  end
+end</pre> </div> <p>Remove comments</p> <p>replace with empty newlines</p> <pre>source = &lt;&lt;~'EOM'
+  # Comment 1
+  puts "hello"
+  # Comment 2
+  puts "world"
+EOM
+
+lines = CleanDocument.new(source: source).lines
+expect(lines[0].to_s).to eq("\n")
+expect(lines[1].to_s).to eq("puts "hello")
+expect(lines[2].to_s).to eq("\n")
+expect(lines[3].to_s).to eq("puts "world")</pre> <p>Important: This must be done before lexing.</p> <p>After this change is made, we lex the document because removing comments can change how the doc is parsed.</p> <p>For example:</p> <pre>values = LexAll.new(source: &lt;&lt;~EOM))
+  User.
+    # comment
+    where(name: 'schneems')
+EOM
+expect(
+  values.count {|v| v.type == :on_ignored_nl}
+).to eq(1)</pre> <p>After the comment is removed:</p> <pre> values = LexAll.new(source: &lt;&lt;~EOM))
+   User.
+
+     where(name: 'schneems')
+ EOM
+ expect(
+  values.count {|v| v.type == :on_ignored_nl}
+).to eq(2)</pre>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-join_consecutive-21"> <span class="method-name">join_consecutive!</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="join_consecutive-21-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 225
+def join_consecutive!
+  consecutive_groups = @document.select(&amp;:ignore_newline_not_beg?).map do |code_line|
+    take_while_including(code_line.index..) do |line|
+      line.ignore_newline_not_beg?
+    end
+  end
+
+  join_groups(consecutive_groups)
+  self
+end</pre> </div> <p>Smushes logically “consecutive” lines</p> <pre class="ruby" data-language="ruby">source = &lt;&lt;~'EOM'
+  User.
+    where(name: 'schneems').
+    first
+EOM
+
+lines = CleanDocument.new(source: source).join_consecutive!.lines
+expect(lines[0].to_s).to eq(source)
+expect(lines[1].to_s).to eq("")
+</pre> <p>The one known case this doesn’t handle is:</p> <pre class="ruby" data-language="ruby">Ripper.lex &lt;&lt;~EOM
+  a &amp;&amp;
+   b ||
+   c
+EOM
+</pre> <p>For some reason this introduces ‘on_ignore_newline` but with BEG type</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-join_groups"> <span class="method-name">join_groups</span><span class="method-args">(groups)</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="join_groups-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 266
+def join_groups(groups)
+  groups.each do |lines|
+    line = lines.first
+
+    # Handle the case of multiple groups in a a row
+    # if one is already replaced, move on
+    next if @document[line.index].empty?
+
+    # Join group into the first line
+    @document[line.index] = CodeLine.new(
+      lex: lines.map(&amp;:lex).flatten,
+      line: lines.join,
+      index: line.index
+    )
+
+    # Hide the rest of the lines
+    lines[1..].each do |line|
+      # The above lines already have newlines in them, if add more
+      # then there will be double newline, use an empty line instead
+      @document[line.index] = CodeLine.new(line: "", index: line.index, lex: [])
+    end
+  end
+  self
+end</pre> </div> <p>Helper method for joining “groups” of lines</p> <p>Input is expected to be type <a href="../array.html"><code>Array</code></a>&lt;Array&lt;CodeLine&gt;&gt;</p> <p>The outer array holds the various “groups” while the inner array holds code lines.</p> <p>All code lines are “joined” into the first line in their group.</p> <p>To preserve document size, empty lines are placed in the place of the lines that were “joined”</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-join_heredoc-21"> <span class="method-name">join_heredoc!</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="join_heredoc-21-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 181
+def join_heredoc!
+  start_index_stack = []
+  heredoc_beg_end_index = []
+  lines.each do |line|
+    line.lex.each do |lex_value|
+      case lex_value.type
+      when :on_heredoc_beg
+        start_index_stack &lt;&lt; line.index
+      when :on_heredoc_end
+        start_index = start_index_stack.pop
+        end_index = line.index
+        heredoc_beg_end_index &lt;&lt; [start_index, end_index]
+      end
+    end
+  end
+
+  heredoc_groups = heredoc_beg_end_index.map { |start_index, end_index| @document[start_index..end_index] }
+
+  join_groups(heredoc_groups)
+  self
+end</pre> </div> <p>Smushes all heredoc lines into one line</p> <pre class="ruby" data-language="ruby">source = &lt;&lt;~'EOM'
+  foo = &lt;&lt;~HEREDOC
+     lol
+     hehehe
+  HEREDOC
+EOM
+
+lines = CleanDocument.new(source: source).join_heredoc!.lines
+expect(lines[0].to_s).to eq(source)
+expect(lines[1].to_s).to eq("")
+</pre>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-join_trailing_slash-21"> <span class="method-name">join_trailing_slash!</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="join_trailing_slash-21-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 246
+def join_trailing_slash!
+  trailing_groups = @document.select(&amp;:trailing_slash?).map do |code_line|
+    take_while_including(code_line.index..) { |x| x.trailing_slash? }
+  end
+  join_groups(trailing_groups)
+  self
+end</pre> </div> <p>Join lines with a trailing slash</p> <pre class="ruby" data-language="ruby">source = &lt;&lt;~'EOM'
+  it "code can be split" \
+     "across multiple lines" do
+EOM
+
+lines = CleanDocument.new(source: source).join_consecutive!.lines
+expect(lines[0].to_s).to eq(source)
+expect(lines[1].to_s).to eq("")
+</pre>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-lines"> <span class="method-name">lines</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="lines-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 104
+def lines
+  @document
+end</pre> </div> <p>Return an array of CodeLines in the document</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-take_while_including"> <span class="method-name">take_while_including</span><span class="method-args">(range = 0..) { |line)| ... }</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="take_while_including-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 296
+def take_while_including(range = 0..)
+  take_next_and_stop = false
+  @document[range].take_while do |line|
+    next if take_next_and_stop
+
+    take_next_and_stop = !(yield line)
+    true
+  end
+end</pre> </div> <p>Helper method for grabbing elements from document</p> <p>Like ‘take_while` except when it stops iterating, it also returns the line that caused it to stop</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-to_s"> <span class="method-name">to_s</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="to_s-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/clean_document.rb, line 109
+def to_s
+  @document.join
+end</pre> </div> <p>Renders the document back to a string</p>  </div> </div> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    Ruby Core &copy; 1993&ndash;2022 Yukihiro Matsumoto<br>Licensed under the Ruby License.<br>Ruby Standard Library &copy; contributors<br>Licensed under their own licenses.<br>
+    
+  </p>
+</div>

@@ -1,0 +1,115 @@
+<h1 id="class-SyntaxSuggest::CodeSearch" class="class"> class SyntaxSuggest::CodeSearch </h1>
+<dl class="meta">
+<dt>Parent:</dt>
+<dd class="meta-parent"><a href="../object.html">Object</a></dd>
+</dl> <section class="description"> <p>Searches code for a syntax error</p> <p>There are three main phases in the algorithm:</p> <ol>
+<li> <p>Sanitize/format input source</p> </li>
+<li> <p>Search for invalid blocks</p> </li>
+<li> <p>Format invalid blocks into something meaninful</p> </li>
+</ol> <p>This class handles the part.</p> <p>The bulk of the heavy lifting is done in:</p> <pre>- CodeFrontier (Holds information for generating blocks and determining if we can stop searching)
+- ParseBlocksFromLine (Creates blocks into the frontier)
+- BlockExpand (Expands existing blocks to search more code)</pre> <p>## Syntax error detection</p> <p>When the frontier holds the syntax error, we can stop searching</p> <pre class="ruby" data-language="ruby">search = CodeSearch.new(&lt;&lt;~EOM)
+  def dog
+    def lol
+  end
+EOM
+
+search.call
+
+search.invalid_blocks.map(&amp;:to_s) # =&gt;
+# =&gt; ["def lol\n"]
+</pre> </section> <section id="5Buntitled-5D" class="documentation-section"> <section class="attribute-method-details"> <header> <h3>Attributes</h3> </header> <div class="method-detail"> <div class="method-heading attribute-method-heading" id="attribute-i-code_lines"> <span class="method-name">code_lines</span><span class="attribute-access-type">[R]</span> </div>  </div> <div class="method-detail"> <div class="method-heading attribute-method-heading" id="attribute-i-frontier"> <span class="method-name">frontier</span><span class="attribute-access-type">[R]</span> </div>  </div> <div class="method-detail"> <div class="method-heading attribute-method-heading" id="attribute-i-invalid_blocks"> <span class="method-name">invalid_blocks</span><span class="attribute-access-type">[R]</span> </div>  </div> <div class="method-detail"> <div class="method-heading attribute-method-heading" id="attribute-i-record_dir"> <span class="method-name">record_dir</span><span class="attribute-access-type">[R]</span> </div>  </div> </section> <section id="public-class-5Buntitled-5D-method-details" class="method-section"> <header> <h3>Public Class Methods</h3> </header> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-c-new"> <span class="method-name">new</span><span class="method-args">(source, record_dir: DEFAULT_VALUE)</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="new-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/code_search.rb, line 44
+def initialize(source, record_dir: DEFAULT_VALUE)
+  record_dir = if record_dir == DEFAULT_VALUE
+    (ENV["SYNTAX_SUGGEST_RECORD_DIR"] || ENV["SYNTAX_SUGGEST_DEBUG"]) ? "tmp" : nil
+  else
+    record_dir
+  end
+
+  if record_dir
+    @record_dir = SyntaxSuggest.record_dir(record_dir)
+    @write_count = 0
+  end
+
+  @tick = 0
+  @source = source
+  @name_tick = Hash.new { |hash, k| hash[k] = 0 }
+  @invalid_blocks = []
+
+  @code_lines = CleanDocument.new(source: source).call.lines
+
+  @frontier = CodeFrontier.new(code_lines: @code_lines)
+  @block_expand = BlockExpand.new(code_lines: @code_lines)
+  @parse_blocks_from_indent_line = ParseBlocksFromIndentLine.new(code_lines: @code_lines)
+end</pre> </div>  </div> </div> </section> <section id="public-instance-5Buntitled-5D-method-details" class="method-section"> <header> <h3>Public Instance Methods</h3> </header> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-call"> <span class="method-name">call</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="call-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/code_search.rb, line 123
+def call
+  until frontier.holds_all_syntax_errors?
+    @tick += 1
+
+    if frontier.expand?
+      expand_existing
+    else
+      create_blocks_from_untracked_lines
+    end
+  end
+
+  @invalid_blocks.concat(frontier.detect_invalid_blocks)
+  @invalid_blocks.sort_by! { |block| block.starts_at }
+  self
+end</pre> </div> <p>Main search loop</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-create_blocks_from_untracked_lines"> <span class="method-name">create_blocks_from_untracked_lines</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="create_blocks_from_untracked_lines-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/code_search.rb, line 100
+def create_blocks_from_untracked_lines
+  max_indent = frontier.next_indent_line&amp;.indent
+
+  while (line = frontier.next_indent_line) &amp;&amp; (line.indent == max_indent)
+    @parse_blocks_from_indent_line.each_neighbor_block(frontier.next_indent_line) do |block|
+      push(block, name: "add")
+    end
+  end
+end</pre> </div> <p>Parses the most indented lines into blocks that are marked and added to the frontier</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-expand_existing"> <span class="method-name">expand_existing</span><span class="method-args">()</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="expand_existing-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/code_search.rb, line 112
+def expand_existing
+  block = frontier.pop
+  return unless block
+
+  record(block: block, name: "before-expand")
+
+  block = @block_expand.call(block)
+  push(block, name: "expand")
+end</pre> </div> <p>Given an already existing block in the frontier, expand it to see if it contains our invalid syntax</p>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-push"> <span class="method-name">push</span><span class="method-args">(block, name:)</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="push-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/code_search.rb, line 91
+def push(block, name:)
+  record(block: block, name: name)
+
+  block.mark_invisible if block.valid?
+  frontier &lt;&lt; block
+end</pre> </div>  </div> </div> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-record"> <span class="method-name">record</span><span class="method-args">(block:, name: "record")</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
+<div class="method-source-code" id="record-source"> <pre class="ruby" data-language="ruby"># File lib/syntax_suggest/code_search.rb, line 69
+def record(block:, name: "record")
+  return unless @record_dir
+  @name_tick[name] += 1
+  filename = "#{@write_count += 1}-#{name}-#{@name_tick[name]}-(#{block.starts_at}__#{block.ends_at}).txt"
+  if ENV["SYNTAX_SUGGEST_DEBUG"]
+    puts "\n\n==== #{filename} ===="
+    puts "\n```#{block.starts_at}..#{block.ends_at}"
+    puts block
+    puts "```"
+    puts "  block indent:      #{block.current_indent}"
+  end
+  @record_dir.join(filename).open(mode: "a") do |f|
+    document = DisplayCodeWithLineNumbers.new(
+      lines: @code_lines.select(&amp;:visible?),
+      terminal: false,
+      highlight_lines: block.lines
+    ).call
+
+    f.write("    Block lines: #{block.starts_at..block.ends_at} (#{name}) \n\n#{document}")
+  end
+end</pre> </div> <p>Used for debugging</p>  </div> </div> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    Ruby Core &copy; 1993&ndash;2022 Yukihiro Matsumoto<br>Licensed under the Ruby License.<br>Ruby Standard Library &copy; contributors<br>Licensed under their own licenses.<br>
+    
+  </p>
+</div>
