@@ -1,0 +1,277 @@
+<h1>What happens inside Eigen, on a simple example</h1>     <div> <div> <div>
+<hr> <p>Consider the following example program:</p> <pre data-language="cpp"><span>#include&lt;Eigen/Core&gt;</span>
+ 
+<span>int</span> main()
+{
+  <span>int</span> size = 50;
+  <span>// VectorXf is a vector of floats, with dynamic size.</span>
+  <a href="classeigen_1_1matrix.html">Eigen::VectorXf</a> u(size), v(size), w(size);
+  u = v + w;
+}</pre>
+<p>The goal of this page is to understand how <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a> compiles it, assuming that SSE2 vectorization is enabled (GCC option -msse2).</p> <h1>
+<a id="WhyInteresting"></a> Why it's interesting</h1> <p>Maybe you think, that the above example program is so simple, that compiling it shouldn't involve anything interesting. So before starting, let us explain what is nontrivial in compiling it correctly – that is, producing optimized code – so that the complexity of <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a>, that we'll explain here, is really useful.</p> <p>Look at the line of code </p>
+<pre data-language="cpp">u = v + w;   <span>//   (*)</span>
+</pre>
+<p>The first important thing about compiling it, is that the arrays should be traversed only once, like </p>
+<pre data-language="cpp"><span>for</span>(<span>int</span> i = 0; i &lt; size; i++) u[i] = v[i] + w[i];
+</pre>
+<p> The problem is that if we make a naive C++ library where the VectorXf class has an operator+ returning a VectorXf, then the line of code (*) will amount to: </p>
+<pre data-language="cpp">VectorXf tmp = v + w;
+VectorXf u = tmp;
+</pre>
+<p> Obviously, the introduction of the temporary <em>tmp</em> here is useless. It has a very bad effect on performance, first because the creation of <em>tmp</em> requires a dynamic memory allocation in this context, and second as there are now two for loops: </p>
+<pre data-language="cpp"><span>for</span>(<span>int</span> i = 0; i &lt; size; i++) tmp[i] = v[i] + w[i];
+<span>for</span>(<span>int</span> i = 0; i &lt; size; i++) u[i] = tmp[i];
+</pre>
+<p> Traversing the arrays twice instead of once is terrible for performance, as it means that we do many redundant memory accesses.</p> <p>The second important thing about compiling the above program, is to make correct use of SSE2 instructions. Notice that <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a> also supports AltiVec and that all the discussion that we make here applies also to AltiVec.</p> <p>SSE2, like AltiVec, is a set of instructions allowing to perform computations on packets of 128 bits at once. Since a float is 32 bits, this means that SSE2 instructions can handle 4 floats at once. This means that, if correctly used, they can make our computation go up to 4x faster.</p> <p>However, in the above program, we have chosen size=50, so our vectors consist of 50 float's, and 50 is not a multiple of 4. This means that we cannot hope to do all of that computation using SSE2 instructions. The second best thing, to which we should aim, is to handle the 48 first coefficients with SSE2 instructions, since 48 is the biggest multiple of 4 below 50, and then handle separately, without SSE2, the 49th and 50th coefficients. Something like this:</p> <pre data-language="cpp"><span>for</span>(<span>int</span> i = 0; i &lt; 4*(size/4); i+=4) u.packet(i)  = v.packet(i) + w.packet(i);
+<span>for</span>(<span>int</span> i = 4*(size/4); i &lt; size; i++) u[i] = v[i] + w[i];
+</pre>
+<p>So let us look line by line at our example program, and let's follow <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a> as it compiles it.</p> <h1>
+<a id="ConstructingVectors"></a> Constructing vectors</h1> <p>Let's analyze the first line:</p> <pre data-language="cpp"><a href="classeigen_1_1matrix.html">Eigen::VectorXf</a> u(size), v(size), w(size);
+</pre>
+<p>First of all, VectorXf is the following typedef: </p>
+<pre data-language="cpp"><span>typedef</span> Matrix&lt;float, Dynamic, 1&gt; VectorXf;
+</pre>
+<p>The class template <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a> is declared in src/Core/util/ForwardDeclarations.h with 6 template parameters, but the last 3 are automatically determined by the first 3. So you don't need to worry about them for now. Here, <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a>&lt;float, Dynamic, 1&gt; means a matrix of floats, with a dynamic number of rows and 1 column.</p> <p>The <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a> class inherits a base class, <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>. Don't worry about it, for now it suffices to say that <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> is what unifies matrices/vectors and all the expressions types – more on that below.</p> <p>When we do </p>
+<pre data-language="cpp"><a href="classeigen_1_1matrix.html">Eigen::VectorXf</a> u(size);
+</pre>
+<p> the constructor that is called is Matrix::Matrix(int), in <a href="https://eigen.tuxfamily.org/dox/Matrix_8h_source.html">src/Core/Matrix.h</a>. Besides some assertions, all it does is to construct the <em>m_storage</em> member, which is of type DenseStorage&lt;float, Dynamic, Dynamic, 1&gt;.</p> <p>You may wonder, isn't it overengineering to have the storage in a separate class? The reason is that the <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a> class template covers all kinds of matrices and vector: both fixed-size and dynamic-size. The storage method is not the same in these two cases. For fixed-size, the matrix coefficients are stored as a plain member array. For dynamic-size, the coefficients will be stored as a pointer to a dynamically-allocated array. Because of this, we need to abstract storage away from the <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a> class. That's DenseStorage.</p> <p>Let's look at this constructor, in <a href="https://eigen.tuxfamily.org/dox/DenseStorage_8h_source.html">src/Core/DenseStorage.h</a>. You can see that there are many partial template specializations of DenseStorages here, treating separately the cases where dimensions are Dynamic or fixed at compile-time. The partial specialization that we are looking at is: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> T, <span>int</span> _Cols&gt; <span>class </span>DenseStorage&lt;T, <a href="namespaceeigen.html#ad81fa7195215a0ce30017dfac309f0b2">Dynamic</a>, <a href="namespaceeigen.html#ad81fa7195215a0ce30017dfac309f0b2">Dynamic</a>, _Cols&gt;</pre>
+<p>Here, the constructor called is DenseStorage::DenseStorage(int size, int rows, int columns) with size=50, rows=50, columns=1.</p> <p>Here is this constructor: </p>
+<pre data-language="cpp"><span>inline</span> DenseStorage(<span>int</span> size, <span>int</span> rows, <span>int</span>) : m_data(internal::aligned_new&lt;T&gt;(size)), m_rows(rows) {}
+</pre>
+<p>Here, the <em>m_data</em> member is the actual array of coefficients of the matrix. As you see, it is dynamically allocated. Rather than calling new[] or malloc(), as you can see, we have our own internal::aligned_new defined in <a href="https://eigen.tuxfamily.org/dox/Memory_8h_source.html">src/Core/util/Memory.h</a>. What it does is that if vectorization is enabled, then it uses a platform-specific call to allocate a 128-bit-aligned array, as that is very useful for vectorization with both SSE2 and AltiVec. If vectorization is disabled, it amounts to the standard new[].</p> <p>As you can see, the constructor also sets the <em>m_rows</em> member to <em>size</em>. Notice that there is no <em>m_columns</em> member: indeed, in this partial specialization of DenseStorage, we know the number of columns at compile-time, since the _Cols template parameter is different from Dynamic. Namely, in our case, _Cols is 1, which is to say that our vector is just a matrix with 1 column. Hence, there is no need to store the number of columns as a runtime variable.</p> <p>When you call <a href="classeigen_1_1plainobjectbase.html#ad12a492bcadea9b65ccd9bc8404c01f1">VectorXf::data()</a> to get the pointer to the array of coefficients, it returns DenseStorage::data() which returns the <em>m_data</em> member.</p> <p>When you call <a href="classeigen_1_1densecoeffsbase_3_01derived_00_01directwriteaccessors_01_4.html#ae106171b6fefd3f7af108a8283de36c9">VectorXf::size()</a> to get the size of the vector, this is actually a method in the base class <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>. It determines that the vector is a column-vector, since ColsAtCompileTime==1 (this comes from the template parameters in the typedef VectorXf). It deduces that the size is the number of rows, so it returns <a href="classeigen_1_1densecoeffsbase_3_01derived_00_01directwriteaccessors_01_4.html#ac22eb0695d00edd7d4a3b2d0a98b81c2">VectorXf::rows()</a>, which returns DenseStorage::rows(), which returns the <em>m_rows</em> member, which was set to <em>size</em> by the constructor.</p> <h1>
+<a id="ConstructionOfSumXpr"></a> Construction of the sum expression</h1> <p>Now that our vectors are constructed, let's move on to the next line:</p> <pre data-language="cpp">u = v + w;
+</pre>
+<p>The executive summary is that operator+ returns a "sum of vectors" expression, but doesn't actually perform the computation. It is the operator=, whose call occurs thereafter, that does the computation.</p> <p>Let us now see what <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a> does when it sees this:</p> <pre data-language="cpp">v + w
+</pre>
+<p>Here, v and w are of type VectorXf, which is a typedef for a specialization of <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a> (as we explained above), which is a subclass of <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>. So what is being called is</p> <pre data-language="cpp">MatrixBase::operator+(<span>const</span> MatrixBase&amp;)
+</pre>
+<p>The return type of this operator is </p>
+<pre data-language="cpp">CwiseBinaryOp&lt;internal::scalar_sum_op&lt;float&gt;, VectorXf, VectorXf&gt;
+</pre>
+<p> The <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> class is our first encounter with an expression template. As we said, the operator+ doesn't by itself perform any computation, it just returns an abstract "sum of vectors" expression. Since there are also "difference of vectors" and "coefficient-wise product of vectors" expressions, we unify them all as "coefficient-wise binary operations", which we abbreviate as "CwiseBinaryOp". "Coefficient-wise" means that the operations is performed coefficient by coefficient. "binary" means that there are two operands – we are adding two vectors with one another.</p> <p>Now you might ask, what if we did something like</p> <pre data-language="cpp">v + w + u;
+</pre>
+<p>The first v + w would return a <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> as above, so in order for this to compile, we'd need to define an operator+ also in the class <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a>... at this point it starts looking like a nightmare: are we going to have to define all operators in each of the expression classes (as you guessed, <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> is only one of many) ? This looks like a dead end!</p> <p>The solution is that <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> itself, as well as <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a> and all the other expression types, is a subclass of <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>. So it is enough to define once and for all the operators in class <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>.</p> <p>Since <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> is the common base class of different subclasses, the aspects that depend on the subclass must be abstracted from <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>. This is called polymorphism.</p> <p>The classical approach to polymorphism in C++ is by means of virtual functions. This is dynamic polymorphism. Here we don't want dynamic polymorphism because the whole design of <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a> is based around the assumption that all the complexity, all the abstraction, gets resolved at compile-time. This is crucial: if the abstraction can't get resolved at compile-time, <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a>'s compile-time optimization mechanisms become useless, not to mention that if that abstraction has to be resolved at runtime it'll incur an overhead by itself.</p> <p>Here, what we want is to have a single class <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> as the base of many subclasses, in such a way that each <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> object (be it a matrix, or vector, or any kind of expression) knows at compile-time (as opposed to run-time) of which particular subclass it is an object (i.e. whether it is a matrix, or an expression, and what kind of expression).</p> <p>The solution is the <a href="http://en.wikipedia.org/wiki/Curiously_Recurring_Template_Pattern">Curiously Recurring Template Pattern</a>. Let's do the break now. Hopefully you can read this wikipedia page during the break if needed, but it won't be allowed during the exam.</p> <p>In short, <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> takes a template parameter <em>Derived</em>. Whenever we define a subclass Subclass, we actually make Subclass inherit <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>&lt;Subclass&gt;. The point is that different subclasses inherit different <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> types. Thanks to this, whenever we have an object of a subclass, and we call on it some <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> method, we still remember even from inside the <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> method which particular subclass we're talking about.</p> <p>This means that we can put almost all the methods and operators in the base class <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>, and have only the bare minimum in the subclasses. If you look at the subclasses in <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a>, like for instance the <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> class, they have very few methods. There are coeff() and sometimes coeffRef() methods for access to the coefficients, there are rows() and cols() methods returning the number of rows and columns, but there isn't much more than that. All the meat is in <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>, so it only needs to be coded once for all kinds of expressions, matrices, and vectors.</p> <p>So let's end this digression and come back to the piece of code from our example program that we were currently analyzing,</p> <pre data-language="cpp">v + w
+</pre>
+<p>Now that <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> is a good friend, let's write fully the prototype of the operator+ that gets called here (this code is from <a href="https://eigen.tuxfamily.org/dox/MatrixBase_8h_source.html">src/Core/MatrixBase.h</a>):</p> <pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Derived&gt;
+<span>class </span>MatrixBase
+{
+  <span>// ...</span>
+ 
+  <span>template</span>&lt;<span>typename</span> OtherDerived&gt;
+  <span>const</span> CwiseBinaryOp&lt;internal::scalar_sum_op&lt;typename internal::traits&lt;Derived&gt;::Scalar&gt;, Derived, OtherDerived&gt;
+  operator+(<span>const</span> MatrixBase&lt;OtherDerived&gt; &amp;other) <span>const</span>;
+ 
+  <span>// ...</span>
+};
+</pre>
+<p>Here of course, <em>Derived</em> and <em>OtherDerived</em> are VectorXf.</p> <p>As we said, <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> is also used for other operations such as substration, so it takes another template parameter determining the operation that will be applied to coefficients. This template parameter is a functor, that is, a class in which we have an operator() so it behaves like a function. Here, the functor used is internal::scalar_sum_op. It is defined in src/Core/Functors.h.</p> <p>Let us now explain the internal::traits here. The internal::scalar_sum_op class takes one template parameter: the type of the numbers to handle. Here of course we want to pass the scalar type (a.k.a. numeric type) of VectorXf, which is <code>float</code>. How do we determine which is the scalar type of <em>Derived</em> ? Throughout <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a>, all matrix and expression types define a typedef <em>Scalar</em> which gives its scalar type. For example, VectorXf::Scalar is a typedef for <code>float</code>. So here, if life was easy, we could find the numeric type of <em>Derived</em> as just </p>
+<pre data-language="cpp"><span>typename</span> Derived::Scalar
+</pre>
+<p> Unfortunately, we can't do that here, as the compiler would complain that the type Derived hasn't yet been defined. So we use a workaround: in src/Core/util/ForwardDeclarations.h, we declared (not defined!) all our subclasses, like <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a>, and we also declared the following class template: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> T&gt; <span>struct </span>internal::traits;
+</pre>
+<p> In <a href="https://eigen.tuxfamily.org/dox/Matrix_8h_source.html">src/Core/Matrix.h</a>, right <em>before</em> the definition of class <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a>, we define a partial specialization of internal::traits for T=<a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a>&lt;any template parameters&gt;. In this specialization of internal::traits, we define the Scalar typedef. So when we actually define <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a>, it is legal to refer to "typename internal::traits\&lt;Matrix\&gt;::Scalar".</p> <p>Anyway, we have declared our operator+. In our case, where <em>Derived</em> and <em>OtherDerived</em> are VectorXf, the above declaration amounts to: </p>
+<pre data-language="cpp"><span>class </span>MatrixBase&lt;VectorXf&gt;
+{
+  <span>// ...</span>
+ 
+  <span>const</span> CwiseBinaryOp&lt;internal::scalar_sum_op&lt;float&gt;, VectorXf, VectorXf&gt;
+  operator+(<span>const</span> MatrixBase&lt;VectorXf&gt; &amp;other) <span>const</span>;
+ 
+  <span>// ...</span>
+};
+</pre>
+<p>Let's now jump to <a href="https://eigen.tuxfamily.org/dox/CwiseBinaryOp_8h_source.html">src/Core/CwiseBinaryOp.h</a> to see how it is defined. As you can see there, all it does is to return a <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> object, and this object is just storing references to the left-hand-side and right-hand-side expressions – here, these are the vectors <em>v</em> and <em>w</em>. Well, the <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> object is also storing an instance of the (empty) functor class, but you shouldn't worry about it as that is a minor implementation detail.</p> <p>Thus, the operator+ hasn't performed any actual computation. To summarize, the operation <em>v</em> + <em>w</em> just returned an object of type <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> which did nothing else than just storing references to <em>v</em> and <em>w</em>.</p> <h1>
+<a id="Assignment"></a> The assignment</h1> <div> <b>PLEASE HELP US IMPROVING THIS SECTION.</b> This page reflects how Eigen worked until 3.2, but since Eigen 3.3 the assignment is more sophisticated as it involves an Assignment expression, and the creation of so called evaluator which are responsible for the evaluation of each kind of expressions. </div>
+<p>At this point, the expression <em>v</em> + <em>w</em> has finished evaluating, so, in the process of compiling the line of code </p>
+<pre data-language="cpp">u = v + w;
+</pre>
+<p> we now enter the operator=.</p> <p>What operator= is being called here? The vector u is an object of class VectorXf, i.e. <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a>. In <a href="https://eigen.tuxfamily.org/dox/Matrix_8h_source.html">src/Core/Matrix.h</a>, inside the definition of class <a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a>, we see this: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> OtherDerived&gt;
+<span>inline</span> Matrix&amp; operator=(<span>const</span> MatrixBase&lt;OtherDerived&gt;&amp; other)
+{
+  eigen_assert(m_storage.data()!=0 &amp;&amp; <span>"you cannot use operator= with a non initialized matrix (instead use set()"</span>);
+  <span>return</span> Base::operator=(other.derived());
+}
+</pre>
+<p> Here, Base is a typedef for <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>&lt;<a href="classeigen_1_1matrix.html" title="The matrix class, also used for vectors and row-vectors.">Matrix</a>&gt;. So, what is being called is the operator= of <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a>. Let's see its prototype in <a href="https://eigen.tuxfamily.org/dox/MatrixBase_8h_source.html">src/Core/MatrixBase.h</a>: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> OtherDerived&gt;
+Derived&amp; operator=(<span>const</span> MatrixBase&lt;OtherDerived&gt;&amp; other);
+</pre>
+<p> Here, <em>Derived</em> is VectorXf (since u is a VectorXf) and <em>OtherDerived</em> is <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a>. More specifically, as explained in the previous section, <em>OtherDerived</em> is: </p>
+<pre data-language="cpp">CwiseBinaryOp&lt;internal::scalar_sum_op&lt;float&gt;, VectorXf, VectorXf&gt;
+</pre>
+<p> So the full prototype of the operator= being called is: </p>
+<pre data-language="cpp">VectorXf&amp; <a href="classeigen_1_1matrixbase.html#a373bf62ad398162df5a71963ed7cbeff">MatrixBase&lt;VectorXf&gt;::operator=</a>(<span>const</span> MatrixBase&lt;CwiseBinaryOp&lt;internal::scalar_sum_op&lt;float&gt;, VectorXf, VectorXf&gt; &gt; &amp; other);</pre>
+<p> This operator= literally reads "copying a sum of two VectorXf's into another VectorXf".</p> <p>Let's now look at the implementation of this operator=. It resides in the file <a href="https://eigen.tuxfamily.org/dox/Assign_8h_source.html">src/Core/Assign.h</a>.</p> <p>What we can see there is: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Derived&gt;
+<span>template</span>&lt;<span>typename</span> OtherDerived&gt;
+<span>inline</span> Derived&amp; <a href="classeigen_1_1matrixbase.html#a373bf62ad398162df5a71963ed7cbeff">MatrixBase&lt;Derived&gt;</a>
+<a href="classeigen_1_1matrixbase.html#a373bf62ad398162df5a71963ed7cbeff">  ::operator=</a>(<span>const</span> MatrixBase&lt;OtherDerived&gt;&amp; other)
+{
+  <span>return</span> internal::assign_selector&lt;Derived,OtherDerived&gt;::run(derived(), other.derived());
+}
+</pre>
+<p>OK so our next task is to understand internal::assign_selector :)</p> <p>Here is its declaration (all that is still in the same file <a href="https://eigen.tuxfamily.org/dox/Assign_8h_source.html">src/Core/Assign.h</a>) </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Derived, <span>typename</span> OtherDerived,
+         <span>bool</span> EvalBeforeAssigning = int(OtherDerived::Flags) &amp; <a href="group__flags.html#ga0972b20dc004d13984e642b3bd12532e">EvalBeforeAssigningBit</a>,
+         <span>bool</span> NeedToTranspose = Derived::IsVectorAtCompileTime
+                &amp;&amp; OtherDerived::IsVectorAtCompileTime
+                &amp;&amp; int(Derived::RowsAtCompileTime) == int(OtherDerived::ColsAtCompileTime)
+                &amp;&amp; int(Derived::ColsAtCompileTime) == int(OtherDerived::RowsAtCompileTime)
+                &amp;&amp; int(Derived::SizeAtCompileTime) != 1&gt;
+<span>struct </span>internal::assign_selector;</pre>
+<p>So internal::assign_selector takes 4 template parameters, but the 2 last ones are automatically determined by the 2 first ones.</p> <p>EvalBeforeAssigning is here to enforce the EvalBeforeAssigningBit. As explained <a href="topiclazyevaluation.html">here</a>, certain expressions have this flag which makes them automatically evaluate into temporaries before assigning them to another expression. This is the case of the <a href="classeigen_1_1product.html" title="Expression of the product of two arbitrary matrices or vectors.">Product</a> expression, in order to avoid strange aliasing effects when doing "m = m * m;" However, of course here our <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> expression doesn't have the EvalBeforeAssigningBit: we said since the beginning that we didn't want a temporary to be introduced here. So if you go to <a href="https://eigen.tuxfamily.org/dox/CwiseBinaryOp_8h_source.html">src/Core/CwiseBinaryOp.h</a>, you'll see that the Flags in internal::traits&lt;<a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a>&gt; don't include the EvalBeforeAssigningBit. The Flags member of <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> is then imported from the internal::traits by the EIGEN_GENERIC_PUBLIC_INTERFACE macro. Anyway, here the template parameter EvalBeforeAssigning has the value <code>false</code>.</p> <p>NeedToTranspose is here for the case where the user wants to copy a row-vector into a column-vector. We allow this as a special exception to the general rule that in assignments we require the dimesions to match. Anyway, here both the left-hand and right-hand sides are column vectors, in the sense that ColsAtCompileTime is equal to 1. So NeedToTranspose is <code>false</code> too.</p> <p>So, here we are in the partial specialization: </p>
+<pre data-language="cpp">internal::assign_selector&lt;Derived, OtherDerived, false, false&gt;
+</pre>
+<p>Here's how it is defined: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Derived, <span>typename</span> OtherDerived&gt;
+<span>struct </span>internal::assign_selector&lt;Derived,OtherDerived,false,false&gt; {
+  <span>static</span> Derived&amp; run(Derived&amp; dst, <span>const</span> OtherDerived&amp; other) { <span>return</span> dst.lazyAssign(other.derived()); }
+};
+</pre>
+<p>OK so now our next job is to understand how lazyAssign works :)</p> <pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Derived&gt;
+<span>template</span>&lt;<span>typename</span> OtherDerived&gt;
+<span>inline</span> Derived&amp; <a href="classeigen_1_1densebase.html#a6bc6c096e3bfc726f28315daecd21b3f">MatrixBase&lt;Derived&gt;</a>
+<a href="classeigen_1_1densebase.html#a6bc6c096e3bfc726f28315daecd21b3f">  ::lazyAssign</a>(<span>const</span> MatrixBase&lt;OtherDerived&gt;&amp; other)
+{
+  EIGEN_STATIC_ASSERT_SAME_MATRIX_SIZE(Derived,OtherDerived)
+  eigen_assert(rows() == other.rows() &amp;&amp; cols() == other.cols());
+  internal::assign_impl&lt;Derived, OtherDerived&gt;::run(derived(),other.derived());
+  <span>return</span> derived();
+}</pre>
+<p>What do we see here? Some assertions, and then the only interesting line is: </p>
+<pre data-language="cpp">internal::assign_impl&lt;Derived, OtherDerived&gt;::run(derived(),other.derived());
+</pre>
+<p>OK so now we want to know what is inside internal::assign_impl.</p> <p>Here is its declaration: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Derived1, <span>typename</span> Derived2,
+         <span>int</span> Vectorization = internal::assign_traits&lt;Derived1, Derived2&gt;::Vectorization,
+         <span>int</span> Unrolling = internal::assign_traits&lt;Derived1, Derived2&gt;::Unrolling&gt;
+<span>struct </span>internal::assign_impl;
+</pre>
+<p> Again, internal::assign_selector takes 4 template parameters, but the 2 last ones are automatically determined by the 2 first ones.</p> <p>These two parameters <em>Vectorization</em> and <em>Unrolling</em> are determined by a helper class internal::assign_traits. Its job is to determine which vectorization strategy to use (that is <em>Vectorization</em>) and which unrolling strategy to use (that is <em>Unrolling</em>).</p> <p>We'll not enter into the details of how these strategies are chosen (this is in the implementation of internal::assign_traits at the top of the same file). Let's just say that here <em>Vectorization</em> has the value <em>LinearVectorization</em>, and <em>Unrolling</em> has the value <em>NoUnrolling</em> (the latter is obvious since our vectors have dynamic size so there's no way to unroll the loop at compile-time).</p> <p>So the partial specialization of internal::assign_impl that we're looking at is: </p>
+<pre data-language="cpp">internal::assign_impl&lt;Derived1, Derived2, LinearVectorization, NoUnrolling&gt;
+</pre>
+<p>Here is how it's defined: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Derived1, <span>typename</span> Derived2&gt;
+<span>struct </span>internal::assign_impl&lt;Derived1, Derived2, LinearVectorization, NoUnrolling&gt;
+{
+  <span>static</span> <span>void</span> run(Derived1 &amp;dst, <span>const</span> Derived2 &amp;src)
+  {
+    <span>const</span> <span>int</span> size = dst.size();
+    <span>const</span> <span>int</span> packetSize = internal::packet_traits&lt;typename Derived1::Scalar&gt;::size;
+    <span>const</span> <span>int</span> alignedStart = internal::assign_traits&lt;Derived1,Derived2&gt;::DstIsAligned ? 0
+                           : internal::first_aligned(&amp;dst.coeffRef(0), size);
+    <span>const</span> <span>int</span> alignedEnd = alignedStart + ((size-alignedStart)/packetSize)*packetSize;
+ 
+    <span>for</span>(<span>int</span> index = 0; index &lt; alignedStart; index++)
+      dst.copyCoeff(index, src);
+ 
+    <span>for</span>(<span>int</span> index = alignedStart; index &lt; alignedEnd; index += packetSize)
+    {
+      dst.template copyPacket&lt;Derived2, Aligned, internal::assign_traits&lt;Derived1,Derived2&gt;::SrcAlignment&gt;(index, src);
+    }
+ 
+    <span>for</span>(<span>int</span> index = alignedEnd; index &lt; size; index++)
+      dst.copyCoeff(index, src);
+  }
+};
+</pre>
+<p>Here's how it works. <em>LinearVectorization</em> means that the left-hand and right-hand side expression can be accessed linearly i.e. you can refer to their coefficients by one integer <em>index</em>, as opposed to having to refer to its coefficients by two integers <em>row</em>, <em>column</em>.</p> <p>As we said at the beginning, vectorization works with blocks of 4 floats. Here, <em>PacketSize</em> is 4.</p> <p>There are two potential problems that we need to deal with: </p>
+<ul> <li>first, vectorization works much better if the packets are 128-bit-aligned. This is especially important for write access. So when writing to the coefficients of <em>dst</em>, we want to group these coefficients by packets of 4 such that each of these packets is 128-bit-aligned. In general, this requires to skip a few coefficients at the beginning of <em>dst</em>. This is the purpose of <em>alignedStart</em>. We then copy these first few coefficients one by one, not by packets. However, in our case, the <em>dst</em> expression is a VectorXf and remember that in the construction of the vectors we allocated aligned arrays. Thanks to <em>DstIsAligned</em>, <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a> remembers that without having to do any runtime check, so <em>alignedStart</em> is zero and this part is avoided altogether. </li> <li>second, the number of coefficients to copy is not in general a multiple of <em>packetSize</em>. Here, there are 50 coefficients to copy and <em>packetSize</em> is 4. So we'll have to copy the last 2 coefficients one by one, not by packets. Here, <em>alignedEnd</em> is 48.</li> </ul> <p>Now come the actual loops.</p> <p>First, the vectorized part: the 48 first coefficients out of 50 will be copied by packets of 4: </p>
+<pre data-language="cpp"><span>for</span>(<span>int</span> index = alignedStart; index &lt; alignedEnd; index += packetSize)
+{
+  dst.template copyPacket&lt;Derived2, Aligned, internal::assign_traits&lt;Derived1,Derived2&gt;::SrcAlignment&gt;(index, src);
+}
+</pre>
+<p>What is copyPacket? It is defined in src/Core/Coeffs.h: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Derived&gt;
+<span>template</span>&lt;<span>typename</span> OtherDerived, <span>int</span> StoreMode, <span>int</span> LoadMode&gt;
+<span>inline</span> <span>void</span> MatrixBase&lt;Derived&gt;::copyPacket(<span>int</span> index, <span>const</span> MatrixBase&lt;OtherDerived&gt;&amp; other)
+{
+  eigen_internal_assert(index &gt;= 0 &amp;&amp; index &lt; size());
+  derived().template writePacket&lt;StoreMode&gt;(index,
+    other.derived().template packet&lt;LoadMode&gt;(index));
+}
+</pre>
+<p>OK, what are writePacket() and packet() here?</p> <p>First, writePacket() here is a method on the left-hand side VectorXf. So we go to <a href="https://eigen.tuxfamily.org/dox/Matrix_8h_source.html">src/Core/Matrix.h</a> to look at its definition: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>int</span> StoreMode&gt;
+<span>inline</span> <span>void</span> writePacket(<span>int</span> index, <span>const</span> PacketScalar&amp; x)
+{
+  internal::pstoret&lt;Scalar, PacketScalar, StoreMode&gt;(m_storage.data() + index, x);
+}
+</pre>
+<p> Here, <em>StoreMode</em> is <em><a href="group__enums.html#gga45fe06e29902b7a2773de05ba27b47a1ae12d0f8f869c40c76128260af2242bc8">Aligned</a></em>, indicating that we are doing a 128-bit-aligned write access, <em>PacketScalar</em> is a type representing a "SSE packet of 4 floats" and internal::pstoret is a function writing such a packet in memory. Their definitions are architecture-specific, we find them in <a href="https://eigen.tuxfamily.org/dox/SSE_2PacketMath_8h_source.html">src/Core/arch/SSE/PacketMath.h</a>:</p> <p>The line in <a href="https://eigen.tuxfamily.org/dox/SSE_2PacketMath_8h_source.html">src/Core/arch/SSE/PacketMath.h</a> that determines the PacketScalar type (via a typedef in <a href="https://eigen.tuxfamily.org/dox/Matrix_8h_source.html">Matrix.h</a>) is: </p>
+<pre data-language="cpp"><span>template</span>&lt;&gt; <span>struct </span>internal::packet_traits&lt;float&gt;  { <span>typedef</span> __m128  type; <span>enum</span> {size=4}; };
+</pre>
+<p> Here, __m128 is a SSE-specific type. Notice that the enum <em>size</em> here is what was used to define <em>packetSize</em> above.</p> <p>And here is the implementation of internal::pstoret: </p>
+<pre data-language="cpp"><span>template</span>&lt;&gt; <span>inline</span> <span>void</span> internal::pstore(<span>float</span>*  to, <span>const</span> __m128&amp;  from) { _mm_store_ps(to, from); }
+</pre>
+<p> Here, __mm_store_ps is a SSE-specific intrinsic function, representing a single SSE instruction. The difference between internal::pstore and internal::pstoret is that internal::pstoret is a dispatcher handling both the aligned and unaligned cases, you find its definition in <a href="https://eigen.tuxfamily.org/dox/GenericPacketMath_8h_source.html">src/Core/GenericPacketMath.h</a>: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Scalar, <span>typename</span> Packet, <span>int</span> LoadMode&gt;
+<span>inline</span> <span>void</span> internal::pstoret(Scalar* to, <span>const</span> Packet&amp; from)
+{
+  <span>if</span>(LoadMode == <a href="group__enums.html#gga45fe06e29902b7a2773de05ba27b47a1ae12d0f8f869c40c76128260af2242bc8">Aligned</a>)
+    internal::pstore(to, from);
+  <span>else</span>
+    internal::pstoreu(to, from);
+}</pre>
+<p>OK, that explains how writePacket() works. Now let's look into the packet() call. Remember that we are analyzing this line of code inside copyPacket(): </p>
+<pre data-language="cpp">derived().template writePacket&lt;StoreMode&gt;(index,
+    other.derived().template packet&lt;LoadMode&gt;(index));
+</pre>
+<p>Here, <em>other</em> is our sum expression <em>v</em> + <em>w</em>. The .derived() is just casting from <a href="classeigen_1_1matrixbase.html" title="Base class for all dense matrices, vectors, and expressions.">MatrixBase</a> to the subclass which here is <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a>. So let's go to <a href="https://eigen.tuxfamily.org/dox/CwiseBinaryOp_8h_source.html">src/Core/CwiseBinaryOp.h</a>: </p>
+<pre data-language="cpp"><span>class </span>CwiseBinaryOp
+{
+  <span>// ...</span>
+    <span>template</span>&lt;<span>int</span> LoadMode&gt;
+    <span>inline</span> PacketScalar packet(<span>int</span> index)<span> const</span>
+<span>    </span>{
+      <span>return</span> m_functor.packetOp(m_lhs.template packet&lt;LoadMode&gt;(index), m_rhs.template packet&lt;LoadMode&gt;(index));
+    }
+};
+</pre>
+<p> Here, <em>m_lhs</em> is the vector <em>v</em>, and <em>m_rhs</em> is the vector <em>w</em>. So the packet() function here is Matrix::packet(). The template parameter <em>LoadMode</em> is <em><a href="group__enums.html#gga45fe06e29902b7a2773de05ba27b47a1ae12d0f8f869c40c76128260af2242bc8">Aligned</a></em>. So we're looking at </p>
+<pre data-language="cpp"><span>class </span>Matrix
+{
+  <span>// ...</span>
+    <span>template</span>&lt;<span>int</span> LoadMode&gt;
+    <span>inline</span> PacketScalar packet(<span>int</span> index)<span> const</span>
+<span>    </span>{
+      <span>return</span> internal::ploadt&lt;Scalar, LoadMode&gt;(m_storage.data() + index);
+    }
+};
+</pre>
+<p> We let you look up the definition of internal::ploadt in <a href="https://eigen.tuxfamily.org/dox/GenericPacketMath_8h_source.html">GenericPacketMath.h</a> and the internal::pload in <a href="https://eigen.tuxfamily.org/dox/SSE_2PacketMath_8h_source.html">src/Core/arch/SSE/PacketMath.h</a>. It is very similar to the above for internal::pstore.</p> <p>Let's go back to CwiseBinaryOp::packet(). Once the packets from the vectors <em>v</em> and <em>w</em> have been returned, what does this function do? It calls m_functor.packetOp() on them. What is m_functor? Here we must remember what particular template specialization of <a href="classeigen_1_1cwisebinaryop.html" title="Generic expression where a coefficient-wise binary operator is applied to two expressions.">CwiseBinaryOp</a> we're dealing with: </p>
+<pre data-language="cpp">CwiseBinaryOp&lt;internal::scalar_sum_op&lt;float&gt;, VectorXf, VectorXf&gt;
+</pre>
+<p> So m_functor is an object of the empty class internal::scalar_sum_op&lt;float&gt;. As we mentioned above, don't worry about why we constructed an object of this empty class at all – it's an implementation detail, the point is that some other functors need to store member data.</p> <p>Anyway, internal::scalar_sum_op is defined in src/Core/Functors.h: </p>
+<pre data-language="cpp"><span>template</span>&lt;<span>typename</span> Scalar&gt; <span>struct </span>internal::scalar_sum_op EIGEN_EMPTY_STRUCT {
+  <span>inline</span> <span>const</span> Scalar operator() (<span>const</span> Scalar&amp; a, <span>const</span> Scalar&amp; b)<span> const </span>{ <span>return</span> a + b; }
+  <span>template</span>&lt;<span>typename</span> PacketScalar&gt;
+  <span>inline</span> <span>const</span> PacketScalar packetOp(<span>const</span> PacketScalar&amp; a, <span>const</span> PacketScalar&amp; b)<span> const</span>
+<span>  </span>{ <span>return</span> internal::padd(a,b); }
+};
+</pre>
+<p> As you can see, all what packetOp() does is to call internal::padd on the two packets. Here is the definition of internal::padd from <a href="https://eigen.tuxfamily.org/dox/SSE_2PacketMath_8h_source.html">src/Core/arch/SSE/PacketMath.h</a>: </p>
+<pre data-language="cpp"><span>template</span>&lt;&gt; <span>inline</span> __m128  internal::padd(<span>const</span> __m128&amp;  a, <span>const</span> __m128&amp;  b) { <span>return</span> _mm_add_ps(a,b); }
+</pre>
+<p> Here, _mm_add_ps is a SSE-specific intrinsic function, representing a single SSE instruction.</p> <p>To summarize, the loop </p>
+<pre data-language="cpp"><span>for</span>(<span>int</span> index = alignedStart; index &lt; alignedEnd; index += packetSize)
+{
+  dst.template copyPacket&lt;Derived2, Aligned, internal::assign_traits&lt;Derived1,Derived2&gt;::SrcAlignment&gt;(index, src);
+}
+</pre>
+<p> has been compiled to the following code: for <em>index</em> going from 0 to the 11 ( = 48/4 - 1), read the i-th packet (of 4 floats) from the vector v and the i-th packet from the vector w using two __mm_load_ps SSE instructions, then add them together using a __mm_add_ps instruction, then store the result using a __mm_store_ps instruction.</p> <p>There remains the second loop handling the last few (here, the last 2) coefficients: </p>
+<pre data-language="cpp"><span>for</span>(<span>int</span> index = alignedEnd; index &lt; size; index++)
+  dst.copyCoeff(index, src);
+</pre>
+<p> However, it works just like the one we just explained, it is just simpler because there is no SSE vectorization involved here. copyPacket() becomes copyCoeff(), packet() becomes coeff(), writePacket() becomes coeffRef(). If you followed us this far, you can probably understand this part by yourself.</p> <p>We see that all the C++ abstraction of <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a> goes away during compilation and that we indeed are precisely controlling which assembly instructions we emit. Such is the beauty of C++! Since we have such precise control over the emitted assembly instructions, but such complex logic to choose the right instructions, we can say that <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a> really behaves like an optimizing compiler. If you prefer, you could say that <a href="namespaceeigen.html" title="Namespace containing all symbols from the Eigen library.">Eigen</a> behaves like a script for the compiler. In a sense, C++ template metaprogramming is scripting the compiler – and it's been shown that this scripting language is Turing-complete. See <a href="http://en.wikipedia.org/wiki/Template_metaprogramming">Wikipedia</a>. </p> </div>
+</div> </div> <div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Eigen.<br>Licensed under the MPL2 License.<br>
+    <a href="https://eigen.tuxfamily.org/dox/TopicInsideEigenExample.html" class="_attribution-link">https://eigen.tuxfamily.org/dox/TopicInsideEigenExample.html</a>
+  </p>
+</div>
