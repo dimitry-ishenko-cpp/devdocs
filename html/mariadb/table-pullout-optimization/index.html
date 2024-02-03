@@ -1,0 +1,64 @@
+<h1>Table Pullout Optimization</h1> <div> <div class="node creole"> <div class="answer formatted">  <p>Table pullout is an optimization for <a href="../semi-join-subquery-optimizations/index.html">Semi-join subqueries</a>.</p> <h2 class="anchored_heading" id="the-idea-of-table-pullout">The idea of Table Pullout</h2> <p>Sometimes, a subquery can be re-written as a join. For example: <br><br></p> <pre class="fixed" data-language="sql">select *
+from City 
+where City.Country in (select Country.Code
+                       from Country 
+                       where Country.Population &lt; 100*1000);
+</pre>
+<p>If we know that there can be, at most, one country with with a given value of <code>Country.Code</code> (we can tell that if we see that table Country has a primary key or unique index over that column), we can re-write this query as:</p> <pre class="fixed" data-language="sql">select City.* 
+from 
+  City, Country 
+where
+ City.Country=Country.Code AND Country.Population &lt; 100*1000;
+</pre>
+<h2 class="anchored_heading" id="table-pullout-in-action">Table pullout in action</h2> <p>If one runs <a href="../explain/index.html">EXPLAIN</a> for the above query in MySQL 5.1-5.6 or <a href="../what-is-mariadb-51/index.html">MariaDB 5.1</a>-5.2, they'll get this plan:</p> <pre class="fixed wrap" data-language="sql">MySQL [world]&gt; explain select * from City where City.Country in (select Country.Code from Country where Country.Population &lt; 100*1000);
++----+--------------------+---------+-----------------+--------------------+---------+---------+------+------+-------------+
+| id | select_type        | table   | type            | possible_keys      | key     | key_len | ref  | rows | Extra       |
++----+--------------------+---------+-----------------+--------------------+---------+---------+------+------+-------------+
+|  1 | PRIMARY            | City    | ALL             | NULL               | NULL    | NULL    | NULL | 4079 | Using where |
+|  2 | DEPENDENT SUBQUERY | Country | unique_subquery | PRIMARY,Population | PRIMARY | 3       | func |    1 | Using where |
++----+--------------------+---------+-----------------+--------------------+---------+---------+------+------+-------------+
+2 rows in set (0.00 sec)
+</pre>
+<p>It shows that the optimizer is going to do a full scan on table <code>City</code>, and for each city it will do a lookup in table <code>Country</code>.</p> <p>If one runs the same query in <a href="../what-is-mariadb-53/index.html">MariaDB 5.3</a>, they will get this plan:</p> <pre class="fixed wrap" data-language="sql">MariaDB [world]&gt; explain select * from City where City.Country in (select Country.Code from Country where Country.Population &lt; 100*1000);
++----+-------------+---------+-------+--------------------+------------+---------+--------------------+------+-----------------------+
+| id | select_type | table   | type  | possible_keys      | key        | key_len | ref                | rows | Extra                 |
++----+-------------+---------+-------+--------------------+------------+---------+--------------------+------+-----------------------+
+|  1 | PRIMARY     | Country | range | PRIMARY,Population | Population | 4       | NULL               |   37 | Using index condition |
+|  1 | PRIMARY     | City    | ref   | Country            | Country    | 3       | world.Country.Code |   18 |                       |
++----+-------------+---------+-------+--------------------+------------+---------+--------------------+------+-----------------------+
+2 rows in set (0.00 sec)
+</pre>
+<p>The interesting parts are:</p> <ul start="1">
+<li>Both tables have <code class="fixed" style="white-space:pre-wrap">select_type=PRIMARY</code>, and <code class="fixed" style="white-space:pre-wrap">id=1</code> as if they were in one join. </li>
+<li>The `Country` table is first, followed by the `City` table. </li>
+</ul> <p>Indeed, if one runs EXPLAIN EXTENDED; SHOW WARNINGS, they will see that the subquery is gone and it was replaced with a join:</p> <pre class="fixed" data-language="sql">MariaDB [world]&gt; show warnings\G
+*************************** 1. row ***************************
+  Level: Note
+   Code: 1003
+Message: select `world`.`City`.`ID` AS `ID`,`world`.`City`.`Name` AS 
+`Name`,`world`.`City`.`Country` AS `Country`,`world`.`City`.`Population` AS 
+`Population` 
+
+  
+   from `world`.`City` join `world`.`Country` where 
+
+
+((`world`.`City`.`Country` = `world`.`Country`.`Code`) and (`world`.`Country`.
+`Population` &lt; (100 * 1000)))
+1 row in set (0.00 sec)
+</pre>
+<p>Changing the subquery into a join allows feeding the join to the join optimizer, which can make a choice between two possible join orders:</p> <ol start="1">
+<li>City -&gt; Country </li>
+<li>Country -&gt; City </li>
+</ol> <p>as opposed to the single choice of </p> <ol start="1"><li>City-&gt;Country </li></ol> <p>which we had before the optimization.</p> <p>In the above example, the choice produces a better query plan. Without pullout, the query plan with a subquery would read <code>(4079 + 1*4079)=8158</code> table records. With table pullout, the join plan would read <code>(37 + 37 * 18) = 703</code> rows. Not all row reads are equal, but generally, reading <code>10</code> times fewer table records is faster.</p> <h2 class="anchored_heading" id="table-pullout-fact-sheet">Table pullout fact sheet</h2> <ul start="1">
+<li>Table pullout is possible only in semi-join subqueries. </li>
+<li>Table pullout is based on <code>UNIQUE</code>/<code>PRIMARY</code> key definitions. </li>
+<li>Doing table pullout does not cut off any possible query plans, so MariaDB will always try to pull out as much as possible. </li>
+<li>Table pullout is able to pull individual tables out of subqueries to their parent selects. If all tables in a subquery have been pulled out, the subquery (i.e. its semi-join) is removed completely. </li>
+<li>One common bit of advice for optimizing MySQL has been "If possible, rewrite your subqueries as joins". Table pullout does exactly that, so manual rewrites are no longer necessary. </li>
+</ul> <h2 class="anchored_heading" id="controlling-table-pullout">Controlling table pullout</h2> <p>There is no separate @@optimizer_switch flag for table pullout. Table pullout can be disabled by switching off all semi-join optimizations with <code class="fixed" style="white-space:pre-wrap">SET @@optimizer_switch='semijoin=off'</code> command.</p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/table-pullout-optimization/" class="_attribution-link">https://mariadb.com/kb/en/table-pullout-optimization/</a>
+  </p>
+</div>

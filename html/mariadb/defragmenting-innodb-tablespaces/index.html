@@ -1,0 +1,161 @@
+<h1>Defragmenting InnoDB Tablespaces</h1> <div> <div class="node creole"> <div class="answer formatted">  <h2 class="anchored_heading" id="overview">Overview</h2> <p>When rows are deleted from an <a href="../innodb/index.html">InnoDB</a> table, the rows are simply marked as deleted and not physically deleted. The free space is not returned to the operating system for re-use. </p> <p>The purge thread will physically delete index keys and rows, but the free space introduced is still not returned to operating system. This can lead to gaps in the pages. If you have variable length rows, new rows may be larger than old rows and cannot make use of the available space.</p> <p>You can run <a href="../optimize-table/index.html">OPTIMIZE TABLE</a> or <a href="../alter-table/index.html">ALTER TABLE &lt;table&gt; ENGINE=InnoDB</a> to reconstruct the table. Unfortunately running <code>OPTIMIZE TABLE</code> against an InnoDB table stored in the shared table-space file <code>ibdata1</code> does two things:</p> <ul start="1">
+<li>Makes the table’s data and indexes contiguous inside <code>ibdata1</code>. </li>
+<li>Increases the size of <code>ibdata1</code> because the contiguous data and index pages are appended to <code>ibdata1</code>. </li>
+</ul> <h2 class="anchored_heading" id="innodb-defragmentation">InnoDB Defragmentation</h2> <div class="cstm-style bluebox">
+<p>The feature described below has been deprecated in <a href="../what-is-mariadb-110/index.html">MariaDB 11.0</a> and was removed in <a href="https://mariadb.com/kb/en/mariadb-11-1-0-release-notes/">MariaDB 11.1.0</a>. See <a href="https://jira.mariadb.org/browse/MDEV-30544">MDEV-30544</a> and <a href="https://jira.mariadb.org/browse/MDEV-30545">MDEV-30545</a>.</p> </div>
+<p><a href="../what-is-mariadb-101/index.html">MariaDB 10.1</a> merged Facebook's defragmentation code prepared for MariaDB by Matt, Seong Uck Lee from Kakao. The only major difference to Facebook's code and Matt’s patch is that MariaDB does not introduce new literals to SQL and makes no changes to the server code. Instead, <a href="../optimize-table/index.html">OPTIMIZE TABLE</a> is used and all code changes are inside the InnoDB/XtraDB storage engines. </p> <p>The behaviour of <code>OPTIMIZE TABLE</code> is unchanged by default, and to enable this new feature, you need to set the <a href="../innodb-system-variables/index.html#innodb_defragment">innodb_defragment</a> system variable to <code>1</code>. </p> <pre class="fixed" data-language="sql">[mysqld]
+...
+innodb-defragment=1
+</pre>
+<p>No new tables are created and there is no need to copy data from old tables to new tables. Instead, this feature loads <code>n</code> pages (determined by <a href="../innodb-system-variables/index.html#innodb_defragment_n_pages">innodb-defragment-n-pages</a>) and tries to move records so that pages would be full of records and then frees pages that are fully empty after the operation. </p> <p>Note that tablespace files (including ibdata1) will not shrink as the result of defragmentation, but one will get better memory utilization in the InnoDB buffer pool as there are fewer data pages in use.</p> <p>A number of new system and status variables for controlling and monitoring the feature are introduced.</p> <h3 class="anchored_heading" id="system-variables">System Variables</h3> <ul start="1">
+<li>
+<a href="../innodb-system-variables/index.html#innodb_defragment">innodb_defragment</a>: Enable InnoDB defragmentation. </li>
+<li>
+<a href="../innodb-system-variables/index.html#innodb_defragment_n_pages">innodb_defragment_n_pages</a>: Number of pages considered at once when merging multiple pages to defragment. </li>
+<li>
+<a href="../innodb-system-variables/index.html#innodb_defragment_stats_accuracy">innodb_defragment_stats_accuracy</a>: Number of defragment stats changes there are before the stats are written to persistent storage. </li>
+<li>
+<a href="../innodb-system-variables/index.html#innodb_defragment_fill_factor_n_recs">innodb_defragment_fill_factor_n_recs</a>: Number of records of space that defragmentation should leave on the page. </li>
+<li>
+<a href="../innodb-system-variables/index.html#innodb_defragment_fill_factor">innodb_defragment_fill_factor</a>: Indicates how full defragmentation should fill a page. </li>
+<li>
+<a href="../innodb-system-variables/index.html#innodb_defragment_frequency">innodb_defragment_frequency</a>: Maximum times per second for defragmenting a single index. </li>
+</ul> <h3 class="anchored_heading" id="status-variables">Status Variables</h3> <ul start="1">
+<li>
+<a href="../innodb-status-variables/index.html#innodb_defragment_compression_failures">Innodb_defragment_compression_failures</a>: Number of defragment re-compression failures </li>
+<li>
+<a href="../innodb-status-variables/index.html#innodb_defragment_failures">Innodb_defragment_failures</a>: Number of defragment failures. </li>
+<li>
+<a href="../innodb-status-variables/index.html#innodb_defragment_count">Innodb_defragment_count</a>: Number of defragment operations. </li>
+</ul> <h2 class="anchored_heading" id="example">Example</h2> <pre class="fixed wrap" data-language="sql">set @@global.innodb_file_per_table = 1;
+set @@global.innodb_defragment_n_pages = 32;
+set @@global.innodb_defragment_fill_factor = 0.95;
+CREATE TABLE tb_defragment (
+pk1 bigint(20) NOT NULL,
+pk2 bigint(20) NOT NULL,
+fd4 text,
+fd5 varchar(50) DEFAULT NULL,
+PRIMARY KEY (pk1),
+KEY ix1 (pk2)
+) ENGINE=InnoDB;
+ 
+delimiter //
+create procedure innodb_insert_proc (repeat_count int)
+begin
+  declare current_num int;
+  set current_num = 0;
+  while current_num &lt; repeat_count do
+    INSERT INTO tb_defragment VALUES (current_num, 1, REPEAT('Abcdefg', 20), REPEAT('12345',5));
+    INSERT INTO tb_defragment VALUES (current_num+1, 2, REPEAT('HIJKLM', 20), REPEAT('67890',5));
+    INSERT INTO tb_defragment VALUES (current_num+2, 3, REPEAT('HIJKLM', 20), REPEAT('67890',5));
+    INSERT INTO tb_defragment VALUES (current_num+3, 4, REPEAT('HIJKLM', 20), REPEAT('67890',5));
+    set current_num = current_num + 4;
+  end while;
+end//
+delimiter ;
+commit;
+ 
+set autocommit=0;
+call innodb_insert_proc(50000);
+commit;
+set autocommit=1;
+</pre>
+<p>After these CREATE and INSERT operations, the following information can be seen from the INFORMATION SCHEMA:</p> <pre class="fixed wrap" data-language="sql">select count(*) as Value from information_schema.innodb_buffer_page 
+  where table_name like '%tb_defragment%' and index_name = 'PRIMARY';
+Value
+313
+ 
+select count(*) as Value from information_schema.innodb_buffer_page 
+  where table_name like '%tb_defragment%' and index_name = 'ix1';
+Value
+72
+ 
+select count(stat_value) from mysql.innodb_index_stats 
+  where table_name like '%tb_defragment%' and stat_name in ('n_pages_freed');
+count(stat_value)
+0
+ 
+select count(stat_value) from mysql.innodb_index_stats 
+  where table_name like '%tb_defragment%' and stat_name in ('n_page_split');
+count(stat_value)
+0
+ 
+select count(stat_value) from mysql.innodb_index_stats 
+  where table_name like '%tb_defragment%' and stat_name in ('n_leaf_pages_defrag');
+count(stat_value)
+0
+ 
+SELECT table_name, data_free/1024/1024 AS data_free_MB, table_rows FROM information_schema.tables 
+  WHERE engine LIKE 'InnoDB' and table_name like '%tb_defragment%';
+table_name data_free_MB table_rows
+tb_defragment 4.00000000 50051
+ 
+SELECT table_name, index_name, sum(number_records), sum(data_size) FROM information_schema.innodb_buffer_page 
+  where table_name like '%tb_defragment%' and index_name like 'PRIMARY';
+table_name index_name sum(number_records) sum(data_size)
+`test`.`tb_defragment` PRIMARY 25873 4739939
+ 
+SELECT table_name, index_name, sum(number_records), sum(data_size) FROM information_schema.innodb_buffer_page 
+  where table_name like '%tb_defragment%' and index_name like 'ix1';
+table_name index_name sum(number_records) sum(data_size)
+`test`.`tb_defragment` ix1 50071 1051775
+</pre>
+<p>Deleting three-quarters of the records, leaving gaps, and then optimizing:</p> <pre class="fixed" data-language="sql">delete from tb_defragment where pk2 between 2 and 4;
+ 
+optimize table tb_defragment;
+Table	Op	Msg_type	Msg_text
+test.tb_defragment	optimize	status	OK
+show status like '%innodb_def%';
+Variable_name	Value
+Innodb_defragment_compression_failures	0
+Innodb_defragment_failures	1
+Innodb_defragment_count	4
+</pre>
+<p>Now some pages have been freed, and some merged:</p> <pre class="fixed wrap" data-language="sql">select count(*) as Value from information_schema.innodb_buffer_page 
+  where table_name like '%tb_defragment%' and index_name = 'PRIMARY';
+Value
+0
+ 
+select count(*) as Value from information_schema.innodb_buffer_page 
+  where table_name like '%tb_defragment%' and index_name = 'ix1';
+Value
+0
+ 
+select count(stat_value) from mysql.innodb_index_stats 
+  where table_name like '%tb_defragment%' and stat_name in ('n_pages_freed');
+count(stat_value)
+2
+ 
+select count(stat_value) from mysql.innodb_index_stats 
+  where table_name like '%tb_defragment%' and stat_name in ('n_page_split');
+count(stat_value)
+2
+ 
+select count(stat_value) from mysql.innodb_index_stats 
+  where table_name like '%tb_defragment%' and stat_name in ('n_leaf_pages_defrag');
+count(stat_value)
+2
+ 
+SELECT table_name, data_free/1024/1024 AS data_free_MB, table_rows FROM information_schema.tables 
+  WHERE engine LIKE 'InnoDB';
+table_name data_free_MB table_rows
+innodb_index_stats 0.00000000 8
+innodb_table_stats 0.00000000 0
+tb_defragment 4.00000000 12431
+ 
+SELECT table_name, index_name, sum(number_records), sum(data_size) FROM information_schema.innodb_buffer_page 
+  where table_name like '%tb_defragment%' and index_name like 'PRIMARY';
+table_name index_name sum(number_records) sum(data_size)
+`test`.`tb_defragment` PRIMARY 690 102145
+ 
+SELECT table_name, index_name, sum(number_records), sum(data_size) FROM information_schema.innodb_buffer_page 
+  where table_name like '%tb_defragment%' and index_name like 'ix1';
+table_name index_name sum(number_records) sum(data_size)
+`test`.`tb_defragment` ix1 5295 111263
+</pre>
+<p>See <a href="https://blog.mariadb.org/defragmenting-unused-space-on-innodb-tablespace/">Defragmenting unused space on InnoDB tablespace</a> on the Mariadb.org blog for more details.</p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/defragmenting-innodb-tablespaces/" class="_attribution-link">https://mariadb.com/kb/en/defragmenting-innodb-tablespaces/</a>
+  </p>
+</div>

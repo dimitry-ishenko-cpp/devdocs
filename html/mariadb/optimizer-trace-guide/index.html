@@ -1,0 +1,197 @@
+<h1>Optimizer Trace Guide</h1> <div> <div class="node creole"> <div class="answer formatted"> <p> <br><br><br> Optimizer trace uses the JSON format. It is basically a structured log file showing what actions were taken by the query optimizer. <br><br></p> <h2 class="anchored_heading" id="a-basic-example">A Basic Example</h2> <p><br><br> Let's take a simple query:<br><br></p> <pre class="fixed" data-language="sql">MariaDB&gt; explain select * from t1 where a&lt;10;
++------+-------------+-------+-------+---------------+------+---------+------+------+-----------------------+
+| id   | select_type | table | type  | possible_keys | key  | key_len | ref  | rows | Extra                 |
++------+-------------+-------+-------+---------------+------+---------+------+------+-----------------------+
+|    1 | SIMPLE      | t1    | range | a             | a    | 5       | NULL | 10   | Using index condition |
++------+-------------+-------+-------+---------------+------+---------+------+------+-----------------------+
+</pre>
+<p>One can see the full trace <a href="../basic-optimizer-trace-example/index.html">here</a>. Taking only the component names, one gets:</p> <pre class="fixed" data-language="sql">MariaDB&gt; select * from information_schema.optimizer_trace limit 1\G
+*************************** 1. row ***************************
+                            QUERY: select * from t1 where a&lt;10
+                            TRACE: 
+{
+  "steps": [
+    {
+      "join_preparation": { ... }
+    },
+    {
+      "join_optimization": {
+        "select_id": 1,
+        "steps": [
+          { "condition_processing": { ... } },
+          { "table_dependencies": [ ... ] },
+          { "ref_optimizer_key_uses": [ ... ] },
+          { "rows_estimation": [
+              {
+                "range_analysis": {
+                   "analyzing_range_alternatives" : { ... },
+                  "chosen_range_access_summary": { ... },
+                },
+                "selectivity_for_indexes" : { ... },
+                "selectivity_for_columns" : { ... }
+              }
+            ]
+          },
+          { "considered_execution_plans": [ ... ] },
+          { "attaching_conditions_to_tables": { ... } }
+         ]
+      }
+    },
+    {
+      "join_execution": { ... }
+    }
+  ]
+}
+</pre>
+<h2 class="anchored_heading" id="trace-structure">Trace Structure</h2> <p>For each SELECT, there are two "Steps": </p> <ul start="1">
+<li>
+<code>join_preparation</code> </li>
+<li>
+<code>join_optimization</code> </li>
+</ul> <p>Join preparation shows early query rewrites. <code>join_optmization</code> is where most of the query optimizations are done. They are:</p> <ul start="1">
+<li>
+<code>condition_processing</code> - basic rewrites in WHERE/ON conditions. </li>
+<li>
+<code>ref_optimizer_key_uses</code> - Construction of possible ways to do ref and eq_ref accesses. </li>
+<li>
+<code>rows_estimation</code> - Consideration of range and index_merge accesses. </li>
+<li>
+<code>considered_execution_plans</code> - Join optimization itself, that is, choice of the join order. </li>
+<li>
+<code>attaching_conditions_to_tables</code> - Once the join order is fixed, parts of the WHERE clause are "attached" to tables to filter out rows as early as possible. </li>
+</ul> <p>The above steps are for just one SELECT. If the query has subqueries, each SELECT will have these steps, and there will be extra steps/rewrites to handle the subquery construct itself.</p> <h2 class="anchored_heading" id="extracting-trace-components">Extracting Trace Components</h2> <p>If you are interested in some particular part of the trace, MariaDB has two functions that come in handy: </p> <ul start="1">
+<li>
+<a href="../json_extract/index.html">JSON_EXTRACT</a> extracts a part of JSON document </li>
+<li>
+<a href="../json_detailed/index.html">JSON_DETAILED</a> presents it in a user-readable way. </li>
+</ul> <p>For example, the contents of the <code>analyzing_range_alternatives</code> node can be extracted like so:</p> <pre class="fixed" data-language="sql">MariaDB&gt; select JSON_DETAILED(JSON_EXTRACT(trace, '$**.analyzing_range_alternatives')) 
+   -&gt;   from INFORMATION_SCHEMA.OPTIMIZER_TRACE\G
+*************************** 1. row ***************************
+JSON_DETAILED(JSON_EXTRACT(trace, '$**.analyzing_range_alternatives')): [
+    {
+        "range_scan_alternatives": 
+        [
+            {
+                "index": "a_b_c",
+                "ranges": 
+                [
+                    "(1) &lt;= (a,b) &lt; (4,50)"
+                ],
+                "rowid_ordered": false,
+                "using_mrr": false,
+                "index_only": false,
+                "rows": 4,
+                "cost": 6.2509,
+                "chosen": true
+            }
+        ],
+        "analyzing_roworder_intersect": 
+        {
+            "cause": "too few roworder scans"
+        },
+        "analyzing_index_merge_union": []
+    }
+]
+</pre>
+<h2 class="anchored_heading" id="examples-of-various-information-in-the-trace">Examples of Various Information in the Trace</h2> <h3 class="anchored_heading" id="basic-rewrites">Basic Rewrites</h3> <p>A lot of applications construct database query text on the fly, which sometimes means that the query has constructs that are repetitive or redundant. In most cases, the optimizer will be able to remove them. One can check the trace to be sure:</p> <pre class="fixed" data-language="sql">explain select * from t1 where not (col1 &gt;= 3);
+</pre>
+<p>Optimizer trace will show:</p> <pre class="fixed" data-language="sql">"steps": [
+  {
+    "join_preparation": {
+      "select_id": 1,
+      "steps": [
+        {
+          "expanded_query": "select t1.a AS a,t1.b AS b,t1.col1 AS col1 from t1 where t1.col1 &lt; 3"
+        }
+</pre>
+<p>Here, one can see that <code>NOT</code> was removed.</p> <p>Similarly, one can also see that <code>IN(...)</code> with one element is the same as equality:</p> <pre class="fixed" data-language="sql">explain select * from t1 where col1  in (1);
+</pre>
+<p>will show</p> <pre class="fixed" data-language="sql">  "join_preparation": {
+    "select_id": 1,
+    "steps": [
+      {
+        "expanded_query": "select t1.a AS a,t1.b AS b,t1.col1 AS col1 from t1 where t1.col1 = 1"
+</pre>
+<p>On the other hand, converting an UTF-8 column to UTF-8 is not removed:</p> <pre class="fixed" data-language="sql">explain select * from t1 where convert(utf8_col using utf8) = 'hello';
+</pre>
+<p>will show </p> <pre class="fixed" data-language="sql">  "join_preparation": {
+    "select_id": 1,
+    "steps": [
+      {
+        "expanded_query": "select t1.a AS a,t1.b AS b,t1.col1 AS col1,t1.utf8_col AS utf8_col from t1 where convert(t1.utf8_col using utf8) = 'hello'"
+          }
+</pre>
+<p>so redundant <code>CONVERT</code> calls should be used with caution.</p> <h3 class="anchored_heading" id="view-processing">VIEW Processing</h3> <p>MariaDB has two algorithms to handle VIEWs: merging and materialization. If you run a query that uses a VIEW, the trace will have either</p> <pre class="fixed" data-language="sql">            "view": {
+              "table": "view1",
+              "select_id": 2,
+              "algorithm": "merged"
+            }
+</pre>
+<p>or</p> <pre class="fixed" data-language="sql">          {
+            "view": {
+              "table": "view2",
+              "select_id": 2,
+              "algorithm": "materialized"
+            }
+          },
+</pre>
+<p>depending on which algorithm was used.</p> <h3 class="anchored_heading" id="range-optimizer-what-ranges-will-be-scanned">Range Optimizer - What Ranges Will Be Scanned</h3> <p>The MariaDB optimizer has a complex part called the Range Optimizer. This is a module that examines WHERE (and ON) clauses and constructs index ranges that need to be scanned to answer the query. The rules for constructing the ranges are quite complex.</p> <p>An example: Consider a table</p> <pre class="fixed" data-language="sql">create table some_events ( 
+  start_date date, 
+  end_date date, 
+  ...
+  key (start_date, end_date)
+);
+</pre>
+<p>and a query:</p> <pre class="fixed" data-language="sql">explain select * from some_events where start_date &gt;= '2019-09-10' and end_date &lt;= '2019-09-14';
++------+-------------+-------------+------+---------------+------+---------+------+------+-------------+
+| id   | select_type | table       | type | possible_keys | key  | key_len | ref  | rows | Extra       |
++------+-------------+-------------+------+---------------+------+---------+------+------+-------------+
+|    1 | SIMPLE      | some_events | ALL  | start_date    | NULL | NULL    | NULL | 1000 | Using where |
++------+-------------+-------------+------+---------------+------+---------+------+------+-------------+
+</pre>
+<p>One might think that the optimizer would be able to use the restrictions on both <em>start_date</em> and <em>end_date</em> to construct a narrow range to be scanned. But this is not so, one of the restrictions creates a left-endpoint range and the other one creates a right-endpoint range, hence they cannot be combined.</p> <pre class="fixed" data-language="sql">select 
+   JSON_DETAILED(JSON_EXTRACT(trace, '$**.analyzing_range_alternatives')) as trace 
+from information_schema.optimizer_trace\G
+*************************** 1. row ***************************
+trace: [
+    {
+        "range_scan_alternatives": 
+        [
+            {
+                "index": "start_date",
+                "ranges": 
+                [
+                    "(2019-09-10,NULL) &lt; (start_date,end_date)"
+                ],
+...
+</pre>
+<p>the potential range only uses one of the bounds.</p> <h3 class="anchored_heading" id="ref-access-options">Ref Access Options</h3> <p>Index-based Nested-loops joins are called "ref access" in the MariaDB optimizer.</p> <p>The optimizer analyzes the WHERE/ON conditions and collects all equality conditions that can be used by ref access using some index. </p> <p>The list of conditions can be found in the <code>ref_optimizer_key_uses</code> node. (TODO example)</p> <h3 class="anchored_heading" id="join-optimization">Join Optimization</h3> <p>The join optimizer's node is named <code>considered_execution_plans</code>.</p> <p>The optimizer constructs the join orders in a left-to-right fashion. That is, if the query is a join of three tables:</p> <pre class="fixed" data-language="sql">select * from t1, t2, t3 where ...
+</pre>
+<p>then the optimizer will</p> <ul start="1">
+<li>Pick the first table (say, it is t1), </li>
+<li>consider adding another table (say, t2), and construct a prefix "t1, t2" </li>
+<li>consider adding the third table (t3), and constructing a prefix "t1, t2, t3", which is a complete join plan Other join orders will be considered as well. </li>
+</ul> <p>The basic operation here is: "given a join prefix of tables A,B,C ..., try adding table X to it". In JSON, it looks like this:</p> <pre class="fixed" data-language="sql">      {
+        "plan_prefix": ["t1", "t2"],
+        "table": "t3",
+        "best_access_path": {
+          "considered_access_paths": [
+            {
+              ...
+            }
+          ]
+        }
+      }
+</pre>
+<p>(search for <code>plan_prefix</code> followed by <code>table</code>).</p> <p>If you are interested in how the join order of #t1,t2,t3# was constructed (or not constructed), you need to search for these patterns:</p> <ul start="1">
+<li>
+<code>"plan_prefix":[], "table":"t1"</code> </li>
+<li>
+<code>"plan_prefix":["t1"], "table":"t2"</code> </li>
+<li><code>"plan_prefix":["t1", "t2"], "table":"t3"</code></li>
+</ul> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/optimizer-trace-guide/" class="_attribution-link">https://mariadb.com/kb/en/optimizer-trace-guide/</a>
+  </p>
+</div>

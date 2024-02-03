@@ -1,0 +1,132 @@
+<h1>Thread Groups in the Unix Implementation of the Thread Pool</h1> <div> <div class="node creole"> <div class="answer formatted"> <div class="cstm-style bluebox">
+<p>This article does not apply to the thread pool implementation on Windows. On Windows, MariaDB uses a native thread pool created with the <code><a href="https://docs.microsoft.com/en-us/windows/desktop/api/threadpoolapiset/nf-threadpoolapiset-createthreadpool">CreateThreadpool</a></code> APl, which has its own methods to distribute threads between CPUs.</p> </div> <p>On Unix, the thread pool implementation uses objects called thread groups to divide up client connections into many independent sets of threads. The <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_size">thread_pool_size</a></code> system variable defines the number of thread groups on a system. Generally speaking, the goal of the thread group implementation is to have one running thread on each CPU on the system at a time. Therefore, the default value of the <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_size">thread_pool_size</a></code> system variable is auto-sized to the number of CPUs on the system.</p> <p>When setting the <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_size">thread_pool_size</a></code> system variable's value at system startup, the max value is <code>100000</code>. However, it is not a good idea to set it that high. When setting its value dynamically, the max value is either <code>128</code> or the value that was set at system startup--whichever value is higher. It can be changed dynamically with <code><a href="../set/index.html#global-session">SET GLOBAL</a></code>. For example:</p> <pre class="fixed" data-language="sql">SET GLOBAL thread_pool_size=32;
+</pre>
+<p>It can also be set in a server <a href="../configuring-mariadb-with-option-files/index.html#option-groups">option group</a> in an <a href="../configuring-mariadb-with-option-files/index.html">option file</a> prior to starting up the server. For example:</p> <pre class="fixed" data-language="sql">[mariadb]
+..
+thread_handling=pool-of-threads
+thread_pool_size=32
+</pre>
+<p>If you do not want MariaDB to use all CPUs on the system for some reason, then you can set it to a lower value than the number of CPUs. For example, this would make sense if the MariaDB Server process is limited to certain CPUs with the <code><a href="https://linux.die.net/man/1/taskset">taskset</a></code> utility on Linux.</p> <p>If you set the value to the number of CPUs and if you find that the CPUs are still underutilized, then try increasing the value.</p> <p>The <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_size">thread_pool_size</a></code> system variable tends to have the most visible performance effect. It is roughly equivalent to the number of threads that can run at the same time. In this case, run means use CPU, rather than sleep or wait. If a client connection needs to sleep or wait for some reason, then it wakes up another client connection in the thread group before it does so.</p> <div class="cstm-style greenbox">
+<p>One reason that CPU underutilization may occur in rare cases is that the thread pool is not always informed when a thread is going to wait. For example, some waits, such as a page fault or a miss in the OS buffer cache, cannot be detected by MariaDB. Prior to <a href="../what-is-mariadb-100/index.html">MariaDB 10.0</a>, network I/O related waits could also be missed.</p> </div>
+<h2 class="anchored_heading" id="distributing-client-connections-between-thread-groups">Distributing Client Connections Between Thread Groups</h2> <p>When a new client connection is created, its thread group is determined using the following calculation:</p> <pre class="fixed" data-language="sql">thread_group_id = connection_id %  thread_pool_size
+</pre>
+<p>The <code>connection_id</code> value in the above calculation is the same monotonically increasing number that you can use to identify connections in <code><a href="../show-processlist/index.html">SHOW PROCESSLIST</a></code> output or the <code><a href="../information-schema-processlist-table/index.html">information_schema.PROCESSLIST</a></code> table.</p> <p>This calculation should assign client connections to each thread group in a round-robin manner. In general, this should result in an even distribution of client connections among thread groups.</p> <h2 class="anchored_heading" id="types-of-threads">Types of Threads</h2> <h3 class="anchored_heading" id="thread-group-threads">Thread Group Threads</h3> <p>Thread groups have two different kinds of threads: a <strong>listener thread</strong> and <strong>worker threads</strong>.</p> <ul start="1"><li>A thread group's <strong>worker threads</strong> actually perform work on behalf of client connections. A thread group can have many <strong>worker threads</strong>, but usually, only one will be actively running at a time. This is not always the case. For example, the thread group can become <em>oversubscribed</em> if the thread pool's <strong>timer thread</strong> detects that the thread group is <em>stalled</em>. This is explained more in the sections below. </li></ul> <ul start="1"><li>A thread group's <strong>listener thread</strong> listens for I/O events and distributes work to the <strong>worker threads</strong>. If it detects that there is a request that needs to be worked on, then it can wake up a sleeping <strong>worker thread</strong> in the thread group, if any exist. If the <strong>listener thread</strong> is the only thread in the thread group, then it can also create a new <strong>worker thread</strong>. If there is only one request to handle, and if the <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_dedicated_listener">thread_pool_dedicated_listener</a></code> system variable is not enabled, then the <strong>listener thread</strong> can also become a <strong>worker thread</strong> and handle the request itself. This helps decrease the overhead that may be introduced by excessively waking up sleeping <strong>worker threads</strong> and excessively creating new <strong>worker threads</strong>. </li></ul> <h3 class="anchored_heading" id="global-threads">Global Threads</h3> <p>The thread pool has one global thread: a <strong>timer thread</strong>. The <strong>timer thread</strong> performs tasks, such as:</p> <ul start="1">
+<li>Checks each thread group for stalls. </li>
+<li>Ensures that each thread group has a <strong>listener thread</strong>. </li>
+</ul> <h2 class="anchored_heading" id="thread-creation">Thread Creation</h2> <p>A new thread is created in a thread group in the scenarios listed below.</p> <p>In all of the scenarios below, the thread pool implementation prefers to wake up a sleeping <strong>worker thread</strong> that already exists in the thread group, rather than to create a new thread.</p> <h3 class="anchored_heading" id="worker-thread-creation-by-listener-thread">Worker Thread Creation by Listener Thread</h3> <p>A thread group's <strong>listener thread</strong> can create a new <strong>worker thread</strong> when it has more client connection requests to distribute, but no pre-existing <strong>worker threads</strong> are available to work on the requests. This can help to ensure that the thread group always has enough threads to keep one <strong>worker thread</strong> active at a time.</p> <p>A thread group's <strong>listener thread</strong> creates a new <strong>worker thread</strong> if all of the following conditions are met:</p> <ul start="1">
+<li>The <strong>listener thread</strong> receives a client connection request that needs to be worked on. </li>
+<li>There are more client connection requests in the thread group's work queue that the <strong>listener thread</strong> still needs to distribute to <strong>worker threads</strong>, so the <strong>listener thread</strong> should not become a <strong>worker thread</strong>. </li>
+<li>There are no active <strong>worker threads</strong> in the thread group. </li>
+<li>There are no sleeping <strong>worker threads</strong> in the thread group that the <strong>listener thread</strong> can wake up. </li>
+<li>And one of the following conditions is also met: <ul start="1">
+<li>The entire thread pool has fewer than <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_max_threads">thread_pool_max_threads</a></code>. </li>
+<li>There are fewer than two threads in the thread group. This is to guarantee that each thread group can have at least two threads, even if <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_max_threads">thread_pool_max_threads</a></code> has already been reached or exceeded. </li>
+</ul> </li>
+</ul> <h3 class="anchored_heading" id="thread-creation-by-worker-threads-during-waits">Thread Creation by Worker Threads during Waits</h3> <p>A thread group's <strong>worker thread</strong> can create a new <strong>worker thread</strong> when the thread has to wait on something, and the thread group has more client connection requests queued, but no pre-existing <strong>worker threads</strong> are available to work on them. This can help to ensure that the thread group always has enough threads to keep one <strong>worker thread</strong> active at a time. For most workloads, this tends to be the primary mechanism that creates new <strong>worker threads</strong>.</p> <p>A thread group's <strong>worker thread</strong> creates a new thread if all of the following conditions are met:</p> <ul start="1">
+<li>The <strong>worker thread</strong> has to wait on some request. For example, it might be waiting on disk I/O, or it might be waiting on a lock, or it might just be waiting for a query that called the <code><a href="../sleep/index.html">SLEEP()</a></code> function to finish. </li>
+<li>There are no active <strong>worker threads</strong> in the thread group. </li>
+<li>There are no sleeping <strong>worker threads</strong> in the thread group that the <strong>worker thread</strong> can wake up. </li>
+<li>And one of the following conditions is also met: <ul start="1">
+<li>The entire thread pool has fewer than <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_max_threads">thread_pool_max_threads</a></code>. </li>
+<li>There are fewer than two threads in the thread group. This is to guarantee that each thread group can have at least two threads, even if <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_max_threads">thread_pool_max_threads</a></code> has already been reached or exceeded. </li>
+</ul> </li>
+<li>And one of the following conditions is also met: <ul start="1">
+<li>There are more client connection requests in the thread group's work queue that the <strong>listener thread</strong> still needs to distribute to <strong>worker threads</strong>. In this case, the new thread is intended to be a <strong>worker thread</strong>. </li>
+<li>There is currently no <strong>listener thread</strong> in the thread group. For example, if the <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_dedicated_listener">thread_pool_dedicated_listener</a></code> system variable is not enabled, then the thread group's <strong>listener thread</strong> can became a <strong>worker thread</strong>, so that it could handle some client connection request. In this case, the new thread can become the thread group's <strong>listener thread</strong>. </li>
+</ul> </li>
+</ul> <h3 class="anchored_heading" id="listener-thread-creation-by-timer-thread">Listener Thread Creation by Timer Thread</h3> <p>The thread pool's <strong>timer thread</strong> can create a new <strong>listener thread</strong> for a thread group when the thread group has more client connection requests that need to be distributed, but the thread group does not currently have a <strong>listener thread</strong> to distribute them. This can help to ensure that the thread group does not miss client connection requests because it has no <strong>listener thread</strong>.</p> <p>The thread pool's <strong>timer thread</strong> creates a new <strong>listener thread</strong> for a thread group if all of the following conditions are met:</p> <ul start="1">
+<li>The thread group has not handled any I/O events since the last check by the timer thread. </li>
+<li>There is currently no <strong>listener thread</strong> in the thread group. For example, if the <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_dedicated_listener">thread_pool_dedicated_listener</a></code> system variable is not enabled, then the thread group's <strong>listener thread</strong> can became a <strong>worker thread</strong>, so that it could handle some client connection request. In this case, the new thread can become the thread group's <strong>listener thread</strong>. </li>
+<li>There are no sleeping <strong>worker threads</strong> in the thread group that the <strong>timer thread</strong> can wake up. </li>
+<li>And one of the following conditions is also met: <ul start="1">
+<li>The entire thread pool has fewer than <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_max_threads">thread_pool_max_threads</a></code>. </li>
+<li>There are fewer than two threads in the thread group. This is to guarantee that each thread group can have at least two threads, even if <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_max_threads">thread_pool_max_threads</a></code> has already been reached or exceeded. </li>
+</ul> </li>
+<li>If the thread group already has active <strong>worker threads</strong>, then the following condition also needs to be met: <ul start="1"><li>A <strong>worker thread</strong> has not been created for the thread group within the <em>throttling interval</em>. </li></ul> </li>
+</ul> <h3 class="anchored_heading" id="worker-thread-creation-by-timer-thread-during-stalls">Worker Thread Creation by Timer Thread during Stalls</h3> <p>The thread pool's <strong>timer thread</strong> can create a new <strong>worker thread</strong> for a thread group when the thread group is stalled. This can help to ensure that a long query can't monopole its thread group.</p> <p>The thread pool's <strong>timer thread</strong> creates a new <strong>worker thread</strong> for a thread group if all of the following conditions are met:</p> <ul start="1">
+<li>The <strong>timer thread</strong> thinks that the thread group is stalled. This means that the following conditions have been met: <ul start="1">
+<li>There are more client connection requests in the thread group's work queue that the <strong>listener thread</strong> still needs to distribute to <strong>worker threads</strong>. </li>
+<li>No client connection requests have been allowed to be dequeued to run since the last stall check by the <strong>timer thread</strong>. </li>
+</ul> </li>
+<li>There are no sleeping <strong>worker threads</strong> in the thread group that the <strong>timer thread</strong> can wake up. </li>
+<li>And one of the following conditions is also met: <ul start="1">
+<li>The entire thread pool has fewer than <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_max_threads">thread_pool_max_threads</a></code>. </li>
+<li>There are fewer than two threads in the thread group. This is to guarantee that each thread group can have at least two threads, even if <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_max_threads">thread_pool_max_threads</a></code> has already been reached or exceeded. </li>
+</ul> </li>
+<li>A <strong>worker thread</strong> has not been created for the thread group within the <em>throttling interval</em>. </li>
+</ul> <h3 class="anchored_heading" id="thread-creation-throttling">Thread Creation Throttling</h3> <p>In some of the scenarios listed above, a thread is only created within a thread group if no new threads have been created for the thread group within the <em>throttling interval</em>. The throttling interval depends on the number of threads that are already in the thread group.</p> <div class="mariadb_from_10_5 mariadb from_10_5 product">
+<strong class="product_title">MariaDB starting with <a href="../what-is-mariadb-105/index.html">10.5</a></strong><p>In <a href="../what-is-mariadb-105/index.html">MariaDB 10.5</a> and later, thread creation is not throttled until a thread group has more than 1 + <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_oversubscribe">thread_pool_oversubscribe</a></code> threads:</p> <div class="cstm-style darkheader-nospace-borders centered">
+<table>
+<tr>
+<th>Number of Threads in Thread Group</th>
+<th>Throttling Interval (milliseconds)</th>
+</tr> <tr>
+<td>0-(1 + <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_oversubscribe">thread_pool_oversubscribe</a></code>)</td>
+<td>0</td>
+</tr> <tr>
+<td>4-7</td>
+<td>50 * <code>THROTTLING_FACTOR</code>
+</td>
+</tr> <tr>
+<td>8-15</td>
+<td>100 * <code>THROTTLING_FACTOR</code>
+</td>
+</tr> <tr>
+<td>16-65536</td>
+<td>20 * <code>THROTTLING_FACTOR</code>
+</td>
+</tr> </table> </div>
+<p><code>THROTTLING_FACTOR = (<a href="../thread-pool-system-status-variables/index.html#thread_pool_stall_limit">thread_pool_stall_limit</a> / MAX (500,<a href="../thread-pool-system-status-variables/index.html#thread_pool_stall_limit">thread_pool_stall_limit</a>))</code></p> </div>
+<div class="mariadb_to_10_4 mariadb to_10_4 product">
+<strong class="product_title">MariaDB until <a href="../what-is-mariadb-104/index.html">10.4</a></strong><p>In <a href="../what-is-mariadb-104/index.html">MariaDB 10.4</a> and before, thread creation is throttled when a thread group has more than 3 threads:</p> <div class="cstm-style darkheader-nospace-borders centered">
+<table>
+<tr>
+<th>Number of Threads in Thread Group</th>
+<th>Throttling Interval (milliseconds)</th>
+</tr> <tr>
+<td>0-3</td>
+<td>0</td>
+</tr> <tr>
+<td>4-7</td>
+<td>50</td>
+</tr> <tr>
+<td>8-15</td>
+<td>100</td>
+</tr> <tr>
+<td>16-65536</td>
+<td>200</td>
+</tr> </table> </div>
+</div>
+<h2 class="anchored_heading" id="thread-group-stalls">Thread Group Stalls</h2> <p>The thread pool has a feature that allows it to detect if a client connection is executing a long-running query that may be monopolizing its thread group. If a client connection were to monopolize its thread group, then that could prevent other client connections in the thread group from running their queries. In other words, the thread group would appear to be <em>stalled</em>.</p> <p>This stall detection feature is implemented by creating a <strong>timer thread</strong> that periodically checks if any of the thread groups are stalled. There is only a single <strong>timer thread</strong> for the entire thread pool. The <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_stall_limit">thread_pool_stall_limit</a></code> system variable defines the number of milliseconds between each stall check performed by the timer thread. The default value is <code>500</code>. It can be changed dynamically with <code><a href="../set/index.html#global-session">SET GLOBAL</a></code>. For example:</p> <pre class="fixed" data-language="sql">SET GLOBAL thread_pool_stall_limit=300;
+</pre>
+<p>It can also be set in a server <a href="../configuring-mariadb-with-option-files/index.html#option-groups">option group</a> in an <a href="../configuring-mariadb-with-option-files/index.html">option file</a> prior to starting up the server. For example:</p> <pre class="fixed" data-language="sql">[mariadb]
+..
+thread_handling=pool-of-threads
+thread_pool_size=32
+thread_pool_stall_limit=300
+</pre>
+<p>The <strong>timer thread</strong> considers a thread group to be stalled if the following is true:</p> <ul start="1">
+<li>There are more client connection requests in the thread group's work queue that the <strong>listener thread</strong> still needs to distribute to <strong>worker threads</strong>. </li>
+<li>No client connection requests have been allowed to be dequeued to run since the last stall check by the <strong>timer thread</strong>. </li>
+</ul> <p>This indicates that the one or more client connections currently using the active <strong>worker threads</strong> may be monopolizing the thread group, and preventing the queued client connections from performing work. When the <strong>timer thread</strong> detects that a thread group is stalled, it wakes up a sleeping <strong>worker thread</strong> in the thread group, if one is available. If there isn't one, then it creates a new <strong>worker thread</strong> in the thread group. This temporarily allows several client connections in the thread group to run in parallel.</p> <div class="cstm-style greenbox">
+<p>The <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_stall_limit">thread_pool_stall_limit</a></code> system variable essentially defines the limit for what a "fast query" is. If a query takes longer than <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_stall_limit">thread_pool_stall_limit</a></code>, then the thread pool is likely to think that it is too slow, and it will either wake up a sleeping worker thread or create a new worker thread to let another client connection in the thread group run a query in parallel.</p> </div>
+<p>In general, changing the value of the <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_stall_limit">thread_pool_stall_limit</a></code> system variable has the following effect:</p> <ul start="1">
+<li>Setting it to <strong>higher</strong> values can help avoid starting too many parallel threads if you expect a lot of client connections to execute long-running queries. </li>
+<li>Setting it to <strong>lower</strong> values can help prevent deadlocks. </li>
+</ul> <h3 class="anchored_heading" id="thread-group-oversubscription">Thread Group Oversubscription</h3> <p>If the <strong>timer thread</strong> were to detect a stall in a thread group, then it would either wake up a sleeping <strong>worker thread</strong> or create a new <strong>worker thread</strong> in that thread group. At that point, the thread group would have multiple active <strong>worker threads</strong>. In other words, the thread group would be <em>oversubscribed</em>.</p> <p>You might expect that the thread pool would shutdown one of the <strong>worker threads</strong> when the stalled client connection finished what it was doing, so that the thread group would only have one active <strong>worker thread</strong> again. However, this does not always happen. Once a thread group is oversubscribed, the <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_oversubscribe">thread_pool_oversubscribe</a></code> system variable defines the upper limit for when <strong>worker threads</strong> start shutting down after they finish work for client connections. The default value is <code>3</code>. It can be changed dynamically with <code><a href="../set/index.html#global-session">SET GLOBAL</a></code>. For example:</p> <pre class="fixed" data-language="sql">SET GLOBAL thread_pool_oversubscribe=10;
+</pre>
+<p>It can also be set in a server <a href="../configuring-mariadb-with-option-files/index.html#option-groups">option group</a> in an <a href="../configuring-mariadb-with-option-files/index.html">option file</a> prior to starting up the server. For example:</p> <pre class="fixed" data-language="sql">[mariadb]
+..
+thread_handling=pool-of-threads
+thread_pool_size=32
+thread_pool_stall_limit=300
+thread_pool_oversubscribe=10
+</pre>
+<div class="cstm-style greenbox">
+<p>To clarify, the <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_oversubscribe">thread_pool_oversubscribe</a></code> system variable does not play any part in the creation of new <strong>worker threads</strong>. The <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_oversubscribe">thread_pool_oversubscribe</a></code> system variable is only used to determine how many <strong>worker threads</strong> should remain active in a thread group, once a thread group is already oversubscribed due to stalls.</p> </div>
+<p>In general, the default value of <code>3</code> should be adequate for most users. Most users should not need to change the value of the <code><a href="../thread-pool-system-status-variables/index.html#thread_pool_oversubscribe">thread_pool_oversubscribe</a></code> system variable.</p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/thread-groups-in-the-unix-implementation-of-the-thread-pool/" class="_attribution-link">https://mariadb.com/kb/en/thread-groups-in-the-unix-implementation-of-the-thread-pool/</a>
+  </p>
+</div>

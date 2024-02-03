@@ -1,0 +1,224 @@
+<h1>Groupwise Max in MariaDB</h1> <div> <div class="node creole"> <div class="answer formatted">  <h2 class="anchored_heading" id="the-problem">The problem</h2> <p>You want to find the largest row in each group of rows. An example is looking for the largest city in each state. While it is easy to find the MAX(population) ... GROUP BY state, it is hard to find the name of the `city` associated with that `population`. Alas, MySQL and MariaDB do not have any syntax to provide the solution directly.</p> <p>This article is under construction, mostly for cleanup. The content is reasonably accurate during construction.</p> <p>The article presents two "good" solutions. They differ in ways that make neither of them 'perfect'; you should try both and weigh the pros and cons.</p> <p>Also, a few "bad" solutions will be presented, together with why they were rejected.</p> <p>MySQL manual gives 3 solutions; only the "Uncorrelated" one is "good", the other two are "bad".</p> <h2 class="anchored_heading" id="sample-data">Sample data</h2> <p>To show how the various coding attempts work, I have devised this simple task: Find the largest city in each Canadian province. Here's a sample of the source data (5493 rows):</p> <pre class="fixed" data-language="sql">+------------------+----------------+------------+
+| province         | city           | population |
++------------------+----------------+------------+
+| Saskatchewan     | Rosetown       |       2309 |
+| British Columbia | Chilliwack     |      51942 |
+| Nova Scotia      | Yarmouth       |       7500 |
+| Alberta          | Grande Prairie |      41463 |
+| Quebec           | Sorel          |      33591 |
+| Ontario          | Moose Factory  |       2060 |
+| Ontario          | Bracebridge    |       8238 |
+| British Columbia | Nanaimo        |      84906 |
+| Manitoba         | Neepawa        |       3151 |
+| Alberta          | Grimshaw       |       2560 |
+| Saskatchewan     | Carnduff       |        950 |
+...
+</pre>
+<p>Here's the desired output (13 rows):</p> <pre class="fixed" data-language="sql">+---------------------------+---------------+------------+
+| province                  | city          | population |
++---------------------------+---------------+------------+
+| Alberta                   | Calgary       |     968475 |
+| British Columbia          | Vancouver     |    1837970 |
+| Manitoba                  | Winnipeg      |     632069 |
+| New Brunswick             | Saint John    |      87857 |
+| Newfoundland and Labrador | Corner Brook  |      18693 |
+| Northwest Territories     | Yellowknife   |      15866 |
+| Nova Scotia               | Halifax       |     266012 |
+| Nunavut                   | Iqaluit       |       6124 |
+| Ontario                   | Toronto       |    4612187 |
+| Prince Edward Island      | Charlottetown |      42403 |
+| Quebec                    | Montreal      |    3268513 |
+| Saskatchewan              | Saskatoon     |     198957 |
+| Yukon                     | Whitehorse    |      19616 |
++---------------------------+---------------+------------+
+</pre>
+<h2 class="anchored_heading" id="duplicate-max">Duplicate max</h2> <p>One thing to consider is whether you want -- or do not want -- to see multiple rows for tied winners. For the dataset being used here, that would imply that the two largest cities in a province had identical populations. For this case, a duplicate would be unlikely. But there are many groupwise-max use cases where duplictes are likely.</p> <p>The two best algorithms differ in whether they show duplicates.</p> <h2 class="anchored_heading" id="using-an-uncorrelated-subquery">Using an uncorrelated subquery</h2> <p>Characteristics:</p> <ul>
+<li>Superior performance or medium performance </li>
+<li>It will show duplicates </li>
+<li>Needs an extra index </li>
+<li>Probably requires 5.6 </li>
+<li>If all goes well, it will run in O(M) where M is the number of output rows. </li>
+</ul> <p>An 'uncorrelated subquery':</p> <pre class="fixed" data-language="sql">SELECT  c1.province, c1.city, c1.population
+    FROM  Canada AS c1
+    JOIN
+      ( SELECT  province, MAX(population) AS population
+            FROM  Canada
+            GROUP BY  province
+      ) AS c2 USING (province, population)
+    ORDER BY c1.province;
+</pre>
+<p>But this also 'requires' an extra index: INDEX(province, population). In addition, MySQL has not always been able to use that index effectively, hence the "requires 5.6". (I am not sure of the actual version.)</p> <p>Without that extra index, you would need 5.6, which has the ability to create indexes for subqueries. This is indicated by &lt;auto_key0&gt; in the EXPLAIN. Even so, the performance is worse with the auto-generated index than with the manually generated one.</p> <p>With neither the extra index, nor 5.6, this 'solution' would belong in 'The Duds' because it would run in O(N*N) time.</p> <h2 class="anchored_heading" id="using-variables">Using @variables</h2> <p>Characteristics:</p> <ul>
+<li>Good performance </li>
+<li>Does not show duplicates (picks one to show) </li>
+<li>Consistent O(N) run time (N = number of input rows) </li>
+<li>Only one scan of the data </li>
+</ul> <pre class="fixed" data-language="sql">SELECT
+        province, city, population   -- The desired columns
+    FROM
+      ( SELECT  @prev := '' ) init
+    JOIN
+      ( SELECT  province != @prev AS first,  -- `province` is the 'GROUP BY'
+                @prev := province,           -- The 'GROUP BY'
+                province, city, population   -- Also the desired columns
+            FROM  Canada           -- The table
+            ORDER BY
+                province,          -- The 'GROUP BY'
+                population DESC    -- ASC for MIN(population), DESC for MAX
+      ) x
+    WHERE  first
+    ORDER BY  province;     -- Whatever you like
+</pre>
+<p>For your application, change the lines with comments.</p> <h2 class="anchored_heading" id="the-duds">The duds</h2> <p><strong>* 'correlated subquery' (from MySQL doc):</strong></p> <pre class="fixed" data-language="sql">SELECT  province, city, population
+    FROM  Canada AS c1
+    WHERE  population =
+      ( SELECT  MAX(c2.population)
+            FROM  Canada AS c2
+            WHERE  c2.province= c1.province
+      )
+    ORDER BY  province;
+</pre>
+<p>O(N*N) (that is, terrible) performance</p> <p><strong>* LEFT JOIN (from MySQL doc):</strong></p> <pre class="fixed" data-language="sql">SELECT  c1.province, c1.city, c1.population
+    FROM  Canada AS c1
+    LEFT JOIN  Canada AS c2 ON c2.province = c1.province
+      AND  c2.population &gt; c1.population
+    WHERE  c2.province IS NULL
+    ORDER BY province;
+</pre>
+<p>Medium performance (2N-3N, depending on join_buffer_size).</p> <p>For O(N*N) time,... It will take one second to do a groupwise-max on a few thousand rows; a million rows could take hours.</p> <h2 class="anchored_heading" id="top-n-in-each-group">Top-N in each group</h2> <p>This is a variant on "groupwise-max" wherein you desire the largest (or smallest) N items in each group. Do these substitutions for your use case:</p> <ul>
+<li>province --&gt; your 'GROUP BY' </li>
+<li>Canada --&gt; your table </li>
+<li>3 --&gt; how many of each group to show </li>
+<li>population --&gt; your numeric field for determining "Top-N" </li>
+<li>city --&gt; more field(s) you want to show </li>
+<li>Change the SELECT and ORDER BY if you desire </li>
+<li>DESC to get the 'largest'; ASC for the 'smallest' </li>
+</ul> <pre class="fixed" data-language="sql">SELECT
+        province, n, city, population
+    FROM
+      ( SELECT  @prev := '', @n := 0 ) init
+    JOIN
+      ( SELECT  @n := if(province != @prev, 1, @n + 1) AS n,
+                @prev := province,
+                province, city, population
+            FROM  Canada
+            ORDER BY
+                province   ASC,
+                population DESC
+      ) x
+    WHERE  n &lt;= 3
+    ORDER BY  province, n;
+</pre>
+<p>Output:</p> <pre class="fixed" data-language="sql">+---------------------------+------+------------------+------------+
+| province                  | n    | city             | population |
++---------------------------+------+------------------+------------+
+| Alberta                   |    1 | Calgary          |     968475 |
+| Alberta                   |    2 | Edmonton         |     822319 |
+| Alberta                   |    3 | Red Deer         |      73595 |
+| British Columbia          |    1 | Vancouver        |    1837970 |
+| British Columbia          |    2 | Victoria         |     289625 |
+| British Columbia          |    3 | Abbotsford       |     151685 |
+| Manitoba                  |    1 | ...
+</pre>
+<p>The performance of this is O(N), actually about 3N, where N is the number of source rows.</p> <p>EXPLAIN EXTENDED gives</p> <pre class="fixed wrap" data-language="sql">+----+-------------+------------+--------+---------------+------+---------+------+------+----------+----------------+
+| id | select_type | table      | type   | possible_keys | key  | key_len | ref  | rows | filtered | Extra          |
++----+-------------+------------+--------+---------------+------+---------+------+------+----------+----------------+
+|  1 | PRIMARY     | &lt;derived2&gt; | system | NULL          | NULL | NULL    | NULL |    1 |   100.00 | Using filesort |
+|  1 | PRIMARY     | &lt;derived3&gt; | ALL    | NULL          | NULL | NULL    | NULL | 5484 |   100.00 | Using where    |
+|  3 | DERIVED     | Canada     | ALL    | NULL          | NULL | NULL    | NULL | 5484 |   100.00 | Using filesort |
+|  2 | DERIVED     | NULL       | NULL   | NULL          | NULL | NULL    | NULL | NULL |     NULL | No tables used |
++----+-------------+------------+--------+---------------+------+---------+------+------+----------+----------------+
+</pre>
+<p>Explanation, shown in the same order as the EXPLAIN, but numbered chronologically: 3. Get the subquery id=2 (init) 4. Scan the the output from subquery id=3 (x) 2. Subquery id=3 -- the table scan of Canada 1. Subquery id=2 -- `init` for simply initializing the two @variables Yes, it took two sorts, though probably in RAM.</p> <p>Main Handler values:</p> <pre class="fixed" data-language="sql">| Handler_read_rnd           | 39    |
+| Handler_read_rnd_next      | 10971 |
+| Handler_write              | 5485  |  -- #rows in Canada (+1)
+</pre>
+<h2 class="anchored_heading" id="top-n-in-each-group-take-ii">Top-n in each group, take II</h2> <p>This variant is faster than the previous, but depends on `city` being unique across the dataset. (from openark.org)</p> <pre class="fixed" data-language="sql">    SELECT  province, city, population
+        FROM  Canada
+        JOIN
+          ( SELECT  GROUP_CONCAT(top_in_province) AS top_cities
+                FROM
+                  ( SELECT  SUBSTRING_INDEX(
+                                   GROUP_CONCAT(city ORDER BY  population DESC),
+                            ',', 3) AS top_in_province
+                        FROM  Canada
+                        GROUP BY  province
+                  ) AS x
+          ) AS y
+        WHERE  FIND_IN_SET(city, top_cities)
+        ORDER BY  province, population DESC;
+</pre>
+<p>Output. Note how there can be more than 3 cities per province:</p> <pre class="fixed" data-language="sql">| Alberta                   | Calgary          |     968475 |
+| Alberta                   | Edmonton         |     822319 |
+| Alberta                   | Red Deer         |      73595 |
+| British Columbia          | Vancouver        |    1837970 |
+| British Columbia          | Victoria         |     289625 |
+| British Columbia          | Abbotsford       |     151685 |
+| British Columbia          | Sydney           |          0 | -- Nova Scotia's second largest is Sydney
+| Manitoba                  | Winnipeg         |     632069 |
+</pre>
+<p>Main Handler values:</p> <pre class="fixed" data-language="sql">| Handler_read_next          | 5484  | -- table size
+| Handler_read_rnd_next      | 5500  | -- table size + number of provinces
+| Handler_write              | 14    | -- number of provinces (+1)
+</pre>
+<h2 class="anchored_heading" id="top-n-using-myisam">Top-n using MyISAM</h2> <p>(This does not need your table to be MyISAM, but it does need MyISAM tmp table for its 2-column PRIMARY KEY feature.) See previous section for what changes to make for your use case.</p> <pre class="fixed" data-language="sql">    -- build tmp table to get numbering
+    -- (Assumes auto_increment_increment = 1)
+    CREATE TEMPORARY TABLE t (
+        nth MEDIUMINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        PRIMARY KEY(province, nth)
+    ) ENGINE=MyISAM
+        SELECT province, NULL AS nth, city, population
+            FROM Canada
+            ORDER BY population DESC;
+    -- Output the biggest 3 cities in each province:
+    SELECT province, nth, city, population
+        FROM t
+        WHERE nth &lt;= 3
+        ORDER BY province, nth;
+
++---------------------------+-----+------------------+------------+
+| province                  | nth | city             | population |
++---------------------------+-----+------------------+------------+
+| Alberta                   |   1 | Calgary          |     968475 |
+| Alberta                   |   2 | Edmonton         |     822319 |
+| Alberta                   |   3 | Red Deer         |      73595 |
+| British Columbia          |   1 | Vancouver        |    1837970 |
+| British Columbia          |   2 | Victoria         |     289625 |
+| British Columbia          |   3 | Abbotsford       |     151685 |
+| Manitoba                  |  ...
+
+SELECT for CREATE:
++----+-------------+--------+------+---------------+------+---------+------+------+----------------+
+| id | select_type | table  | type | possible_keys | key  | key_len | ref  | rows | Extra          |
++----+-------------+--------+------+---------------+------+---------+------+------+----------------+
+|  1 | SIMPLE      | Canada | ALL  | NULL          | NULL | NULL    | NULL | 5484 | Using filesort |
++----+-------------+--------+------+---------------+------+---------+------+------+----------------+
+Other SELECT:
++----+-------------+-------+-------+---------------+---------+---------+------+------+-------------+
+| id | select_type | table | type  | possible_keys | key     | key_len | ref  | rows | Extra       |
++----+-------------+-------+-------+---------------+---------+---------+------+------+-------------+
+|  1 | SIMPLE      | t     | index | NULL          | PRIMARY | 104     | NULL |   22 | Using where |
++----+-------------+-------+-------+---------------+---------+---------+------+------+-------------+
+</pre>
+<p>The main handler values (total of all operations):</p> <pre class="fixed" data-language="sql">| Handler_read_rnd_next      | 10970 |
+| Handler_write              | 5484  |  -- number of rows in Canada (write tmp table)
+</pre>
+<p>Both "Top-n" formulations probably take about the same amount of time.</p> <h2 class="anchored_heading" id="windowing-functions">Windowing functions</h2> <p>Hot off the press from Percona Live... <a href="../what-is-mariadb-102/index.html">MariaDB 10.2</a> has "windowing functions", which make "groupwise max" much more straightforward.</p> <p>The code:</p> <p>TBD</p> <h2 class="anchored_heading" id="postlog">Postlog</h2> <p>Developed an first posted, Feb, 2015; Add MyISAM approach: July, 2015; Openark's method added: Apr, 2016; Windowing: Apr 2016</p> <p>I did not include the technique(s) using GROUP_CONCAT. They are useful in some situations with small datasets. They can be found in the references below.</p> <h2 class="anchored_heading" id="see-also">See also</h2> <ul start="1">
+<li>This has some of these algorithms, plus some others: <a href="http://www.artfulsoftware.com/infotree/queries.php?&amp;bw=1179#101">Peter Brawley's blog</a> </li>
+<li>
+<a href="http://jan.kneschke.de/projects/mysql/groupwise-max">Jan Kneschke's blog from 2007</a> </li>
+<li>
+<a href="http://stackoverflow.com/questions/14770671/mysql-order-by-before-group-by">StackOverflow discussion of 'Uncorrelated'</a> </li>
+<li>Other references: <a href="../mariadb/group-by-trick-has-been-optimized-away/index.html">Inner ORDER BY thrown away</a> </li>
+<li>Adding a large LIMIT to a subquery may make things work. <a href="../mariadb/why-is-order-by-in-a-from-subquery-ignored/index.html">Why ORDER BY in subquery is ignored</a> </li>
+<li>
+<a href="http://stackoverflow.com/questions/36485072/select-with-order-and-group-by-in-maria-dbmysql">StackOverflow thread</a> </li>
+<li>
+<a href="http://kennethxu.blogspot.com/2016/04/analytical-function-in-mysql-rownumber.html">row_number(), rank(), dense_rank()</a> </li>
+<li>
+<a href="#">http://rpbouman.blogspot.de/2008/07/calculating-nth-percentile-in-mysql.html][Perentile blog</a> </li>
+</ul> <p>Rick James graciously allowed us to use this article in the Knowledge Base.</p> <p><a href="http://mysql.rjweb.org/">Rick James' site</a> has other useful tips, how-tos, optimizations, and debugging tips.</p> <p> Original source: <a href="http://mysql.rjweb.org/doc.php/groupwise_max">http://mysql.rjweb.org/doc.php/groupwise_max</a></p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/groupwise-max-in-mariadb/" class="_attribution-link">https://mariadb.com/kb/en/groupwise-max-in-mariadb/</a>
+  </p>
+</div>

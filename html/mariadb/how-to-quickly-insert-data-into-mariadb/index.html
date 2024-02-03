@@ -1,0 +1,77 @@
+<h1>How to Quickly Insert Data Into MariaDB</h1> <div> <div class="node creole"> <div class="answer formatted">  <p>This article describes different techniques for inserting data quickly into MariaDB.</p> <h2 class="anchored_heading" id="background">Background</h2> <p>When inserting new data into MariaDB, the things that take time are: (in order of importance):</p> <ul start="1">
+<li>Syncing data to disk (as part of the end of transactions) </li>
+<li>Adding new keys. The larger the index, the more time it takes to keep keys updated. </li>
+<li>Checking against foreign keys (if they exist). </li>
+<li>Adding rows to the storage engine. </li>
+<li>Sending data to the server. </li>
+</ul> <p>The following describes the different techniques (again, in order of importance) you can use to quickly insert data into a table.</p> <h2 class="anchored_heading" id="disabling-keys">Disabling Keys</h2> <p>You can temporarily disable updating of non unique indexes. This is mostly useful when there are zero (or very few) rows in the table into which you are inserting data.</p> <pre class="fixed" data-language="sql">ALTER TABLE table_name DISABLE KEYS;
+BEGIN;
+... inserting data with INSERT or LOAD DATA ....
+COMMIT;
+ALTER TABLE table_name ENABLE KEYS;
+</pre>
+<p>In many storage engines (at least MyISAM and Aria), <code>ENABLE KEYS</code> works by scanning through the row data and collecting keys, sorting them, and then creating the index blocks. This is an order of magnitude faster than creating the index one row at a time and it also uses less key buffer memory.</p> <div class="cstm-style bluebox">
+<p><strong>Note:</strong> When you insert into an <strong>empty table</strong> with <a href="../insert/index.html">INSERT</a> or <a href="../load-data-infile/index.html">LOAD DATA</a>, MariaDB <strong>automatically</strong> does an <a href="../alter-table/index.html">DISABLE KEYS</a> before and an <a href="../alter-table/index.html">ENABLE KEYS</a> afterwards.</p> </div>
+<p>When inserting big amounts of data, integrity checks are sensibly time-consuming. It is possible to disable the <code>UNIQUE</code> indexes and the <a href="../foreign-keys/index.html">foreign keys</a> checks using the <a href="../server-system-variables/index.html#unique_checks">unique_checks</a> and the <a href="../server-system-variables/index.html#foreign_key_checks">foreign_key_checks</a> system variables:</p> <pre class="fixed" data-language="sql">SET @@session.unique_checks = 0;
+SET @@session.foreign_key_checks = 0;
+</pre>
+<p>For InnoDB tables, the <a href="../auto_increment-handling-in-innodb/index.html">AUTO_INCREMENT lock mode</a> can be temporarily set to 2, which is the fastest setting:</p> <pre class="fixed" data-language="sql">SET @@global.innodb_autoinc_lock_mode = 2;
+</pre>
+<p>Also, if the table has <a href="../triggers/index.html">INSERT triggers</a> or <a href="../virtual-columns/index.html">PERSISTENT</a> columns, you may want to drop them, insert all data, and recreate them.</p> <h2 class="anchored_heading" id="loading-text-files">Loading Text Files</h2> <p>The <strong>fastest way</strong> to insert data into MariaDB is through the <a href="../load-data-infile/index.html">LOAD DATA INFILE</a> command.</p> <p>The simplest form of the command is:</p> <pre class="fixed" data-language="sql">LOAD DATA INFILE 'file_name' INTO TABLE table_name;
+</pre>
+<p>You can also read a file locally on the machine where the client is running by using:</p> <pre class="fixed" data-language="sql">LOAD DATA LOCAL INFILE 'file_name' INTO TABLE table_name;
+</pre>
+<p>This is not as fast as reading the file on the server side, but the difference is not that big.</p> <p><code>LOAD DATA INFILE</code> is very fast because:</p> <ol start="1">
+<li>there is no parsing of SQL. </li>
+<li>data is read in big blocks. </li>
+<li>if the table is empty at the beginning of the operation, all non unique indexes are disabled during the operation. </li>
+<li>the engine is told to cache rows first and then insert them in big blocks (At least MyISAM and Aria support this). </li>
+<li>for empty tables, some transactional engines (like Aria) do not log the inserted data in the transaction log because one can rollback the operation by just doing a <a href="../truncate-table/index.html">TRUNCATE</a> on the table. </li>
+</ol> <p>Because of the above speed advantages there are many cases, when you need to insert <strong>many</strong> rows at a time, where it may be faster to create a file locally, add the rows there, and then use <code>LOAD DATA INFILE</code> to load them; compared to using <code>INSERT</code> to insert the rows.</p> <p>You will also get <a href="../progress-reporting/index.html">progress reporting</a> for <code>LOAD DATA INFILE</code>.</p> <h3 class="anchored_heading" id="mariadb-import">mariadb-import</h3> <p>You can import many files in parallel with <a href="../mariadb-import/index.html">mariadb-import</a> (<code>mysqlimport</code> before <a href="../what-is-mariadb-105/index.html">MariaDB 10.5</a>). For example:</p> <pre class="fixed" data-language="sql">mariadb-import --use-threads=10 database text-file-name [text-file-name...]
+</pre>
+<p>Internally <a href="../mariadb-import/index.html">mariadb-import</a> uses <a href="../load-data-infile/index.html">LOAD DATA INFILE</a> to read in the data.</p> <h2 class="anchored_heading" id="inserting-data-with-insert-statements">Inserting Data with INSERT Statements</h2> <h3 class="anchored_heading" id="using-big-transactions">Using Big Transactions</h3> <p>When doing many inserts in a row, you should wrap them with <code>BEGIN / END</code> to avoid doing a full transaction (which includes a disk sync) for every row. For example, doing a begin/end every 1000 inserts will speed up your inserts by almost 1000 times.</p> <pre class="fixed" data-language="sql">BEGIN;
+INSERT ...
+INSERT ...
+END;
+BEGIN;
+INSERT ...
+INSERT ...
+END;
+...
+</pre>
+<p>The reason why you may want to have many <code>BEGIN/END</code> statements instead of just one is that the former will use up less transaction log space.</p> <h3 class="anchored_heading" id="multi-value-inserts">Multi-Value Inserts</h3> <p>You can insert many rows at once with multi-value row inserts:</p> <pre class="fixed" data-language="sql">INSERT INTO table_name values(1,"row 1"),(2, "row 2"),...;
+</pre>
+<p>The limit for how much data you can have in one statement is controlled by the <a href="../server-system-variables/index.html#max_allowed_packet">max_allowed_packet</a> server variable.</p> <h2 class="anchored_heading" id="inserting-data-into-several-tables-at-once">Inserting Data Into Several Tables at Once</h2> <p>If you need to insert data into several tables at once, the best way to do so is to enable multi-row statements and send many inserts to the server at once:</p> <pre class="fixed" data-language="sql">INSERT INTO table_name_1 (auto_increment_key, data) VALUES (NULL,"row 1");
+INSERT INTO table_name_2 (auto_increment, reference, data) values (NULL, LAST_INSERT_ID(), "row 2");
+</pre>
+<p><a href="../last_insert_id/index.html">LAST_INSERT_ID()</a> is a function that returns the last <code>auto_increment</code> value inserted.</p> <p>By default, the command line <code>mariadb</code> client will send the above as multiple statements.</p> <p>To test this in the <code>mariadb</code> client you have to do:</p> <pre class="fixed" data-language="sql">delimiter ;;
+select 1; select 2;;
+delimiter ;
+</pre>
+<div class="cstm-style bluebox">
+<p><strong>Note:</strong> for multi-query statements to work, your client must specify the <code>CLIENT_MULTI_STATEMENTS</code> flag to <code>mysql_real_connect()</code>.</p> </div>
+<h2 class="anchored_heading" id="server-variables-that-can-be-used-to-tune-insert-speed">Server Variables That Can be Used to Tune Insert Speed</h2> <div class="cstm-style darkheader-nospace-borders">
+<table>
+<tr>
+<th>Option</th>
+<th>Description</th>
+</tr> <tr>
+<td><a href="../innodb-system-variables/index.html#innodb_buffer_pool_size">innodb_buffer_pool_size</a></td>
+<td>Increase this if you have many indexes in InnoDB/XtraDB tables</td>
+</tr> <tr>
+<td><a href="../myisam-system-variables/index.html#key_buffer_size">key_buffer_size</a></td>
+<td>Increase this if you have many indexes in MyISAM tables</td>
+</tr> <tr>
+<td><a href="../server-system-variables/index.html#max_allowed_packet">max_allowed_packet</a></td>
+<td>Increase this to allow bigger multi-insert statements</td>
+</tr> <tr>
+<td><a href="../server-system-variables/index.html#read_buffer_size">read_buffer_size</a></td>
+<td>Read block size when reading a file with <code>LOAD DATA</code>
+</td>
+</tr> </table> </div>
+<p>See <a href="../server-system-variables/index.html">Server System Variables</a> for the full list of server variables.</p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/how-to-quickly-insert-data-into-mariadb/" class="_attribution-link">https://mariadb.com/kb/en/how-to-quickly-insert-data-into-mariadb/</a>
+  </p>
+</div>

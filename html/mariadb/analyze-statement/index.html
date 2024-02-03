@@ -1,0 +1,81 @@
+<h1>ANALYZE Statement</h1> <div> <div class="node creole"> <div class="answer formatted">  <h2 class="anchored_heading" id="description">Description</h2> <p>The <code>ANALYZE statement</code> is similar to the <code>EXPLAIN statement</code>. <code>ANALYZE statement</code> will invoke the optimizer, execute the statement, and then produce <code>EXPLAIN</code> output instead of the result set. The <code>EXPLAIN</code> output will be annotated with statistics from statement execution.</p> <p>This lets one check how close the optimizer's estimates about the query plan are to the reality. <code>ANALYZE</code> produces an overview, while the <a href="../analyze-formatjson/index.html">ANALYZE FORMAT=JSON</a> command provides a more detailed view of the query plan and the query execution.</p> <p>The syntax is </p> <pre class="fixed" data-language="sql">ANALYZE explainable_statement;
+</pre>
+<p>where the statement is any statement for which one can run <a href="../explain/index.html">EXPLAIN</a>.</p> <h2 class="anchored_heading" id="command-output">Command Output</h2> <p>Consider an example:</p> <pre class="fixed" data-language="sql">ANALYZE SELECT * FROM tbl1 
+WHERE key1 
+  BETWEEN 10 AND 200 AND 
+  col1 LIKE 'foo%'\G
+</pre>
+<pre class="fixed" data-language="sql">*************************** 1. row ***************************
+           id: 1
+  select_type: SIMPLE
+        table: tbl1
+         type: range
+possible_keys: key1
+          key: key1
+      key_len: 5
+          ref: NULL
+         rows: 181
+       r_rows: 181
+     filtered: 100.00
+   r_filtered: 10.50
+        Extra: Using index condition; Using where
+</pre>
+<p>Compared to <code>EXPLAIN</code>, <code>ANALYZE</code> produces two extra columns:</p> <ul start="1">
+<li>
+<strong><code>r_rows</code></strong> is an observation-based counterpart of the <strong>rows</strong> column. It shows how many rows were actually read from the table. </li>
+<li>
+<strong><code>r_filtered</code></strong> is an observation-based counterpart of the <strong>filtered</strong> column. It shows which fraction of rows was left after applying the WHERE condition. </li>
+</ul> <h2 class="anchored_heading" id="interpreting-the-output">Interpreting the Output</h2> <h3 class="anchored_heading" id="joins">Joins</h3> <p>Let's consider a more complicated example.</p> <pre class="fixed" data-language="sql">ANALYZE SELECT *
+FROM orders, customer 
+WHERE
+  customer.c_custkey=orders.o_custkey AND
+  customer.c_acctbal &lt; 0 AND
+  orders.o_totalprice &gt; 200*1000
+</pre>
+<pre class="fixed wrap" data-language="sql">+----+-------------+----------+------+---------------+-------------+---------+--------------------+--------+--------+----------+------------+-------------+
+| id | select_type | table    | type | possible_keys | key         | key_len | ref                | rows   | r_rows | filtered | r_filtered | Extra       |
++----+-------------+----------+------+---------------+-------------+---------+--------------------+--------+--------+----------+------------+-------------+
+|  1 | SIMPLE      | customer | ALL  | PRIMARY,...   | NULL        | NULL    | NULL               | 149095 | 150000 |    18.08 |       9.13 | Using where |
+|  1 | SIMPLE      | orders   | ref  | i_o_custkey   | i_o_custkey | 5       | customer.c_custkey |      7 |     10 |   100.00 |      30.03 | Using where |
++----+-------------+----------+------+---------------+-------------+---------+--------------------+--------+--------+----------+------------+-------------+
+</pre>
+<p>Here, one can see that</p> <ul start="1">
+<li>For table customer, <strong>customer.rows=149095, customer.r_rows=150000</strong>. The estimate for number of rows we will read was fairly precise </li>
+<li>
+<strong>customer.filtered=18.08, customer.r_filtered=9.13</strong>. The optimizer somewhat overestimated the number of records that will match selectivity of condition attached to `customer` table (in general, when you have a full scan and r_filtered is less than 15%, it's time to consider adding an appropriate index). </li>
+<li>For table orders, <strong>orders.rows=7, orders.r_rows=10</strong>. This means that on average, there are 7 orders for a given c_custkey, but in our case there were 10, which is close to the expectation (when this number is consistently far from the expectation, it may be time to run ANALYZE TABLE, or even edit the table statistics manually to get better query plans). </li>
+<li>
+<strong>orders.filtered=100, orders.r_filtered=30.03</strong>. The optimizer didn't have any way to estimate which fraction of records will be left after it checks the condition that is attached to table orders (it's orders.o_totalprice &gt; 200*1000). So, it used 100%. In reality, it is 30%. 30% is typically not selective enough to warrant adding new indexes. For joins with many tables, it might be worth to collect and use <a href="../engine-independent-table-statistics/index.html">column statistics</a> for columns in question, this may help the optimizer to pick a better query plan. </li>
+</ul> <h3 class="anchored_heading" id="meaning-of-null-in-r_rows-and-r_filtered">Meaning of NULL in r_rows and r_filtered</h3> <p>Let's modify the previous example slightly</p> <pre class="fixed" data-language="sql">ANALYZE SELECT * 
+FROM orders, customer 
+WHERE
+  customer.c_custkey=orders.o_custkey AND
+  customer.c_acctbal &lt; -0 AND 
+  customer.c_comment LIKE '%foo%' AND
+  orders.o_totalprice &gt; 200*1000;
+</pre>
+<pre class="fixed wrap" data-language="sql">+----+-------------+----------+------+---------------+-------------+---------+--------------------+--------+--------+----------+------------+-------------+
+| id | select_type | table    | type | possible_keys | key         | key_len | ref                | rows   | r_rows | filtered | r_filtered | Extra       |
++----+-------------+----------+------+---------------+-------------+---------+--------------------+--------+--------+----------+------------+-------------+
+|  1 | SIMPLE      | customer | ALL  | PRIMARY,...   | NULL        | NULL    | NULL               | 149095 | 150000 |    18.08 |       0.00 | Using where |
+|  1 | SIMPLE      | orders   | ref  | i_o_custkey   | i_o_custkey | 5       | customer.c_custkey |      7 |   NULL |   100.00 |       NULL | Using where |
++----+-------------+----------+------+---------------+-------------+---------+--------------------+--------+--------+----------+------------+-------------+
+</pre>
+<p>Here, one can see that <strong>orders.r_rows=NULL</strong> and <strong>orders.r_filtered=NULL</strong>. This means that table orders was not scanned even once. Indeed, we can also see customer.r_filtered=0.00. This shows that a part of WHERE attached to table `customer` was never satisfied (or, satisfied in less than 0.01% of cases).</p> <h2 class="anchored_heading" id="analyze-formatjson">ANALYZE FORMAT=JSON</h2> <p><a href="../analyze-formatjson/index.html">ANALYZE FORMAT=JSON</a> produces JSON output. It produces much more information than tabular <code>ANALYZE</code>.</p> <h2 class="anchored_heading" id="notes">Notes</h2> <ul start="1">
+<li>
+<code>ANALYZE UPDATE</code> or <code>ANALYZE DELETE</code> will actually make updates/deletes (<code>ANALYZE SELECT</code> will perform the select operation and then discard the resultset). </li>
+<li>PostgreSQL has a similar command, <code>EXPLAIN ANALYZE</code>. </li>
+<li>The <a href="../explain-in-the-slow-query-log/index.html">EXPLAIN in the slow query log</a> feature allows MariaDB to have <code>ANALYZE</code> output of slow queries printed into the <a href="../slow-query-log/index.html">slow query log</a> (see <a href="https://jira.mariadb.org/browse/MDEV-6388">MDEV-6388</a>). </li>
+</ul> <h2 class="anchored_heading" id="see-also">See Also</h2> <ul start="1">
+<li>
+<a href="../analyze-formatjson/index.html">ANALYZE FORMAT=JSON</a> </li>
+<li>
+<a href="../analyze-table/index.html">ANALYZE TABLE</a> </li>
+<li>JIRA task for ANALYZE statement, <a href="https://jira.mariadb.org/browse/MDEV-406">MDEV-406</a>
+</li>
+</ul> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/analyze-statement/" class="_attribution-link">https://mariadb.com/kb/en/analyze-statement/</a>
+  </p>
+</div>

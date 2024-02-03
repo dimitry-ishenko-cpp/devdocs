@@ -1,0 +1,97 @@
+<h1>Tips on Converting to Galera</h1> <div> <div class="node creole"> <div class="answer formatted"> <p> These topics will be discussed in more detail below.</p> <p>Dear Schema Designer:</p> <ul><li>InnoDB only, always have PK. </li></ul> <p>Dear Developer:</p> <ul>
+<li>Check for errors, even after COMMIT. </li>
+<li>Moderate sized transactions. </li>
+<li>Don't make assumptions about AUTO_INCREMENT values. </li>
+<li>Handling of "critical reads" is quite different (arguably better). </li>
+<li>Read/Write split is not necessary, but is still advised in case the underlying structure changes in the future. </li>
+</ul> <p>Dear DBA:</p> <ul>
+<li>Building the machines is quite different. (Not covered here) </li>
+<li>ALTERs are handled differently. </li>
+<li>TRIGGERs and EVENTs may need checking. </li>
+<li>Tricks in replication (eg, BLACKHOLE) may not work. </li>
+<li>Several variables need to be set differently. </li>
+</ul> <h2 class="anchored_heading" id="galera-is-available-in-many-places">Galera is available in many places</h2> <p>Galera's High Availability replication is available via:</p> <ul start="1">
+<li>
+<a href="../what-is-mariadb-101/index.html">MariaDB 10.1</a> and later </li>
+<li>Percona XtraDB Cluster </li>
+<li>Codership's Galera Cluster for MySQL </li>
+</ul> <h2 class="anchored_heading" id="overview-of-cross-colo-writing">Overview of cross-colo writing</h2> <p>(This overview is valid even for same-datacenter nodes, but the issues of latency vanish.)</p> <p>Cross-colo latency is an 'different' than with traditional replication, but not necessarily better or worse with Galera. The latency happens at a very different time for Galera.</p> <p>In 'traditional' replication, these steps occur:</p> <ul>
+<li>Client talks to Master. If Client and Master are in different colos, this has a latency hit. </li>
+<li>Each SQL to Master is another latency hit, including(?) the COMMIT (unless using autocommit). </li>
+<li>Replication to Slave(s) is asynchronous, so this does not impact the client writing to the Master. </li>
+<li>Since replication is asynchronous, a Client (same or subsequent) cannot be guaranteed to see that data on the Slave. This is a "critical read". The async Replication delay forces apps to take some evasive action. </li>
+</ul> <p>In Galera-based replication:</p> <ul>
+<li>Client talks to any Master -- possibly with cross-colo latency. Or you could arrange to have Galera nodes co-located with clients to avoid this latency. </li>
+<li>At COMMIT time (or end of statement, in case of autocommit=1), galera makes one roundtrip to other nodes. </li>
+<li>The COMMIT usually succeeds, but could fail if some other node is messing with the same rows. (Galera retries on autocommit failures.) </li>
+<li>Failure of the COMMIT is reported to the Client, who should simply replay the SQL statements from the BEGIN. </li>
+<li>Later, the whole transaction will be applied (with possibility of conflict) on the other nodes. </li>
+<li>Critical Read -- details below </li>
+</ul> <p>For an N-statement transaction: In a typical 'traditional' replication setup:</p> <ul>
+<li>0 or N (N+2?) latency hits, depending on whether the Client is co-located with the Master. </li>
+<li>Replication latencies and delays lead to issues with "Critical Reads". </li>
+</ul> <p>In Galera:</p> <ul>
+<li>0 latency hits (assuming Client is 'near' some node) </li>
+<li>1 latency hit for the COMMIT. </li>
+<li>0 (usually) for Critical Read (details below) </li>
+</ul> <p>Bottom line: Depending on where your Clients are, and whether you clump statements into BEGIN...COMMIT transacitons, Galera may be faster or slower than traditional replication in a WAN topology.</p> <h2 class="anchored_heading" id="auto_increment">AUTO_INCREMENT</h2> <p>By using wsrep_auto_increment_control = ON, the values of auto_increment_increment and auto_increment_offset will be automatically adjusted as nodes come/go.</p> <p>If you are building a Galera cluster by starting with one node as a Slave to an existing non-Galera system, and if you have multi-row INSERTs that depend on AUTO_INCREMENTs, the read this Percona blog</p> <p>Bottom line: There may be gaps in AUTO_INCREMENT values. Consecutive rows, even on one connection, will not have consecutive ids.</p> <p>Beware of Proxies that try to implement a "read/write split". In some situations, a reference to LAST_INSERT_ID() will be sent to a "Slave".</p> <h2 class="anchored_heading" id="innodb-only">InnoDB only</h2> <p>For effective replication of data, you must use only InnoDB. This eliminates</p> <ul>
+<li>FULLTEXT index (until 5.6) </li>
+<li>SPATIAL index </li>
+<li>MyISAM's PK as second column </li>
+</ul> <p>You can use MyISAM and MEMORY for data that does not need to be replicated.</p> <p>Also, you should use "START TRANSACTION READONLY" wherever appropriate.</p> <h2 class="anchored_heading" id="check-after-commit">Check after COMMIT</h2> <p>Check for errors after issuing COMMIT. A "deadlock" can occur due to writes on other node(s).</p> <p>Possible exception (could be useful for legacy code without such checks): Treat the system as single-Master, plus Slaves. By writing only to one node, COMMIT should always succeed(?)</p> <p>What about autocommit = 1? wsrep_retry_autocommit tells Galera to retry if a single statement that is autocommited N times. So, there is still a chance (very slim) of getting a deadlock on such a statement. The default setting of "1" retry is probably good.</p> <h2 class="anchored_heading" id="always-have-primary-key">Always have PRIMARY KEY</h2> <p>"Row Based Replication" will be used; this requires a PK on every table.</p> <p>A non-replicated table (eg, MyISAM) does not have to have a PK.</p> <h2 class="anchored_heading" id="transaction-size">Transaction "size"</h2> <p>(This section assumes you have Galera nodes in multiple colos.) Because of some of the issues discussed, it is wise to group your write statements into moderate sized BEGIN...COMMIT transactions. There is one latency hit per COMMIT or autocommit. So, combining statements will decrease those hits. On the other hand, it is unwise (for other reasons) to make huge transactions, such as inserting/modifying millions of rows in a single transaction.</p> <p>To deal with failure on COMMIT, design your code so you can redo the SQL statements in the transaction without messing up other data. For example, move "normalization" statements out of the main transaction; there is arguably no compelling reason to roll them back if the main code rolls back.</p> <p>In any case, doing what is "right" for the business logic overrides other considerations.</p> <p>Galera's tx_isolation is between Serializable and Repeatable Read. tx_isolation variable is ignored.</p> <p>Set wsrep_log_conflicts to get errors put in the regular MySQL mysqld.err.</p> <p>XA transactions cannot be supported. (Galera is already doing a form of XA in order to do its thing.)</p> <h2 class="anchored_heading" id="critical-reads">Critical reads</h2> <p>Here is a 'simple' (but not 'free') way to assure that a read-after-write, even from a different connection, will see the updated data.</p> <p> SET SESSION wsrep_sync_wait = 1; SELECT ... SET SESSION wsrep_sync_wait = 0;</p> <p>For non-SELECTs, use a different bit set for the first select. (TBD: Would 0xffff always work?) (Before Galera 3.6, it was wsrep_causal_reads = ON.) Doc for wsrep_sync_wait</p> <p>This setting stalls the SELECT until all current updates have been applied to the node. That is sufficient to guarantee that a previous write will be visible. The time cost is usually zero. However, a large UPDATE could lead to a delay. Because of RBR and parallel application, delays are likely to be less than on traditional replication. Zaitsev's blog</p> <p>It may be more practical (for a web app) to simply set wsrep_sync_wait right after connecting.</p> <h2 class="anchored_heading" id="myisam-and-memory">MyISAM and MEMORY</h2> <p>As said above, use InnoDB only. However, here is more info on the MyISAM (and hence FULLTEXT, SPATIAL, etc) issues.</p> <p>MyISAM and MEMORY tables are not replicated.</p> <p>Having MyISAM not replicated can be a big benefit -- You can "CREATE TEMPORARY TABLE ... ENGINE=MyISAM" and have it exist on only one node. RBR assures that any data transferred from that temp table into a 'real' table can still be replicated.</p> <h2 class="anchored_heading" id="replicating-grants">Replicating GRANTs</h2> <p>GRANTs and related operations act on the MyISAM tables in the database `mysql`. The GRANT statements will(?) be replicated, but the underlying tables will not.</p> <h2 class="anchored_heading" id="alters">ALTERs</h2> <p>Many DDL changes on Galera can be achieved without downtime, even if they take a long time.</p> <p><a href="https://galeracluster.com/documentation-webpages/documentation/schema-upgrades.html">RSU vs TOI</a>:</p> <ul start="1">
+<li>Rolling Schema Upgrade (RSU): manually execute the DDL on each node in the cluster. The node will desync while executing the DDL. </li>
+<li>Total Order Isolation (TOI): Galera automatically replicates the DDL to each node in the cluster, and it synchronizes each node so that the statement is executed at same time (in the replication sequence) on all nodes. </li>
+</ul> <p>Caution: Since there is no way to synchronize the clients with the DDL, you must make sure that the clients are happy with either the old or the new schema. Otherwise, you will probably need to take down the entire cluster while simultaneously switching over both the schema and the client code.</p> <p>Fast DDL operations can usually be executed in TOI mode:</p> <ul start="1">
+<li>DDL operations that support the <code>NOCOPY</code> and <code>INSTANT</code> algorithms are usually very fast. </li>
+<li>DDL operations that support the <code>INPLACE</code> algorithm may be fast or slow, depending on whether the table needs to be rebuilt. </li>
+<li>DDL operations that only support the <code>COPY</code> algorithm are usually very slow. </li>
+</ul> <p>For a list of which operations support which algorithms, see <a href="../innodb-online-ddl/index.html">InnoDB Online DDL</a>.</p> <p>If you need to use RSU mode, then do the following separately for each node:</p> <pre class="fixed" data-language="sql">SET SESSION wsrep_OSU_method='RSU';
+ALTER TABLE tab &lt;alter options here&gt;;
+SET SESSION wsrep_OSU_method='TOI';
+</pre>
+<p><a href="http://www.severalnines.com/blog/online-schema-upgrade-mysql-galera-cluster-using-rsu-method">More discussion of RSU procedures</a></p> <h2 class="anchored_heading" id="single-master-configuration">Single "Master" Configuration</h2> <p>You can 'simulate' Master + Slaves by having clients write only to one node.</p> <ul>
+<li>No need to check for errors after COMMIT. </li>
+<li>Lose the latency benefits. </li>
+</ul> <h2 class="anchored_heading" id="dba-tricks">DBA tricks</h2> <ul>
+<li>Remove node from cluster; back it up; put it back in. Syncup is automatic. </li>
+<li>Remove node from cluster; use it for testing, etc; put it back in. Syncup is automatic. </li>
+<li>Rolling hardware/software upgrade: Remove; upgrade; put back in. Repeat. </li>
+</ul> <h2 class="anchored_heading" id="variables-that-may-need-to-be-different">Variables that may need to be different</h2> <ul>
+<li>
+<a href="../replication-and-binary-log-server-system-variables/index.html#auto_increment_increment">auto_increment_increment</a> - If you are writing to multiple nodes, and you use AUTO_INCREMENT, then auto_increment_increment will automatically be equal the current number of nodes. </li>
+<li>
+<a href="../mysqld-options/index.html#-binlog-do-db">binlog-do</a>/<a href="../mysqld-options/index.html#-binlog-ignore-db">ignore-db</a> - Do not use. </li>
+<li>
+<a href="../replication-and-binary-log-server-system-variables/index.html#binlog_format">binlog_format</a> - ROW is required for Galera. </li>
+<li>
+<a href="../replication-and-binary-log-server-system-variables/index.html#auto_autoinc_lock_mode">innodb_autoinc_lock_mode</a> - 2 </li>
+<li>
+<a href="../xtradbinnodb-server-system-variables/index.html#innodb_doublewrite">innodb_doublewrite</a> - ON: When an IST occurs, want there to be no torn pages? (With FusionIO or other drives that guarantee atomicity, OFF is better.) </li>
+<li>
+<a href="../xtradbinnodb-server-system-variables/index.html#innodb_doublewrite">innodb_flush_log_at_trx_commit</a> - 2 or 0. IST or SST will recover from loss if you have 1. </li>
+<li>
+<a href="../server-system-variables/index.html#query_cache_size">query_cache_size</a> - 0 </li>
+<li>
+<a href="../server-system-variables/index.html#query_cache_type">query_cache_type</a> - 0: The Query cache cannot be used in a Galera context. </li>
+<li>
+<a href="../galera-cluster-system-variables/index.html#wsrep_auto_increment_control">wsrep_auto_increment_control</a> - Normally want ON </li>
+<li>
+<a href="../galera-cluster-system-variables/index.html#wsrep_on">wsrep_on</a> - ON </li>
+<li>
+<a href="../galera-cluster-system-variables/index.html#wsrep_provider_options">wsrep_provider_options</a> - Various settings may need tuning if you are using a WAN. </li>
+<li>
+<a href="../galera-cluster-system-variables/index.html#wsrep_slave_threads">wsrep_slave_threads</a> - use for parallel replication </li>
+<li>
+<a href="../galera-cluster-system-variables/index.html#wsrep_sync_wait">wsrep_sync_wait</a> (previously wsrep_causal_reads) - used transiently to dealing with "critical reads". </li>
+</ul> <h2 class="anchored_heading" id="miscellany">Miscellany</h2> <p>Until recently, FOREIGN KEYs were buggy.</p> <p>LOAD DATA is auto-chunked. That is, it is passed to other nodes piecemeal, not all at once.</p> <p><a href="../mariadb-galera-cluster-known-limitations/index.html">MariaDB's known issues with Galera</a></p> <p>DROP USER may not replicate?</p> <p>A slight difference in ROLLBACK for conflict: InnoDB rolls back smaller transaction; Galera rolls back last.</p> <p><a href="http://www.slideshare.net/skysql/mariadb-galera-cluster-simple-transparent-highly-available">Slide Deck for Galera</a></p> <p>SET GLOBAL wsrep_debug = 1; leads to a lot of debug info in the error log.</p> <p>Large UPDATEs / DELETEs should be broken up. This admonition is valid for all databases, but there are additional issues in Galera.</p> <p>WAN: May need to increase (from the defaults) wsrep_provider_options = evs...</p> <p>MySQL/Perona 5.6 or MariaDB 10 is recommended when going to Galera.</p> <p><a href="../mariadb-galera-cluster-known-limitations/index.html">Cluster limitations</a> <a href="https://www.percona.com/files/presentations/percona-live/nyc-2012/PLNY12-galera-cluster-best-practices.pdf">Slide show</a></p> <h2 class="anchored_heading" id="gtids">GTIDs</h2> <p>See <a href="../using-mariadb-gtids-with-mariadb-galera-cluster/index.html">Using MariaDB GTIDs with MariaDB Galera Cluster</a>.</p> <h2 class="anchored_heading" id="how-many-nodes-to-have-in-a-cluster">How many nodes to have in a cluster</h2> <p>If all the servers are in the same 'vulnerability zone' -- eg, rack or data center -- Have an odd number (at least 3) of nodes.</p> <p>When spanning colos, you need 3 (or more) data centers in order to be 'always' up, even during a colo failure. With only 2 data centers, Galera can automatically recover from one colo outage, but not the other. (You pick which.)</p> <p>If you use 3 or 4 colos, these number of nodes per colo are safe:</p> <ul>
+<li>3 nodes: 1+1+1 (1 node in each of 3 colos) </li>
+<li>4 nodes: 1+1+1+1 (4 nodes won't work in 3 colos) </li>
+<li>5 nodes: 2+2+1, 2+1+1+1 (5 nodes spread 'evenly' across the colos) </li>
+<li>6 nodes: 2+2+2, 2+2+1+1 </li>
+<li>7 nodes: 3+2+2, 3+3+1, 2+2+2+1, 3+2+1+1 There may be a way to "weight" the nodes differently; that would allow a few more configurations. With "weighting", give each colo the same weight; then subdivide the weight within each colo evenly. Four nodes in 3 colos: (1/6+1/6) + 1/3 + 1/3 That way, any single colo failure cannot lead to "split brain". </li>
+</ul> <h2 class="anchored_heading" id="postlog">Postlog</h2> <p>Posted 2013; VARIABLES: 2015; Refreshed Feb. 2016 </p> <h2 class="anchored_heading" id="see-also">See also</h2> <p>Rick James graciously allowed us to use this article in the Knowledge Base.</p> <p><a href="http://mysql.rjweb.org/">Rick James' site</a> has other useful tips, how-tos, optimizations, and debugging tips.</p> <p> Original source: <a href="http://mysql.rjweb.org/doc.php/galera">http://mysql.rjweb.org/doc.php/galera</a></p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/tips-on-converting-to-galera/" class="_attribution-link">https://mariadb.com/kb/en/tips-on-converting-to-galera/</a>
+  </p>
+</div>

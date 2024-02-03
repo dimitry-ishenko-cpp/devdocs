@@ -1,0 +1,74 @@
+<h1>LevelDB Storage Engine MS2</h1> <div> <div class="node creole"> <div class="answer formatted">  <h2 class="anchored_heading" id="remove-the-need-for-a-second-database">Remove the need for a second database</h2> <p>MS1 code needs to use two databases, because</p> <ul start="1"><li>
+<code>leveldb</code> database uses type-aware key comparison. This means, one must have knowledge about types of values in indexes before the database can be opened. </li></ul> <ul start="1"><li>
+<code>leveldb-ddl</code> stores information about <ul start="1">
+<li>datatypes used by various indexes. </li>
+<li>Mapping from <code>dbname.tablename.index_no</code> to <code>index_number</code>. </li>
+</ul> </li></ul> <p>The database itself uses default key comparison function, so one can open it without any knowledge.</p> <p>It is possible to switch to having one database, if the keys can use the default key comparison function, memcmp(). The database will store </p> <ul start="1">
+<li>table/index data </li>
+<li>Mapping from <code>dbname.tablename.index_no</code> to <code>index_number</code>. </li>
+</ul> <p>It seems, it is possible to convert MySQL field values into values comparable with memcmp() by using Field::make_sort_key() function.</p> <h3 class="anchored_heading" id="index-only-scans">Index-only scans</h3> <p>Index-only scans require that it is possible to restore key value from its memcmp()'able form.</p> <p>In general, it is not possible. For some particular datatypes, it is possible. We want to target the following types:</p> <ul start="1">
+<li>
+<code>INT</code>, <code>BIGINT</code>, <code>TINYINT</code>, and their <code>UNSIGNED</code> variants (i.e., all INT-based types) </li>
+<li>
+<code>CHAR(n) COLLATE latin1_bin</code>, <code>VARCHAR(n) COLLATE latin1_bin</code>, possibly support <code>utf8_bin</code>. </li>
+</ul> <h4 class="anchored_heading" id="int-based-types">INT-based types</h4> <p>For INT-based types, mem-comparable form is the integer stored in most-significant-bytes-first order. For SIGNED types, one needs to make negative values precede positive ones (memcmp() assumes all bytes are unsigned). This can be achieved by adding MAX_VALUE/2 to the number.</p> <p>It is apparent that one can restore integer values back from their mem-comparable form.</p> <h4 class="anchored_heading" id="string-based-types">String-based types</h4> <p>For string-based types, getting the value back from its mem-comparable form is harder.</p> <h5 class="anchored_heading" id="problem1-case-insensitivity">Problem#1: case-insensitivity</h5> <p>For case-insensitive collations, conversion to mem-comparable form is, roughly speaking, conversion of all characters to upper case (it's actually more complex, but that's the idea)</p> <p>For example, for column='foo' and column='FOO' the mem-comparable form is 'FOO', and there is no way to get the original case back.</p> <h5 class="anchored_heading" id="problem2-varchar-and-end-spaces">Problem#2: VARCHAR and end-spaces</h5> <p>Consider a [VAR]CHAR(n) type. The mem-comparable form must have the same length for all values. If some values have different length, we won't be able to support multi-part keys.</p> <p>In MySQL charset functions, mem-comparable form does have a fixed length. Fixed length is achieved by end-padding the value with spaces (more precisely, with mem-comparable images of spaces). This raises a question of, how do we get rid of these spaces when we're decoding the value back?</p> <p>For <code>CHAR(n)</code> fields, the problem doesn't exist, because MySQL strips all trailing spaces:</p> <pre class="fixed" data-language="sql">create table t10 (a char(10) primary key); 
+insert into t10 values ('abc   ');
+select a, length(a) from t10;
++-----+-----------+
+| a   | length(a) |
++-----+-----------+
+| abc |         3 |
++-----+-----------+
+</pre>
+<p>(@@sql_mode has a PAD_CHAR_TO_FULL_LENGTH flag which will make MySQL to pad strings with as many spaces as possible instead of stripping. But either way, we don't have to care about how many end-spaces are in a CHAR(n) value).</p> <p>For VARCHAR fields, end-spaces are not removed:</p> <pre class="fixed" data-language="sql">create table t11 (a varchar(10) primary key);
+insert into t11 values ('abc   ');
+select a, length(a) from t11;
++--------+-----------+
+| a      | length(a) |
++--------+-----------+
+| abc    |         6 |
++--------+-----------+
+</pre>
+<p>When we try to decode a string from its mem-comparable form, we will not know how many end-spaces were in the original value. We need to store the length somewhere.</p> <h5 class="anchored_heading" id="solution-for-case-insensitivity">Solution for case-insensitivity</h5> <p>We will avoid the problem of upper-casing by supporting index-only reads when used collations do not map two different characters to the same mem-comparable value. The following collations are ok:</p> <ul start="1">
+<li>
+<code>BINARY</code> - characters are not transformed </li>
+<li>
+<code>latin1_bin</code> - characters are not transformed </li>
+<li>
+<code>utf8_bin</code> - characters are transformed into 2-byte images with <code>my_utf8_uni()</code> and can be restored with <code>my_uni_utf8()</code>. The functions are stored in <code>cs-&gt;cset-&gt;mb_wc</code> and <code>cs-&gt;cset-&gt;wc_mb</code>. </li>
+<li>
+<code>utf8mb4_bin</code> - characters are transformed into 3-byte images with <code>my_mb_wc_utf8mb4()</code> and can be restored with <code>my_wc_mb_utf8mb4()</code> </li>
+</ul> <h5 class="anchored_heading" id="solution-for-end-spaces">Solution for end-spaces</h5> <p>We need to store the original length of the value somewhere. There is no way we could put it into a mem-comparable form. If we put it there, we would have</p> <pre class="fixed" data-language="sql">memcmp(mem_comparable('abc'), mem_comparable('abc  '), len) != 0
+</pre>
+<p>which would make equal values be compared as non equal. </p> <p>The solution is: don't store length in leveldb key. </p> <ul start="1">
+<li>For PRIMARY KEY, length is stored in leveldb's Value (we have entire table-&gt;record[0] there, with special encoding for blobs). </li>
+<li>For secondary indexes, we will store length in the leveldb's Value (which is currently empty). </li>
+</ul> <h2 class="anchored_heading" id="fix-cant-see-own-changes">Fix CANT-SEE-OWN-CHANGES</h2> <p>The property is described at <a href="../leveldb-storage-engine-ms1/index.html">leveldb-storage-engine-ms1</a> page. A solution is also described there:</p> <div style="margin-left:2em">
+<p> After MS1, LevelDB SE will make sure that CANT-SEE-OWN changes is not observed. It will use the following approach:</p> <ul start="1">
+<li>keep track of what records have been modified by this transaction in a buffer $R. </li>
+<li>If SQL layer makes a request to read a row, then <ul start="1">
+<li>Consult $R if the record was INSERTed. If yes, return what was inserted. </li>
+<li>Consult $R if the record was modified. if yes, return what was recorded as the result of modification </li>
+<li>Consult $R if the record was deleted. If yes, return "record not found". </li>
+<li>Finally, try reading the row from the LevelDB. </li>
+</ul> </li>
+</ul> </div> <p>Note: this allows us to keep only the last update if the transaction has made multiple updates in the same row. (as long as we didn't use to store both transaction and statement's changes together. In that case, we need to keep both transaction's and statement's changes)</p> <h2 class="anchored_heading" id="more-test-coverage">More test coverage</h2> <p>Adopt a storage-engine-independent testsuite to be used together with leveldb.</p> <h2 class="anchored_heading" id="statement-rollback-inside-a-transaction">Statement rollback inside a transaction</h2> <p>A truly transactional MySQL engine needs to support two kinds of rollback</p> <ol start="1">
+<li>Rollback a statement </li>
+<li>Rollback a transaction </li>
+</ol> <p>If a statement fails inside a transaction, the engine will need to rollback the statement, but not the transaction. Currently, leveldb SE is unable to do so, because transaction's changes and statement's changes are stored in a single <code>leveldb::WriteBatch</code> object.</p> <p>The solution will be to keep transaction's changes and statement's changes separate, and put statement's changes into transaction's changes on statement end.</p> <p>Another way: when we maintain a hashtable of changes, remember query_id of every change. If we need to roll back a statement, go through the changes and remove those that have query_id equal to the last query (TODO: is statement the same as query here, or not?)</p> <h2 class="anchored_heading" id="fix-the-build-process">Fix the build process</h2> <p><a href="https://jira.mariadb.org/browse/MDEV-4154">MDEV-4154</a>: Currently, leveldb SE hardcodes paths to leveldb library. Lift this limitation.</p> <h2 class="anchored_heading" id="leveldb_max_row_locks">@@leveldb_max_row_locks</h2> <p>Transaction locks are held in memory. Hence, there is an idea: prevent transactions from getting too big - have a variable that explicitly limits how many locks a transaction can take. (there was a similar variable in BDB storage engine). If a transaction attempts to take more locks than allowed, an error will be returned.</p> <h2 class="anchored_heading" id="tasks">Tasks</h2> <h3 class="anchored_heading" id="remove-the-need-for-a-second-database">Remove the need for a second database</h3> <ul start="1">
+<li>Store mem-comparable values as keys (no index-only support) </li>
+<li>Switch rowlock table to use the same hash value? </li>
+</ul> <h3 class="anchored_heading" id="index-only-scans">Index-only scans</h3> <ul start="1">
+<li>Analyze index definition and set HA_KEYREAD_ONLY only when appropriate </li>
+<li>Unpack functions for integer columns </li>
+<li>Unpack function for CHAR(n) </li>
+<li>Storage an unpack for VARCHAR(n) </li>
+</ul> <h3 class="anchored_heading" id="fix-cant-see-own-changes">Fix CANT-SEE-OWN-CHANGES</h3> <ul start="1">
+<li>Maintain a hash table of changes made by the transaction </li>
+<li>Have read functions consult the hashtable before reading actual data </li>
+</ul> <h3 class="anchored_heading" id="statement-rollback-inside-a-transaction">Statement rollback inside a transaction</h3> <ul start="1"><li>Maintain transaction's changes and last statement's changes separately. <ul start="1"><li>Roll back the right set of changes on statement/transaction abort. </li></ul> </li></ul> <h3 class="anchored_heading" id="more-test-coverage">More test coverage</h3> <ul start="1"><li>Adopt the engine-independent testsuite to be used with leveldb </li></ul> <h2 class="anchored_heading" id="misc">Misc</h2> <ul start="1"><li>(from skype discussion)_Currently max. auto_increment value is loaded every time a TABLE is opened. Make it to be loaded only when TABLE_SHARE is opened.</li></ul> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/leveldb-storage-engine-ms2/" class="_attribution-link">https://mariadb.com/kb/en/leveldb-storage-engine-ms2/</a>
+  </p>
+</div>

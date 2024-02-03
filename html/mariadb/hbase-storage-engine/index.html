@@ -1,0 +1,243 @@
+<h1>HBase Storage Engine</h1> <div> <div class="node creole"> <div class="answer formatted"> <p>Data mapping from HBase to SQL</p> <p>The Jira task for this is <a href="https://jira.mariadb.org/browse/MDEV-122">MDEV-122</a></p> <div class="cstm-style redbox" style="text-align:center;font-family:Droid Sans;font-weight:bold;">
+<p>Nobody is working on this feature ATM. See <a href="../cassandra-storage-engine/index.html">Cassandra Storage Engine</a> for a related development that has reached the release stage.</p> </div>
+<div class="cstm-style redbox" style="text-align:center;font-size:0.8em;font-family:Droid Sans;">
+<p>This page describes a feature that's under development. The feature has not been released (even in beta), its interface and function may change, etc.</p> </div> <h2 class="anchored_heading" id="hbase-data-model-and-operations">Hbase data model and operations</h2> <h3 class="anchored_heading" id="11-hbase-data-model">1.1 HBase data model</h3> <ul start="1">
+<li>An HBase table consists of rows, which are identified by row key. </li>
+<li>Each row has an arbitrary (potentially, very large) number of columns. </li>
+<li>Columns are split into column groups, column groups define how the columns are stored (not reading some column groups is an optimization). </li>
+<li>Each (row, column) combination can have multiple versions of the data, identified by timestamp. </li>
+</ul> <h3 class="anchored_heading" id="12-hbase-read-operations">1.2 Hbase read operations</h3> <p>HBase API defines two ways to read data:</p> <ul start="1"><li>Point lookup: get record for a given row_key. </li></ul> <ul start="1"><li>Point scan: read all records in [startRow, stopRow) range. </li></ul> <p>Both kinds of scans allow to specify:</p> <ul start="1">
+<li>A column family we're interested in </li>
+<li>A particular column we're interested in </li>
+</ul> <p>The default behavior for versioned columns is to return only the most recent version. HBase API also allows to ask for </p> <ul start="1">
+<li>versions of columns that were valid at some specific timestamp value; </li>
+<li>all versions that were valid within a specifed [minStamp, maxStamp) interval. </li>
+<li>N most recent versions We'll refer to the above as [VersionedDataConds]. </li>
+</ul> <p>One can see two ways to map HBase tables to SQL tables:</p> <ul start="1">
+<li>Per-cell mapping </li>
+<li>Per-row mapping </li>
+</ul> <h2 class="anchored_heading" id="2-per-cell-mapping">2. Per-cell mapping</h2> <p>HBase shell has 'scan' command, here's an example of its output:</p> <pre class="fixed" data-language="sql">hbase(main):007:0&gt; scan 'testtable'
+ ROW COLUMN+CELL
+  myrow-1 column=colfam1:q1, timestamp=1297345476469, value=value-1
+  myrow-2 column=colfam1:q2, timestamp=1297345495663, value=value-2
+  myrow-2 column=colfam1:q3, timestamp=1297345508999, value=value-3
+</pre>
+<p>Here, one HBase row produces multiple rows in the query output. Each output row represents one (row_id, column) combination, so rows with multiple columns (and multiple revisions of column data) can be easily represented.</p> <h3 class="anchored_heading" id="21-table-definition">2.1 Table definition</h3> <p>Mapping could be defined as follows:</p> <pre class="fixed" data-language="sql">CREATE TABLE hbase_tbl_cells (
+  row_id binary(MAX_HBASE_ROWID_LEN),
+  column_family binary(MAX_HBASE_COLFAM_LEN),
+  column_name binary(MAX_HBASE_NAME_LEN),
+  timestamp TIMESTAMP,
+  value BLOB,
+  PRIMARY KEY (row_id, column_family, column_name, timestamp)
+) ENGINE=hbase_cell;
+</pre>
+<p>There is no need for dynamic columns in this mapping.</p> <ul start="1"><li>NOTE: It is nice to have SQL table DDLs independent of the content of the backend hbase table. This saves us from the need to synchronize table DDLs between hbase and mysql (NDB cluster had to do this and they have ended up implementing a very complex system to do this). </li></ul> <h3 class="anchored_heading" id="22-queries-in-per-cell-mapping">2.2 Queries in per-cell mapping</h3> <pre class="fixed" data-language="sql"># Point-select:
+SELECT value 
+FROM hbase_cell
+WHERE 
+  row_id='hbase_row_id' AND 
+  column_family='hbase_column_family' AND column_name='hbase_column'
+  ...
+</pre>
+<pre class="fixed" data-language="sql">#  Range select:
+#   (the example uses BETWEEN but we will support arbitrary predicates)
+SELECT value 
+FROM hbase_cell
+WHERE 
+  row_id BETWEEN 'hbase_row_id1' AND 'hbase_row_id2' AND 
+  column_family='hbase_column_family' AND column_name='hbase_column'
+</pre>
+<pre class="fixed" data-language="sql"># Update a value for {row, column}
+UPDATE hbase_cell SET value='value' 
+WHERE row_id='hbase_row' AND 
+      column_family='col_family' AND column_name='col_name'
+</pre>
+<pre class="fixed" data-language="sql"># Add a column into row
+INSERT INTO hbase_cell values ('hbase_row', 'col_family','col_name','value');
+</pre>
+<p>Note that</p> <ul start="1">
+<li>accessing versioned data is easy: one can read some particular version, versions within a date range, etc </li>
+<li>it is also easy to select all columns from a certain column family. </li>
+</ul> <h3 class="anchored_heading" id="23-mapping-of-sql-statements">2.3 Mapping of SQL statements</h3> <h4 class="anchored_heading" id="mapping-for-select">Mapping for SELECT</h4> <p>The table is defined as having a </p> <pre class="fixed" data-language="sql">  PRIMARY KEY (row_id, column_family, column_name, timestamp)
+</pre>
+<p>which allows to make use of range optimizer to get ranges on</p> <ul start="1">
+<li>rowid </li>
+<li>rowid, column_family </li>
+<li>rowid, column_family, column_name </li>
+<li>... </li>
+</ul> <p>If a range specifies one row, we can read it with HTable.get(), otherwise we'll have to use HTable.getScanner() and make use of the obtained scanner.</p> <h5 class="anchored_heading" id="multiple-non-equality-conditions">Multiple non-equality conditions</h5> <p>HBase API allows to scan a range of rows, retrieving only certain column name or certain column families. In our SQL mapping, this can be written as:</p> <pre class="fixed" data-language="sql">SELECT value
+FROM hbase_cell
+WHERE
+  row_id BETWEEN 'hbase_row_id1' AND 'hbase_row_id2' AND
+  column_family='hbase_column_family'                           (*)
+</pre>
+<p>If we feed this into the range optimizer, it will produce a range:</p> <pre class="fixed" data-language="sql">  ('hbase_row_id1', 'hbase_column_family') &lt;= (row_id, column_family) &lt;=
+  ('hbase_row_id2', 'hbase_column_family')
+</pre>
+<p>which includes all column families for records which satisfy</p> <pre class="fixed" data-language="sql">  'hbase_row_id1' &lt; rowid &lt; 'hbase_row_id2'
+</pre>
+<p>This will cause extra data to be read.</p> <p>Possible solutions:</p> <ul start="1">
+<li>Extend multi-range-read interface to walk the 'SEL_ARG graph' instead of list of ranges. This will allow to capture the exact form of conditions like (*). </li>
+<li>Implement table condition pushdown and and perform independent condition analysis. </li>
+<li>Define more indexes, so that ranges are "dense". <sup> what about (row_id BETWEEN $X AND $Y) AND (timestamp BETWEEN $T1 AND $T2) ? No matter which index you define, the range list will not be identical to the WHERE clause.</sup> </li>
+</ul> <h4 class="anchored_heading" id="mapping-for-insert">Mapping for INSERT</h4> <p>INSERT will be translated into HTable.checkAndPut(..., value=NULL) call. That way, attempt to insert a {rowid, column} that already exists will fail.</p> <h4 class="anchored_heading" id="mapping-for-delete">Mapping for DELETE</h4> <p>MySQL/MariaDB's storage engine API handles DELETEs like this:</p> <ul start="1">
+<li>Use some way to read the record that should be deleted </li>
+<li>call handler-&gt;ha_delete_row(). It will delete the row that was last read. </li>
+</ul> <p>ha_hbase_cell can remember {rowid, column_name} of the record, and then use HBase.checkAndDelete() call, so that we're sure we're deleting what we've read.</p> <p>If we get a statement in form of</p> <pre class="fixed" data-language="sql">DELETE FROM hbase_cell 
+WHERE rowid='hbase_row_id' AND column_family='...' AND column_name='...';
+</pre>
+<p>then reading the record is redundant (we could just make one HBase.checkAndDelete() call). This will require some form of query pushdown, though.</p> <h4 class="anchored_heading" id="mapping-for-update">Mapping for UPDATE</h4> <p>UPDATEs are similar to deletes as long as row_id, column_family, and column_name fields are not changed (that is, only column_value changes). Like with DELETEs:</p> <ul start="1">
+<li>HBase.checkAndPut() call can be used to make sure we're updating what we've read </li>
+<li>one-point UPDATEs may need a shortcut so that we don't have to read the value before we make an update. </li>
+</ul> <p>If UPDATE statement changes row_id, column_family, or column_name field, it becomes totally different. HBase doesn't allow to change rowid of a record. We can only remove the record with old rowid, and insert a record with the new rowid. HBase doesn't support multi-row transactions, so we'll want to insert the new variant of the record before we have deleted the old one (I assume that data duplication is better than data loss).</p> <p>For first milestone, we could disallow UPDATEs that change row_id, column_family or column_name.</p> <h2 class="anchored_heading" id="3-per-row-mapping">3. Per-row mapping</h2> <p>Let each row in HBase table be mapped into a row from SQL point of view:</p> <pre class="fixed" data-language="sql">SELECT * FROM hbase_table;
+
+row-id column1 column2  column3  column4  ...
+------ ------- -------  -------  -------  
+row1    data1   data2
+row2                     data3    
+row3    data4                      data5
+</pre>
+<p>The problem is that the set of columns in a HBase table is not fixed and is potentially is very large. The solution is to put all columns into one blob column and use Dynamic Columns (<a href="http://kb.askmonty.org/en/dynamic-columns">http://kb.askmonty.org/en/dynamic-columns</a>) functions to pack/extract values of individual columns:</p> <pre class="fixed" data-language="sql">row-id dyn_columns
+------ ------------------------------
+row1   {column1=data1,column2=data2}
+row2   {column3=data3}
+row3   {column1=data4,column4=data5}
+</pre>
+<h3 class="anchored_heading" id="32-mapping-definition">3.2 Mapping definition</h3> <p>Table DDL could look like this:</p> <pre class="fixed" data-language="sql">CREATE TABLE hbase_tbl_rows (
+  row_id BINARY(MAX_HBASE_ROWID_LEN),
+  columns BLOB,  -- All columns/values packed in dynamic column format
+  PRIMARY KEY (row_id)
+) ENGINE=hbase_row;
+</pre>
+<p>(TODO: Does Hbase have MAX_HBASE_ROWID_LEN limit? What is it? We can ignore this. Let the user define 'row_id' column with whatever limit he desires; don't do operations with rows that have row_id longer than the limit)</p> <p>Functions for reading data:</p> <pre class="fixed" data-language="sql">  COLUMN_GET(dynamic_column, column_nr as type)
+  COLUMN_EXISTS(dynamic_column, column_nr);
+  COLUMN_LIST(dynamic_column);
+</pre>
+<p>Functions for data modification:</p> <pre class="fixed" data-language="sql">  COLUMN_ADD(dynamic_column, column_nr,  value [as type], ...)
+  COLUMN_DELETE(dynamic_column, column_nr, column_nr, ...);
+</pre>
+<h3 class="anchored_heading" id="321-required-improvements-in-dynamic-columns">3.2.1 Required improvements in Dynamic Columns</h3> <p>Dynamic column functions cannot be used as-is:</p> <ul start="1"><li>
+<strong>HBase columns have string names, Dynamic Columns have numbers</strong> (see column_nr parameter for the above functions). The set of column names in HBase is potentially very large, there is no way to get a list of all names: we won't be able to solve this with enum-style mapping, we'll need real support for string names. </li></ul> <ul start="1"><li>
+<strong>HBase has column families, Dynamic Columns do not </strong>. Column family is not just a ':' in the column name. For example, HBase API allows to request "all columns from within a certain column family". </li></ul> <ul start="1"><li>
+<strong>HBase supports versioned data, Dynamic Columns do not</strong>. A possible limited solution is to have global/session @@hbase_timestamp variable which will globally specify the required data version. </li></ul> <ul start="1"><li>(See also note below about efficient execution) </li></ul> <p>Names for dynamic columns are covered in <a href="https://jira.mariadb.org/browse/MDEV-377">MDEV-377</a></p> <h3 class="anchored_heading" id="33-queries-in-per-row-mapping">3.3 Queries in per-row mapping</h3> <pre class="fixed" data-language="sql"># Point-select, get value of one column
+SELECT COLUMN_GET(hbase_tbl.columns, 'column_name' AS INTEGER)
+FROM hbase_tbl
+WHERE 
+  row_id='hbase_row_id';
+</pre>
+<pre class="fixed" data-language="sql">#  Range select:
+#   (the example uses BETWEEN but we will support arbitrary predicates)
+SELECT COLUMN_GET(hbase_tbl.columns, 'column_name' AS INTEGER)
+FROM hbase_tbl
+WHERE 
+  row_id BETWEEN 'hbase_row_id1' AND 'hbase_row_id2';
+</pre>
+<pre class="fixed" data-language="sql"># Update or add a column for a row
+UPDATE hbase_tbl SET columns=COLUMN_ADD(columns, 'column_name', 'value') WHERE row_id='hbase_row_id1';
+</pre>
+<p>Use of COLUMN_ADD like above will make no check whether column_name=X already existed for that row. If it did, it will be silently overwritten.</p> <p>ATTENTION: There seems to be no easy way to do something that would be like SQL's INSERT statement, i.e. which would fail if the data you're changing already exists.</p> <p>One can write a convoluted IF(..., ....) expression will do the store-if-not-exist operation, but it's bad when basic operations require convoluted expressions.</p> <p>ATTENTION: One could also question whether a statement with semantics of "store this data irrespectively of what was there before" has any value for "remote" storage engine, where you're not the only one who's modifying the data.</p> <pre class="fixed" data-language="sql"># Set all columns at once, overwriting the content that was there
+UPDATE hbase_tbl SET columns=... WHERE row_id='hbase_row_id1';
+
+UPDATE hbase_tbl SET columns=COLUMN_CREATE('column1', 'foo') WHERE row_id='row1';
+</pre>
+<p>Note that the lsat statement will cause all columns except for 'column1' to be deleted for row 'row1'. This seems logical for SQL but there is no such operation in HBase.</p> <pre class="fixed" data-language="sql"># Insert a new row with column(s)
+INSERT INTO hbase_tbl (row_id, columns) VALUES
+  ('hbase_row_id', COLUMN_CREATE('column_name', 'column-value'));
+</pre>
+<p>Q: It's not clear how to access versioned data? Can we go without versioned data for the first milestone? (and then, use @@hbase_timestamp for the second milestone?)</p> <p>Q: It's not clear how to select "all columns from column family X".</p> <h3 class="anchored_heading" id="34-efficient-execution-for-per-row-mapping">3.4 Efficient execution for per-row mapping</h3> <h4 class="anchored_heading" id="341-predicate-analysis">3.4.1 Predicate analysis</h4> <p>The table declares:</p> <pre class="fixed" data-language="sql">  row_id BINARY(MAX_HBASE_ROWID_LEN),
+  ...
+  PRIMARY KEY (row_id)
+</pre>
+<p>which allows to use range/ref optimizer to extract ranges over the row_id column. </p> <p>One can also imagine a realistic query which uses conditions on hbase column names:</p> <pre class="fixed" data-language="sql">SELECT column_get(columns, 'some_data') FROM hbase_tbl 
+WHERE 
+  row_id BETWEEN 'first_interesting_row' and 'last_interesting_row' AND 
+  column_get(columns, 'attribute' as string)='eligible';
+</pre>
+<p>Range optimizer is unable to catch conditions in form of</p> <pre class="fixed" data-language="sql">column_get(columns, 'attribute' as string)='eligible'
+</pre>
+<p>We'll need to either extend it, or create another condition analyzer.</p> <h4 class="anchored_heading" id="342-dynamic-columns-optimizations">3.4.2 Dynamic columns optimizations</h4> <p>Currently, MariaDB works with Dynamic Columns with this scenario:</p> <ol start="1">
+<li>When the record is read, the entire blob (=all columns) is read into memory </li>
+<li>The query operates on the blob with Dynamic Columns Functions (reads and updates values for some columns, etc) </li>
+<li>[If this is an UPDATE] the entire blob is written back to the table </li>
+</ol> <p>If we use this approach with HBase, we will cause a lot of overhead with reading/writing of unneeded data.</p> <h4 class="anchored_heading" id="solution-1-on-demand-reads">Solution #1: on-demand reads</h4> <ul start="1">
+<li>When table record is read, don't read any columns, return a blob handle. </li>
+<li>Dynamic Column functions will use the handle to read particular columns. The column is read from HBase only when its value is requested. </li>
+</ul> <p>This scheme ensures there are no redundant data reads, at the cost making extra mysqld&lt;-&gt;HBase roundtrips (which are likely to be expensive)</p> <h4 class="anchored_heading" id="solution-2-list-of-reads">Solution #2: List of reads</h4> <ul start="1">
+<li>Walk through the query and find all references to hbase_table.columns. </li>
+<li>Collect the names of columns that are read, and retrieve only these columns. </li>
+</ul> <p>This may cause redundant data reads, for example for</p> <pre class="fixed" data-language="sql">  SELECT COLUMN_GET(hbase_tbl, 'column1' AS INTEGER) 
+  FROM hbase_tbl
+  WHERE 
+    row_id BETWEEN 'hbase_row_id1' AND 'hbase_row_id2' AND 
+    COLUMN_GET(hbase_tbl, 'column2' AS INTEGER)=1
+</pre>
+<p>column1 will be read for rows which have column2!=1. This still seems to be better than making extra roundtrips.</p> <p>There is a question of what should be done when the query has references like</p> <pre class="fixed" data-language="sql">  COLUMN_GET(hbase_tbl, {non-const-item} AS ...) 
+</pre>
+<p>where it is not possible to tell in advance which columns must be read. Possible approaches are</p> <ul start="1">
+<li>retrieve all columns </li>
+<li>fetch columns on demand </li>
+<li>stop the query with an error. </li>
+</ul> <h3 class="anchored_heading" id="35-mapping-of-sql-statements">3.5 Mapping of SQL statements</h3> <h4 class="anchored_heading" id="select">SELECT</h4> <p>See above sections: we'll be able to analyze condition on row_id, and a list of columns we need to read. That will give sufficient info to do either an HTable.get() call, or call HTable.getScanner() and use the scanner.</p> <h4 class="anchored_heading" id="insert">INSERT</h4> <p>INSERT should make sure it actually creates the row, it should not overwrite existing rows. This is not trivial in HBase. The closest we can get is to make a number of HTable.checkAndPut() calls, with the checks that we're not overwriting the data.</p> <p>This will cause INSERT ('row_id', COLUMN_CREATE('column1', 'data')) to succeed even if the table already had a row with ('row_id', COLUMN_CREATE('column2', 'data')).</p> <p>Another possible problem is that INSERT can fail mid-way (we will insert only some columns of the record).</p> <h4 class="anchored_heading" id="delete">DELETE</h4> <p>DELETE seems to be ok: we can delete all {rowid, column_name} combinations for the given row_id. I'm not sure, perhaps this will require multiple HBase calls.</p> <h4 class="anchored_heading" id="update">UPDATE</h4> <p>Just like with per-cell mapping, UPDATEs that change the row_id are actually deletions followed by inserts. We can disallow them in the first milestone.</p> <p>The most frequent form of UPDATE is expected to be one that changes the value of a column:</p> <pre class="fixed" data-language="sql">UPDATE hbase_tbl SET columns=COLUMN_ADD(columns, 'column_name', 'value') 
+WHERE 
+  row_id='hbase_row_id1' AND COLUMN_GET(columns, 'column_name')='foo';
+</pre>
+<p>For that one, we need modified Dynamic Column Functions that will represent *changes* in the set of columns (and not *state*), so that we can avoid reading columns and writing them back.</p> <h2 class="anchored_heading" id="4-select-columns-mapping">4. Select-columns mapping</h2> <p>This is a simplification of the per-row mapping. Suppose, the user is only interested in particular columns with names `column1` and `column2`. They create a table with this definition:</p> <pre class="fixed" data-language="sql">CREATE TABLE hbase_tbl_cells (
+  row_id binary(MAX_HBASE_ROWID_LEN),
+  column1  TYPE,
+  column2  TYPE,
+  PRIMARY KEY (row_id),
+  KEY(column1),
+  KEY(column2)
+) ENGINE=hbase_columns;
+</pre>
+<p>and then access it. Access is done like in per-row mapping, but without use of dynamic columns. </p> <p>This mapping imposes lots of restrictions: it is only possible to select a fixed set of columns, there is no way to specify version of the data, etc.</p> <h2 class="anchored_heading" id="5-comparison-of-the-mappings">5. Comparison of the mappings</h2> <p>If we select two columns from a certain row, per-cell mapping produces "vertical" result, while per-row mapping produces "horizontal" result.</p> <pre class="fixed" data-language="sql"># Per-cell:
+SELECT column_name, value 
+FROM hbase_cell
+WHERE 
+  row_id='hbase_row_id1' AND 
+  column_family='col_fam' AND column_name IN ('column1','column2')
++-------------+-------+
+| column_name | value |
++-------------+-------+
+| column1     | val1  |
+| column2     | val2  |
++-------------+-------+
+</pre>
+<pre class="fixed" data-language="sql"># Per row:
+SELECT 
+  COLUMN_GET(columns, 'col_fam:column1') as column1,  
+  COLUMN_GET(columns, 'col_fam:column2') as column2,
+FROM hbase_row
+WHERE 
+  row_id='hbase_row_id1' 
++---------+---------+
+| column1 | column2 |
++---------+---------+
+| val1    | val2    |
++---------+---------+
+</pre>
+<p>Per-cell mapping:</p> <ul start="1">
+<li>Allows a finer control over selection of versioned data (easy to specify [range of] versions to select), column families, etc. </li>
+<li>Is more suitable for cases when one needs to select an arbitrarily-long list of columns. </li>
+</ul> <p>Per-row (or select-columns) mapping is easier when:</p> <ul start="1">
+<li>one is accessing a limited set of columns </li>
+<li>one needs to access multiple columns from multiple rows (in per-cell mapping this will require an [inefficient?] self-join). </li>
+</ul> <h2 class="anchored_heading" id="6-interfacing-with-hbase">6. Interfacing with HBase</h2> <p>HBase is in Java, and its native client API is a java library. We need to interface with it from C++ storage engine code. Possible options are:</p> <h3 class="anchored_heading" id="61-use-thrift">6.1 Use Thrift</h3> <p>This requires HBase installation to run a Thrift server</p> <h3 class="anchored_heading" id="62-re-implement-hbases-network-protocol">6.2 Re-implement HBase's network protocol</h3> <ul start="1">
+<li>It seems to be a custom-made RPC protocol. </li>
+<li>There is an independent re-implementation here: <a href="https://github.com/stumbleupon/asynchbase">https://github.com/stumbleupon/asynchbase</a>. It is 10K lines of Java code, which gives an idea about HBase's protocol complexity <ul start="1">
+<li>It seems to support only a subset of features? I.e. I was unable to find mention of pushed down conditions support? </li>
+<li>Look in <code>HBaseRpc.java</code> for <code>"Unofficial Hadoop / HBase RPC protocol documentation"</code> </li>
+</ul> </li>
+</ul> <h3 class="anchored_heading" id="63-use-jnihbase-client-protocol">6.3 Use JNI+HBase client protocol</h3> <ul start="1">
+<li>not sure how complex this is </li>
+<li>Mark has mentioned this has an unacceptable overhead? </li>
+</ul> <h2 class="anchored_heading" id="7-consistency-transactions-etc">7. Consistency, transactions, etc</h2> <ul start="1"><li>HBase has single-record transactions. Does this mean that HBase storage engine will have MyISAM-like characteristics? e.g. if we fail in the middle of a multi-row UPDATE, there is no way to go back. </li></ul> <ul start="1"><li>Q: Are the writes important at all? (e.g. if we've had the first version with provide read-only access, would that be useful?) A: Yes? </li></ul> <h2 class="anchored_heading" id="8-batching">8. Batching</h2> <p>Q: will we need joins, i.e. do I need to implement Multi-Range-Read and support Batched Key Access right away?</p> <h2 class="anchored_heading" id="9-results-of-discussion-with-monty">9. Results of discussion with Monty</h2> <ul start="1">
+<li>Per-row mapping seems to be much more useful than per-cell mapping, because a lot of users have queries that retrieve lots of columns for lots of rows (is this so?) </li>
+<li>Dynamic column format will support string column names (see <a href="https://jira.mariadb.org/browse/MDEV-377">MDEV-377</a>) </li>
+<li>For the first milestone, forget about dynamic column concerns mentioned in "Efficient execution for per-row mapping". It is sufficient that all columns are returned as one blob that physically contains all columns. </li>
+</ul> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/hbase-storage-engine/" class="_attribution-link">https://mariadb.com/kb/en/hbase-storage-engine/</a>
+  </p>
+</div>

@@ -1,0 +1,98 @@
+<h1>Individual Database Restores with MariaBackup from Full Backup</h1> <div> <div class="node creole"> <div class="answer formatted"> <p>This method is to solve a flaw with Mariabackup; it cannot do single database restores from a full backup easily. There is a <a href="https://mariadb.com/resources/blog/how-to-restore-a-single-database-from-mariadb-backup/">blog post that details a way to do this</a>, but it's a manual process which is fine for a few tables but if you have hundreds or even thousands of tables then it would be impossible to do quickly. </p> <p>We can't just move the data files to the datadir as the tables are not registered in the engines, so the database will error. Currently, the only effective method is to a do full restore in a test database and then dump the database that requires restoring or running a partial backup. <strong>This has only been tested with InnoDB. Also, if you have stored procedures or triggers then these will need to be deleted and recreated.</strong></p> <p>Some of the issues that this method overcomes:</p> <ul>
+<li>Tables not registered in the InnoDB engine so will error when you try to select from a table if you move the data files into the datadir </li>
+<li>Tables with foreign keys need to be created without keys, otherwise it will error when you discard the tablespace </li>
+</ul> <h2 class="anchored_heading" id="single-node">Single Node</h2> <p>Below is the process to perform a single database restore.</p> <p>Firstly, we will need the table structure from a mariadb-dump backup with the <a href="../mariadb-dump/index.html#options">--no-data</a> option. I recommend this is done at least once per day or every six hours via a cronjob. As it is just the structure, it will be very fast. </p> <pre class="fixed" data-language="sql">mariadb-dump -u root -p --all-databases --no-data &gt; nodata.sql
+</pre>
+<p>Using SED to return only the table structure we require, then use vim or another text editor to make sure nothing is left.</p> <pre class="fixed" data-language="sql">sed -n '/Current Database: `DATABASENAME`/, /Current Database:/p' nodata.sql &gt; trimednodata.sql
+vim trimednodata.sql
+</pre>
+<p>I won’t go over the backup process, as this is done earlier in other documents, such as <a href="../full-backup-and-restore-with-mariabackup/index.html">full-backup-and-restore-with-mariabackup</a>. Prepare the backup with any <a href="../incremental-backup-and-restore-with-mariabackup/index.html#backing-up-the-incremental-changes">incremental-backup-and-restores</a> that you have, and then run the following on the full backup folder using the --export option to generate files with .cfg extensions which InnoDB will look for.</p> <pre class="fixed" data-language="sql">Mariabackup --prepare --export --target-dir=/media/backups/fullbackupfolder
+</pre>
+<p>Once we have done these steps, we can then import the table structure. If you have used the <a href="../mariadb-dump/index.html#options">--all-databases</a> option, then you will need to either use SED or open it in a text editor and export out tables that you require. You will also need to log in to the database and create the database if the dump file doesn't. Run the following command below:</p> <pre class="fixed" data-language="sql">Mysql -u root -p schema_name &lt; nodata.sql
+</pre>
+<p>Once the structure is in the database, we have now registered the tables to the engine. Next, we will run the following statements in the information_schema database, to export statements to import/discard table spaces and drop and create foreign keys which we will use later. (edit the CONSTRAINT_SCHEMA and TABLE_SCHEMA WHERE clause to the database you are restoring. Also, add the following lines after your SELECT and before the FROM to have MariaDB export the files to the OS)</p> <pre class="fixed" data-language="sql">SELECT ...
+into outfile '/tmp/filename.sql'
+FIELDS TERMINATED BY ','
+LINES TERMINATED BY '\n'
+FROM ...
+</pre>
+<p>The following are the statements that we will need later.</p> <pre class="fixed" data-language="sql">USE information_schema;
+select concat("ALTER TABLE ",table_name," DISCARD TABLESPACE;")  AS discard_tablespace
+from information_schema.tables 
+where TABLE_SCHEMA="DATABASENAME";
+
+select concat("ALTER TABLE ",table_name," IMPORT TABLESPACE;") AS import_tablespace
+from information_schema.tables 
+where TABLE_SCHEMA="DATABASENAME";
+
+SELECT 
+concat ("ALTER TABLE ", rc.CONSTRAINT_SCHEMA, ".",rc.TABLE_NAME," DROP FOREIGN KEY ", rc.CONSTRAINT_NAME,";") AS drop_keys
+FROM REFERENTIAL_CONSTRAINTS AS rc
+where CONSTRAINT_SCHEMA = 'DATABASENAME';
+
+SELECT
+CONCAT ("ALTER TABLE ", 
+KCU.CONSTRAINT_SCHEMA, ".",
+KCU.TABLE_NAME," 
+ADD CONSTRAINT ", 
+KCU.CONSTRAINT_NAME, " 
+FOREIGN KEY ", "
+(`",KCU.COLUMN_NAME,"`)", " 
+REFERENCES `",REFERENCED_TABLE_NAME,"` 
+(`",REFERENCED_COLUMN_NAME,"`)" ," 
+ON UPDATE " ,(SELECT UPDATE_RULE FROM REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_NAME = KCU.CONSTRAINT_NAME AND CONSTRAINT_SCHEMA = KCU.CONSTRAINT_SCHEMA)," 
+ON DELETE ",(SELECT DELETE_RULE FROM REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_NAME = KCU.CONSTRAINT_NAME AND CONSTRAINT_SCHEMA = KCU.CONSTRAINT_SCHEMA),";") AS add_keys
+FROM KEY_COLUMN_USAGE AS KCU
+WHERE KCU.CONSTRAINT_SCHEMA = 'DATABASENAME'
+AND KCU.POSITION_IN_UNIQUE_CONSTRAINT &gt;= 0
+AND KCU.CONSTRAINT_NAME NOT LIKE 'PRIMARY';
+</pre>
+<p>Once we have run those statements, and they have been exported to a Linux directory or copied from a GUI interface.</p> <p>Run the ALTER DROP KEYS statements in the database</p> <pre class="fixed" data-language="sql">ALTER TABLE schemaname.tablename DROP FOREIGN KEY key_name;
+...
+</pre>
+<p>Once completed, run the DROP TABLE SPACE statements in the database</p> <pre class="fixed" data-language="sql">ALTER TABLE test DISCARD TABLESPACE;
+...
+</pre>
+<p>Exit out the database and change into the directory of the full backup location. Run the following commands to copy all the .cfg and .ibd files to the datadir such as /var/lib/mysql/testdatabase (Change the datadir location if needed). Learn more about files that Mariabackup generates with <a href="../files-created-by-mariabackup/index.html">files-created-by-mariabackup</a></p> <pre class="fixed" data-language="sql">cp *.cfg /var/lib/mysql
+cp *.ibd /var/lib/mysql
+</pre>
+<p>After moving the files, it is very important that MySQL is the owner of the files, otherwise it won't have access to them and will error when we import the tablespaces.</p> <pre class="fixed" data-language="sql">sudo chown -R mysql:mysql /var/lib/mysql
+</pre>
+<p>Run the import table spaces statements in the database.</p> <pre class="fixed" data-language="sql">ALTER TABLE test IMPORT TABLESPACE;
+...
+</pre>
+<p>Run the add key statements in the database</p> <pre class="fixed" data-language="sql">ALTER TABLE schmeaname.tablename ADD CONSTRAINT key_name FOREIGN KEY (`column_name`) REFERENCES `foreign_table` (`colum_name`) ON UPDATE NO ACTION ON DELETE NO ACTION;
+...
+</pre>
+<p>We have successfully restored a single database. To test that this has worked, we can do a basic check on some tables.</p> <pre class="fixed" data-language="sql">use database
+SELECT * from test limit 10;
+</pre>
+<h2 class="anchored_heading" id="replica-nodes">Replica nodes</h2> <p>If you have a primary-replica set up, it would be best to follow the sets above for the primary node and then either take a full mariadb-dump or take a new full mariabackup and restore this to the replica. You can find more information about restoring a replica with mariabackup in <a href="../setting-up-a-replica-with-mariabackup/index.html#backup-the-database-and-prepare-it">Setting up a Replica with Mariabackup</a></p> <p>After running the below command, copy to the replica and use the LESS linux command to grab the change master statement. Remember to follow this process: Stop replica &gt; restore data &gt; run CHANGE MASTER statement &gt; start replica again.</p> <pre class="fixed" data-language="sql">mariadb-dump -u user -p --single-transaction --master-data=2 &gt; fullbackup.sql
+</pre>
+<p>Please follow <a href="../setting-up-a-replica-with-mariabackup/index.html#backup-the-database-and-prepare-it">Setting up a Replica with Mariabackup</a> on restoring a replica with Mariabackup </p> <pre class="fixed" data-language="sql">$ mariabackup --backup \
+   --slave-info --safe-slave-backup \
+   --target-dir=/var/mariadb/backup/ \
+   --user=mariabackup --password=mypassword
+</pre>
+<h2 class="anchored_heading" id="galera-cluster">Galera cluster</h2> <p>For this process to work with Galera cluster, we first need to understand that some statements are not replicated across Galera nodes. One of which is the DISCARD and IMPORT for ALTER TABLES statements, and these statements will need to be ran on all nodes. We also need to run the OS level steps on each server as seen below.</p> <p>Run the ALTER DROP KEYS statements on ONE NODE as these are replicated.</p> <pre class="fixed" data-language="sql">ALTER TABLE schemaname.tablename DROP FOREIGN KEY key_name;
+...
+</pre>
+<p>Once completed, run the DROP TABLE SPACE statements on EVERY NODE, as these are not replicated.</p> <pre class="fixed" data-language="sql">ALTER TABLE test DISCARD TABLESPACE;
+...
+</pre>
+<p>Exit out the database and change into the directory of the full backup location. Run the following commands to copy all the .cfg and .ibd files to the datadir such as /var/lib/mysql/testdatabase (Change the datadir location if needed). Learn more about files that Mariabackup generates with <a href="../files-created-by-mariabackup/index.html">files-created-by-mariabackup</a>. This step needs to be done on all nodes. You will need to copy the backup files to each node, we can use the same backup on all nodes.</p> <pre class="fixed" data-language="sql">cp *.cfg /var/lib/mysql
+cp *.ibd /var/lib/mysql
+</pre>
+<p>After moving the files, it is very important that MySQL is the owner of the files, otherwise it won't have access to them and will error when we import the tablespaces.</p> <pre class="fixed" data-language="sql">sudo chown -R mysql:mysql /var/lib/mysql
+</pre>
+<p>Run the import table spaces statements on EVERY NODE.</p> <pre class="fixed" data-language="sql">ALTER TABLE test IMPORT TABLESPACE;
+...
+</pre>
+<p>Run the add key statements on ONE NODE</p> <pre class="fixed" data-language="sql">ALTER TABLE schmeaname.tablename ADD CONSTRAINT key_name FOREIGN KEY (`column_name`) REFERENCES `foreign_table` (`colum_name`) ON UPDATE NO ACTION ON DELETE NO ACTION;
+...
+</pre> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/individual-database-restores-with-mariabackup-from-full-backup/" class="_attribution-link">https://mariadb.com/kb/en/individual-database-restores-with-mariabackup-from-full-backup/</a>
+  </p>
+</div>

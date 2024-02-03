@@ -1,0 +1,60 @@
+<h1>Changing a Replica to Become the Primary</h1> <div> <div class="node creole"> <div class="answer formatted"> <div class="cstm-style bluebox text">
+<p>The terms <em>master</em> and <em>slave</em> have historically been used in replication, but the terms terms <em>primary</em> and <em>replica</em> are now preferred. The old terms are used still used in parts of the documentation, and in MariaDB commands, although <a href="../what-is-mariadb-105/index.html">MariaDB 10.5</a> has begun the process of renaming. The documentation process is ongoing. See <a href="https://jira.mariadb.org/browse/MDEV-18777">MDEV-18777</a> to follow progress on this effort.</p> </div> <p> This article describes how to change a replica to become a primary and optionally to set the old primary as a replica for the new primary.</p> <p>A typical scenario of when this is useful is if you have set up a new version of MariaDB as a replica, for example for testing, and want to upgrade your primary to the new version.</p> <p>In MariaDB replication, a replica should be of a version same or newer than the primary. Because of this, one should first upgrades all replicas to the latest version before changing a replica to be a primary. In some cases one can have a replica to be of an older version than the primary, as long as one doesn't execute on the primary any SQL commands that the replica doesn't understand. This is however not guaranteed between all major MariaDB versions.</p> <p>Note that in the examples below, <code class="fixed" style="white-space:pre-wrap">[connection_name]</code> is used as the <a href="../multi-source-replication/index.html">name of the connection</a>. If you are not using named connections you can ignore this.</p> <h3 class="anchored_heading" id="stopping-the-original-master">Stopping the Original Master.</h3> <p>First one needs to take down the original primary in such a way that the replica has all information on the primary.</p> <p>If you are using <a href="../semisynchronous-replication/index.html">Semisynchronous Replication</a> you can just stop the server with the <a href="../shutdown/index.html">SHUTDOWN</a> command as the replicas should be automatically up to date.</p> <p>If you are using <a href="../maxscale/index.html">MariaDB MaxScale proxy</a>, then you <a href="https://mariadb.com/resources/blog/mariadb-maxscale-2-2-introducing-failover-switchover-and-automatic-rejoin">can use MaxScale</a> to handle the whole process of taking down the primary and replacing it with one of the replicas.</p> <p>If neither of the above is true, you have to do this step manually:</p> <h4 class="anchored_heading" id="manually-take-down-the-primary">Manually Take Down the Primary</h4> <p>First we have to set the primary to read only to ensure that there are no new updates on the primary:</p> <pre class="fixed" data-language="sql">FLUSH TABLES WITH READ LOCK;
+</pre>
+<p>Note that you should not disconnect this session as otherwise the read lock will disappear and you have to start from the beginning.</p> <p>Then you should check the current position of the primary:</p> <pre class="fixed" data-language="sql">SHOW MASTER STATUS;
++--------------------+----------+--------------+------------------+
+| File               | Position | Binlog_Do_DB | Binlog_Ignore_DB |
++--------------------+----------+--------------+------------------+
+| mariadb-bin.000003 |      343 |              |                  |
++--------------------+----------+--------------+------------------+
+SELECT @@global.gtid_binlog_pos;
++--------------------------+
+| @@global.gtid_binlog_pos |
++--------------------------+
+| 0-1-2                    |
++--------------------------+
+</pre>
+<p>And wait until you have the same position on the replica: (The following should be excepted on the replica)</p> <pre class="fixed" data-language="sql">SHOW SLAVE [connection_name] STATUS;
++-------------------+-------------------+
+Master_Log_File     | narttu-bin.000003 +
+Read_Master_Log_Pos | 343               +
+Exec_Master_Log_Pos | 343               +
+...
+Gtid_IO_Pos          0-1-2              +
++-------------------+-------------------+
+</pre>
+<p>The most important information to watch are <code>Master_Log_File</code> and <code>Exec_Master_Log_Pos</code> as when this matches the primary, it signals that all transactions has been committed on the replica.</p> <p>Note that <code>Gtid_IO_Pos</code> on replica can contain many different positions separated with ',' if the replica has been connected to many different primaries. What is important is that all the sequences that are on the primary is also on the replica.</p> <p>When replica is up to date, you can then take the <strong>PRIMARY</strong> down. This should be on the same connection where you executed <a href="../flush/index.html">FLUSH TABLES WITH READ LOCK</a>.</p> <pre class="fixed" data-language="sql">SHUTDOWN;
+</pre>
+<h3 class="anchored_heading" id="preparing-the-replica-to-be-a-primary">Preparing the Replica to be a Primary</h3> <p>Stop all old connections to the old primary(s) and reset <strong>read only mode</strong>, if you had it enabled. You also want to save the values of <a href="../show-master-status/index.html">SHOW MASTER STATUS</a> and <code>gtid_binlog_pos</code>, as you may need these to setup new replicas.</p> <pre class="fixed" data-language="sql">STOP ALL SLAVES;
+RESET SLAVE ALL;
+SHOW MASTER STATUS;
+SELECT @@global.gtid_binlog_pos;
+SET @@global.read_only=0;
+</pre>
+<h3 class="anchored_heading" id="reconnect-other-replicas-to-the-new-primary">Reconnect Other Replicas to the New Primary</h3> <p>On the other replicas you have point them to the new primary (the replica you promoted to a primary).</p> <pre class="fixed" data-language="sql">STOP SLAVE [connection_name];
+CHANGE MASTER [connection_name] TO MASTER_HOST="new_master_name",
+MASTER_PORT=3306, MASTER_USER='root', MASTER_USE_GTID=current_pos,
+MASTER_LOG_FILE="XXX", MASTER_LOG_POS=XXX;
+START SLAVE;
+</pre>
+<p>The <code class="fixed" style="white-space:pre-wrap">XXX</code> values for <code>MASTER_LOG_FILE</code> and <code>MASTER_LOG_POS</code> should be the values you got from the <code>SHOW MASTER STATUS</code> command you did when you finished setting up the replica.</p> <h3 class="anchored_heading" id="changing-the-old-primary-to-be-a-replica">Changing the Old Primary to be a Replica</h3> <p>Now you can upgrade the new primary to a newer version of MariaDB and then follow the same procedure to connect it as a replica.</p> <p>When starting the original primary, it's good to start the <code>mysqld</code> executable with the <code>--with-skip-slave-start</code> and <code>--read-only</code> options to ensure that no old replica configurations could cause any conflicts.</p> <p>For the same reason it's also good to execute the following commands on the old primary (same as for other replicas, but with some extra security). The <code>read_only</code> option below is there to ensure that old applications doesn't by accident try to update the old primary by mistake. It only affects normal connections to the replica, not changes from the new primary.</p> <pre class="fixed" data-language="sql">set @@global.read_only=1;
+STOP ALL SLAVES;
+RESET MASTER;
+RESET SLAVE ALL;
+CHANGE MASTER [connection_name] TO MASTER_HOST="new_master_name",
+MASTER_PORT=3306, MASTER_USER='root', MASTER_USE_GTID=current_pos,
+MASTER_LOG_FILE="XXX", MASTER_LOG_POS=XXX;
+START SLAVE;
+</pre>
+<h3 class="anchored_heading" id="moving-applications-to-use-new-primary">Moving Applications to Use New Primary</h3> <p>You should now point your applications to use the new primary. If you are using the <a href="../maxscale/index.html">MariaDB MaxScale proxy</a>, then you don't have to do this step as MaxScale will take care of sending write request to the new primary.</p> <h3 class="anchored_heading" id="see-also">See Also</h3> <ul start="1">
+<li>
+<a href="../change-master-to/index.html">CHANGE MASTER TO</a> command </li>
+<li>
+<a href="https://mariadb.com/resources/blog/mariadb-maxscale-2-2-introducing-failover-switchover-and-automatic-rejoin">MaxScale Blog about using Switchover to swap a primary and replica</a> </li>
+<li><a href="https://www.percona.com/blog/2015/12/01/upgrade-master-server-minimal-downtime">Percona blog about how to upgrade replica to primary</a></li>
+</ul> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/changing-a-replica-to-become-the-primary/" class="_attribution-link">https://mariadb.com/kb/en/changing-a-replica-to-become-the-primary/</a>
+  </p>
+</div>

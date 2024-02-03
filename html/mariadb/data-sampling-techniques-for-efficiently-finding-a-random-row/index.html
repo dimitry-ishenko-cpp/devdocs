@@ -1,0 +1,139 @@
+<h1>Data Sampling: Techniques for Efficiently Finding a Random Row</h1> <div> <div class="node creole"> <div class="answer formatted">  <h2 class="anchored_heading" id="fetching-random-rows-from-a-table-beyond-order-by-rand">Fetching random rows from a table (beyond ORDER BY RAND())</h2> <h3 class="anchored_heading" id="the-problem">The problem</h3> <p>One would like to do "SELECT ... ORDER BY RAND() LIMIT 10" to get 10 rows at random. But this is slow. The optimizer does</p> <ul>
+<li>Fetch all the rows -- this is costly </li>
+<li>Append <a href="../rand/index.html">RAND()</a> to the rows </li>
+<li>Sort the rows -- also costly </li>
+<li>Pick the first 10. </li>
+</ul> <p>All the algorithms given below are "fast", but most introduce flaws:</p> <ul>
+<li>Bias -- some rows are more like to be fetched than others. </li>
+<li>Repetitions -- If two random sets contain the same row, they are likely to contain other dups. </li>
+<li>Sometimes failing to fetch the desired number of rows. </li>
+</ul> <p>"Fast" means avoiding reading all the rows. There are many techniques that require a full table scan, or at least an index scan. They are not acceptable for this list. There is even a technique that averages half a scan; it is relegated to a footnote.</p> <h3 class="anchored_heading" id="metrics">Metrics</h3> <p>Here's a way to measure performance without having a big table.</p> <pre class="fixed" data-language="sql">    FLUSH STATUS;
+    SELECT ...;
+    SHOW SESSION STATUS LIKE 'Handler%';
+</pre>
+<p>If some of the "Handler" numbers look like the number of rows in the table, then there was a table scan.</p> <p>None of the queries presented here need a full table (or index) scan. Each has a time proportional to the number of rows returned.</p> <p>Virtually all published algorithms involve a table scan. The previously published version of this blog had, embarrassingly, several algorithms that had table scans.</p> <p>Sometimes the scan can be avoided via a subquery. For example, the first of these will do a table scan; the second will not.</p> <pre class="fixed" data-language="sql">SELECT *  FROM RandTest AS a
+  WHERE id = FLOOR(@min + (@max - @min + 1) * RAND());  -- BAD: table scan
+SELECT *
+ FROM RandTest AS a
+ JOIN (
+   SELECT FLOOR(@min + (@max - @min + 1) * RAND()) AS id -- Good; single eval.
+      ) b  USING (id);
+</pre>
+<h3 class="anchored_heading" id="case-consecutive-auto_increment-without-gaps-1-row-returned">Case: Consecutive AUTO_INCREMENT without gaps, 1 row returned</h3> <ul>
+<li>Requirement: <a href="../auto_increment/index.html">AUTO_INCREMENT</a> id </li>
+<li>Requirement: No gaps in id </li>
+</ul> <pre class="fixed" data-language="sql">  SELECT r.*
+      FROM (
+          SELECT FLOOR(mm.min_id + (mm.max_id - mm.min_id + 1) * RAND()) AS id
+              FROM (
+                  SELECT MIN(id) AS min_id,
+                         MAX(id) AS max_id
+                      FROM RandTest
+                   ) AS mm
+           ) AS init
+      JOIN  RandTest AS r  ON r.id = init.id;
+</pre>
+<p>(Of course, you might be able to simplify this. For example, min_id is likely to be 1. Or precalculate limits into @min and @max.)</p> <h3 class="anchored_heading" id="case-consecutive-auto_increment-without-gaps-10-rows">Case: Consecutive AUTO_INCREMENT without gaps, 10 rows</h3> <ul>
+<li>Requirement: AUTO_INCREMENT id </li>
+<li>Requirement: No gaps in id </li>
+<li>Flaw: Sometimes delivers fewer than 10 rows </li>
+</ul> <pre class="fixed" data-language="sql">  -- First select is one-time:
+  SELECT @min := MIN(id),
+         @max := MAX(id)
+      FROM RandTest;
+  SELECT DISTINCT *
+      FROM RandTest AS a
+      JOIN (
+          SELECT FLOOR(@min + (@max - @min + 1) * RAND()) AS id
+              FROM RandTest
+              LIMIT 11    -- more than 10 (to compensate for dups)
+           ) b  USING (id)
+      LIMIT 10;           -- the desired number of rows
+</pre>
+<p>The FLOOR expression could lead to duplicates, hence the inflated inner LIMIT. There could (rarely) be so many duplicates that the inflated LIMIT leads to fewer than the desired 10 different rows. One approach to that Flaw is to rerun the query if it delivers too few rows.</p> <p>A variant:</p> <pre class="fixed" data-language="sql">  SELECT r.*
+      FROM (
+          SELECT FLOOR(mm.min_id + (mm.max_id - mm.min_id + 1) * RAND()) AS id
+              FROM (
+                  SELECT MIN(id) AS min_id,
+                         MAX(id) AS max_id
+                      FROM RandTest
+                   ) AS mm
+              JOIN ( SELECT id dummy FROM RandTest LIMIT 11 ) z
+           ) AS init
+      JOIN  RandTest AS r  ON r.id = init.id
+      LIMIT 10;
+</pre>
+<p>Again, ugly but fast, regardless of table size.</p> <h3 class="anchored_heading" id="case-auto_increment-with-gaps-1-or-more-rows-returned">Case: AUTO_INCREMENT with gaps, 1 or more rows returned</h3> <ul>
+<li>Requirement: AUTO_INCREMENT, possibly with gaps due to DELETEs, etc </li>
+<li>Flaw: Only semi-random (rows do not have an equal chance of being picked), but it does partially compensate for the gaps </li>
+<li>Flaw: The first and last few rows of the table are less likely to be delivered. </li>
+</ul> <p>This gets 50 "consecutive" ids (possibly with gaps), then delivers a random 10 of them.</p> <pre class="fixed" data-language="sql">-- First select is one-time:
+SELECT @min := MIN(id),
+       @max := MAX(id)
+    FROM RandTest;
+SELECT a.*
+    FROM RandTest a
+    JOIN ( SELECT id FROM
+            ( SELECT id
+                FROM ( SELECT @min + (@max - @min + 1 - 50) * RAND() 
+                  AS start FROM DUAL ) AS init
+                JOIN RandTest y
+                WHERE    y.id &gt; init.start
+                ORDER BY y.id
+                LIMIT 50         -- Inflated to deal with gaps
+            ) z ORDER BY RAND()
+           LIMIT 10              -- number of rows desired (change to 1 if looking for a single row)
+         ) r ON a.id = r.id;
+</pre>
+<p>Yes, it is complex, but yes, it is fast, regardless of the table size.</p> <h3 class="anchored_heading" id="case-extra-float-column-for-randomizing">Case: Extra FLOAT column for randomizing</h3> <p>(Unfinished: need to check these.)</p> <p>Assuming `rnd` is a FLOAT (or DOUBLE) populated with RAND() and INDEXed:</p> <ul>
+<li>Requirement: extra, indexed, FLOAT column </li>
+<li>Flaw: Fetches 10 adjacent rows (according to `rnd`), hence not good randomness </li>
+<li>Flaw: Near 'end' of table, can't find 10 rows. </li>
+</ul> <pre class="fixed" data-language="sql">  SELECT r.*
+      FROM ( SELECT RAND() AS start FROM DUAL ) init
+      JOIN RandTest r
+      WHERE r.rnd &gt;= init.start
+      ORDER BY r.rnd
+      LIMIT 10;
+</pre>
+<ul><li>These two variants attempt to resolve the end-of-table flaw: </li></ul> <pre class="fixed" data-language="sql">  SELECT r.*
+      FROM ( SELECT RAND() * ( SELECT rnd
+                        FROM RandTest
+                        ORDER BY rnd DESC
+                        LIMIT 10,1 ) AS start
+           ) AS init
+      JOIN RandTest r
+      WHERE r.rnd &gt; init.start
+      ORDER BY r.rnd
+      LIMIT 10;
+
+
+  SELECT @start := RAND(),
+         @cutoff := CAST(1.1 * 10 + 5 AS DECIMAL(20,8)) / TABLE_ROWS
+      FROM information_schema.TABLES
+      WHERE TABLE_SCHEMA = 'dbname'
+        AND TABLE_NAME = 'RandTest'; -- 0.0030
+  SELECT d.*
+      FROM (
+          SELECT a.id
+              FROM RandTest a
+              WHERE rnd BETWEEN @start AND @start + @cutoff
+           ) sample
+      JOIN RandTest d USING (id)
+      ORDER BY rand()
+      LIMIT 10;
+</pre>
+<h3 class="anchored_heading" id="case-uuid-or-md5-column">Case: UUID or MD5 column</h3> <ul>
+<li>Requirement: UUID/GUID/MD5/SHA1 column exists and is indexed. </li>
+<li>Similar code/benefits/flaws to AUTO_INCREMENT with gaps. </li>
+<li>Needs 7 random HEX digits: </li>
+</ul> <pre class="fixed" data-language="sql">RIGHT( HEX( (1&lt;&lt;24) * (1+RAND()) ), 6)
+</pre>
+<p>can be used as a `start` for adapting a gapped AUTO_INCREMENT case. If the field is BINARY instead of hex, then </p> <pre class="fixed" data-language="sql">UNHEX(RIGHT( HEX( (1&lt;&lt;24) * (1+RAND()) ), 6))
+</pre>
+<h2 class="anchored_heading" id="see-also">See also</h2> <p>Rick James graciously allowed us to use this article in the Knowledge Base.</p> <p><a href="http://mysql.rjweb.org/">Rick James' site</a> has other useful tips, how-tos, optimizations, and debugging tips.</p> <p> Original source: <a href="http://mysql.rjweb.org/doc.php/random">http://mysql.rjweb.org/doc.php/random</a></p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/data-sampling-techniques-for-efficiently-finding-a-random-row/" class="_attribution-link">https://mariadb.com/kb/en/data-sampling-techniques-for-efficiently-finding-a-random-row/</a>
+  </p>
+</div>

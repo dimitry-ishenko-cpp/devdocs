@@ -1,0 +1,160 @@
+<h1>Compound (Composite) Indexes</h1> <div> <div class="node creole"> <div class="answer formatted"> <h2 class="anchored_heading" id="a-mini-lesson-in-compound-indexes-composite-indexes">A mini-lesson in "compound indexes" ("composite indexes")</h2> <p>This document starts out trivial and perhaps boring, but builds up to more interesting information, perhaps things you did not realize about how MariaDB and MySQL indexing works.</p> <p>This also explains <a href="../explain/index.html">EXPLAIN</a> (to some extent).</p> <p>(Most of this applies to other databases, too.)</p> <h2 class="anchored_heading" id="the-query-to-discuss">The query to discuss</h2> <p>The question is "When was Andrew Johnson president of the US?".</p> <p>The available table `Presidents` looks like:</p> <pre class="fixed" data-language="sql">+-----+------------+----------------+-----------+
+| seq | last_name  | first_name     | term      |
++-----+------------+----------------+-----------+
+|   1 | Washington | George         | 1789-1797 |
+|   2 | Adams      | John           | 1797-1801 |
+...
+|   7 | Jackson    | Andrew         | 1829-1837 |
+...
+|  17 | Johnson    | Andrew         | 1865-1869 |
+...
+|  36 | Johnson    | Lyndon B.      | 1963-1969 |
+...
+</pre>
+<p>("Andrew Johnson" was picked for this lesson because of the duplicates.)</p> <p>What index(es) would be best for that question? More specifically, what would be best for</p> <pre class="fixed" data-language="sql">    SELECT  term
+        FROM  Presidents
+        WHERE  last_name = 'Johnson'
+          AND  first_name = 'Andrew';
+</pre>
+<p>Some INDEXes to try...</p> <ul>
+<li>No indexes </li>
+<li>INDEX(first_name), INDEX(last_name) (two separate indexes) </li>
+<li>"Index Merge Intersect" </li>
+<li>INDEX(last_name, first_name) (a "compound" index) </li>
+<li>INDEX(last_name, first_name, term) (a "covering" index) </li>
+<li>Variants </li>
+</ul> <h2 class="anchored_heading" id="no-indexes">No indexes</h2> <p>Well, I am fudging a little here. I have a PRIMARY KEY on `seq`, but that has no advantage on the query we are studying.</p> <pre class="fixed" data-language="sql">SHOW CREATE TABLE Presidents \G
+CREATE TABLE `presidents` (
+  `seq` tinyint(3) unsigned NOT NULL AUTO_INCREMENT,
+  `last_name` varchar(30) NOT NULL,
+  `first_name` varchar(30) NOT NULL,
+  `term` varchar(9) NOT NULL,
+  PRIMARY KEY (`seq`)
+) ENGINE=InnoDB AUTO_INCREMENT=45 DEFAULT CHARSET=utf8
+
+EXPLAIN  SELECT  term
+   FROM  Presidents
+   WHERE  last_name = 'Johnson'
+   AND  first_name = 'Andrew';
++----+-------------+------------+------+---------------+------+---------+------+------+-------------+
+| id | select_type | table      | type | possible_keys | key  | key_len | ref  | rows | Extra       |
++----+-------------+------------+------+---------------+------+---------+------+------+-------------+
+|  1 | SIMPLE      | Presidents | ALL  | NULL          | NULL | NULL    | NULL |   44 | Using where |
++----+-------------+------------+------+---------------+------+---------+------+------+-------------+
+
+# Or, using the other form of display:  EXPLAIN ... \G
+           id: 1
+  select_type: SIMPLE
+        table: Presidents
+         type: ALL        &lt;-- Implies table scan
+possible_keys: NULL
+          key: NULL       &lt;-- Implies that no index is useful, hence table scan
+      key_len: NULL
+          ref: NULL
+         rows: 44         &lt;-- That's about how many rows in the table, so table scan
+        Extra: Using where
+</pre>
+<h2 class="anchored_heading" id="implementation-details">Implementation Details</h2> <p>First, let's describe how InnoDB stores and uses indexes.</p> <ul>
+<li>The data and the PRIMARY KEY are "clustered" together in on BTree. </li>
+<li>A BTree lookup is quite fast and efficient. For a million-row table there might be 3 levels of BTree, and the top two levels are probably cached. </li>
+<li>Each secondary index is in another BTree, with the PRIMARY KEY at the leaf. </li>
+<li>Fetching 'consecutive' (according to the index) items from a BTree is very efficient because they are stored consecutively. </li>
+<li>For the sake of simplicity, we can count each BTree lookup as 1 unit of work, and ignore scans for consecutive items. This approximates the number of disk hits for a large table in a busy system. </li>
+</ul> <p>For MyISAM, the PRIMARY KEY is not stored with the data, so think of it as being a secondary key (over-simplified).</p> <h2 class="anchored_heading" id="indexfirst_name-indexlast_name">INDEX(first_name), INDEX(last_name)</h2> <p>The novice, once he learns about indexing, decides to index lots of columns, one at a time. But...</p> <p>MariaDB rarely uses more than one index at a time in a query. So, it will analyze the possible indexes.</p> <ul>
+<li>first_name -- there are 2 possible rows (one BTree lookup, then scan consecutively) </li>
+<li>last_name -- there are 2 possible rows Let's say it picks last_name. Here are the steps for doing the SELECT: 1. Using INDEX(last_name), find 2 index entries with last_name = 'Johnson'. 2. Get the PRIMARY KEY (implicitly added to each secondary index in InnoDB); get (17, 36). 3. Reach into the data using seq = (17, 36) to get the rows for Andrew Johnson and Lyndon B. Johnson. 4. Use the rest of the WHERE clause filter out all but the desired row. 5. Deliver the answer (1865-1869). </li>
+</ul> <pre class="fixed" data-language="sql">EXPLAIN  SELECT  term
+  FROM  Presidents
+  WHERE  last_name = 'Johnson'
+  AND  first_name = 'Andrew'  \G
+  select_type: SIMPLE
+        table: Presidents
+         type: ref
+possible_keys: last_name, first_name
+          key: last_name
+      key_len: 92                 &lt;-- VARCHAR(30) utf8 may need 2+3*30 bytes
+          ref: const
+         rows: 2                  &lt;-- Two 'Johnson's
+        Extra: Using where
+</pre>
+<h2 class="anchored_heading" id="index-merge-intersect">"Index Merge Intersect"</h2> <p>OK, so you get really smart and decide that MariaDB should be smart enough to use both name indexes to get the answer. This is called "Intersect". 1. Using INDEX(last_name), find 2 index entries with last_name = 'Johnson'; get (7, 17) 2. Using INDEX(first_name), find 2 index entries with first_name = 'Andrew'; get (17, 36) 3. "And" the two lists together (7,17) &amp; (17,36) = (17) 4. Reach into the data using seq = (17) to get the row for Andrew Johnson. 5. Deliver the answer (1865-1869).</p> <pre class="fixed" data-language="sql">           id: 1
+  select_type: SIMPLE
+        table: Presidents
+         type: index_merge
+possible_keys: first_name,last_name
+          key: first_name,last_name
+      key_len: 92,92
+          ref: NULL
+         rows: 1
+        Extra: Using intersect(first_name,last_name); Using where
+</pre>
+<p>The EXPLAIN fails to give the gory details of how many rows collected from each index, etc.</p> <h2 class="anchored_heading" id="indexlast_name-first_name">INDEX(last_name, first_name)</h2> <p>This is called a "compound" or "composite" index since it has more than one column. 1. Drill down the BTree for the index to get to exactly the index row for Johnson+Andrew; get seq = (17). 2. Reach into the data using seq = (17) to get the row for Andrew Johnson. 3. Deliver the answer (1865-1869). This is much better. In fact this is usually the "best".</p> <pre class="fixed" data-language="sql">    ALTER TABLE Presidents
+        (drop old indexes and...)
+        ADD INDEX compound(last_name, first_name);
+
+           id: 1
+  select_type: SIMPLE
+        table: Presidents
+         type: ref
+possible_keys: compound
+          key: compound
+      key_len: 184             &lt;-- The length of both fields
+          ref: const,const     &lt;-- The WHERE clause gave constants for both
+         rows: 1               &lt;-- Goodie!  It homed in on the one row.
+        Extra: Using where
+</pre>
+<h2 class="anchored_heading" id="covering-indexlast_name-first_name-term">"Covering": INDEX(last_name, first_name, term)</h2> <p>Surprise! We can actually do a little better. A "Covering" index is one in which _all_ of the fields of the SELECT are found in the index. It has the added bonus of not having to reach into the "data" to finish the task. 1. Drill down the BTree for the index to get to exactly the index row for Johnson+Andrew; get seq = (17). 2. Deliver the answer (1865-1869). The "data" BTree is not touched; this is an improvement over "compound".</p> <pre class="fixed" data-language="sql">    ... ADD INDEX covering(last_name, first_name, term);
+
+           id: 1
+  select_type: SIMPLE
+        table: Presidents
+         type: ref
+possible_keys: covering
+          key: covering
+      key_len: 184
+          ref: const,const
+         rows: 1
+        Extra: Using where; Using index   &lt;-- Note
+</pre>
+<p>Everything is similar to using "compound", except for the addition of "Using index".</p> <h2 class="anchored_heading" id="variants">Variants</h2> <ul>
+<li>What would happen if you shuffled the fields in the WHERE clause? Answer: The order of ANDed things does not matter. </li>
+<li>What would happen if you shuffled the fields in the INDEX? Answer: It may make a huge difference. More in a minute. </li>
+<li>What if there are extra fields on the the end? Answer: Minimal harm; possibly a lot of good (eg, 'covering'). </li>
+<li>Reduncancy? That is, what if you have both of these: INDEX(a), INDEX(a,b)? Answer: Reduncy costs something on INSERTs; it is rarely useful for SELECTs. </li>
+<li>Prefix? That is, INDEX(last_name(5). first_name(5)) Answer: Don't bother; it rarely helps, and often hurts. (The details are another topic.) </li>
+</ul> <h2 class="anchored_heading" id="more-examples">More examples:</h2> <pre class="fixed" data-language="sql">    INDEX(last, first)
+    ... WHERE last = '...' -- good (even though `first` is unused)
+    ... WHERE first = '...' -- index is useless
+
+    INDEX(first, last), INDEX(last, first)
+    ... WHERE first = '...' -- 1st index is used
+    ... WHERE last = '...' -- 2nd index is used
+    ... WHERE first = '...' AND last = '...' -- either could be used equally well
+
+    INDEX(last, first)
+    Both of these are handled by that one INDEX:
+    ... WHERE last = '...'
+    ... WHERE last = '...' AND first = '...'
+
+    INDEX(last), INDEX(last, first)
+    In light of the above example, don't bother including INDEX(last).
+</pre>
+<h2 class="anchored_heading" id="postlog">Postlog</h2> <p>Refreshed -- Oct, 2012; more links -- Nov 2016</p> <h2 class="anchored_heading" id="see-also">See also</h2> <ul start="1">
+<li>
+<a href="http://mysql.rjweb.org/doc.php/index_cookbook_mysql">Cookbook on designing the best index for a SELECT</a> </li>
+<li>
+<a href="http://technocation.org/files/doc/2013_02_MySQLindexes.pdf">Sheeri's discussing of Indexes</a> </li>
+<li>
+<a href="http://www.slideshare.net/phpcodemonkey/mysql-explain-explained">Slides on EXPLAIN</a> </li>
+<li>
+<a href="http://dev.mysql.com/doc/refman/5.7/en/range-optimization.html#range-access-multi-part">Mysql manual page on range accesses in composite indexes</a> </li>
+<li>
+<a href="http://stackoverflow.com/questions/32418812/overhead-of-composite-indexes">Overhead of Composite Indexes</a> </li>
+<li>
+<a href="http://mysql.rjweb.org/doc.php/limits">Size and other limits on Indexes</a> </li>
+</ul> <p>Rick James graciously allowed us to use this article in the Knowledge Base.</p> <p><a href="http://mysql.rjweb.org/">Rick James' site</a> has other useful tips, how-tos, optimizations, and debugging tips.</p> <p> Original source: <a href="http://mysql.rjweb.org/doc.php/index1">http://mysql.rjweb.org/doc.php/index1</a></p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/compound-composite-indexes/" class="_attribution-link">https://mariadb.com/kb/en/compound-composite-indexes/</a>
+  </p>
+</div>

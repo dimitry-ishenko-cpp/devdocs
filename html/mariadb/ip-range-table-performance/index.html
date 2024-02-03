@@ -1,0 +1,62 @@
+<h1>IP Range Table Performance</h1> <div> <div class="node creole"> <div class="answer formatted">  <h2 class="anchored_heading" id="the-situation">The situation</h2> <p>Your data includes a large set of non-overlapping 'ranges'. These could be IP addresses, datetimes (show times for a single station), zipcodes, etc.</p> <p>You have pairs of start and end values; one 'item' belongs to each such 'range'. So, instinctively, you create a table with start and end of the range, plus info about the item. Your queries involve a WHERE clause that compares for being between the start and end values.</p> <h2 class="anchored_heading" id="the-problem">The problem</h2> <p>Once you get a large set of items, performance degrades. You play with the indexes, but find nothing that works well. The indexes fail to lead to optimal functioning because the database does not understand that the ranges are non-overlapping.</p> <h2 class="anchored_heading" id="the-solution">The solution</h2> <p>I will present a solution that enforces the fact that items cannot have overlapping ranges. The solution builds a table to take advantage of that, then uses Stored Routines to get around the clumsiness imposed by it.</p> <h2 class="anchored_heading" id="performance">Performance</h2> <p>The instinctive solution often leads to scanning half the table to do just about anything, such as finding the item containing an 'address'. In complexity terms, this is Order(N).</p> <p>The solution here can usually get the desired information by fetching a single row, or a small number of rows. It is Order(1).</p> <p>In a large table, "counting the disk hits" is the important part of performance. Since InnoDB is used, and the PRIMARY KEY (clustered) is used, most operations hit only 1 block.</p> <p>Finding the 'block' where a given IP address lives:</p> <ul>
+<li>For start of block: One single-row fetch using the PRIMARY KEY </li>
+<li>For end of block: Ditto. The record containing this will be 'adjacent' to the other record. </li>
+</ul> <p>For allocating or freeing a block:</p> <ul>
+<li>2-7 SQL statements, hitting the clustered PRIMARY KEY for the rows containing and immediately adjacent to the block. </li>
+<li>One SQL statement is a DELETE; if hits as many rows as are needed for the block. </li>
+<li>The other statements hit one row each. </li>
+</ul> <h2 class="anchored_heading" id="design-decisions">Design decisions</h2> <p>This is crucial to the design and its performance:</p> <ul>
+<li>Having just one address in the row. These were alternative designs; they seemed to be no better, and possibly worse: </li>
+<li>That one address could have been the 'end' address. </li>
+<li>The routine parameters for a 'block' could have be start of this block and start of next block. </li>
+<li>The IPv4 parameters could have been dotted quads; I chose to keep the reference implemetation simpler instead. </li>
+<li>The IPv6 parameters are 32-digit hex because it was the simpler that BINARY(16) or IPv5 for a reference implementation. </li>
+</ul> <p>The interesting work is in the Ips, not the second table, so I focus on it. The inconvenience of JOINing to the second table is small compared to the performance gains.</p> <h2 class="anchored_heading" id="details">Details</h2> <p>Two, not one, tables will be used. The first table (`Ips` in the reference implementations) is carefully designed to be optimal for all the basic operations needed. The second table contains other infomation about the 'owner' of each 'item'. In the reference implementations `owner` is an id used to JOIN the two tables. This discussion centers around `Ips` and how to efficiently map IP(s) to/from owner(s). The second table has "PRIMARY KEY(owner)".</p> <p>In addition to the two-table schema, there are a set of Stored Routines to encapsulate the necessary code.</p> <p>One row of Ips represents one 'item' by specifying the starting IP address and the 'owner'. The next row gives the starting IP address of the next "address block", thereby indirectly providing the ending address for the current block.</p> <p>This lack of explicitly stating the "end address" leads to some clumsiness. The stored routines hide it from the user.</p> <p>A special owner (indicated by '0') is reserved for "free" or "not-owned" blocks. Hence, sparse allocation of address blocks is no problem. Also, the 'free' owner is handled no differently than real owners, so there are no extra Stored Routines for such.</p> <p>Links below give "reference" implementations for IPv4 and IPv6. You will need to make changes for non-IP situations, and may need to make changes even for IP situations.</p> <p>These are the main stored routines provided:</p> <ul>
+<li>IpIncr, IpDecr -- for adding/subtracting 1 </li>
+<li>IpStore -- for allocating/freeing a range </li>
+<li>IpOwner, IpRangeOwners, IpFindRanges, Owner2IpStarts, Owner2IpRanges -- for lookups </li>
+<li>IpNext, IpEnd -- IP of start of next block, or end of current block </li>
+</ul> <p>None of the provided routines JOIN to the other table; you may wish to develop custom queries based on the given reference Stored Procedures.</p> <p>The Ips table's size is proportional to the number of blocks. A million 'owned' blocks may be 20-50MB. This varies due to</p> <ul>
+<li>number of 'free' gaps (between zero and the number of owned blocks) </li>
+<li>datatypes used for `ip` and `owner` </li>
+<li>
+<a href="../innodb/index.html">InnoDB</a> overhead Even 100M blocks is quite manageable in today's hardware. Once things are cached, most operations would take only a few milliseconds. A trillion blocks would work, but most operations would hit the disk a few times -- only a few times. </li>
+</ul> <h2 class="anchored_heading" id="reference-implementation-of-ipv4">Reference implementation of IPv4</h2> <p>This specific to IPv4 (32 bit, a la '196.168.1.255'). It can handle anywhere from 'nothing assigned' (1 row) to 'everything assigned' (4B rows) 'equally' well. That is, to ask the question "who owns '11.22.33.44'" is equally efficient regardless of how many blocks of IP addresses exist in the table. (OK, caching, disk hits, etc may make a slight difference.) The one function that can vary is the one that reassigns a range to a new owner. Its speed is a function of how many existing ranges need to be consumed, since those rows will be DELETEd. (It helps that they are, by schema design, 'clustered'.)</p> <p>Notes on the <a href="http://mysql.rjweb.org/doc.php/ipv4.sql">Reference implementation for IPv4</a>:</p> <ul>
+<li>Externally, the user may use the dotted quad notation (11.22.33.44), but needs to convert to INT UNSIGNED for calling the Stored Procs. </li>
+<li>The user is responsible for converting to/from the calling datatype (INT UNSIGNED) when accessing the stored routine; suggest <a href="../inet_aton/index.html">INET_ATON</a>/<a href="../inet_ntoa/index.html">INET_NTOA</a>. </li>
+<li>The internal datatype for addresses is the same as the calling datatype (INT UNSIGNED). </li>
+<li>Adding and subtracting 1 (simple arithmetic). </li>
+<li>The datatype of an 'owner' (MEDIUMINT UNSIGNED: 0..16M) -- adjust if needed. </li>
+<li>The address "Off the end" (255.255.255.255+1 - represented as NULL). </li>
+<li>The table is initialized to one row: (ip=0, owner=0), meaning "all addresses are free See the comments in the code for more details. </li>
+</ul> <p>(The reference implementation does not handle CDRs. Such should be easy to add on, by first turning it into an IP range.)</p> <h2 class="anchored_heading" id="reference-implementation-of-ipv6">Reference implementation of IPv6</h2> <p>The code for handling IP address is more complex, but the overall structure is the same as for IPv4. Launch into it only if you need IPv6.</p> <p>Notes on the <a href="http://mysql.rjweb.org/doc.php/ipv6.sql">reference implementation for IPv6</a>:</p> <ul>
+<li>Externally, IPv6 has a complex string, VARCHAR(39) CHARACTER SET ASCII. The Stored Procedure IpStr2Hex() is provided. </li>
+<li>The user is responsible for converting to/from the calling datatype (BINARY(16)) when accessing the stored routine; suggest <a href="../inet6_aton/index.html">INET6_ATON</a>/<a href="../inet6_ntoa/index.html">INET6_NTOA</a>. </li>
+<li>The internal datatype for addresses is the same as the calling datatype (BINARY(16)). </li>
+<li>Communication with the Stored routines is via 32-char hex strings. </li>
+<li>Inside the Procedures, and in the Ips table, an address is stored as BINARY(16) for efficiency. HEX() and UNHEX() are used at the boundaries. </li>
+<li>Adding/subtracting 1 is rather complex (see the code). </li>
+<li>The datatype of an 'owner' (MEDIUMINT UNSIGNED: 0..16M); 'free' is represented by 0. You may need a bigger datatype. </li>
+<li>The address "Off the end" (ffff.ffff.ffff.ffff.ffff.ffff.ffff.ffff+1 is represented by NULL). </li>
+<li>The table is initialized to one row: (UNHEX('00000000000000000000000000000000'), 0), meaning "all addresses are free. </li>
+<li>You may need to decide on a canonical representation of IPv4 in IPv6. See the comments in the code for more details. </li>
+</ul> <p>The INET6* functions were first available in MySQL 5.6.3 and <a href="https://mariadb.com/kb/en/mariadb-1003-release-notes/">MariaDB 10.0.3</a></p> <p>Adapting to a different non-IP 'address range' data</p> <ul>
+<li>The external datatype for an 'address' should be whatever is convenient for the application. </li>
+<li>The datatype for the 'address' in the table must be ordered, and should be as compact as possible. </li>
+<li>You must write the Stored functions (IpIncr, IpDecr) for incrementing/decrementing an 'address'. </li>
+<li>An 'owner' is an id of your choosing, but smaller is better. </li>
+<li>A special value (such as 0 or '') must be provided for 'free'. </li>
+<li>The table must be initialized to one row: (SmallestAddress, Free) </li>
+</ul> <p>"Owner" needs a special value to represent "not owned". The reference implementations use "=" and "!=" to compare two 'owners'. Numeric values and strings work nicely with those operators; NULL does not. Hence, please do not use NULL for "not owned".</p> <p>Since the datatypes are pervasive in the stored routines, adapting a reference implementation to a different concept of 'address' would require multiple minor changes.</p> <p>The code enforces that consecutive blocks never have the same 'owner', so the table is of 'minimal' size. Your application can assume that such is always the case.</p> <h2 class="anchored_heading" id="postlog">Postlog</h2> <p>Original writing -- Oct, 2012; Notes on INET6 functions -- May, 2015.</p> <h2 class="anchored_heading" id="see-also">See also</h2> <ul>
+<li>
+<a href="http://jorgenloland.blogspot.co.uk/2011/09/tips-and-tricks-killer-response-time.html">Related blog</a> </li>
+<li>
+<a href="http://dba.stackexchange.com/questions/83458/mysql-select-with-between-optimization/83471#83471">Another approach</a> </li>
+<li>
+<a href="https://lite.ip2location.com/">Free IP tables</a> </li>
+</ul> <p>Rick James graciously allowed us to use this article in the Knowledge Base.</p> <p><a href="http://mysql.rjweb.org/">Rick James' site</a> has other useful tips, how-tos, optimizations, and debugging tips.</p> <p> Original source: <a href="http://mysql.rjweb.org/doc.php/ipranges">http://mysql.rjweb.org/doc.php/ipranges</a></p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/ip-range-table-performance/" class="_attribution-link">https://mariadb.com/kb/en/ip-range-table-performance/</a>
+  </p>
+</div>

@@ -1,0 +1,177 @@
+<h1>The Optimizer Cost Model from MariaDB 11.0</h1> <div> <div class="node creole"> <div class="answer formatted">  <h2 class="anchored_heading" id="background">Background</h2> <p>Before <a href="../what-is-mariadb-110/index.html">MariaDB 11.0</a>, the MariaDB Query optimizer used a 'basic cost' of 1 for:</p> <ul start="1">
+<li>One disk access </li>
+<li>Fetching a key </li>
+<li>Fetching a row based on the rowid (= unique row identifier) from the key </li>
+</ul> <p>There were some smaller costs:</p> <ul start="1">
+<li>filter lookup: 0.01 </li>
+<li>Examining a where clause: 0.20 </li>
+<li>Comparing two keys: 0.05 </li>
+<li>Fetching a row through an index from a temporary memory table: 0.05 </li>
+</ul> <p>The above costs are reasonable for finding out the best index to use. However, they where not good for finding out if we should use a table scan, index scan or range lookup. The cost for the different engines were not properly calibrated.</p> <h2 class="anchored_heading" id="new-cost-model">New Cost Model</h2> <p>In <a href="../what-is-mariadb-110/index.html">MariaDB 11.0</a> we have fixed the above shortcomings by changing the basic cost for 'storage engine operations' to be 1 millisecond. This means that for most queries the query cost (<code>LAST_QUERY_COST</code>) should be close (or at least proportional) to the time the server is spending in the storage engine + join_cache + sorting.</p> <p>Note that the user level costs are in <strong>microseconds</strong> (as milliseconds would have so many zero's that it makes it hard to compare values).</p> <p>The engine costs have also been separated into smaller parts to make things more accurate.</p> <p>The "disk"-read cost now assumes a mid level SSD disk with 400MB/second. This can be changed by the end user by modifying <code>OPTIMIZER_DISK_READ_COST</code>.</p> <p>All engine specific costs are visible in <code>information_schema.optimizer_costs</code>.</p> <p>For example:</p> <p>The "default" cost for an engine can be found with:</p> <pre class="fixed" data-language="sql"> select * from information_schema.optimizer_costs where engine="default"\G
+*************************** 1. row ***************************
+                         ENGINE: default
+       OPTIMIZER_DISK_READ_COST: 10.240000
+OPTIMIZER_INDEX_BLOCK_COPY_COST: 0.035600
+     OPTIMIZER_KEY_COMPARE_COST: 0.011361
+        OPTIMIZER_KEY_COPY_COST: 0.015685
+      OPTIMIZER_KEY_LOOKUP_COST: 0.435777
+   OPTIMIZER_KEY_NEXT_FIND_COST: 0.082347
+      OPTIMIZER_DISK_READ_RATIO: 0.020000
+        OPTIMIZER_ROW_COPY_COST: 0.060866
+      OPTIMIZER_ROW_LOOKUP_COST: 0.130839
+   OPTIMIZER_ROW_NEXT_FIND_COST: 0.045916
+   OPTIMIZER_ROWID_COMPARE_COST: 0.002653
+      OPTIMIZER_ROWID_COPY_COST: 0.002653
+</pre>
+<p>The above costs are the default (base) for all engines and should be reasonable for engines that does not have a clustered index (like <a href="../myisam/index.html">MyISAM</a>, <a href="../aria/index.html">Aria</a> etc). The default costs can be changed by specifying just the cost as an argument, like <code>mariadbd --optimizer-disk-read-cost=20</code> or from SQL: <code>set global optimizer_disk_read_cost=20</code>. An engine specific cost can be tuned by prefixing the cost with the engine name, like <code>set global innodb.optimizer_disk_read_cost=20</code>. </p> <p>An engine can tune some or all of the above cost in the storage engine interface. Here follows the cost for the <a href="../innodb/index.html">InnoDB storage engine</a>.</p> <pre class="fixed" data-language="sql">select * from information_schema.optimizer_costs where engine="innodb"\G
+*************************** 1. row ***************************
+                         ENGINE: InnoDB
+       OPTIMIZER_DISK_READ_COST: 10.240000
+OPTIMIZER_INDEX_BLOCK_COPY_COST: 0.035600
+     OPTIMIZER_KEY_COMPARE_COST: 0.011361
+        OPTIMIZER_KEY_COPY_COST: 0.015685
+      OPTIMIZER_KEY_LOOKUP_COST: 0.791120
+   OPTIMIZER_KEY_NEXT_FIND_COST: 0.099000
+      OPTIMIZER_DISK_READ_RATIO: 0.020000
+        OPTIMIZER_ROW_COPY_COST: 0.060870
+      OPTIMIZER_ROW_LOOKUP_COST: 0.765970
+   OPTIMIZER_ROW_NEXT_FIND_COST: 0.070130
+   OPTIMIZER_ROWID_COMPARE_COST: 0.002653
+      OPTIMIZER_ROWID_COPY_COST: 0.002653
+</pre>
+<p>As can be seen, the <code>ROW_LOOKUP_COST</code> is close to the <code>KEY_LOOKUP_COST</code>, which is because InnoDB has clustered primary key indexes and is using it to find the row from a secondary index.</p> <p>Some engines, like <code>HEAP</code>/<code>MEMORY</code> implement their own cost functions as different indexes in the same engine can have different costs. This is why some of the cost numbers for these engines are 0.</p> <p>There are also some SQL level costs that are independent of the storage engine:</p> <pre class="fixed" data-language="sql">select * from information_schema.global_variables where variable_name like "%where%cost%" or variable_name like "%scan%cost%";
++---------------------------+----------------+
+| VARIABLE_NAME             | VARIABLE_VALUE |
++---------------------------+----------------+
+| OPTIMIZER_SCAN_SETUP_COST | 10.000000      |
+| OPTIMIZER_WHERE_COST      | 0.032000       |
++---------------------------+----------------+
+</pre>
+<h2 class="anchored_heading" id="description-of-the-different-cost-variables">Description of the Different Cost Variables</h2> <p>Time and cost are quite interchangeable in the new cost model. Below we will use cost for most things, except for <code>OPTIMIZER_DISK_READ_COST</code> as one should use published/tested timings for the SSD/harddisk if one wants to change the value..</p> <div class="cstm-style darkheader-nospace-borders">
+<table>
+<tr>
+<th>Variable</th>
+<th>Type</th>
+<th>Description</th>
+</tr> <tr>
+<td><code>OPTIMIZER_DISK_READ_COST</code></td>
+<td>Engine</td>
+<td>Time in microseconds to read a 4K block from a disk/SSD. The default is set for a 400MB/second SSD</td>
+</tr> <tr>
+<td><code>OPTIMIZER_INDEX_BLOCK_COPY_COST</code></td>
+<td>Engine</td>
+<td>Cost to lock and a copy a block from the global cache to a local cache. This cost is added for every block accessed, independent of whether they are cached or not</td>
+</tr> <tr>
+<td><code>OPTIMIZER_KEY_COMPARE_COST</code></td>
+<td>Engine</td>
+<td>Cost to compare two keys</td>
+</tr> <tr>
+<td><code>OPTIMIZER_KEY_COPY_COST</code></td>
+<td>Engine</td>
+<td>Cost to copy a key from the index to a local buffer as part of searching for a key</td>
+</tr> <tr>
+<td><code>OPTIMIZER_KEY_LOOKUP_COST</code></td>
+<td>Engine</td>
+<td>Cost to find a key entry in the index (index read)</td>
+</tr> <tr>
+<td><code>OPTIMIZER_KEY_NEXT_FIND_COST</code></td>
+<td>Engine</td>
+<td>Cost to find the next key in the index (index next)</td>
+</tr> <tr>
+<td><code>OPTIMIZER_DISK_READ_RATIO</code></td>
+<td>Engine</td>
+<td>The ratio of BLOCK_NOT_IN_CACHE/CACHE_READS. The cost of disk usage is calculated as <code>estimated_blocks</code> * <code>OPTIMIZER_DISK_READ_RATIO</code> * <code><code>OPTIMIZER_DISK_READ_COST</code></code>. A value of 0 means that all blocks are always in the cache. A value of 1 means that a block is never in the cache</td>
+</tr> <tr>
+<td><code>OPTIMIZER_ROW_COPY_COST</code></td>
+<td>Engine</td>
+<td>Cost of copying a row to a local buffer. Should be slightly more than <code>OPTIMIZER_KEY_COPY_COST</code>
+</td>
+</tr> <tr>
+<td><code>OPTIMIZER_ROW_LOOKUP_COST</code></td>
+<td>Engine</td>
+<td>Cost to find a row based on the rowid (Rowid is stored in the index together with the key)</td>
+</tr> <tr>
+<td><code>OPTIMIZER_ROW_NEXT_FIND_COST</code></td>
+<td>Engine</td>
+<td>Cost of finding the next row</td>
+</tr> <tr>
+<td><code>OPTIMIZER_ROWID_COMPARE_COST</code></td>
+<td>Engine</td>
+<td>Cost of comparing two rowids</td>
+</tr> <tr>
+<td><code> OPTIMIZER_ROWID_COPY_COST</code></td>
+<td>Engine</td>
+<td>Cost of copying a rowid from the index</td>
+</tr> <tr>
+<td><code> OPTIMIZER_SCAN_SETUP_COST</code></td>
+<td>Session</td>
+<td>Cost of starting a table or index scan. This has a low value to encourage the optimizer to use index lookup also tables with very few rows</td>
+</tr> <tr>
+<td><code>OPTIMIZER_WHERE_COST</code></td>
+<td>Session</td>
+<td>Cost to execute the <code>WHERE</code> clause for every found row. Increasing this variable will encourage the optimizer to find plans which read fewer rows</td>
+</tr> </table> </div>
+<p>More information of the costs and how they were calculated can be found in the <code>Docs/optimizer_costs.txt</code> file in the <a href="../getting-the-mariadb-source-code/index.html">MariaDB Source distributions</a>.</p> <h2 class="anchored_heading" id="other-optimizer-cost-changes">Other Optimizer Cost Changes</h2> <ul start="1"><li>When counting disk accesses, we assume that all rows and index data are cached for the duration of the query. This is to avoid the following problem: <ul start="1"><li>table t1 with 1 million_rows is scanned <ul start="1"><li>For each row we do a lookup in table t2, which has only 10 rows </li></ul> </li></ul> </li></ul> <p>If we would count all lookups in t2, there would be 1 million lookups. If this would be the case, the optimizer would choose to use a join cache on the rows in t1 and do a table scan over t2.</p> <ul start="1"><li>The cost of sorting (filesort) is now more accurate, which allows the optimizer to better choose between index scan and filesort for <code>ORDER BY/GROUP BY</code> queries. </li></ul> <p>A lot of rule-based cost has been changed to be cost-based:</p> <ul start="1">
+<li>The decision to use an index (and which index) for resolving <code>ORDER BY/GROUP BY</code> were only partly cost-based before. </li>
+<li>The old optimizer would limit the number of ‘expected key lookups’ to 10% of the number of rows. This would cause the optimizer to use an index to scan a big part of a table when a full table scan would be much faster. This code is now removed. </li>
+<li>InnoDB would limit the number of rows in a range to 50% of the total rows, which would confuse the optimizer for big ranges. The cap is now removed. </li>
+<li>If there was a usable filter for an index, it was sometimes used without checking the complete cost of the filter. </li>
+<li>‘Aggregate distinct optimization with indexes’ is now cost-based. This will change many queries from "Using index for group-by (scanning)” to “Using index for group-by”. </li>
+</ul> <h2 class="anchored_heading" id="other-notable-plan-changes">Other Notable Plan Changes</h2> <ul start="1">
+<li>Indexes can now be used for <code>ORDER BY/GROUP BY</code> in sub queries (instead of filesort) </li>
+<li>Derived tables and queries with <code>UNION</code> can now create a distinct key (instead of a key with duplicates) to speed up key accesses. </li>
+<li>Indexes with more used key parts are preferred if the number of resulting rows is the same: <ul start="1">
+<li>
+<code class="fixed" style="white-space:pre-wrap"><span class="k">WHERE</span> <span class="n">key_part_1</span> <span class="o">=</span> <span class="mi">1</span> <span class="k">and</span> <span class="n">key_part_2</span> <span class="o">&lt;</span> <span class="mi">10</span>
+</code> </li>
+<li>This will now use a <code>RANGE</code> over both key parts instead of using lookups on key_part_1. </li>
+</ul> </li>
+<li>For very small tables, index lookup is preferred over table scan. </li>
+<li>
+<code>EXPLAIN</code> does not report "Using index" for scans using a clustered primary key as technically this a table scan. </li>
+</ul> <h2 class="anchored_heading" id="when-the-optimizer-changes-matter">When the Optimizer Changes Matter</h2> <p>The new, improved optimizer should be able to find a better plan</p> <ul start="1">
+<li>If you are using queries with more than two tables. </li>
+<li>If you have indexes with a lot of identical values. </li>
+<li>If you are using ranges that cover more than 10% of a table. <ul start="1"><li>
+<code class="fixed" style="white-space:pre-wrap"><span class="k">WHERE</span> <span class="k">key</span> <span class="k">between</span> <span class="mi">1</span> <span class="k">and</span> <span class="mi">1000</span>  <span class="c1">-- Table has values 1-2000 </span>
+</code> </li></ul> </li>
+<li>If you have complex queries when not all used columns are or can be indexed. <ul><li>In which case you may need to depend on selectivity to get the right plan. </li></ul> </li>
+<li>If you are using queries mixing different storage engines. <ul start="1"><li>Like using tables from both InnoDB and Memory in the same query. </li></ul> </li>
+<li>If you have had to use <code>FORCE INDEX</code> to get a good plan. </li>
+<li>If using <a href="../analyze-table/index.html">ANALYZE TABLE</a> made your plans worse (or not good enough). </li>
+<li>If your queries have lots of derived tables (subselects). </li>
+<li>You are using <code>ORDER BY / GROUP BY</code> that could be resolved via indexes. </li>
+</ul> <h2 class="anchored_heading" id="changing-costs">Changing Costs</h2> <p>All engine and “SQL level” cost variables can be changed via MariaDB startup options, in configuration files or dynamically using SQL.</p> <h3 class="anchored_heading" id="in-configuration-files-and-command-line">In Configuration Files (and Command Line)</h3> <pre class="fixed" data-language="sql">[mariadbd]
+# Archive is using a hard disk (typical seek is 8-10 ms)
+archive.OPTIMIZER_DISK_READ_COST=8000
+# All other engines are using an SSD.
+OPTIMIZER_DISK_READ_COST=10.240000
+</pre>
+<h3 class="anchored_heading" id="from-sql">From SQL</h3> <pre class="fixed" data-language="sql"># Tell optimizer to find a plan with as few accepted rows as possible
+SET SESSION OPTIMIZER_WHERE_COST=1.0;
+# Inform the optimizer that InnoDB buffer pool has a 80% hit rate
+SET GLOBAL innodb.OPTIMIZER_DISK_READ_RATIO=0.20;
+</pre>
+<ul start="1">
+<li>Note engine costs are <code>GLOBAL</code> while other costs can also be <code>SESSION</code>. </li>
+<li>To keep things fast, engine-specific costs are stored in the table definition (TABLE_SHARE). One effect of this is that if one changes the cost for an engine, it will only take effect when new, not previously cached tables are accessed. You can use <a href="../flush/index.html">FLUSH TABLES</a> to force the table to use the new costs at next access. </li>
+</ul> <h3 class="anchored_heading" id="examples-of-changing-costs">Examples of Changing Costs</h3> <ul start="1">
+<li>
+<code>OPTIMIZER_WHERE_COST</code> is added as a cost for for all 'accepted rows'. Increasing this variable will cause the optimizer to choose plans with less estimated rows. </li>
+<li>One can specify the kind of disk used by the system by changing <code>OPTIMIZER_DISK_READ_COST</code>. This should be the time to do a random read of a 4096 byte block. </li>
+<li>The cost of a potential disk read is calculated as <code>OPTIMIZER_DISK_READ_COST * OPTIMIZER_DISK_READ_RATIO</code>. Increasing <code>OPTIMIZER_DISK_READ_RATIO</code> will inform the optimizer that not all data is cached. </li>
+<li>
+<code>OPTIMIZER_SCAN_SETUP_COST</code> will increase the cost of a table scan. One can increase this to avoid using table scans. </li>
+</ul> <h2 class="anchored_heading" id="for-storage-engine-developers">For Storage Engine Developers</h2> <p>The costs for an engine are set the following way when the engine plugin is loaded/initialized:</p> <ul start="1">
+<li>Copy the "default" storage engine costs to the plugin engine costs. <ul start="1"><li>#handlerton-&gt;costs<code> points to the engine specific cost data.</code> </li></ul> </li>
+<li>Call <code>handlerton-&gt;update_optimizer_costs()</code> to let the storage engine update the costs. </li>
+<li>Apply all user specific engine costs (from configuration files/startup) to the engine costs structure. </li>
+<li>When a TABLE_SHARE is created, the costs are copied from <code>handlerton-&gt;costs</code> to <code>TABLE_SHARE.optimizer_costs</code> . <code>handler::update_optimizer_costs()</code> is called to allow the engine to tune the cost for this specific table instance. This is done to avoid having to take any "cost" mutex while running queries. </li>
+<li>User changes to engine costs are stored in the data pointed to by <code>handlerton-&gt;costs</code>. This is why <a href="../flush/index.html">FLUSH TABLES</a> is needed to activate new engine costs. </li>
+<li>To speed up cost access for the optimizer, <code>handler::set_optimizer_costs()</code> is called for each query to copy <code>OPTIMIZER_WHERE_COST</code> and <code>OPTIMIZER_SCAN_SETUP_COST</code> to the engine cost structure.</li>
+</ul> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/the-optimizer-cost-model-from-mariadb-11-0/" class="_attribution-link">https://mariadb.com/kb/en/the-optimizer-cost-model-from-mariadb-11-0/</a>
+  </p>
+</div>

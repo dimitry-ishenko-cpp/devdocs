@@ -1,0 +1,98 @@
+<h1>MariaDB 5.3 Optimizer Debugging</h1> <div> <div class="node creole"> <div class="answer formatted">  <p><a href="../what-is-mariadb-53/index.html">MariaDB 5.3</a> has an optimizer debugging patch. The patch is pushed into</p> <p><a href="https://code.launchpad.net/~maria-captains/maria/5.3-optimizer-debugging">lp:maria-captains/maria/5.3-optimizer-debugging</a></p> <p>The patch is wrapped in #ifdef, but there is a #define straight in mysql_priv.h so simply compiling that tree should produce a binary with optimizer debugging enabled.</p> <p>The patch adds two system variables:</p> <ul start="1">
+<li>
+<code>@@debug_optimizer_prefer_join_prefix</code> </li>
+<li>
+<code>@@debug_optimizer_dupsweedout_penalized</code> </li>
+</ul> <p>the variables are present as session/global variables, and are also settable via the server command line.</p> <h2 class="anchored_heading" id="debug_optimizer_prefer_join_prefix">debug_optimizer_prefer_join_prefix</h2> <p>If this variable is non-NULL, it is assumed to specify a join prefix as a comma-separated list of table aliases:</p> <pre class="fixed" data-language="sql">set debug_optimizer_prefer_join_prefix='tbl1,tbl2,tbl3';
+</pre>
+<p>The optimizer will try its best to build a join plan which matches the specified join prefix. It does this by comparing join prefixes it is considering with <code>@@debug_optimizer_prefer_join_prefix</code>, and multiplying cost by a million if the plan doesn't match the prefix.</p> <p>As a result, you can more-or-less control the join order. For example, let's take this query:</p> <pre class="fixed" data-language="sql">MariaDB [test]&gt; explain select * from ten A, ten B, ten C;
++----+-------------+-------+------+---------------+------+---------+------+------+------------------------------------+
+| id | select_type | table | type | possible_keys | key  | key_len | ref  | rows | Extra                              |
++----+-------------+-------+------+---------------+------+---------+------+------+------------------------------------+
+|  1 | SIMPLE      | A     | ALL  | NULL          | NULL | NULL    | NULL |   10 |                                    |
+|  1 | SIMPLE      | B     | ALL  | NULL          | NULL | NULL    | NULL |   10 | Using join buffer (flat, BNL join) |
+|  1 | SIMPLE      | C     | ALL  | NULL          | NULL | NULL    | NULL |   10 | Using join buffer (flat, BNL join) |
++----+-------------+-------+------+---------------+------+---------+------+------+------------------------------------+
+3 rows in set (0.00 sec)
+</pre>
+<p>and request a join order of C,A,B:</p> <pre class="fixed" data-language="sql">MariaDB [test]&gt; set debug_optimizer_prefer_join_prefix='C,A,B';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [test]&gt; explain select * from ten A, ten B, ten C;
++----+-------------+-------+------+---------------+------+---------+------+------+------------------------------------+
+| id | select_type | table | type | possible_keys | key  | key_len | ref  | rows | Extra                              |
++----+-------------+-------+------+---------------+------+---------+------+------+------------------------------------+
+|  1 | SIMPLE      | C     | ALL  | NULL          | NULL | NULL    | NULL |   10 |                                    |
+|  1 | SIMPLE      | A     | ALL  | NULL          | NULL | NULL    | NULL |   10 | Using join buffer (flat, BNL join) |
+|  1 | SIMPLE      | B     | ALL  | NULL          | NULL | NULL    | NULL |   10 | Using join buffer (flat, BNL join) |
++----+-------------+-------+------+---------------+------+---------+------+------+------------------------------------+
+3 rows in set (0.00 sec)
+</pre>
+<p>We got it. </p> <p>Note that this is still a <em>best-effort</em> approach:</p> <ul start="1">
+<li>you won't be successful in forcing join orders which the optimizer considers invalid (e.g. for "t1 LEFT JOIN t2" you won't be able to get a join order of t2,t1). </li>
+<li>The optimizer does various plan pruning and may discard the requested join order before it has a chance to find out that it is a million-times cheaper than any other. </li>
+</ul> <h3 class="anchored_heading" id="semi-joins">Semi-joins</h3> <p>It is possible to force the join order of joins plus semi-joins. This may cause a different strategy to be used:</p> <pre class="fixed" data-language="sql">MariaDB [test]&gt; set debug_optimizer_prefer_join_prefix=NULL;
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [test]&gt; explain select * from ten A where a in (select B.a from ten B, ten C where C.a + A.a &lt; 4);
++----+-------------+-------+------+---------------+------+---------+------+------+----------------------------+
+| id | select_type | table | type | possible_keys | key  | key_len | ref  | rows | Extra                      |
++----+-------------+-------+------+---------------+------+---------+------+------+----------------------------+
+|  1 | PRIMARY     | A     | ALL  | NULL          | NULL | NULL    | NULL |   10 |                            |
+|  1 | PRIMARY     | B     | ALL  | NULL          | NULL | NULL    | NULL |   10 | Using where                |
+|  1 | PRIMARY     | C     | ALL  | NULL          | NULL | NULL    | NULL |   10 | Using where; FirstMatch(A) |
++----+-------------+-------+------+---------------+------+---------+------+------+----------------------------+
+3 rows in set (0.00 sec)
+
+MariaDB [test]&gt; set debug_optimizer_prefer_join_prefix='C,A,B';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [test]&gt; explain select * from ten A where a in (select B.a from ten B, ten C where C.a + A.a &lt; 4);
++----+-------------+-------+------+---------------+------+---------+------+------+-------------------------------------------------+
+| id | select_type | table | type | possible_keys | key  | key_len | ref  | rows | Extra                                           |
++----+-------------+-------+------+---------------+------+---------+------+------+-------------------------------------------------+
+|  1 | PRIMARY     | C     | ALL  | NULL          | NULL | NULL    | NULL |   10 | Start temporary                                 |
+|  1 | PRIMARY     | A     | ALL  | NULL          | NULL | NULL    | NULL |   10 | Using where; Using join buffer (flat, BNL join) |
+|  1 | PRIMARY     | B     | ALL  | NULL          | NULL | NULL    | NULL |   10 | Using where; End temporary                      |
++----+-------------+-------+------+---------------+------+---------+------+------+-------------------------------------------------+
+3 rows in set (0.00 sec)
+
+</pre>
+<p>Semi-join materialization is a somewhat special case, because "join prefix" is not exactly what you see in the EXPLAIN output. For semi-join materialization:</p> <ul start="1">
+<li>don't put "<code>&lt;subqueryN&gt;</code>" into <code>@@debug_optimizer_prefer_join_prefix</code> </li>
+<li>instead, put all of the materialization tables into the place where you want the <code>&lt;subqueryN&gt;</code> line. </li>
+<li>Attempts to control the join order inside the materialization nest will be unsuccessful. Example: we want A-C-B-AA: </li>
+</ul> <pre class="fixed" data-language="sql">MariaDB [test]&gt; set debug_optimizer_prefer_join_prefix='A,C,B,AA';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [test]&gt; explain select * from ten A, ten AA where A.a in (select B.a from ten B, ten C);
++----+-------------+-------------+--------+---------------+--------------+---------+------+------+------------------------------------+
+| id | select_type | table       | type   | possible_keys | key          | key_len | ref  | rows | Extra                              |
++----+-------------+-------------+--------+---------------+--------------+---------+------+------+------------------------------------+
+|  1 | PRIMARY     | A           | ALL    | NULL          | NULL         | NULL    | NULL |   10 |                                    |
+|  1 | PRIMARY     | &lt;subquery2&gt; | eq_ref | distinct_key  | distinct_key | 5       | func |    1 |                                    |
+|  1 | PRIMARY     | AA          | ALL    | NULL          | NULL         | NULL    | NULL |   10 | Using join buffer (flat, BNL join) |
+|  2 | SUBQUERY    | B           | ALL    | NULL          | NULL         | NULL    | NULL |   10 |                                    |
+|  2 | SUBQUERY    | C           | ALL    | NULL          | NULL         | NULL    | NULL |   10 |                                    |
++----+-------------+-------------+--------+---------------+--------------+---------+------+------+------------------------------------+
+5 rows in set (0.00 sec)
+</pre>
+<p>but we get A-B-C-AA.</p> <h2 class="anchored_heading" id="debug_optimizer_dupsweedout_penalized">debug_optimizer_dupsweedout_penalized</h2> <p>There are four semi-join execution strategies:</p> <ol start="1">
+<li>
+<code>FirstMatch</code> </li>
+<li>
+<code>Materialization</code> </li>
+<li>
+<code>LooseScan</code> </li>
+<li>
+<code>DuplicateWeedout</code> </li>
+</ol> <p>The first three strategies have flags in @@optimizer_switch that can be used to disable them. The <code>DuplicateWeedout</code> strategy does not have a flag. This was done for a reason, as that strategy is the catch-all strategy and it can handle all kinds of subqueries, in all kinds of join orders. (We're slowly moving to the point where it will be possible to run with <code>FirstMatch</code> enabled and everything else disabled but we are not there yet.)</p> <p>Since <code>DuplicateWeedout</code> cannot be disabled, there are cases where it "gets in the way" by being chosen over the strategy you need. This is what <code>debug_optimizer_dupsweedout_penalized</code> is for. if you set:</p> <pre class="fixed" data-language="sql">MariaDB [test]&gt; set debug_optimizer_dupsweedout_penalized=TRUE;
+</pre>
+<p>...the costs of query plans that use <code>DuplicateWeedout</code> will be multiplied by a millon. This doesn't mean that you will get rid of <code>DuplicateWeedout</code> <span>—</span> due to <a href="https://bugs.launchpad.net/bugs/898747">Bug #898747</a> it is still possible to have <code>DuplicateWeedout</code> used even if a cheaper plan exits. A partial remedy to this is to run with</p> <pre class="fixed" data-language="sql">MariaDB [test]&gt; set optimizer_prune_level=0;
+</pre>
+<p>It is possible to use both <code>debug_optimizer_dupsweedout_penalized</code> and <code>debug_optimizer_prefer_join_prefix</code> at the same time. This should give you the desired strategy and join order.</p> <h2 class="anchored_heading" id="further-reading">Further reading</h2> <ul start="1"><li>See mysql-test/t/debug_optimizer.test (in the MariaDB source code) for examples </li></ul> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/mariadb-53-optimizer-debugging/" class="_attribution-link">https://mariadb.com/kb/en/mariadb-53-optimizer-debugging/</a>
+  </p>
+</div>

@@ -1,0 +1,105 @@
+<h1>The Debug Sync Facility</h1> <div> <div class="node creole"> <div class="answer formatted"> <p> The Debug Sync Facility allows placement of synchronization points in the server code by using the DEBUG_SYNC macro:</p> <pre class="fixed" data-language="sql">open_tables(...)
+
+DEBUG_SYNC(thd, "after_open_tables");
+
+lock_tables(...)
+</pre>
+<p>When activated, a sync point can</p> <ul start="1">
+<li>Emit a signal and/or </li>
+<li>Wait for a signal </li>
+</ul> <div class="cstm-style darkheader-nospace-borders">
+<table>
+<tr>
+<th>Nomenclature</th>
+<th>Description</th>
+</tr> <tr>
+<td>signal</td>
+<td>A value of a global variable that persists until overwritten by a new signal. The global variable can also be seen as a "signal post" or "flag mast". Then the signal is what is attached to the "signal post" or "flag mast".</td>
+</tr> <tr>
+<td>emit a signal</td>
+<td>Assign the value (the signal) to the global variable ("set a flag") and broadcast a global condition to wake those waiting for a signal.</td>
+</tr> <tr>
+<td>wait for a signal</td>
+<td>Loop over waiting for the global condition until the global value matches the wait-for signal.</td>
+</tr> </table> </div>
+<p>By default, all sync points are inactive. They do nothing (except to burn a couple of CPU cycles for checking if they are active).</p> <p>A sync point becomes active when an action is requested for it. To do so, put a line like this in the test case file:</p> <pre class="fixed" data-language="sql">SET DEBUG_SYNC= 'after_open_tables SIGNAL opened WAIT_FOR flushed';
+</pre>
+<p>This activates the sync point <code class="highlight fixed" style="white-space:pre-wrap">'after_open_tables'</code>. It requests it to emit the signal <code class="highlight fixed" style="white-space:pre-wrap">'opened'</code> and wait for another thread to emit the signal <code class="highlight fixed" style="white-space:pre-wrap">'flushed'</code> when the thread's execution runs through the sync point.</p> <p>For every sync point there can be one action per thread only. Every thread can request multiple actions, but only one per sync point. In other words, a thread can activate multiple sync points.</p> <p>Here is an example how to activate and use the sync points:</p> <pre class="fixed" data-language="sql">--connection conn1
+SET DEBUG_SYNC= 'after_open_tables SIGNAL opened WAIT_FOR flushed';
+send INSERT INTO t1 VALUES(1);
+    --connection conn2
+    SET DEBUG_SYNC= 'now WAIT_FOR opened';
+    SET DEBUG_SYNC= 'after_abort_locks SIGNAL flushed';
+    FLUSH TABLE t1;
+</pre>
+<p>When <code class="highlight fixed" style="white-space:pre-wrap">conn1</code> runs through the <code class="highlight fixed" style="white-space:pre-wrap">INSERT</code> statement, it hits the sync point <code class="highlight fixed" style="white-space:pre-wrap">'after_open_tables'</code>. It notices that it is active and executes its action. It emits the signal <code class="highlight fixed" style="white-space:pre-wrap">'opened'</code> and waits for another thread to emit the signal <code class="highlight fixed" style="white-space:pre-wrap">'flushed'</code>.</p> <p><code class="highlight fixed" style="white-space:pre-wrap">conn2</code> waits immediately at the special sync point <code class="highlight fixed" style="white-space:pre-wrap">'now'</code> for another thread to emit the <code class="highlight fixed" style="white-space:pre-wrap">'opened'</code> signal.</p> <p>A signal remains in effect until it is overwritten. If <code class="highlight fixed" style="white-space:pre-wrap">conn1</code> signals <code class="highlight fixed" style="white-space:pre-wrap">'opened'</code> before <code class="highlight fixed" style="white-space:pre-wrap">conn2</code> reaches <code class="highlight fixed" style="white-space:pre-wrap">'now'</code>, <code class="highlight fixed" style="white-space:pre-wrap">conn2</code> will still find the <code class="highlight fixed" style="white-space:pre-wrap">'opened'</code> signal. It does not wait in this case.</p> <p>When <code class="highlight fixed" style="white-space:pre-wrap">conn2</code> reaches <code class="highlight fixed" style="white-space:pre-wrap">'after_abort_locks'</code>, it signals <code class="highlight fixed" style="white-space:pre-wrap">'flushed'</code>, which lets <code class="highlight fixed" style="white-space:pre-wrap">conn1</code> awake.</p> <p>Normally the activation of a sync point is cleared when it has been executed. Sometimes it is necessary to keep the sync point active for another execution. You can add an execute count to the action:</p> <pre class="fixed" data-language="sql">SET DEBUG_SYNC= 'name SIGNAL sig EXECUTE 3';
+</pre>
+<p>This sets the signal point's activation counter to 3. Each execution decrements the counter. After the third execution the sync point becomes inactive.</p> <p>One of the primary goals of this facility is to eliminate sleeps from the test suite. In most cases it should be possible to rewrite test cases so that they do not need to sleep. (But this facility cannot synchronize multiple processes.) However, to support test development, and as a last resort, sync point waiting times out. There is a default timeout, but it can be overridden:</p> <pre class="fixed" data-language="sql">SET DEBUG_SYNC= 'name WAIT_FOR sig TIMEOUT 10 EXECUTE 2';
+</pre>
+<p><code class="highlight fixed" style="white-space:pre-wrap">TIMEOUT 0</code> is special: If the signal is not present, the wait times out immediately.</p> <p>When a wait timed out (even on <code class="highlight fixed" style="white-space:pre-wrap">TIMEOUT 0</code>), a warning is generated so that it shows up in the test result.</p> <p>You can throw an error message and kill the query when a synchronization point is hit a certain number of times:</p> <pre class="fixed" data-language="sql">SET DEBUG_SYNC= 'name HIT_LIMIT 3';
+</pre>
+<p>Or combine it with signal and/or wait:</p> <pre class="fixed" data-language="sql">SET DEBUG_SYNC= 'name SIGNAL sig EXECUTE 2 HIT_LIMIT 3';
+</pre>
+<p>Here the first two hits emit the signal, the third hit returns the error message and kills the query.</p> <p>For cases where you are not sure that an action is taken and thus cleared in any case, you can force to clear (deactivate) a sync point:</p> <pre class="fixed" data-language="sql">SET DEBUG_SYNC= 'name CLEAR';
+</pre>
+<p>If you want to clear all actions and clear the global signal, use:</p> <pre class="fixed" data-language="sql">SET DEBUG_SYNC= 'RESET';
+</pre>
+<p>This is the only way to reset the global signal to an empty string.</p> <p>For testing of the facility itself you can execute a sync point just as if it had been hit:</p> <pre class="fixed" data-language="sql">SET DEBUG_SYNC= 'name TEST';
+</pre>
+<h3 class="anchored_heading" id="formal-syntax">Formal Syntax</h3> <p>The string to "assign" to the DEBUG_SYNC variable can contain:</p> <pre class="fixed" data-language="sql">RESET |
+&lt;sync point name&gt; TEST |
+&lt;sync point name&gt; CLEAR |
+&lt;sync point name&gt; {{SIGNAL &lt;signal name&gt; |
+                   WAIT_FOR &lt;signal name&gt; [TIMEOUT &lt;seconds&gt;]}
+                   [EXECUTE &lt;count&gt;] &amp;| HIT_LIMIT &lt;count&gt;}
+</pre>
+<p>Here '&amp;|' means 'and/or'. This means that one of the sections separated by '&amp;|' must be present or both of them.</p> <h3 class="anchored_heading" id="activationdeactivation">Activation/Deactivation</h3> <p>With a <a href="../compiling-mariadb-for-debugging/index.html">MariaDB for debug build</a>, it can be enabled by a mysqld command line option:</p> <pre class="fixed" data-language="sql"> --debug-sync-timeout[=default_wait_timeout_value_in_seconds]
+</pre>
+<p><code class="highlight fixed" style="white-space:pre-wrap">'default_wait_timeout_value_in_seconds'</code> is the default timeout for the <code class="highlight fixed" style="white-space:pre-wrap">WAIT_FOR</code> action. If set to zero, the facility stays disabled.</p> <p>The facility is enabled by default in the test suite, but can be disabled with:</p> <pre class="fixed" data-language="sql">mariadb-test-run.pl ... --debug-sync-timeout=0 ...
+</pre>
+<p>Likewise the default wait timeout can be set:</p> <pre class="fixed" data-language="sql">mariadb-test-run.pl ... --debug-sync-timeout=10 ...
+</pre>
+<p>The command line option influences the readable value of the <a href="../server-system-variables/index.html#debug_sync">debug_sync</a> system variable.</p> <ul start="1"><li>If the facility is not compiled in, the system variable does not exist. </li></ul> <ul start="1"><li>If <code class="highlight fixed" style="white-space:pre-wrap">--debug-sync-timeout=0</code> the value of the variable reads as <code class="highlight fixed" style="white-space:pre-wrap">"OFF"</code>. </li></ul> <ul start="1"><li>Otherwise the value reads as <code class="highlight fixed" style="white-space:pre-wrap">"ON - current signal: "</code> followed by the current signal string, which can be empty. </li></ul> <p>The readable variable value is the same, regardless if read as a global or session value.</p> <p>Setting the <a href="../server-system-variables/index.html#debug_sync">debug_sync</a> system variable requires the <code class="highlight fixed" style="white-space:pre-wrap">'SUPER'</code> privilege. You can never read back the string that you assigned to the variable, unless you assign the value that the variable already has. But that would give a parse error. A syntactically correct string is parsed into a debug sync action and stored apart from the variable value.</p> <h3 class="anchored_heading" id="implementation">Implementation</h3> <p>Pseudo code for a sync point:</p> <pre class="fixed" data-language="sql">#define DEBUG_SYNC(thd, sync_point_name)
+        if (unlikely(opt_debug_sync_timeout))
+          debug_sync(thd, STRING_WITH_LEN(sync_point_name))
+</pre>
+<p>The sync point performs a binary search in a sorted array of actions for this thread.</p> <p>The <code class="highlight fixed" style="white-space:pre-wrap">SET DEBUG_SYNC</code> statement adds a requested action to the array or overwrites an existing action for the same sync point. When it adds a new action, the array is sorted again.</p> <h3 class="anchored_heading" id="a-typical-synchronization-pattern">A typical synchronization pattern</h3> <p>There are quite a few places in MariaDB and MySQL where we use a synchronization pattern like this:</p> <pre class="fixed" data-language="sql">mysql_mutex_lock(&amp;mutex);
+thd-&gt;enter_cond(&amp;condition_variable, &amp;mutex, new_message);
+#if defined(ENABLE_DEBUG_SYNC)
+if (!thd-&gt;killed &amp;&amp; !end_of_wait_condition)
+   DEBUG_SYNC(thd, "sync_point_name");
+#endif
+while (!thd-&gt;killed &amp;&amp; !end_of_wait_condition)
+  mysql_cond_wait(&amp;condition_variable, &amp;mutex);
+thd-&gt;exit_cond(old_message);
+</pre>
+<p>Here are some explanations:</p> <p><code class="highlight fixed" style="white-space:pre-wrap">thd-&gt;enter_cond()</code> is used to register the condition variable and the mutex in <code class="highlight fixed" style="white-space:pre-wrap">thd-&gt;mysys_var</code>. This is done to allow the thread to be interrupted (killed) from its sleep. Another thread can find the condition variable to signal and mutex to use for synchronization in this thread's <code class="highlight fixed" style="white-space:pre-wrap">THD::mysys_var</code>.</p> <p><code class="highlight fixed" style="white-space:pre-wrap">thd-&gt;enter_cond()</code> requires the mutex to be acquired in advance.</p> <p><code class="highlight fixed" style="white-space:pre-wrap">thd-&gt;exit_cond()</code> unregisters the condition variable and mutex and releases the mutex.</p> <p>If you want to have a Debug Sync point with the wait, please place it behind <code class="highlight fixed" style="white-space:pre-wrap">enter_cond()</code>. Only then you can safely decide, if the wait will be taken. Also you will have <code class="highlight fixed" style="white-space:pre-wrap">THD::proc_info</code> correct when the sync point emits a signal. <code class="highlight fixed" style="white-space:pre-wrap">DEBUG_SYNC</code> sets its own proc_info, but restores the previous one before releasing its internal mutex. As soon as another thread sees the signal, it does also see the proc_info from before entering the sync point. In this case it will be "new_message", which is associated with the wait that is to be synchronized.</p> <p>In the example above, the wait condition is repeated before the sync point. This is done to skip the sync point, if no wait takes place. The sync point is before the loop (not inside the loop) to have it hit once only. It is possible that the condition variable is signaled multiple times without the wait condition to be true.</p> <p>A bit off-topic: At some places, the loop is taken around the whole synchronization pattern:</p> <pre class="fixed" data-language="sql">while (!thd-&gt;killed &amp;&amp; !end_of_wait_condition)
+{
+  mysql_mutex_lock(&amp;mutex);
+  thd-&gt;enter_cond(&amp;condition_variable, &amp;mutex, new_message);
+  if (!thd-&gt;killed [&amp;&amp; !end_of_wait_condition])
+  {
+    [DEBUG_SYNC(thd, "sync_point_name");]
+    mysql_cond_wait(&amp;condition_variable, &amp;mutex);
+  }
+  thd-&gt;exit_cond(old_message);
+}
+</pre>
+<p>Note that it is important to repeat the test for thd-&gt;killed after <code class="highlight fixed" style="white-space:pre-wrap">enter_cond()</code>. Otherwise the killing thread may kill this thread after it tested <code class="highlight fixed" style="white-space:pre-wrap">thd-&gt;killed</code> in the loop condition and before it registered the condition variable and mutex in <code class="highlight fixed" style="white-space:pre-wrap">enter_cond()</code>. In this case, the killing thread does not know that this thread is going to wait on a condition variable. It would just set <code class="highlight fixed" style="white-space:pre-wrap">THD::killed</code>. But if we would not test it again, we would go asleep though we are killed. If the killing thread would kill us when we are after the second test, but still before sleeping, we hold the mutex, which is registered in mysys_var. The killing thread would try to acquire the mutex before signaling the condition variable. Since the mutex is only released implicitly in <code class="highlight fixed" style="white-space:pre-wrap">mysql_cond_wait()</code>, the signaling happens at the right place. We have a safe synchronization.</p> <h3 class="anchored_heading" id="co-work-with-the-dbug-facility">Co-work with the DBUG facility</h3> <p>When running the MariaDB test suite with the <code class="highlight fixed" style="white-space:pre-wrap">--debug-dbug</code> command line option, the Debug Sync Facility writes trace messages to the DBUG trace. The following shell commands proved very useful in extracting relevant information:</p> <pre class="fixed" data-language="sql">egrep 'query:|debug_sync_exec:' mysql-test/var/log/mysqld.1.trace
+</pre>
+<p>It shows all executed SQL statements and all actions executed by synchronization points.</p> <p>Sometimes it is also useful to see, which synchronization points have been run through (hit) with or without executing actions. Then add <code class="highlight fixed" style="white-space:pre-wrap">"|debug_sync_point:"</code> to the egrep pattern.</p> <h3 class="anchored_heading" id="synchronizing-debug_sync-actions">Synchronizing DEBUG_SYNC Actions</h3> <p>Tests may need additional synchronization mechanisms between <code class="highlight fixed" style="white-space:pre-wrap">DEBUG_SYNC</code> actions, because certain combinations of actions can result in lost signals. More specifically, once a <code class="highlight fixed" style="white-space:pre-wrap">SIGNAL</code> action is issued, it is stored in a global variable for any waiting threads to determine if they are depending on that signal for continuing. However, if a subsequent action overwrites that variable before a waiting thread is able to check against it, the original signal is lost. Examples of actions which would change the variable state are another <code class="highlight fixed" style="white-space:pre-wrap">SIGNAL</code> or a <code class="highlight fixed" style="white-space:pre-wrap">RESET</code>. Therefore, before issuing these commands, the test writer should verify the previous signal has been acknowledged. The following code snippets show an example of a problematic pattern and a potential solution.</p> <pre class="fixed wrap" data-language="sql">SET DEBUG_SYNC='now SIGNAL sig';
+SET DEBUG_SYNC='RESET'; # Problematic because sig can be cleared before a waiting thread can acknowledge it
+</pre>
+<pre class="fixed wrap" data-language="sql">SET DEBUG_SYNC='now SIGNAL sig';
+
+# Don't issue the RESET until we have proven the waiting thread has received the signal
+let $wait_condition= select count(*)=0 from information_schema.processlist where state like "debug sync point%";
+source include/wait_condition.inc;
+
+SET DEBUG_SYNC='RESET'; # Now this is safe
+</pre> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/the-debug-sync-facility/" class="_attribution-link">https://mariadb.com/kb/en/the-debug-sync-facility/</a>
+  </p>
+</div>

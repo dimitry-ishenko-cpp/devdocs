@@ -1,0 +1,80 @@
+<h1>Copying Tables Between Different MariaDB Databases and MariaDB Servers</h1> <div> <div class="node creole"> <div class="answer formatted"> <p> With MariaDB it's very easy to copy tables between different MariaDB databases and different MariaDB servers. This works for tables created with the <a href="../archive/index.html">Archive</a>, <a href="../aria/index.html">Aria</a>, <a href="../csv/index.html">CSV</a>, <a href="../innodb/index.html">InnoDB</a>, <a href="../myisam/index.html">MyISAM</a>, <a href="../merge/index.html">MERGE</a>, and <a href="../innodb/index.html">XtraDB</a> engines.</p> <p>The normal procedures to copy a table is:</p> <pre class="fixed" data-language="sql">FLUSH TABLES db_name.table_name FOR EXPORT
+
+# Copy the relevant files associated with the table
+
+UNLOCK TABLES;
+</pre>
+<p>The table files can be found in <a href="../server-system-variables/index.html#datadir">datadir</a>/databasename (you can execute <code>SELECT @@datadir</code> to find the correct directory). When copying the files, you should copy all files with the same table_name + various extensions. For example, for an Aria table of name foo, you will have files foo.frm, foo.MAI, foo.MAD and possibly foo.TRG if you have <a href="../triggers/index.html">triggers</a>.</p> <p>If one wants to distribute a table to a user that doesn't need write access to the table and one wants to minimize the storage size of the table, the recommended engine to use is Aria or MyISAM as one can pack the table with <a href="../aria_pack/index.html">aria_pack</a> or <a href="../myisampack/index.html">myisampack</a> respectively to make it notablly smaller. MyISAM is the most portable format as it's not dependent on whether the server settings are different. Aria and InnoDB require the same block size on both servers.</p> <h2 class="anchored_heading" id="copying-tables-when-the-mariadb-server-is-down">Copying Tables When the MariaDB Server is Down</h2> <p>The following storage engines support export without <code>FLUSH TABLES ... FOR EXPORT</code>, assuming the source server is down and the receiving server is not accessing the files during the copy.</p> <div class="cstm-style darkheader-nospace-borders">
+<table>
+<tr>
+<th>Engine</th>
+<th>Comment</th>
+</tr> <tr>
+<td><a href="../archive/index.html">Archive</a></td>
+<td></td>
+</tr> <tr>
+<td><a href="../aria/index.html">Aria</a></td>
+<td>Requires clean shutdown. Table will automatically be fixed on the receiving server if <code>aria_chk --zerofill</code> was not run. If <code>aria_chk --zerofill</code> is run, then the table is immediately usable without any delays</td>
+</tr> <tr>
+<td><a href="../csv/index.html">CSV</a></td>
+<td></td>
+</tr> <tr>
+<td><a href="../myisam/index.html">MyISAM</a></td>
+<td></td>
+</tr> <tr>
+<td><a href="../merge/index.html">MERGE</a></td>
+<td>.MRG files can be copied even while server is running as the file only contains a list of tables that are part of merge.</td>
+</tr> </table> </div>
+<h2 class="anchored_heading" id="copying-tables-live-from-a-running-mariadb-server">Copying Tables Live From a Running MariaDB Server</h2> <p>For all of the above storage engines (Archive, Aria, CSV, MyISAM and MERGE), one can copy tables even from a live server under the following circumstances:</p> <ul start="1">
+<li>You have done a <code>FLUSH TABLES</code> or <code>FLUSH TABLE table_name</code> for the specific table. </li>
+<li>The server is not accessing the tables during the copy process. </li>
+</ul> <p>The advantage of <a href="../flush-tables-for-export/index.html">FLUSH TABLES table_name FOR EXPORT</a> is that the table is read locked until <a href="https://mariadb.com/lock-tables-and-unlock-tables">UNLOCK TABLES</a> is executed.</p> <p><strong>Warning</strong>: If you do the above live copy, you are doing this on <strong>your own risk</strong> as if you do something wrong, the copied table is very likely to be corrupted. The original table will of course be fine.</p> <h2 class="anchored_heading" id="an-efficient-way-to-give-someone-else-access-to-a-read-only-table">An Efficient Way to Give Someone Else Access to a Read Only Table</h2> <p>If you want to give a user access to some data in a table for the user to use in their MariaDB server, you can do the following:</p> <p>First let's create the table we want to export. To speed up things, we create this without any indexes. We use <code>TRANSACTIONAL=0
+ROW_FORMAT=DYNAMIC</code> for Aria to use the smallest possible row format.</p> <pre class="fixed" data-language="sql">CREATE TABLE new_table ... ENGINE=ARIA TRANSACTIONAL=0;
+ALTER TABLE new_table DISABLE_KEYS;
+# Fill the table with data:
+INSERT INTO new_table SELECT * ...
+FLUSH TABLE new_table WITH READ LOCK;
+
+# Copy table data to some external location, like /tmp with something
+# like cp /my/data/test/new_table.* /tmp/
+
+UNLOCK TABLES;
+</pre>
+<p>Then we pack it and generate the indexes. We use a big sort buffer to speed up generating the index.</p> <pre class="fixed" data-language="sql">&gt; ls -l /tmp/new_table.*
+-rw-rw---- 1 mysql my 42396148 Sep 21 17:58 /tmp/new_table.MAD
+-rw-rw---- 1 mysql my     8192 Sep 21 17:58 /tmp/new_table.MAI
+-rw-rw---- 1 mysql my     1039 Sep 21 17:58 /tmp/new_table.frm
+&gt; aria_pack /tmp/new_table
+Compressing /tmp/new_table.MAD: (922666 records)
+- Calculating statistics
+- Compressing file
+46.07%
+&gt; aria_chk -rq --ignore-control-file --sort_buffer_size=1G /tmp/new_table
+Recreating table '/tmp/new_table'
+- check record delete-chain
+- recovering (with sort) Aria-table '/tmp/new_table'
+Data records: 922666
+- Fixing index 1
+State updated
+&gt; ls -l /tmp/new_table.*
+-rw-rw---- 1 mysql my 26271608 Sep 21 17:58 /tmp/new_table.MAD
+-rw-rw---- 1 mysql my 10207232 Sep 21 17:58 /tmp/new_table.MAI
+-rw-rw---- 1 mysql my     1039 Sep 21 17:58 /tmp/new_table.frm
+</pre>
+<p>The procedure for MyISAM tables is identical, except that <a href="../myisamchk/index.html">myisamchk</a> doesn't have the <code>--ignore-control-file</code> option.</p> <h2 class="anchored_heading" id="copying-innodbs-transportable-tablespaces">Copying InnoDB's Transportable Tablespaces</h2> <p>InnoDB's file-per-table tablespaces are transportable, which means that you can copy a file-per-table tablespace from one MariaDB Server to another server. See <a href="../innodb-file-per-table-tablespaces/index.html#copying-transportable-tablespaces">Copying Transportable Tablespaces</a> for more information.</p> <h2 class="anchored_heading" id="importing-tables">Importing Tables</h2> <p>Tables that use most storage engines are immediately usable when their files are copied to the new <code><a href="../server-system-variables/index.html#datadir">datadir</a></code>.</p> <p>However, this is not true for tables that use <a href="../innodb/index.html">InnoDB</a>. InnoDB tables have to be imported with <a href="../alter-table/index.html#import-tablespace">ALTER TABLE ... IMPORT TABLESPACE</a>. See <a href="../innodb-file-per-table-tablespaces/index.html#copying-transportable-tablespaces">Copying Transportable Tablespaces</a> for more information.</p> <h2 class="anchored_heading" id="see-also">See Also</h2> <ul start="1">
+<li>
+<a href="../flush-tables-for-export/index.html">FLUSH TABLES FOR EXPORT</a> </li>
+<li>
+<a href="../flush/index.html">FLUSH TABLES</a> </li>
+<li>
+<a href="../myisampack/index.html">myisampack</a> - Compressing the MyISAM data file for easier distribution. </li>
+<li>
+<a href="../aria_pack/index.html">aria_pack</a> - Compressing the Aria data file for easier distribution </li>
+<li>
+<a href="../mariadb-dump/index.html">mariadb-dump</a> - Copying tables to other SQL servers. You can use the <code>--tab</code> to create a CSV file of your table content.</li>
+</ul> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/copying-tables-between-different-mariadb-databases-and-mariadb-servers/" class="_attribution-link">https://mariadb.com/kb/en/copying-tables-between-different-mariadb-databases-and-mariadb-servers/</a>
+  </p>
+</div>

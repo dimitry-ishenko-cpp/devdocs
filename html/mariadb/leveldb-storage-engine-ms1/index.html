@@ -1,0 +1,66 @@
+<h1>LevelDB Storage Engine MS1</h1> <div> <div class="node creole"> <div class="answer formatted"> <p>This page describes what will be implemented for milestone#1 of <a href="../leveldb-storage-engine/index.html">LevelDB Storage Engine</a>. <em>For development after MS1, see <a href="../leveldb-storage-engine-development/index.html">LevelDB Storage Engine Development</a></em></p>  <h1 class="anchored_heading" id="feature-description">Feature Description</h1> <h2 class="anchored_heading" id="how-the-data-is-stored-in-leveldb">How the data is stored in LevelDB</h2> <h3 class="anchored_heading" id="one-leveldb-instance">One leveldb instance</h3> <p>We will use one LevelDB instance for mysqld process. LevelDB keys will be prefixed with 'dbname.table_name.PRIMARY' for the table itself, and 'dbname.table_name.index_name' for the secondary indexes. This allows to store arbitrary number of tables/indexes in one LevelDB instance.</p> <h3 class="anchored_heading" id="data-encoding">Data encoding</h3> <p>We will rely on LevelDB's compression to make the storage compact. Data that goes into LevelDB's key will be stored in KeyTupleFormat (which allows mysql's lookup/index ordering functions to work). </p> <p>Data that goes into LevelDB's value will be stored in table-&gt;record[0] format, except blobs. (Blobs will require special storage convention because they store a char* pointer in table-&gt;record[0]). </p> <p>We will need to support blobs because table <code>nodetable</code> has a <code>mediumtext</code> field.</p> <h3 class="anchored_heading" id="secondary-indexes">Secondary indexes</h3> <p>Non-unique secondary indexes will be supported.</p> <p>LevelDB stores {KEY-&gt;VALUE} mappings. Non-unique index will need to have some unique values for KEY. This can be arranged by using this mapping:</p> <pre class="fixed" data-language="sql">KEY = {index_columns, primary_key_columns}.   
+VALUE = {nothing}
+</pre>
+<p>Using primary key as suffix will make DB::Get() useless. Instead, we will have to do lookups with:</p> <pre class="fixed" data-language="sql">get(secondary_index_key_val)
+{
+  open cursor for (secondary_index_key_val)
+  read the first record
+  if (record &gt; secondary_index_key_val)
+    return NOT_FOUND;
+  else
+    return FOUND;
+}
+</pre>
+<p><em>TODO: we will not support unique secondary indexes in MS1. ALTER/CREATE TABLE statements attempting to add a unique index will fail. Is this ok?</em></p> <h2 class="anchored_heading" id="concurrency-handling">Concurrency handling</h2> <p>We will use what was discussed in the "Pessimistic locking proposal".</p> <p>Basic idea is: LevelDB's operations do blind overwrites. In order to make sure we're not overwriting anything, we will use this pattern:</p> <pre class="fixed" data-language="sql">  acqure record lock;
+  read;
+  modify as necessary;
+  write;
+  release record lock;
+</pre>
+<p>record locks can be obtained for {table_name, primary_key}. Locks are exclusive, for a given record, only one lock can obtained at a time. A lock can be obtained when its record doesn't exist (see INSERT below)</p> <h3 class="anchored_heading" id="c1-update">C1. UPDATE</h3> <p>UPDATE will use the above scheme. It will get row locks for the keys it is reading in order to prevent concurrent updates.</p> <h3 class="anchored_heading" id="c2-insert">C.2 INSERT</h3> <p>INSERT will use a row lock to make sure the record of interest does not exist.</p> <h3 class="anchored_heading" id="c3-delete">C.3 DELETE</h3> <p>If a DELETE statement has a form of</p> <pre class="fixed" data-language="sql">DELETE FROM tbl WHERE tbl.primary_key=const
+</pre>
+<p>then it theoretically can be translated into a DB::Delete() call, that is, into a write-without-read. In other cases, we will need to do reads and put locks on the rows that we want to delete.</p> <p>MS1 will only implement the variant with locking DELETE.</p> <h3 class="anchored_heading" id="c4-select">C.4 SELECT</h3> <p>SELECT statements will use a read snapshot. They will not put (or check) whether there are any locks for records they are reading. This is similar to the definition of <code>read-committed</code> isolation level.</p> <p>We will also support <code>SELECT FOR UPDATE</code>. In this mode, the read records will be locked with a write lock until the end of the transaction.</p> <h3 class="anchored_heading" id="c5-locking-mechanism">C.5 Locking mechanism</h3> <p>As specified in previous sections, we will be employing locks on the values of {dbname, tablename, primary_key_value}. Locks will be exclusive: only one transaction can hold a lock at a time.</p> <p>Locks are acquired one-by-one, which allows for deadlocks. There will be no deadlock detection or deadlock prevention systems. Instead, lock waits will time out after @@leveldb_lock_wait_timeout milliseconds. When @@leveldb_lock_wait_timeout==0, lock system will not wait at all, attempt to acquire a lock that's occupied will result in an immediate transaction abort.</p> <p>Locks will be stored in a highly-concurrent hashtable. Current candidate for it is mysys/lf_hash.</p> <h3 class="anchored_heading" id="c6-applying-transaction-changes">C.6 Applying transaction changes</h3> <p>The changes made by transaction will be accumulated as a LevelDB batch operation, and applied at transaction commit. This has a consequence: </p> <p><strong>the transaction is unable to see its own changes until it commits</strong> </p> <p>We'll call the above CANT-SEE-OWN-CHANGES property. The property is contrary to the SQL's semantics. In SQL, one expects to see the changes they've made in preceding statements. However, the set of transactions we're targeting can live with CANT-SEE-OWN-CHANGES, so we'll live with the property for MS1.</p> <p>After MS1, LevelDB SE will make sure that CANT-SEE-OWN changes is not observed. It will use the following approach:</p> <ul start="1">
+<li>keep track of what records have been modified by this transaction in a buffer $R. </li>
+<li>If SQL layer makes a request to read a row, then <ul start="1">
+<li>Consult $R if the record was INSERTed. If yes, return what was inserted. </li>
+<li>Consult $R if the record was modified. if yes, return what was recorded to be the result of modification </li>
+<li>Consult $R if the record was deleted. If yes, return "record not found". </li>
+<li>Finally, try reading the row from the LevelDB. </li>
+</ul> </li>
+</ul> <h2 class="anchored_heading" id="table-access-methods">Table Access methods</h2> <p>MS1 will support:</p> <ul start="1">
+<li>Full table scan. </li>
+<li>index lookups and range scans over primary and secondary indexes. </li>
+</ul> <h3 class="anchored_heading" id="optimizer-statistics">Optimizer statistics</h3> <ul start="1">
+<li>Estimate of #records in the table will be obtained from DB::GetApproximateSizes() (see below for details) </li>
+<li>Estimate of #records-in-range will be obtained from DB::GetApproximateSizes() </li>
+<li>There is no acceptable estimate for #rec_per_key of secondary indexes (or for prefixes of the primary key). MS1 will perform some trivial guesswork. </li>
+</ul> <p>Note: DB::GetApproximateSizes() returns amount of disk space occupied by the data. The number cannot be directly translated to #rows, because</p> <ul start="1">
+<li>We do not always know average record length </li>
+<li>Disk data is compressed. </li>
+</ul> <p>Because of this, optimizer will have very imprecise input. It is expected to be still sufficient for MS1.</p> <h2 class="anchored_heading" id="write-optimized-inserts">Write-optimized INSERTs</h2> <p>We will need to do fast bulk data loads. During the bulk load, writes-without-reads are ok: the user knows he's not overwriting data, he doesn't care about @@rows_affected.</p> <p>These will be achieved as follows: </p> <ul start="1">
+<li>there will be a thread-local @@leveldb_bulk_load variable. </li>
+<li>Its default value is FALSE. </li>
+<li>When it is set to true, INSERTS (which make ha_leveldb::write() calls) will work in bulk-loading mode. </li>
+</ul> <p>Bulk-loading mode means:</p> <ul start="1">
+<li>INSERTs will be done in batches of @@leveldb_bulk_load_size each </li>
+<li>INSERTs will take no locks, and do no-read-writes. In other words, they will silently overwrite data </li>
+<li>@@affected_rows will return the value that will show that all records were successfully inserted. </li>
+</ul> <h2 class="anchored_heading" id="what-will-not-be-supported">What will not be supported</h2> <ul start="1">
+<li>Non-blocking schema changes will not be supported at all in the first milestone. All DDL-modifying operations will use pump all the data from the original table to the table with the new DDL. </li>
+<li>Binlog XA on the master will not be supported. </li>
+<li>Crash-proof slave will not be supported. </li>
+<li>Building server packages (*.rpm, *.deb, etc) will not be supported (leveldb dependency may be challenging). </li>
+</ul> <h2 class="anchored_heading" id="other-details">Other details</h2> <ul start="1">
+<li>The patch will be against mysql-5.6 </li>
+<li>
+<em>TODO: How to run DROP TABLE </em> The only way we implement DROP TABLE is to delete record by record. The size of changes may become too big to be in RAM. If we split into multiple transactions, we'll have to handle crashes in the middle of DROP TABLE. <em>Q: can we avoid that for the first milestone? </em> </li>
+<li>
+<em>TODO: There is no efficient way to run TRUNCATE TABLE. Is this ok?</em> </li>
+<li>
+<em>TODO: In the above spec, nothing is said about max. transaction size. Is it ok not to have it for MS1? </em> </li>
+</ul> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/leveldb-storage-engine-ms1/" class="_attribution-link">https://mariadb.com/kb/en/leveldb-storage-engine-ms1/</a>
+  </p>
+</div>

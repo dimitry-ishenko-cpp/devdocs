@@ -1,0 +1,130 @@
+<h1>Partition Maintenance</h1> <div> <div class="node creole"> <div class="answer formatted">  <h2 class="anchored_heading" id="preface">Preface</h2> <p>This article covers</p> <ul>
+<li>PARTITIONing uses and non-uses </li>
+<li>How to Maintain a time-series PARTITIONed table </li>
+<li>AUTO_INCREMENT secrets </li>
+</ul> <p>First, my Opinions on PARTITIONing</p> <p>Taken from <a href="http://mysql.rjweb.org/doc.php/ricksrots">Rick's RoTs - Rules of Thumb</a></p> <ul>
+<li>#1: Don't use <a href="../managing-mariadb-partitioning/index.html">PARTITIONing</a> until you know how and why it will help. </li>
+<li>Don't use PARTITION unless you will have &gt;1M rows </li>
+<li>No more than 50 PARTITIONs on a table (open, show table status, etc, are impacted) (fixed in MySQL 5.6.6?; a better fix coming eventually in 5.7) </li>
+<li>PARTITION BY RANGE is the only useful method. </li>
+<li>SUBPARTITIONs are not useful. </li>
+<li>The partition field should not be the field first in any key. </li>
+<li>It is OK to have an <a href="../auto_increment/index.html">AUTO_INCREMENT</a> as the first part of a compound key, or in a non-UNIQUE index. </li>
+</ul> <p>It is so tempting to believe that PARTITIONing will solve performance problems. But it is so often wrong.</p> <p>PARTITIONing splits up one table into several smaller tables. But table size is rarely a performance issue. Instead, I/O time and indexes are the issues.</p> <p>A common fallacy: "Partitioning will make my queries run faster". It won't. Ponder what it takes for a 'point query'. Without partitioning, but with an appropriate index, there is a BTree (the index) to drill down to find the desired row. For a billion rows, this might be 5 levels deep. With partitioning, first the partition is chosen and "opened", then a smaller BTree (of say 4 levels) is drilled down. Well, the savings of the shallower BTree is consumed by having to open the partition. Similarly, if you look at the disk blocks that need to be touched, and which of those are likely to be cached, you come to the conclusion that about the same number of disk hits is likely. Since disk hits are the main cost in a query, Partitioning does not gain any performance (at least for this typical case). The 2D case (below) gives the main contradiction to this discussion.</p> <h2 class="anchored_heading" id="use-cases-for-partitioning">Use Cases for PARTITIONing</h2> <p><strong>Use case #1 -- time series</strong>. Perhaps the most common use case where PARTITIONing shines is in a dataset where "old" data is periodically deleted from the table. RANGE PARTITIONing by day (or other unit of time) lets you do a nearly instantaneous DROP PARTITION plus REORGANIZE PARTITION instead of a much slower DELETE. Much of this blog is focused on this use case. This use case is also discussed in <a href="../big-deletes/index.html">Big DELETEs</a></p> <p>The big win for Case #1: DROP PARTITION is a lot faster than DELETEing a lot of rows.</p> <p><strong>Use case #2 -- 2-D index</strong>. INDEXes are inherently one-dimensional. If you need two "ranges" in the WHERE clause, try to migrate one of them to PARTITIONing.</p> <p>Finding the nearest 10 pizza parlors on a map needs a 2D index. Partition pruning sort of gives a second dimension. See Latitude/Longitude Indexing That uses PARTITION BY RANGE(latitude) together with PRIMARY KEY(longitude, ...)</p> <p>The big win for Case #2: Scanning fewer rows.</p> <p><strong>Use case #3 -- hot spot</strong>. This is a bit complicated to explain. Given this combination:</p> <ul>
+<li>A table's index is too big to be cached, but the index for one partition is cacheable, and </li>
+<li>The index is randomly accessed, and </li>
+<li>Data ingestion would normally be I/O bound due to updating the index Partitioning can keep all the index "hot" in RAM, thereby avoiding a lot of I/O. </li>
+</ul> <p>The big win for Case #3: Improving caching to decrease I/O to speed up operations.</p> <h2 class="anchored_heading" id="auto_increment-in-partition">AUTO_INCREMENT in PARTITION</h2> <ul>
+<li>For <a href="../auto_increment/index.html">AUTO_INCREMENT</a> to work (in any table), it must be the first field in some index. Period. There are no other requirements on indexing it. </li>
+<li>Being the first field in some index lets the engine find the 'next' value when opening the table. </li>
+<li>AUTO_INCREMENT need not be UNIQUE. What you lose: prevention of explicitly inserting a duplicate id. (This is rarely needed, anyway.) </li>
+</ul> <p>Examples (where id is AUTO_INCREMENT):</p> <ul>
+<li>PRIMARY KEY (...), INDEX(id) </li>
+<li>PRIMARY KEY (...), UNIQUE(id, partition_key) -- not useful </li>
+<li>INDEX(id), INDEX(...) (but no UNIQUE keys) </li>
+<li>PRIMARY KEY(id), ... -- works only if id is the partition key (not very useful) </li>
+</ul> <h2 class="anchored_heading" id="partition-maintenance-for-the-time-series-case">PARTITION maintenance for the time-series case</h2> <p>Let's focus on the maintenance task involved in Case #1, as described above.</p> <p>You have a large table that is growing on one end and being pruned on the other. Examples include news, logs, and other transient information. PARTITION BY RANGE is an excellent vehicle for such a table.</p> <ul>
+<li>DROP PARTITION is much faster than DELETE. (This is the big reason for doing this flavor of partitioning.) </li>
+<li>Queries often limit themselves to 'recent' data, thereby taking advantage of "partition pruning". </li>
+</ul> <p>Depending on the type of data, and how long before it expires, you might have daily or weekly or hourly (etc) partitions.</p> <p>There is no simple SQL statement to "drop partitions older than 30 days" or "add a new partition for tomorrow". It would be tedious to do this by hand every day.</p> <h2 class="anchored_heading" id="high-level-view-of-the-code">High level view of the code</h2> <pre class="fixed" data-language="sql">ALTER TABLE tbl
+    DROP PARTITION from20120314;
+ALTER TABLE tbl
+    REORGANIZE PARTITION future INTO (
+        PARTITION from20120415 VALUES LESS THAN (TO_DAYS('2012-04-16')),
+        PARTITION future     VALUES LESS THAN MAXVALUE);
+</pre>
+<p>After which you have...</p> <pre class="fixed" data-language="sql">    CREATE TABLE tbl (
+        dt DATETIME NOT NULL,  -- or DATE
+        ...
+        PRIMARY KEY (..., dt),
+        UNIQUE KEY (..., dt),
+        ...
+    )
+    PARTITION BY RANGE (TO_DAYS(dt)) (
+        PARTITION start        VALUES LESS THAN (0),
+        PARTITION from20120315 VALUES LESS THAN (TO_DAYS('2012-03-16')),
+        PARTITION from20120316 VALUES LESS THAN (TO_DAYS('2012-03-17')),
+        ...
+        PARTITION from20120414 VALUES LESS THAN (TO_DAYS('2012-04-15')),
+        PARTITION from20120415 VALUES LESS THAN (TO_DAYS('2012-04-16')),
+        PARTITION future       VALUES LESS THAN MAXVALUE
+    );
+</pre>
+<h2 class="anchored_heading" id="why">Why?</h2> <p>Perhaps you noticed some odd things in the example. Let me explain them.</p> <ul>
+<li>Partition naming: Make them useful. </li>
+<li>from20120415 ... 04-16: Note that the LESS THAN is the next day's date </li>
+<li>The "start" partition: See paragraph below. </li>
+<li>The "future" partition: This is normally empty, but it can catch overflows; more later. </li>
+<li>The range key (dt) must be included in any PRIMARY or UNIQUE key. </li>
+<li>The range key (dt) should be last in any keys it is in -- You have already "pruned" with it; it is almost useless in the index, especially at the beginning. </li>
+<li>DATETIME, etc -- I picked this datatype because it is typical for a time series. Newer MySQL versions allow TIMESTAMP. INT could be used; etc. </li>
+<li>There is an extra day (03-16 thru 04-16): The latest day is only partially full. </li>
+</ul> <p>Why the bogus "start" partition? If an invalid datetime (Feb 31) were to be used, the datetime would turn into NULL. NULLs are put into the first partition. Since any SELECT could have an invalid date (yeah, this stretching things), the partition pruner always includes the first partition in the resulting set of partitions to search. So, if the SELECT must scan the first partition, it would be slightly more efficient if that partition were empty. Hence the bogus "start" partition. Longer discussion, by The Data Charmer 5.5 eliminates the bogus check, but only if you switch to a new syntax:</p> <pre class="fixed" data-language="sql">    PARTITION BY RANGE COLUMNS(dt) (
+    PARTITION day_20100226 VALUES LESS THAN ('2010-02-27'), ...
+</pre>
+<p>More on the "future" partition. Sooner or later the cron/EVENT to add tomorrow's partition will fail to run. The worst that could happen is for tomorrow's data to be lost. The easiest way to prevent that is to have a partition ready to catch it, even if this partition is normally always empty.</p> <p>Having the "future" partition makes the ADD PARTITION script a little more complex. Instead, it needs to take tomorrow's data from "future" and put it into a new partition. This is done with the REORGANIZE command shown. Normally nothing need be moved, and the ALTER takes virtually zero time.</p> <h2 class="anchored_heading" id="when-to-do-the-alters">When to do the ALTERs?</h2> <ul>
+<li>DROP if the oldest partition is "too old". </li>
+<li>Add 'tomorrow' near the end of today, but don't try to add it twice. </li>
+<li>Do not count partitions -- there are two extra ones. Use the partition names or information_schema.PARTITIONS.PARTITION_DESCRIPTION. </li>
+<li>DROP/Add only once in the script. Rerun the script if you need more. </li>
+<li>Run the script more often than necessary. For daily partitions, run the script twice a day, or even hourly. Why? Automatic repair. </li>
+</ul> <h2 class="anchored_heading" id="variants">Variants</h2> <p>As I have said many times, in many places, BY RANGE is perhaps the only useful variant. And a time series is the most common use for PARTITIONing.</p> <ul>
+<li>(as discussed here) DATETIME/DATE with TO_DAYS() </li>
+<li>DATETIME/DATE with TO_DAYS(), but with 7-day intervals </li>
+<li>TIMESTAMP with TO_DAYS(). (version 5.1.43 or later) </li>
+<li>PARTITION BY RANGE COLUMNS(DATETIME) (5.5.0) </li>
+<li>PARTITION BY RANGE(TIMESTAMP) (version 5.5.15 / 5.6.3) </li>
+<li>PARTITION BY RANGE(TO_SECONDS()) (5.6.0) </li>
+<li>INT UNSIGNED with constants computed as unix timestamps. </li>
+<li>INT UNSIGNED with constants for some non-time-based series. </li>
+<li>MEDIUMINT UNSIGNED containing an "hour id": FLOOR(FROM_UNIXTIME(timestamp) / 3600) </li>
+<li>Months, Quarters, etc: Concoct a notation that works. </li>
+</ul> <p>How many partitions?</p> <ul>
+<li>Under, say, 5 partitions -- you get very little of the benefits. </li>
+<li>Over, say, 50 partitions, and you hit inefficiencies elsewhere. </li>
+<li>Certain operations (SHOW TABLE STATUS, opening the table, etc) open every partition. </li>
+<li>
+<a href="../myisam/index.html">MyISAM</a>, before version 5.6.6, would lock all partitions before pruning! </li>
+<li>Partition pruning does not happen on INSERTs (until Version 5.6.7), so INSERT needs to open all the partitions. </li>
+<li>A possible 2-partition use case: <a href="http://forums.mysql.com/read.php?24,633179,633179">http://forums.mysql.com/read.php?24,633179,633179</a> </li>
+<li>8192 partitions is a hard limit (1024 before 5.6.7). </li>
+<li>Before "native partitions" (5.7.6), each partition consumed a chunk of memory. </li>
+</ul> <h2 class="anchored_heading" id="detailed-code">Detailed code</h2> <p><a href="http://mysql.rjweb.org/demo_part_maint.pl.txt">Reference implementation, in Perl, with demo of daily partitions</a></p> <p>The complexity of the code is in the discovery of the PARTITION names, especially of the oldest and the 'next'.</p> <p>To run the demo,</p> <ul>
+<li>Install Perl and DBIx::DWIW (from CPAN). </li>
+<li>copy the txt file (link above) to demo_part_maint.pl </li>
+<li>execute perl demo_part_maint.pl to get the rest of the instructions </li>
+</ul> <p>The program will generate and execute (when needed) either of these:</p> <pre class="fixed" data-language="sql">   ALTER TABLE tbl REORGANIZE PARTITION
+        future
+   INTO (
+        PARTITION from20150606 VALUES LESS THAN (736121),
+        PARTITION future VALUES LESS THAN MAXVALUE
+   )
+
+   ALTER TABLE tbl
+                    DROP PARTITION from20150603
+</pre>
+<h2 class="anchored_heading" id="postlog">Postlog</h2> <p>Original writing -- Oct, 2012; Use cases added: Oct, 2014; Refreshed: June, 2015; 8.0: Sep, 2016 </p> <p><a href="http://mysql.rjweb.org/slides/Partition.pdf">Slides from Percona Amsterdam 2015</a></p> <p>PARTITIONing requires at least MySQL 5.1</p> <p>The tips in this document apply to MySQL, MariaDB, and Percona.</p> <ul>
+<li>
+<a href="http://www.mysqlperformanceblog.com/2010/12/11/mysql-partitioning-can-save-you-or-kill-you/">More on PARTITIONing</a> </li>
+<li>
+<a href="http://www.linkedin.com/groups/MySql-Horizontal-partitioning-ProsCons-78638.S.5861525157444595715?qid=0d54d3f9-21d7-43e8-9b75-dbc0270c7236&amp;trk=groups_guest_most_popular-0-b-ttl&amp;goback=%2Egmp_78638">LinkedIn discussion</a> </li>
+<li>
+<a href="http://dba.stackexchange.com/questions/107408/why-not-partition">Why NOT Partition</a> </li>
+<li>
+<a href="http://www.geoffmontee.com/automatically-dropping-old-partitions-in-mysql-and-mariadb-part-2/">Geoff Montee's Stored Proc</a> </li>
+</ul> <p>Future (as envisioned in 2016):</p> <ul>
+<li>MySQL 5.7.6 has "native partitioning for InnoDB". </li>
+<li>FOREIGN KEY support, perhaps in a later 8.0.xx. </li>
+<li>"GLOBAL INDEX" -- this would avoid the need for putting the partition key in every unique index, but make DROP PARTITION costly. This will be farther into the future. </li>
+</ul> <p>MySQL 8.0, released Sep, 2016, not yet GA)</p> <ul>
+<li>Only InnoDB tables can be partitioned -- MariaDB is likely to continue maintaining Partitioning on non-InnoDB tables, but Oracle is clearly not. </li>
+<li>Some of the problems having lots of partitions are lessened by the Data-Dictionary-in-a-table. </li>
+</ul> <p>Native partitioning will give:</p> <ul>
+<li>This will improve performance slightly by combining two "handlers" into one. </li>
+<li>Decreased memory usage, especially when using a large number of partitions. </li>
+</ul> <h2 class="anchored_heading" id="see-also">See also</h2> <p>Rick James graciously allowed us to use this article in the Knowledge Base.</p> <p><a href="http://mysql.rjweb.org/">Rick James' site</a> has other useful tips, how-tos, optimizations, and debugging tips.</p> <p> Original source: <a href="http://mysql.rjweb.org/doc.php/partitionmaint">http://mysql.rjweb.org/doc.php/partitionmaint</a></p> </div>     </div> <div id="content_disclaimer" class="graybox"> Content reproduced on this site is the property of its respective owners, and this content is not reviewed in advance by MariaDB. The views, information and opinions expressed by this content do not necessarily represent those of MariaDB or any other party. </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2023 MariaDB<br>Licensed under the Creative Commons Attribution 3.0 Unported License and the GNU Free Documentation License.<br>
+    <a href="https://mariadb.com/kb/en/partition-maintenance/" class="_attribution-link">https://mariadb.com/kb/en/partition-maintenance/</a>
+  </p>
+</div>
