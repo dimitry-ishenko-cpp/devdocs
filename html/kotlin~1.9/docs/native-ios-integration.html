@@ -1,0 +1,197 @@
+<h1 data-toc="native-ios-integration" id="native-ios-integration.md">iOS integration</h1>
+<aside data-type="note" class="prompt" data-title="" id="f4b51dbc"><p id="e71f3e0d">This page describes the new memory manager enabled by default since Kotlin 1.7.20. See our <a href="native-migration-guide.html" id="fd4bf7f3">migration guide</a> to move your projects from the legacy memory manager.</p></aside><p id="e95f90ab">Integration of Kotlin/Native garbage collector with Swift/Objective-C ARC is seamless and generally requires no additional work to be done. Learn more about <a href="native-objc-interop.html" id="66ba8ebb">Swift/Objective-C interoperability</a>.</p>
+<p id="b57ce6fd">However, there are some specifics you should keep in mind:</p>
+<section class="chapter"><h2 id="threads" data-toc="threads">Threads</h2>
+<section class="chapter"><h3 id="deinitializers" data-toc="deinitializers">Deinitializers</h3>
+<p id="b2e2cfef">Deinitialization on the Swift/Objective-C objects and the objects they refer to is called on the main thread if these objects are passed to Kotlin on the main thread, for example:</p>
+<pre class="code" data-language="kotlin">// Kotlin
+class KotlinExample {
+    fun action(arg: Any) {
+        println(arg)
+    }
+}
+</pre>
+<pre class="code" data-language="swift">// Swift
+class SwiftExample {
+    init() {
+        print("init on \(Thread.current)")
+    }
+
+    deinit {
+        print("deinit on \(Thread.current)")
+    }
+}
+
+func test() {
+    KotlinExample().action(arg: SwiftExample())
+}
+</pre>
+<p id="a79634ae">The resulting output:</p>
+<pre class="code" data-language="plaintext">init on &lt;_NSMainThread: 0x600003bc0000&gt;{number = 1, name = main}
+shared.SwiftExample
+deinit on &lt;_NSMainThread: 0x600003bc0000&gt;{number = 1, name = main}
+</pre>
+<p id="7f0dfca8">Deinitialization on the Swift/Objective-C objects is called on a special GC thread if:</p>
+<ul class="list _bullet" id="56b6459d">
+<li class="list__item" id="45b40981"><p>Swift/Objective-C objects are passed to Kotlin on a thread other than main.</p></li>
+<li class="list__item" id="fd631d04"><p>The main dispatch queue isn't processed.</p></li>
+</ul>
+<p id="3b62e5c9">If you want to call deinitialization on a special GC thread explicitly, set <code class="code ">kotlin.native.binary.objcDisposeOnMain=false</code> in your <code class="code ">gradle.properties</code>. This option enables deinitialization on a special GC thread, even if Swift/Objective-C objects were passed to Kotlin on the main thread.</p></section><section class="chapter"><h3 id="completion-handlers" data-toc="completion-handlers">Completion handlers</h3>
+<p id="612013cd">When calling Kotlin suspending functions from Swift, completion handlers might be called on threads other than the main one, for example:</p>
+<pre class="code" data-language="kotlin">// Kotlin
+// coroutineScope, launch, and delay are from kotlinx.coroutines
+suspend fun asyncFunctionExample() = coroutineScope {
+    launch {
+        delay(1000L)
+        println("World!")
+    }
+    println("Hello")
+}
+</pre>
+<pre class="code" data-language="swift">// Swift
+func test() {
+    print("Running test on \(Thread.current)")
+    PlatformKt.asyncFunctionExample(completionHandler: { _ in
+        print("Running completion handler on \(Thread.current)")
+    })
+}
+</pre>
+<p id="464e1928">The resulting output:</p>
+<pre class="code" data-language="plaintext">Running test on &lt;_NSMainThread: 0x600001b100c0&gt;{number = 1, name = main}
+Hello
+World!
+Running completion handler on &lt;NSThread: 0x600001b45bc0&gt;{number = 7, name = (null)}
+</pre></section><section class="chapter"><h3 id="calling-kotlin-suspending-functions" data-toc="calling-kotlin-suspending-functions">Calling Kotlin suspending functions</h3>
+<p id="e8fdde1">The Kotlin/Native memory manager has a restriction on calling Kotlin suspending functions from Swift and Objective-C from threads other than the main one.</p>
+<p id="4d07d469">This restriction was originally introduced in the legacy memory manager due to cases when the code dispatched a continuation to be resumed on the original thread. If this thread didn't have a supported event loop, the task would never run, and the coroutine would never be resumed.</p>
+<p id="a8972822">In certain cases, this restriction is not required anymore. You can lift it by adding the following option to your <code class="code ">gradle.properties</code>:</p>
+<pre class="code" data-language="none">kotlin.native.binary.objcExportSuspendFunctionLaunchThreadRestriction=none
+</pre></section></section><section class="chapter"><h2 id="garbage-collection-and-lifecycle" data-toc="garbage-collection-and-lifecycle">Garbage collection and lifecycle</h2>
+<section class="chapter"><h3 id="object-reclamation" data-toc="object-reclamation">Object reclamation</h3>
+<p id="267345">An object is reclaimed only during the garbage collection. This applies to Swift/Objective-C objects that cross interop boundaries into Kotlin/Native, for example:</p>
+<pre class="code" data-language="kotlin">// Kotlin
+class KotlinExample {
+    fun action(arg: Any) {
+        println(arg)
+    }
+}
+</pre>
+<pre class="code" data-language="swift">// Swift
+class SwiftExample {
+    deinit {
+        print("SwiftExample deinit")
+    }
+}
+
+func test() {
+    swiftTest()
+    kotlinTest()
+}
+
+func swiftTest() {
+    print(SwiftExample())
+    print("swiftTestFinished")
+}
+
+func kotlinTest() {
+    KotlinExample().action(arg: SwiftExample())
+    print("kotlinTest finished")
+}
+</pre>
+<p id="8ef2bee7">The resulting output:</p>
+<pre class="code" data-language="plaintext">shared.SwiftExample
+SwiftExample deinit
+swiftTestFinished
+shared.SwiftExample
+kotlinTest finished
+SwiftExample deinit
+</pre></section><section class="chapter"><h3 id="objective-c-objects-lifecycle" data-toc="objective-c-objects-lifecycle">Objective-C objects lifecycle</h3>
+<p id="656f92d6">The Objective-C objects might live longer than they should, which sometimes might cause performance issues. For example, when a long-running loop creates several temporary objects that cross the Swift/Objective-C interop boundary on each iteration.</p>
+<p id="1fb3350c">In the <a href="native-memory-manager.html#monitor-gc-performance" id="54f05e60">GC logs</a>, there's a number of stable refs in the root set. If this number keeps growing, it may indicate that the Swift/Objective-C objects are not freed up when they should. In this case, try the <code class="code ">autoreleasepool</code> block around loop bodies that do interop calls:</p>
+<pre class="code" data-language="kotlin">// Kotlin
+fun growingMemoryUsage() {
+    repeat(Int.MAX_VALUE) {
+        NSLog("$it\n")
+    }
+}
+
+fun steadyMemoryUsage() {
+    repeat(Int.MAX_VALUE) {
+        autoreleasepool {
+            NSLog("$it\n")
+        }
+    }
+}
+</pre></section><section class="chapter"><h3 id="garbage-collection-of-swift-and-kotlin-objects-chains" data-toc="garbage-collection-of-swift-and-kotlin-objects-chains">Garbage collection of Swift and Kotlin objects' chains</h3>
+<p id="3de0a154">Consider the following example:</p>
+<pre class="code" data-language="kotlin">// Kotlin
+interface Storage {
+    fun store(arg: Any)
+}
+
+class KotlinStorage(var field: Any? = null) : Storage {
+    override fun store(arg: Any) {
+        field = arg
+    }
+}
+
+class KotlinExample {
+    fun action(firstSwiftStorage: Storage, secondSwiftStorage: Storage) {
+        // Here, we create the following chain:
+        // firstKotlinStorage -&gt; firstSwiftStorage -&gt; secondKotlinStorage -&gt; secondSwiftStorage.
+        val firstKotlinStorage = KotlinStorage()
+        firstKotlinStorage.store(firstSwiftStorage)
+        val secondKotlinStorage = KotlinStorage()
+        firstSwiftStorage.store(secondKotlinStorage)
+        secondKotlinStorage.store(secondSwiftStorage)
+    }
+}
+</pre>
+<pre class="code" data-language="swift">// Swift
+class SwiftStorage : Storage {
+
+    let name: String
+
+    var field: Any? = nil
+
+    init(_ name: String) {
+        self.name = name
+    }
+
+    func store(arg: Any) {
+        field = arg
+    }
+
+    deinit {
+        print("deinit SwiftStorage \(name)")
+    }
+}
+
+func test() {
+    KotlinExample().action(
+        firstSwiftStorage: SwiftStorage("first"),
+        secondSwiftStorage: SwiftStorage("second")
+    )
+}
+</pre>
+<p id="61006c90">It takes some time between "deinit SwiftStorage first" and "deinit SwiftStorage second" messages to appear in the log. The reason is that <code class="code ">firstKotlinStorage</code> and <code class="code ">secondKotlinStorage</code> are collected in different GC cycles. Here's the sequence of events:</p>
+<ol class="list _decimal" id="101a3977" type="1">
+<li class="list__item" id="5a457c4a"><p><code class="code ">KotlinExample.action</code> finishes. <code class="code ">firstKotlinStorage</code> is considered "dead" because nothing references it, while <code class="code ">secondKotlinStorage</code> is not because it is referenced by <code class="code ">firstSwiftStorage</code>.</p></li>
+<li class="list__item" id="94a111a7"><p>First GC cycle starts, and <code class="code ">firstKotlinStorage</code> is collected.</p></li>
+<li class="list__item" id="a917991"><p>There are no references to <code class="code ">firstSwiftStorage</code>, so it is "dead" as well, and <code class="code ">deinit</code> is called.</p></li>
+<li class="list__item" id="bb1d6d04"><p>Second GC cycle starts. <code class="code ">secondKotlinStorage</code> is collected because <code class="code ">firstSwiftStorage</code> is no longer referencing it.</p></li>
+<li class="list__item" id="d9e93a1f"><p><code class="code ">secondSwiftStorage</code> is finally reclaimed.</p></li>
+</ol>
+<p id="a49cde50">It requires two GC cycles to collect these four objects because deinitialization of Swift and Objective-C objects happens after the GC cycle. The limitation stems from <code class="code ">deinit</code>, which can call arbitrary code, including the Kotlin code that cannot be run during the GC pause.</p></section></section><section class="chapter"><h2 id="support-for-background-state-and-app-extensions" data-toc="support-for-background-state-and-app-extensions">Support for background state and App Extensions</h2>
+<p id="9868e512">The current memory manager does not track application state by default and does not integrate with <a href="https://developer.apple.com/app-extensions/" id="b40b2eee" data-external="true" rel="noopener noreferrer">App Extensions</a> out of the box.</p>
+<p id="29b19c5a">It means that the memory manager doesn't adjust GC behavior accordingly, which might be harmful in some cases. To change this behavior, add the following <a href="components-stability.html" id="d60b133d">Experimental</a> binary option to your <code class="code ">gradle.properties</code>:</p>
+<pre class="code" data-language="none">kotlin.native.binary.appStateTracking=enabled
+</pre>
+<p id="5659944c">It turns off a timer-based invocation of the garbage collector when the application is in the background, so GC is called only when memory consumption becomes too high.</p></section><div class="last-modified"> Last modified: 18 July 2023</div>
+
+<div class="navigation-links _bottom"> <a class="navigation-links__prev" href="native-memory-manager.html">Kotlin/Native memory management</a> <a class="navigation-links__next" href="native-migration-guide.html">Migrate to the new memory manager</a> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2023 JetBrains s.r.o. and Kotlin Programming Language contributors<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://kotlinlang.org/docs/native-ios-integration.html" class="_attribution-link">https://kotlinlang.org/docs/native-ios-integration.html</a>
+  </p>
+</div>
