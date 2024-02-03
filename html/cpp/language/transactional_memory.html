@@ -1,0 +1,152 @@
+    <h1 id="firstHeading" class="firstHeading">Transactional memory</h1>            <div class="plainlinks fmbox fmbox-system noprint">     Work in progress This page is under construction   </div> <div class="plainlinks fmbox fmbox-system noprint">     Experimental Feature The functionality described on this page is part of the Transactional Memory Technical Specification ISO/IEC TS 19841:2015 (TM TS)   </div> <p>Transactional memory is a concurrency synchronization mechanism that combines groups of statements in transactions, that are</p>
+<ul>
+<li> atomic (either all statements occur, or nothing occurs) </li>
+<li> isolated (statements in a transaction may not observe half-written writes made by another transaction, even if they execute in parallel) </li>
+</ul> <p>Typical implementations use hardware transactional memory where supported and to the limits that it is available (e.g. until the changeset is saturated) and fall back to software transactional memory, usually implemented with optimistic concurrency: if another transaction updated some of the variables used by a transaction, it is silently retried. For that reason, retriable transactions ("atomic blocks") can only call transaction-safe functions.</p>
+<p>Note that accessing a variable in a transaction and out of a transaction without other external synchronization is a data race.</p>
+<p>If feature testing is supported, the features described here are indicated by the macro constant <code>__cpp_transactional_memory</code> with a value equal or greater <code>201505</code>.</p>
+<h3 id="Synchronized_blocks"> Synchronized blocks</h3> <p><code>synchronized</code> <span class="t-spar">compound-statement</span></p>
+<p>Executes the <a href="statements.html#Compound_statements" title="cpp/language/statements">compound statement</a> as if under a global lock: all outermost synchronized blocks in the program execute in a single total order. The end of each synchronized block synchronizes with the beginning of the next synchronized block in that order. Synchronized blocks that are nested within other synchronized blocks have no special semantics.</p>
+<p>Synchronized blocks are not transactions (unlike the atomic blocks below) and may call transaction-unsafe functions.</p>
+<div class="t-example"> <div class="cpp source-cpp"><pre data-language="cpp">#include &lt;iostream&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+ 
+int f()
+{
+    static int i = 0;
+    synchronized { // begin synchronized block
+        std::cout &lt;&lt; i &lt;&lt; " -&gt; ";
+        ++i;       // each call to f() obtains a unique value of i
+        std::cout &lt;&lt; i &lt;&lt; '\n';
+        return i;  // end synchronized block
+    }
+}
+ 
+int main()
+{
+    std::vector&lt;std::thread&gt; v(10);
+    for (auto&amp; t : v)
+        t = std::thread([] { for (int n = 0; n &lt; 10; ++n) f(); });
+    for (auto&amp; t : v)
+        t.join();
+}</pre></div> <p>Output:</p>
+<div class="text source-text"><pre data-language="c">0 -&gt; 1
+1 -&gt; 2
+2 -&gt; 3
+...
+99 -&gt; 100</pre></div> </div> <p>Leaving a synchronized block by any means (reaching the end, executing goto, break, continue, or return, or throwing an exception) exits the block and synchronizes-with the next block in the single total order if the exited block was an outer block. The behavior is undefined if <code><a href="../utility/program/longjmp.html" title="cpp/utility/program/longjmp">std::longjmp</a></code> is used to exit a synchronized block.</p>
+<p>Entering a synchronized block by goto or switch is not allowed.</p>
+<p>Although synchronized blocks execute as-if under a global lock, the implementations are expected to examine the code within each block and use optimistic concurrency (backed up by hardware transactional memory where available) for transaction-safe code and minimal locking for non-transaction safe code. When a synchronized block makes a call to a non-inlined function, the compiler may have to drop out of speculative execution and hold a lock around the entire call unless the function is declared <code>transaction_safe</code> (see below) or the attribute <code>[[optimize_for_synchronized]]</code> (see below) is used.</p>
+<h3 id="Atomic_blocks"> Atomic blocks</h3>  <p><code>atomic_noexcept</code> <span class="t-spar">compound-statement</span></p>
+<p><code>atomic_cancel</code> <span class="t-spar">compound-statement</span></p>
+<p><code>atomic_commit</code> <span class="t-spar">compound-statement</span></p>
+<div class="t-li1">
+<span class="t-li">1)</span> If an exception is thrown, <code><a href="http://en.cppreference.com/w/cpp/utility/program/abort"><span class="kw968">std::<span class="me2">abort</span></span></a></code> is called.</div> <div class="t-li1">
+<span class="t-li">2)</span> If an exception is thrown, <code><a href="http://en.cppreference.com/w/cpp/utility/program/abort"><span class="kw968">std::<span class="me2">abort</span></span></a></code> is called, unless the exception is one of the exceptions used for transaction cancellation (see below) in which case the transaction is <i>cancelled</i>: the values of all memory locations in the program that were modified by side effects of the operations of the atomic block are restored to the values they had at the time the start of the atomic block was executed, and the exception continues stack unwinding as usual.</div> <div class="t-li1">
+<span class="t-li">3)</span> If an exception is thrown, the transaction is committed normally.</div> <p>The exceptions used for transaction cancellation in <code>atomic_cancel</code> blocks are <code><a href="../memory/new/bad_alloc.html" title="cpp/memory/new/bad alloc">std::bad_alloc</a></code>, <code><a href="../memory/new/bad_array_new_length.html" title="cpp/memory/new/bad array new length">std::bad_array_new_length</a></code>, <code><a href="../types/bad_cast.html" title="cpp/types/bad cast">std::bad_cast</a></code>, <code><a href="../types/bad_typeid.html" title="cpp/types/bad typeid">std::bad_typeid</a></code>, <code><a href="../error/bad_exception.html" title="cpp/error/bad exception">std::bad_exception</a></code>, <code><a href="../error/exception.html" title="cpp/error/exception">std::exception</a></code> and all standard library exceptions derived from it, and the special exception type <a href="../error/tx_exception.html" title="cpp/error/tx exception"><code>std::tx_exception&lt;T&gt;</code></a>.</p>
+<p>The <span class="t-spar">compound-statement</span> in an atomic block is not allowed to execute any expression or statement or call any function that isn't <code>transaction_safe</code> (this is a compile time error).</p>
+<div class="cpp source-cpp"><pre data-language="cpp">// each call to f() retrieves a unique value of i, even when done in parallel
+int f()
+{
+    static int i = 0;
+    atomic_noexcept { // begin transaction
+//  printf("before %d\n", i); // error: cannot call a non transaction-safe function
+        ++i;
+        return i; // commit transaction
+    }
+}</pre></div> <p>Leaving an atomic block by any means other than exception (reaching the end, goto, break, continue, return) commits the transaction. The behavior is undefined if <code><a href="../utility/program/longjmp.html" title="cpp/utility/program/longjmp">std::longjmp</a></code> is used to exit an atomic block.</p>
+<h3 id="Transaction-safe_functions"> Transaction-safe functions</h3>  <p>A function can be explicitly declared to be transaction-safe by using the keyword <code>transaction_safe</code> in its declaration.</p>
+<p>In a <a href="lambda.html" title="cpp/language/lambda">lambda</a> declaration, it appears either immediately after the capture list, or immediately after the (keyword <code>mutable</code> (if one is used).</p>
+<div class="cpp source-cpp"><pre data-language="cpp">extern volatile int * p = 0;
+struct S
+{
+    virtual ~S();
+};
+int f() transaction_safe
+{
+    int x = 0;  // ok: not volatile
+    p = &amp;x;     // ok: the pointer is not volatile
+    int i = *p; // error: read through volatile glvalue
+    S s;        // error: invocation of unsafe destructor
+}</pre></div> <div class="cpp source-cpp"><pre data-language="cpp">int f(int x) { // implicitly transaction-safe
+    if (x &lt;= 0)
+        return 0;
+    return x + f(x - 1);
+}</pre></div> <p>If a function that is not transaction-safe is called through a reference or pointer to a transaction-safe function, the behavior is undefined.</p>
+<p><br> Pointers to transaction-safe functions and pointers to transaction-safe member functions are implicitly convertible to pointers to functions and pointers to member functions respectively. It is unspecified if the resulting pointer compares equal to the original.</p>
+<h4 id="Transaction-safe_virtual_functions"> Transaction-safe virtual functions</h4>  <p>If the final overrider of a <code>transaction_safe_dynamic</code> function is not declared <code>transaction_safe</code>, calling it in an atomic block is undefined behavior.</p>
+<h3 id="Standard_library"> Standard library</h3> <p>Besides introducing the new exception template <a href="../error/tx_exception.html" title="cpp/error/tx exception"><code>std::tx_exception</code></a>, the transactional memory technical specification makes the following changes to the standard library:</p>
+<ul>
+<li> makes the following functions explicitly <code>transaction_safe</code>: </li>
+<ul><li> <code><a href="../utility/forward.html" title="cpp/utility/forward">std::forward</a></code>, <code>std::move</code>, <code><a href="../utility/move_if_noexcept.html" title="cpp/utility/move if noexcept">std::move_if_noexcept</a></code>, <code><a href="../memory/align.html" title="cpp/memory/align">std::align</a></code>, <code><a href="../utility/program/abort.html" title="cpp/utility/program/abort">std::abort</a></code>, global default <code><a href="../memory/new/operator_new.html" title="cpp/memory/new/operator new">operator new</a></code>, global default <code><a href="../memory/new/operator_delete.html" title="cpp/memory/new/operator delete">operator delete</a></code>, <code><a href="../memory/allocator/construct.html" title="cpp/memory/allocator/construct">std::allocator::construct</a></code> if the invoked constructor is transaction-safe, <code><a href="../memory/allocator/destroy.html" title="cpp/memory/allocator/destroy">std::allocator::destroy</a></code> if the invoked destructor is transaction-safe, <code><a href="../memory/get_temporary_buffer.html" title="cpp/memory/get temporary buffer">std::get_temporary_buffer</a></code>, <code><a href="../memory/return_temporary_buffer.html" title="cpp/memory/return temporary buffer">std::return_temporary_buffer</a></code>, <code><a href="../memory/addressof.html" title="cpp/memory/addressof">std::addressof</a></code>, <code><a href="../memory/pointer_traits/pointer_to.html" title="cpp/memory/pointer traits/pointer to">std::pointer_traits::pointer_to</a></code>, each non-virtual member function of all exception types that support transaction cancellation (see <code>atomic_cancel</code> above)  </li></ul>
+<li> makes the following functions explicitly <code>transaction_safe_dynamic</code> </li>
+<ul><li> each virtual member function of all exception types that support transaction cancellation (see <code>atomic_cancel</code> above) </li></ul>
+<li> requires that all operations that are transaction-safe on an <a href="../named_req/allocator.html" title="cpp/named req/Allocator">Allocator</a> X are transaction-safe on <code>X::rebind&lt;&gt;::other</code> </li>
+</ul>     <h3 id="Attributes"> Attributes</h3> <p>The attribute <code>[[<a href="attributes/optimize_for_synchronized.html" title="cpp/language/attributes/optimize for synchronized">optimize_for_synchronized</a>]]</code> may be applied to a declarator in a function declaration and must appear on the first declaration of the function.</p>
+<p>If a function is declared <code>[[optimize_for_synchronized]]</code> in one translation unit and the same function is declared without <code>[[optimize_for_synchronized]]</code> in another translation unit, the program is ill-formed; no diagnostic required.</p>
+<p>It indicates that a the function definition should be optimized for invocation from a <code>synchronized</code> statement. In particular, it avoids serializing synchronized blocks that make a call to a function that is transaction-safe for the majority of calls, but not for all calls (e.g. hash table insertion that may have to rehash, allocator that may have to request a new block, a simple function that may rarely log).</p>
+<div class="cpp source-cpp"><pre data-language="cpp">std::atomic&lt;bool&gt; rehash{false};
+ 
+// maintenance thread runs this loop
+void maintenance_thread(void*)
+{
+    while (!shutdown)
+    {
+        synchronized
+        {
+            if (rehash)
+            {
+                hash.rehash();
+                rehash = false;
+            }
+        }
+    }
+}
+ 
+// worker threads execute hundreds of thousands of calls to this function 
+// every second. Calls to insert_key() from synchronized blocks in other
+// translation units will cause those blocks to serialize, unless insert_key()
+// is marked [[optimize_for_synchronized]]
+[[optimize_for_synchronized]] void insert_key(char* key, char* value)
+{
+    bool concern = hash.insert(key, value);
+    if (concern)
+        rehash = true;
+}</pre></div> <p>GCC assembly without the attribute: the entire function is serialized</p>
+<pre data-language="c">insert_key(char*, char*):
+        subq        $8, %rsp
+        movq        %rsi, %rdx
+        movq        %rdi, %rsi
+        movl        $hash, %edi
+        call        Hash::insert(char*, char*)
+        testb        %al, %al
+        je        .L20
+        movb        $1, rehash(%rip)
+        mfence
+.L20:
+        addq        $8, %rsp
+        ret
+</pre> <p>GCC assembly with the attribute:</p>
+<pre data-language="c">transaction clone for insert_key(char*, char*):
+        subq        $8, %rsp
+        movq        %rsi, %rdx
+        movq        %rdi, %rsi
+        movl        $hash, %edi
+        call        transaction clone for Hash::insert(char*, char*)
+        testb        %al, %al
+        je        .L27
+        xorl        %edi, %edi
+        call        _ITM_changeTransactionMode # Note: this is the serialization point
+        movb        $1, rehash(%rip)
+        mfence
+.L27:
+        addq        $8, %rsp
+        ret
+</pre>  <h3 id="Notes"> Notes</h3>  <h3 id="Compiler_support"> Compiler support</h3> <p>This technical specification is supported by GCC as of version 6.1 (requires <code>-fgnu-tm</code> to enable). An older variant of this specification was <a rel="nofollow" class="external text" href="http://www-users.cs.umn.edu/~boutcher/stm/">supported in GCC</a> as of 4.7.</p>
+<div class="_attribution">
+  <p class="_attribution-p">
+    &copy; cppreference.com<br>Licensed under the Creative Commons Attribution-ShareAlike Unported License v3.0.<br>
+    <a href="https://en.cppreference.com/w/cpp/language/transactional_memory" class="_attribution-link">https://en.cppreference.com/w/cpp/language/transactional_memory</a>
+  </p>
+</div>

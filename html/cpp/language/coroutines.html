@@ -1,0 +1,544 @@
+    <h1 id="firstHeading" class="firstHeading">Coroutines <span class="t-mark-rev t-since-cxx20">(C++20)</span>
+</h1>            <p>A coroutine is a function that can suspend execution to be resumed later. Coroutines are stackless: they suspend execution by returning to the caller and the data that is required to resume execution is stored separately from the stack. This allows for sequential code that executes asynchronously (e.g. to handle non-blocking I/O without explicit callbacks), and also supports algorithms on lazy-computed infinite sequences and other uses.</p>
+<p>A function is a coroutine if its definition contains any of the following:</p>
+<ul><li> the co_await expression — to suspend execution until resumed </li></ul> <div class="cpp source-cpp"><pre data-language="cpp">task&lt;&gt; tcp_echo_server()
+{
+    char data[1024];
+    while (true)
+    {
+        std::size_t n = co_await socket.async_read_some(buffer(data));
+        co_await async_write(socket, buffer(data, n));
+    }
+}</pre></div> <ul><li> the co_yield expression — to suspend execution returning a value </li></ul> <div class="cpp source-cpp"><pre data-language="cpp">generator&lt;unsigned int&gt; iota(unsigned int n = 0)
+{
+    while (true)
+        co_yield n++;
+}</pre></div> <ul><li> the co_return statement — to complete execution returning a value </li></ul> <div class="cpp source-cpp"><pre data-language="cpp">lazy&lt;int&gt; f()
+{
+    co_return 7;
+}</pre></div> <p>Every coroutine must have a return type that satisfies a number of requirements, noted below.</p>
+<h3 id="Restrictions"> Restrictions</h3> <p>Coroutines cannot use <a href="variadic_arguments.html" title="cpp/language/variadic arguments">variadic arguments</a>, plain <a href="return.html" title="cpp/language/return">return</a> statements, or <a href="function.html" title="cpp/language/function">placeholder return types</a> (<a href="auto.html" title="cpp/language/auto"><code>auto</code></a> or <a href="constraints.html#Concepts" title="cpp/language/constraints">Concept</a>).</p>
+<p><a href="consteval.html" title="cpp/language/consteval">Consteval functions</a>, <a href="constexpr.html" title="cpp/language/constexpr">constexpr functions</a>, <a href="constructor.html" title="cpp/language/constructor">constructors</a>, <a href="destructor.html" title="cpp/language/destructor">destructors</a>, and the <a href="main_function.html" title="cpp/language/main function">main function</a> cannot be coroutines.</p>
+<h3 id="Execution"> Execution</h3> <p>Each coroutine is associated with</p>
+<ul>
+<li> the <i>promise object</i>, manipulated from inside the coroutine. The coroutine submits its result or exception through this object. </li>
+<li> the <i>coroutine handle</i>, manipulated from outside the coroutine. This is a non-owning handle used to resume execution of the coroutine or to destroy the coroutine frame. </li>
+<li> the <i>coroutine state</i>, which is internal, dynamically-allocated storage (unless the allocation is optimized out), object that contains </li>
+<ul>
+<li> the promise object </li>
+<li> the parameters (all copied by value) </li>
+<li> some representation of the current suspension point, so that a resume knows where to continue, and a destroy knows what local variables were in scope </li>
+<li> local variables and temporaries whose lifetime spans the current suspension point. </li>
+</ul>
+</ul>  <p>When a coroutine begins execution, it performs the following:</p>
+<ul>
+<li> <a href="#Dynamic_allocation">allocates</a> the coroutine state object using <code><a href="../memory/new/operator_new.html" title="cpp/memory/new/operator new">operator new</a></code>. </li>
+<li> copies all function parameters to the coroutine state: by-value parameters are moved or copied, by-reference parameters remain references (thus, may become dangling, if the coroutine is resumed after the lifetime of referred object ends — see below for examples). </li>
+<li> calls the constructor for the promise object. If the promise type has a constructor that takes all coroutine parameters, that constructor is called, with post-copy coroutine arguments. Otherwise the default constructor is called. </li>
+<li> calls <code>promise.get_return_object()</code> and keeps the result in a local variable. The result of that call will be returned to the caller when the coroutine first suspends. Any exceptions thrown up to and including this step propagate back to the caller, not placed in the promise. </li>
+<li> calls <code>promise.initial_suspend()</code> and <code>co_await</code>s its result. Typical <code>Promise</code> types either return a <code><a href="../coroutine/suspend_always.html" title="cpp/coroutine/suspend always">std::suspend_always</a></code>, for lazily-started coroutines, or <code><a href="../coroutine/suspend_never.html" title="cpp/coroutine/suspend never">std::suspend_never</a></code>, for eagerly-started coroutines. </li>
+<li> when <code>co_await promise.initial_suspend()</code> resumes, starts executing the body of the coroutine. </li>
+</ul> <p>Some examples of a parameter becoming dangling:</p>
+<div class="cpp source-cpp"><pre data-language="cpp">#include &lt;coroutine&gt;
+#include &lt;iostream&gt;
+ 
+struct promise;
+ 
+struct coroutine : std::coroutine_handle&lt;promise&gt;
+{
+    using promise_type = ::promise;
+};
+ 
+struct promise
+{
+    coroutine get_return_object() { return {coroutine::from_promise(*this)}; }
+    std::suspend_always initial_suspend() noexcept { return {}; }
+    std::suspend_always final_suspend() noexcept { return {}; }
+    void return_void() {}
+    void unhandled_exception() {}
+};
+ 
+struct S
+{
+    int i;
+    coroutine f()
+    {
+        std::cout &lt;&lt; i;
+        co_return;
+    }
+};
+ 
+void bad1()
+{
+    coroutine h = S{0}.f();
+    // S{0} destroyed
+    h.resume(); // resumed coroutine executes std::cout &lt;&lt; i, uses S::i after free
+    h.destroy();
+}
+ 
+coroutine bad2()
+{
+    S s{0};
+    return s.f(); // returned coroutine can't be resumed without committing use after free
+}
+ 
+void bad3()
+{
+    coroutine h = [i = 0]() -&gt; coroutine // a lambda that's also a coroutine
+    {
+        std::cout &lt;&lt; i;
+        co_return;
+    }(); // immediately invoked
+    // lambda destroyed
+    h.resume(); // uses (anonymous lambda type)::i after free
+    h.destroy();
+}
+ 
+void good()
+{
+    coroutine h = [](int i) -&gt; coroutine // make i a coroutine parameter
+    {
+        std::cout &lt;&lt; i;
+        co_return;
+    }(0);
+    // lambda destroyed
+    h.resume(); // no problem, i has been copied to the coroutine
+                // frame as a by-value parameter
+    h.destroy();
+}</pre></div> <p>When a coroutine reaches a suspension point</p>
+<ul><li> the return object obtained earlier is returned to the caller/resumer, after implicit conversion to the return type of the coroutine, if necessary. </li></ul> <p>When a coroutine reaches the co_return statement, it performs the following:</p>
+<ul>
+<li> calls <code>promise.return_void()</code> for </li>
+<ul>
+<li> <code>co_return;</code> </li>
+<li> <code>co_return expr;</code> where <code>expr</code> has type <span class="kw4">void</span> </li>
+</ul>
+<li> or calls <code>promise.return_value(expr)</code> for <code>co_return expr;</code> where <code>expr</code> has non-void type </li>
+<li> destroys all variables with automatic storage duration in reverse order they were created. </li>
+<li> calls <code>promise.final_suspend()</code> and co_awaits the result. </li>
+</ul>   <p>Falling off the end of the coroutine is equivalent to <code>co_return;</code>, except that the behavior is undefined if no declarations of <code>return_void</code> can be found in the scope of <code>Promise</code>. A function with none of the defining keywords in its function body is not a coroutine, regardless of its return type, and falling off the end results in undefined behavior if the return type is not (possibly cv-qualified) <span class="kw4">void</span>.</p>
+<div class="cpp source-cpp"><pre data-language="cpp">// assuming that task is some coroutine task type
+task&lt;void&gt; f()
+{
+    // not a coroutine, undefined behavior
+}
+ 
+task&lt;void&gt; g()
+{
+    co_return;  // OK
+}
+ 
+task&lt;void&gt; h()
+{
+    co_await g();
+    // OK, implicit co_return;
+}</pre></div> <p>If the coroutine ends with an uncaught exception, it performs the following:</p>
+<ul>
+<li> catches the exception and calls <code>promise.unhandled_exception()</code> from within the catch-block </li>
+<li> calls <code>promise.final_suspend()</code> and co_awaits the result (e.g. to resume a continuation or publish a result). It's undefined behavior to resume a coroutine from this point. </li>
+</ul> <p>When the coroutine state is destroyed either because it terminated via co_return or uncaught exception, or because it was destroyed via its handle, it does the following:</p>
+<ul>
+<li> calls the destructor of the promise object. </li>
+<li> calls the destructors of the function parameter copies. </li>
+<li> calls <code><a href="../memory/new/operator_delete.html" title="cpp/memory/new/operator delete">operator delete</a></code> to free the memory used by the coroutine state. </li>
+<li> transfers execution back to the caller/resumer. </li>
+</ul> <h3 id="Dynamic_allocation"> Dynamic allocation</h3> <p>Coroutine state is allocated dynamically via non-array <code><a href="../memory/new/operator_new.html" title="cpp/memory/new/operator new">operator new</a></code>.</p>
+<p>If the <code>Promise</code> type defines a class-level replacement, it will be used, otherwise global <code><a href="../memory/new/operator_new.html" title="cpp/memory/new/operator new">operator new</a></code> will be used.</p>
+<p>If the <code>Promise</code> type defines a placement form of <code><a href="../memory/new/operator_new.html" title="cpp/memory/new/operator new">operator new</a></code> that takes additional parameters, and they match an argument list where the first argument is the size requested (of type <code><a href="../types/size_t.html" title="cpp/types/size t">std::size_t</a></code>) and the rest are the coroutine function arguments, those arguments will be passed to <code><a href="../memory/new/operator_new.html" title="cpp/memory/new/operator new">operator new</a></code> (this makes it possible to use <a href="../memory/uses_allocator.html#Uses-allocator_construction" title="cpp/memory/uses allocator">leading-allocator-convention</a> for coroutines).</p>
+<p>The call to <code><a href="../memory/new/operator_new.html" title="cpp/memory/new/operator new">operator new</a></code> can be optimized out (even if custom allocator is used) if</p>
+<ul>
+<li> The lifetime of the coroutine state is strictly nested within the lifetime of the caller, and </li>
+<li> the size of coroutine frame is known at the call site. </li>
+</ul> <p>In that case, coroutine state is embedded in the caller's stack frame (if the caller is an ordinary function) or coroutine state (if the caller is a coroutine).</p>
+<p>If allocation fails, the coroutine throws <code><a href="../memory/new/bad_alloc.html" title="cpp/memory/new/bad alloc">std::bad_alloc</a></code>, unless the <code>Promise</code> type defines the member function Promise<span class="sy4">::</span><span class="me2">get_return_object_on_allocation_failure</span><span class="br0">(</span><span class="br0">)</span>. If that member function is defined, allocation uses the nothrow form of <code><a href="../memory/new/operator_new.html" title="cpp/memory/new/operator new">operator new</a></code> and on allocation failure, the coroutine immediately returns the object obtained from Promise<span class="sy4">::</span><span class="me2">get_return_object_on_allocation_failure</span><span class="br0">(</span><span class="br0">)</span> to the caller, e.g.:</p>
+<div class="cpp source-cpp"><pre data-language="cpp">struct Coroutine::promise_type
+{
+    /* ... */
+ 
+    // ensure the use of non-throwing operator-new
+    static Coroutine get_return_object_on_allocation_failure()
+    {
+        std::cerr &lt;&lt; __func__ &lt;&lt; '\n';
+        throw std::bad_alloc(); // or, return Coroutine(nullptr);
+    }
+ 
+    // custom non-throwing overload of new
+    void* operator new(std::size_t n) noexcept
+    {
+        if (void* mem = std::malloc(n))
+            return mem;
+        return nullptr; // allocation failure
+    }
+};</pre></div> <h3 id="Promise"> Promise</h3> <p>The <code>Promise</code> type is determined by the compiler from the return type of the coroutine using <code><a href="../coroutine/coroutine_traits.html" title="cpp/coroutine/coroutine traits">std::coroutine_traits</a></code>.</p>
+<p>Formally, let <code>R</code> and <code>Args...</code> denote the return type and parameter type list of a coroutine respectively, <code>ClassT</code> and <code><i>cv-qual</i></code> (if any) denote the class type to which the coroutine belongs and its cv-qualification respectively if it is defined as a non-static member function, its <code>Promise</code> type is determined by:</p>
+<ul>
+<li> <code><a href="http://en.cppreference.com/w/cpp/coroutine/coroutine_traits"><span class="kw3207">std::<span class="me2">coroutine_traits</span></span></a><span class="sy1">&lt;</span>R, Args...<span class="sy1">&gt;</span><span class="sy4">::</span><span class="me2">promise_type</span></code>, if the coroutine is not defined as a non-static member function, </li>
+<li> <code><a href="http://en.cppreference.com/w/cpp/coroutine/coroutine_traits"><span class="kw3207">std::<span class="me2">coroutine_traits</span></span></a><span class="sy1">&lt;</span>R, ClassT <span class="coMULTI">/*cv-qual*/</span><span class="sy3">&amp;</span>, Args...<span class="sy1">&gt;</span><span class="sy4">::</span><span class="me2">promise_type</span></code>, if the coroutine is defined as a non-static member function that is not rvalue-reference-qualified, </li>
+<li> <code><a href="http://en.cppreference.com/w/cpp/coroutine/coroutine_traits"><span class="kw3207">std::<span class="me2">coroutine_traits</span></span></a><span class="sy1">&lt;</span>R, ClassT <span class="coMULTI">/*cv-qual*/</span><span class="sy3">&amp;&amp;</span>, Args...<span class="sy1">&gt;</span><span class="sy4">::</span><span class="me2">promise_type</span></code>, if the coroutine is defined as a non-static member function that is rvalue-reference-qualified. </li>
+</ul> <p>For example:</p>
+<table class="wikitable"> <tr> <th>If the coroutine is defined as ...</th> <th>then its <code>Promise</code> type is ... </th>
+</tr> <tr> <td><code>task&lt;void&gt; foo(int x);</code></td> <td>
+<code><a href="http://en.cppreference.com/w/cpp/coroutine/coroutine_traits"><span class="kw3207">std::<span class="me2">coroutine_traits</span></span></a><span class="sy1">&lt;</span>task<span class="sy1">&lt;</span><span class="kw4">void</span><span class="sy1">&gt;</span>, <span class="kw4">int</span><span class="sy1">&gt;</span><span class="sy4">::</span><span class="me2">promise_type</span></code> </td>
+</tr> <tr> <td><code>task&lt;void&gt; Bar::foo(int x) const;</code></td> <td>
+<code><a href="http://en.cppreference.com/w/cpp/coroutine/coroutine_traits"><span class="kw3207">std::<span class="me2">coroutine_traits</span></span></a><span class="sy1">&lt;</span>task<span class="sy1">&lt;</span><span class="kw4">void</span><span class="sy1">&gt;</span>, <span class="kw4">const</span> Bar<span class="sy3">&amp;</span>, <span class="kw4">int</span><span class="sy1">&gt;</span><span class="sy4">::</span><span class="me2">promise_type</span></code> </td>
+</tr> <tr> <td><code>task&lt;void&gt; Bar::foo(int x) &amp;&amp;;</code></td> <td>
+<code><a href="http://en.cppreference.com/w/cpp/coroutine/coroutine_traits"><span class="kw3207">std::<span class="me2">coroutine_traits</span></span></a><span class="sy1">&lt;</span>task<span class="sy1">&lt;</span><span class="kw4">void</span><span class="sy1">&gt;</span>, Bar<span class="sy3">&amp;&amp;</span>, <span class="kw4">int</span><span class="sy1">&gt;</span><span class="sy4">::</span><span class="me2">promise_type</span></code> </td>
+</tr>
+</table> <h3 id="co_await"> co_await</h3> <p>The unary operator co_await suspends a coroutine and returns control to the caller. Its operand is an expression that either (1) is of a class type that defines a member operator co_await or may be passed to a non-member operator co_await, or (2) is convertible to such a class type by means of the current coroutine's <code>Promise::await_transform</code>.</p>
+<table class="t-sdsc-begin">  <tr class="t-sdsc"> <td class="t-sdsc-nopad"> <code>co_await</code> <span class="t-spar">expr</span> </td> <td class="t-sdsc-nopad"> </td> <td class="t-sdsc-nopad"> </td>
+</tr> 
+</table> <p>A co_await expression can only appear in a <a href="expressions.html#Potentially-evaluated_expressions" title="cpp/language/expressions">potentially-evaluated</a> expression within a regular <a href="function.html#Function_definition" title="cpp/language/function">function body</a>, and cannot appear</p>
+<ul>
+<li> in an <a href="try_catch.html" title="cpp/language/try catch">exception handler</a>, </li>
+<li> in a <a href="declarations.html" title="cpp/language/declarations">declaration</a> statement, unless it appears in an initializer of that declaration statement, </li>
+<li> in the <a href="declarations.html#Simple_declaration" title="cpp/language/declarations">simple declaration</a> of an <span class="t-spar">init-statement</span> (see <a href="if.html" title="cpp/language/if"><code>if</code></a>, <a href="switch.html" title="cpp/language/switch"><code>switch</code></a>, <a href="for.html" title="cpp/language/for"><code>for</code></a> and <a href="range-for.html" title="cpp/language/range-for">range-for</a>), unless it appears in an initializer of that <span class="t-spar">init-statement</span>, </li>
+<li> in a <a href="default_arguments.html" title="cpp/language/default arguments">default argument</a>, or </li>
+<li> in the initializer of a block-scope variable with static or thread <a href="storage_duration.html" title="cpp/language/storage duration">storage duration</a>. </li>
+</ul> <p>First, <span class="t-spar">expr</span> is converted to an awaitable as follows:</p>
+<ul>
+<li> if <span class="t-spar">expr</span> is produced by an initial suspend point, a final suspend point, or a yield expression, the awaitable is <span class="t-spar">expr</span>, as-is. </li>
+<li> otherwise, if the current coroutine's <code>Promise</code> type has the member function <code>await_transform</code>, then the awaitable is <code>promise.await_transform(expr)</code>. </li>
+<li> otherwise, the awaitable is <span class="t-spar">expr</span>, as-is. </li>
+</ul> <p>Then, the awaiter object is obtained, as follows:</p>
+<ul>
+<li> if overload resolution for operator co_await gives a single best overload, the awaiter is the result of that call: </li>
+<ul>
+<li> <code>awaitable.operator co_await()</code> for member overload, </li>
+<li> <code>operator co_await(static_cast&lt;Awaitable&amp;&amp;&gt;(awaitable))</code> for the non-member overload. </li>
+</ul>
+<li> otherwise, if overload resolution finds no operator co_await, the awaiter is awaitable, as-is. </li>
+<li> otherwise, if overload resolution is ambiguous, the program is ill-formed. </li>
+</ul>   <p>If the expression above is a <a href="value_category.html#prvalue" title="cpp/language/value category">prvalue</a>, the awaiter object is a temporary <a href="implicit_conversion.html#Temporary_materialization" title="cpp/language/implicit conversion">materialized</a> from it. Otherwise, if the expression above is a <a href="value_category.html#glvalue" title="cpp/language/value category">glvalue</a>, the awaiter object is the object to which it refers.</p>
+<p>Then, <code>awaiter.await_ready()</code> is called (this is a short-cut to avoid the cost of suspension if it's known that the result is ready or can be completed synchronously). If its result, contextually-converted to <span class="kw4">bool</span> is <code>false</code> then</p>
+<dl>
+<dd> The coroutine is suspended (its coroutine state is populated with local variables and current suspension point). </dd>
+<dd> <code>awaiter.await_suspend(handle)</code> is called, where handle is the coroutine handle representing the current coroutine. Inside that function, the suspended coroutine state is observable via that handle, and it's this function's responsibility to schedule it to resume on some executor, or to be destroyed (returning false counts as scheduling) <ul>
+<li> if <code>await_suspend</code> returns <span class="kw4">void</span>, control is immediately returned to the caller/resumer of the current coroutine (this coroutine remains suspended), otherwise </li>
+<li> if <code>await_suspend</code> returns <span class="kw4">bool</span>, </li>
+<ul>
+<li> the value <code>true</code> returns control to the caller/resumer of the current coroutine </li>
+<li> the value <code>false</code> resumes the current coroutine. </li>
+</ul>
+<li> if <code>await_suspend</code> returns a coroutine handle for some other coroutine, that handle is resumed (by a call to <code>handle.resume()</code>) (note this may chain to eventually cause the current coroutine to resume). </li>
+<li> if <code>await_suspend</code> throws an exception, the exception is caught, the coroutine is resumed, and the exception is immediately re-thrown. </li>
+</ul>   </dd>
+</dl> <p>Finally, <code>awaiter.await_resume()</code> is called (whether the coroutine was suspended or not), and its result is the result of the whole <code>co_await expr</code> expression.</p>
+<p>If the coroutine was suspended in the co_await expression, and is later resumed, the resume point is immediately before the call to <code>awaiter.await_resume()</code>.</p>
+<p>Note that because the coroutine is fully suspended before entering <code>awaiter.await_suspend()</code>, that function is free to transfer the coroutine handle across threads, with no additional synchronization. For example, it can put it inside a callback, scheduled to run on a threadpool when async I/O operation completes. In that case, since the current coroutine may have been resumed and thus executed the awaiter object's destructor, all concurrently as <code>await_suspend()</code> continues its execution on the current thread, <code>await_suspend()</code> should treat <code>*this</code> as destroyed and not access it after the handle was published to other threads.</p>
+<h3 id="Example"> Example</h3> <div class="t-example"> <div class="cpp source-cpp"><pre data-language="cpp">#include &lt;coroutine&gt;
+#include &lt;iostream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;thread&gt;
+ 
+auto switch_to_new_thread(std::jthread&amp; out)
+{
+    struct awaitable
+    {
+        std::jthread* p_out;
+        bool await_ready() { return false; }
+        void await_suspend(std::coroutine_handle&lt;&gt; h)
+        {
+            std::jthread&amp; out = *p_out;
+            if (out.joinable())
+                throw std::runtime_error("Output jthread parameter not empty");
+            out = std::jthread([h] { h.resume(); });
+            // Potential undefined behavior: accessing potentially destroyed *this
+            // std::cout &lt;&lt; "New thread ID: " &lt;&lt; p_out-&gt;get_id() &lt;&lt; '\n';
+            std::cout &lt;&lt; "New thread ID: " &lt;&lt; out.get_id() &lt;&lt; '\n'; // this is OK
+        }
+        void await_resume() {}
+    };
+    return awaitable{&amp;out};
+}
+ 
+struct task
+{
+    struct promise_type
+    {
+        task get_return_object() { return {}; }
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() {}
+        void unhandled_exception() {}
+    };
+};
+ 
+task resuming_on_new_thread(std::jthread&amp; out)
+{
+    std::cout &lt;&lt; "Coroutine started on thread: " &lt;&lt; std::this_thread::get_id() &lt;&lt; '\n';
+    co_await switch_to_new_thread(out);
+    // awaiter destroyed here
+    std::cout &lt;&lt; "Coroutine resumed on thread: " &lt;&lt; std::this_thread::get_id() &lt;&lt; '\n';
+}
+ 
+int main()
+{
+    std::jthread out;
+    resuming_on_new_thread(out);
+}</pre></div> <p>Possible output:</p>
+<div class="text source-text"><pre data-language="c">Coroutine started on thread: 139972277602112
+New thread ID: 139972267284224
+Coroutine resumed on thread: 139972267284224</pre></div> </div> <p>Note: the awaiter object is part of coroutine state (as a temporary whose lifetime crosses a suspension point) and is destroyed before the co_await expression finishes. It can be used to maintain per-operation state as required by some async I/O APIs without resorting to additional dynamic allocations.</p>
+<p>The standard library defines two trivial awaitables: <code><a href="../coroutine/suspend_always.html" title="cpp/coroutine/suspend always">std::suspend_always</a></code> and <code><a href="../coroutine/suspend_never.html" title="cpp/coroutine/suspend never">std::suspend_never</a></code>.</p>
+<div style="margin-left:0px"> <table class="mw-collapsible mw-collapsed"> <tr> <th>Demo of promise_type<span class="sy4">::</span><span class="me2">await_transform</span> and a program provided awaiter </th>
+</tr> <tr> <td> <h3 id="Example_2"> Example</h3>  <div class="cpp source-cpp"><pre data-language="cpp">#include &lt;cassert&gt;
+#include &lt;coroutine&gt;
+#include &lt;iostream&gt;
+ 
+struct tunable_coro
+{
+    // An awaiter whose "readiness" is determined via constructor's parameter.
+    class tunable_awaiter
+    {
+        bool ready_;
+    public:
+        explicit(false) tunable_awaiter(bool ready) : ready_{ready} {}
+        // Three standard awaiter interface functions:
+        bool await_ready() const noexcept { return ready_; }
+        static void await_suspend(std::coroutine_handle&lt;&gt;) noexcept {}
+        static void await_resume() noexcept {}
+    };
+ 
+    struct promise_type
+    {
+        using coro_handle = std::coroutine_handle&lt;promise_type&gt;;
+        auto get_return_object() { return coro_handle::from_promise(*this); }
+        static auto initial_suspend() { return std::suspend_always(); }
+        static auto final_suspend() noexcept { return std::suspend_always(); }
+        static void return_void() {}
+        static void unhandled_exception() { std::terminate(); }
+        // A user provided transforming function which returns the custom awaiter:
+        auto await_transform(std::suspend_always) { return tunable_awaiter(!ready_); }
+        void disable_suspension() { ready_ = false; }
+    private:
+        bool ready_{true};
+    };
+ 
+    tunable_coro(promise_type::coro_handle h) : handle_(h) { assert(h); }
+ 
+    // For simplicity, declare these 4 special functions as deleted:
+    tunable_coro(tunable_coro const&amp;) = delete;
+    tunable_coro(tunable_coro&amp;&amp;) = delete;
+    tunable_coro&amp; operator=(tunable_coro const&amp;) = delete;
+    tunable_coro&amp; operator=(tunable_coro&amp;&amp;) = delete;
+ 
+    ~tunable_coro()
+    {
+        if (handle_)
+            handle_.destroy();
+    }
+ 
+    void disable_suspension() const
+    {
+        if (handle_.done())
+            return;
+        handle_.promise().disable_suspension();
+        handle_();
+    }
+ 
+    bool operator()()
+    {
+        if (!handle_.done())
+            handle_();
+        return !handle_.done();
+    }
+private:
+    promise_type::coro_handle handle_;
+};
+ 
+tunable_coro generate(int n)
+{
+    for (int i{}; i != n; ++i)
+    {
+        std::cout &lt;&lt; i &lt;&lt; ' ';
+        // The awaiter passed to co_await goes to promise_type::await_transform which
+        // issues tunable_awaiter that initially causes suspension (returning back to
+        // main at each iteration), but after a call to disable_suspension no suspension
+        // happens and the loop runs to its end without returning to main().
+        co_await std::suspend_always{};
+    }
+}
+ 
+int main()
+{
+    auto coro = generate(8);
+    coro(); // emits only one first element == 0
+    for (int k{}; k &lt; 4; ++k)
+    {
+        coro(); // emits 1 2 3 4, one per each iteration
+        std::cout &lt;&lt; ": ";
+    }
+    coro.disable_suspension();
+    coro(); // emits the tail numbers 5 6 7 all at ones
+}</pre></div> <p>Output:</p>
+<div class="text source-text"><pre data-language="c">0 1 : 2 : 3 : 4 : 5 6 7</pre></div>  </td>
+</tr>
+</table>
+</div> <h3 id="co_yield"> co_yield</h3> <p><code>co_yield</code> expression returns a value to the caller and suspends the current coroutine: it is the common building block of resumable generator functions.</p>
+<table class="t-sdsc-begin">  <tr class="t-sdsc"> <td class="t-sdsc-nopad"> <code>co_yield</code> <span class="t-spar">expr</span> </td> <td class="t-sdsc-nopad"> </td> <td class="t-sdsc-nopad"> </td>
+</tr>  <tr class="t-sdsc"> <td class="t-sdsc-nopad"> <code>co_yield</code> <span class="t-spar">braced-init-list</span> </td> <td class="t-sdsc-nopad"> </td> <td class="t-sdsc-nopad"> </td>
+</tr> 
+</table> <p>It is equivalent to</p>
+<div class="cpp source-cpp"><pre data-language="cpp">co_await promise.yield_value(expr)</pre></div> <p>A typical generator's <code>yield_value</code> would store (copy/move or just store the address of, since the argument's lifetime crosses the suspension point inside the <code>co_await</code>) its argument into the generator object and return <code><a href="../coroutine/suspend_always.html" title="cpp/coroutine/suspend always">std::suspend_always</a></code>, transferring control to the caller/resumer.</p>
+<div class="t-example"> <div class="cpp source-cpp"><pre data-language="cpp">#include &lt;coroutine&gt;
+#include &lt;cstdint&gt;
+#include &lt;exception&gt;
+#include &lt;iostream&gt;
+ 
+template&lt;typename T&gt;
+struct Generator
+{
+    // The class name 'Generator' is our choice and it is not required for coroutine
+    // magic. Compiler recognizes coroutine by the presence of 'co_yield' keyword.
+    // You can use name 'MyGenerator' (or any other name) instead as long as you include
+    // nested struct promise_type with 'MyGenerator get_return_object()' method.
+ 
+    struct promise_type;
+    using handle_type = std::coroutine_handle&lt;promise_type&gt;;
+ 
+    struct promise_type // required
+    {
+        T value_;
+        std::exception_ptr exception_;
+ 
+        Generator get_return_object()
+        {
+            return Generator(handle_type::from_promise(*this));
+        }
+        std::suspend_always initial_suspend() { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void unhandled_exception() { exception_ = std::current_exception(); } // saving
+                                                                              // exception
+ 
+        template&lt;std::convertible_to&lt;T&gt; From&gt; // C++20 concept
+        std::suspend_always yield_value(From&amp;&amp; from)
+        {
+            value_ = std::forward&lt;From&gt;(from); // caching the result in promise
+            return {};
+        }
+        void return_void() {}
+    };
+ 
+    handle_type h_;
+ 
+    Generator(handle_type h) : h_(h) {}
+    ~Generator() { h_.destroy(); }
+    explicit operator bool()
+    {
+        fill(); // The only way to reliably find out whether or not we finished coroutine,
+                // whether or not there is going to be a next value generated (co_yield)
+                // in coroutine via C++ getter (operator () below) is to execute/resume
+                // coroutine until the next co_yield point (or let it fall off end).
+                // Then we store/cache result in promise to allow getter (operator() below
+                // to grab it without executing coroutine).
+        return !h_.done();
+    }
+    T operator()()
+    {
+        fill();
+        full_ = false; // we are going to move out previously cached
+                       // result to make promise empty again
+        return std::move(h_.promise().value_);
+    }
+ 
+private:
+    bool full_ = false;
+ 
+    void fill()
+    {
+        if (!full_)
+        {
+            h_();
+            if (h_.promise().exception_)
+                std::rethrow_exception(h_.promise().exception_);
+            // propagate coroutine exception in called context
+ 
+            full_ = true;
+        }
+    }
+};
+ 
+Generator&lt;std::uint64_t&gt;
+fibonacci_sequence(unsigned n)
+{
+    if (n == 0)
+        co_return;
+ 
+    if (n &gt; 94)
+        throw std::runtime_error("Too big Fibonacci sequence. Elements would overflow.");
+ 
+    co_yield 0;
+ 
+    if (n == 1)
+        co_return;
+ 
+    co_yield 1;
+ 
+    if (n == 2)
+        co_return;
+ 
+    std::uint64_t a = 0;
+    std::uint64_t b = 1;
+ 
+    for (unsigned i = 2; i &lt; n; ++i)
+    {
+        std::uint64_t s = a + b;
+        co_yield s;
+        a = b;
+        b = s;
+    }
+}
+ 
+int main()
+{
+    try
+    {
+        auto gen = fibonacci_sequence(10); // max 94 before uint64_t overflows
+ 
+        for (int j = 0; gen; ++j)
+            std::cout &lt;&lt; "fib(" &lt;&lt; j &lt;&lt; ")=" &lt;&lt; gen() &lt;&lt; '\n';
+    }
+    catch (const std::exception&amp; ex)
+    {
+        std::cerr &lt;&lt; "Exception: " &lt;&lt; ex.what() &lt;&lt; '\n';
+    }
+    catch (...)
+    {
+        std::cerr &lt;&lt; "Unknown exception.\n";
+    }
+}</pre></div> <p>Output:</p>
+<div class="text source-text"><pre data-language="c">fib(0)=0
+fib(1)=1
+fib(2)=1
+fib(3)=2
+fib(4)=3
+fib(5)=5
+fib(6)=8
+fib(7)=13
+fib(8)=21
+fib(9)=34</pre></div> </div> <h3 id="Notes"> Notes</h3> <table class="wikitable ftm-begin ftm-has-value"> <tr> <th>
+<a href="../utility/feature_test.html" title="cpp/utility/feature test">Feature-test</a> macro</th> <th>Value</th> <th><span title="Standard in which the feature is introduced">Std</span></th> <th>Feature </th>
+</tr> <tr> <td><a href="../feature_test.html#cpp_impl_coroutine" title="cpp/feature test"><code>__cpp_impl_coroutine</code></a></td> <td><span class="nu0">201902L</span></td> <td><span class="t-mark">(C++20)</span></td> <td>
+<a href="#top">Coroutines</a> (compiler support) </td>
+</tr> <tr> <td><a href="../feature_test.html#cpp_lib_coroutine" title="cpp/feature test"><code>__cpp_lib_coroutine</code></a></td> <td><span class="nu0">201902L</span></td> <td><span class="t-mark">(C++20)</span></td> <td>
+<a href="../coroutine.html" title="cpp/coroutine">Coroutines</a> (library support) </td>
+</tr> <tr> <td><a href="../feature_test.html#cpp_lib_generator" title="cpp/feature test"><code>__cpp_lib_generator</code></a></td> <td><span class="nu0">202207L</span></td> <td><span class="t-mark">(C++23)</span></td> <td>
+<code>std::generator</code>: synchronous coroutine generator for ranges </td>
+</tr>
+</table> <h3 id="Library_support"> Library support</h3> <p><a href="../coroutine.html" title="cpp/coroutine">Coroutine support library</a> defines several types providing compile and run-time support for coroutines.</p>
+<h3 id="Defect_reports"> Defect reports</h3> <p>The following behavior-changing defect reports were applied retroactively to previously published C++ standards.</p>
+<table class="dsctable"> <tr> <th>DR </th> <th>Applied to </th> <th>Behavior as published </th> <th>Correct behavior </th>
+</tr> <tr> <td>
+<a rel="nofollow" class="external text" href="https://cplusplus.github.io/CWG/issues/2556.html">CWG 2556</a> </td> <td>C++20 </td> <td>invalid <code>return_void</code> made the behavior of<br>falling off the end of the coroutine undefined </td> <td>the program is ill-<br>formed in this case </td>
+</tr>
+</table> <h3 id="See_also"> See also</h3> <table class="t-dsc-begin"> <tr class="t-dsc"> <td> <div><a href="../coroutine/generator.html" title="cpp/coroutine/generator"> <span class="t-lines"><span>generator</span></span></a></div>
+<div><span class="t-lines"><span><span class="t-mark-rev t-since-cxx23">(C++23)</span></span></span></div> </td> <td> A <a href="../ranges/view.html" title="cpp/ranges/view"><code>view</code></a> that represents synchronous <strong class="selflink">coroutine</strong> generator <br> <span class="t-mark">(class template)</span>  </td>
+</tr> </table> <h3 id="External_links"> External links</h3> <table> <tr style="vertical-align:top;"> <td>1. </td> <td>David Mazières, 2021 - <a rel="nofollow" class="external text" href="https://www.scs.stanford.edu/~dm/blog/c++-coroutines.html">Tutorial on C++20 coroutines.</a> </td>
+</tr> <tr style="vertical-align:top;"> <td>2. </td> <td>Lewis Baker, 2017-2022 - <a rel="nofollow" class="external text" href="https://lewissbaker.github.io/">Asymmetric Transfer.</a> </td>
+</tr>
+</table>           <div class="_attribution">
+  <p class="_attribution-p">
+    &copy; cppreference.com<br>Licensed under the Creative Commons Attribution-ShareAlike Unported License v3.0.<br>
+    <a href="https://en.cppreference.com/w/cpp/language/coroutines" class="_attribution-link">https://en.cppreference.com/w/cpp/language/coroutines</a>
+  </p>
+</div>

@@ -1,0 +1,204 @@
+    <h1 id="firstHeading" class="firstHeading">PImpl</h1>            <p>"Pointer to implementation" or "pImpl" is a C++ <a href="#External_links">programming technique</a> that removes implementation details of a class from its object representation by placing them in a separate class, accessed through an opaque pointer:</p>
+<div class="cpp source-cpp"><pre data-language="cpp">// --------------------
+// interface (widget.h)
+struct widget
+{
+    // public members
+private:
+    struct impl; // forward declaration of the implementation class
+    // One implementation example: see below for other design options and trade-offs
+    std::experimental::propagate_const&lt; // const-forwarding pointer wrapper
+        std::unique_ptr&lt;                // unique-ownership opaque pointer
+            impl&gt;&gt; pImpl;               // to the forward-declared implementation class
+};
+ 
+// ---------------------------
+// implementation (widget.cpp)
+struct widget::impl
+{
+    // implementation details
+};</pre></div> <p>This technique is used to construct C++ library interfaces with stable ABI and to reduce compile-time dependencies.</p>
+<h3 id="Explanation"> Explanation</h3> <p>Because private data members of a class participate in its object representation, affecting size and layout, and because private member functions of a class participate in <a href="overload_resolution.html" title="cpp/language/overload resolution">overload resolution</a> (which takes place before member access checking), any change to those implementation details requires recompilation of all users of the class.</p>
+<p>pImpl removes this compilation dependency; changes to the implementation do not cause recompilation. Consequently, if a library uses pImpl in its ABI, newer versions of the library may change the implementation while remaining ABI-compatible with older versions.</p>
+<h3 id="Trade-offs"> Trade-offs</h3> <p>The alternatives to the pImpl idiom are</p>
+<ul>
+<li> inline implementation: private members and public members are members of the same class. </li>
+<li> pure abstract class (OOP factory): users obtain a unique pointer to a lightweight or abstract base class, the implementation details are in the derived class that overrides its virtual member functions. </li>
+</ul> <h4 id="Compilation_firewall"> Compilation firewall</h4> <p>In simple cases, both pImpl and factory method remove compile-time dependency between the implementation and the users of the class interface. Factory method creates a hidden dependency on the vtable, and so reordering, adding, or removing virtual member functions breaks the ABI. The pImpl approach has no hidden dependencies, however if the implementation class is a class template specialization, the compilation firewall benefit is lost: the users of the interface must observe the entire template definition in order to instantiate the correct specialization. A common design approach in this case is to refactor the implementation in a way that avoids parametrization, this is another use case for the C++ Core Guidelines:</p>
+<ul>
+<li> <a rel="nofollow" class="external text" href="https://github.com/isocpp/CppCoreGuidelines/blob/master/CppCoreGuidelines.md#Rt-scary">T.61 Do not over-parametrize members</a> and </li>
+<li> <a rel="nofollow" class="external text" href="https://github.com/isocpp/CppCoreGuidelines/blob/master/CppCoreGuidelines.md#t84-use-a-non-template-core-implementation-to-provide-an-abi-stable-interface">T.84 Use a non-template core implementation to provide an ABI-stable interface</a>. </li>
+</ul> <p>For example, the following class template does not use the type <code>T</code> in its private member or in the body of <code>push_back</code>:</p>
+<div class="cpp source-cpp"><pre data-language="cpp">template&lt;class T&gt;
+class ptr_vector
+{
+    std::vector&lt;void*&gt; vp;
+public:
+    void push_back(T* p)
+    {
+        vp.push_back(p);
+    }
+};</pre></div> <p>Therefore, private members can be transferred to implementation as-is, and <code>push_back</code> can forward to an implementation that does not use <code>T</code> in the interface either:</p>
+<div class="t-example"> <div class="cpp source-cpp"><pre data-language="cpp">// ---------------------
+// header (ptr_vector.hpp)
+#include &lt;memory&gt;
+ 
+class ptr_vector_base
+{
+    struct impl; // does not depend on T
+    std::unique_ptr&lt;impl&gt; pImpl;
+protected:
+    void push_back_fwd(void*);
+    void print() const;
+    // ... see implementation section for special member functions
+public:
+    ptr_vector_base();
+    ~ptr_vector_base();
+};
+ 
+template&lt;class T&gt;
+class ptr_vector : private ptr_vector_base
+{
+public:
+    void push_back(T* p) { push_back_fwd(p); }
+    void print() const { ptr_vector_base::print(); }
+};
+ 
+// -----------------------
+// source (ptr_vector.cpp)
+// #include "ptr_vector.hpp"
+#include &lt;iostream&gt;
+#include &lt;vector&gt;
+ 
+struct ptr_vector_base::impl
+{
+    std::vector&lt;void*&gt; vp;
+ 
+    void push_back(void* p)
+    {
+        vp.push_back(p);
+    }
+ 
+    void print() const
+    {
+        for (void const * const p: vp) std::cout &lt;&lt; p &lt;&lt; '\n';
+    }
+};
+ 
+void ptr_vector_base::push_back_fwd(void* p) { pImpl-&gt;push_back(p); }
+ptr_vector_base::ptr_vector_base() : pImpl{std::make_unique&lt;impl&gt;()} {}
+ptr_vector_base::~ptr_vector_base() {}
+void ptr_vector_base::print() const { pImpl-&gt;print(); }
+ 
+// ---------------
+// user (main.cpp)
+// #include "ptr_vector.hpp"
+ 
+int main()
+{
+    int x{}, y{}, z{};
+    ptr_vector&lt;int&gt; v;
+    v.push_back(&amp;x);
+    v.push_back(&amp;y);
+    v.push_back(&amp;z);
+    v.print();
+}</pre></div> <p>Possible output:</p>
+<div class="text source-text"><pre data-language="c">0x7ffd6200a42c
+0x7ffd6200a430
+0x7ffd6200a434</pre></div> </div> <h4 id="Runtime_overhead"> Runtime overhead</h4> <ul>
+<li> Access overhead: In pImpl, each call to a private member function indirects through a pointer. Each access to a public member made by a private member indirects through another pointer. Both indirections cross translation unit boundaries and so can only be optimized out by link-time optimization. Note that OO factory requires indirection across translation units to access both public data and implementation detail, and offers even fewer opportunities for the link time optimizer due to virtual dispatch. </li>
+<li> Space overhead: pImpl adds one pointer to the public component and, if any private member needs access to a public member, another pointer is either added to the implementation component or passed as a parameter for each call to the private member that requires it. If stateful custom allocators are supported, the allocator instance also has to be stored. </li>
+<li> Lifetime management overhead: pImpl (as well as OO factory) place the implementation object on the heap, which imposes significant runtime overhead at construction and destruction. This may be partially offset by custom allocators, since allocation size for pImpl (but not OO factory) is known at compile time. </li>
+</ul> <p>On the other hand, pImpl classes are move-friendly; refactoring a large class as movable pImpl may improve performance of algorithms that manipulate containers holding such objects, although movable pImpl has an additional source of runtime overhead: any public member function that is permitted on a moved-from object and needs access to private implementation incurs a null pointer check.</p>
+<h4 id="Maintenance_overhead"> Maintenance overhead</h4> <p>Use of pImpl requires a dedicated translation unit (a header-only library cannot use pImpl), introduces an additional class, a set of forwarding functions, and, if allocators are used, exposes the implementation detail of allocator use in the public interface.</p>
+<p>Since virtual members are part of the interface component of pImpl, mocking a pImpl implies mocking the interface component alone. A testable pImpl is typically designed to allow full test coverage through the available interface.</p>
+<h3 id="Implementation"> Implementation</h3> <p>As the object of the interface type controls the lifetime of the object of the implementation type, the pointer to implementation is usually <code><a href="../memory/unique_ptr.html" title="cpp/memory/unique ptr">std::unique_ptr</a></code>.</p>
+<p>Because <code><a href="../memory/unique_ptr.html" title="cpp/memory/unique ptr">std::unique_ptr</a></code> requires that the pointed-to type is a complete type in any context where the deleter is instantiated, the special member functions must be user-declared and defined out-of-line, in the implementation file, where the implementation class is complete.</p>
+<p>Because when const member function calls a function through a non-const member pointer, the non-const overload of the implementation function is called, the pointer has to be wrapped in <code><a href="https://en.cppreference.com/w/cpp/experimental/propagate_const" title="cpp/experimental/propagate const">std::experimental::propagate_const</a></code> or equivalent.</p>
+<p>All private data members and all private non-virtual member functions are placed in the implementation class. All public, protected, and virtual members remain in the interface class (see <a rel="nofollow" class="external text" href="https://herbsutter.com/gotw/_100/">GOTW #100</a> for the discussion of the alternatives).</p>
+<p>If any of the private members needs to access a public or protected member, a reference or pointer to the interface may be passed to the private function as a parameter. Alternatively, the back-reference may be maintained as part of the implementation class.</p>
+<p>If non-default allocators are intended to be supported for the allocation of the implementation object, any of the usual allocator awareness patterns may be utilized, including allocator template parameter defaulting to <code><a href="../memory/allocator.html" title="cpp/memory/allocator">std::allocator</a></code> and constructor argument of type <a href="../memory/memory_resource.html" title="cpp/memory/memory resource"><code>std::pmr::memory_resource*</code></a>.</p>
+<h3 id="Notes"> Notes</h3>  <h3 id="Example"> Example</h3> <div class="t-example">
+<p>Demonstrates a pImpl with const propagation, with back-reference passed as a parameter, without allocator awareness, and move-enabled without runtime checks:</p>
+<div class="cpp source-cpp"><pre data-language="cpp">// ----------------------
+// interface (widget.hpp)
+#include &lt;experimental/propagate_const&gt;
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+ 
+class widget
+{
+    class impl;
+    std::experimental::propagate_const&lt;std::unique_ptr&lt;impl&gt;&gt; pImpl;
+public:
+    void draw() const; // public API that will be forwarded to the implementation
+    void draw();
+    bool shown() const { return true; } // public API that implementation has to call
+ 
+    widget(); // even the default ctor needs to be defined in the implementation file
+              // Note: calling draw() on default constructed object is UB
+    explicit widget(int);
+    ~widget(); // defined in the implementation file, where impl is a complete type
+    widget(widget&amp;&amp;); // defined in the implementation file
+                      // Note: calling draw() on moved-from object is UB
+    widget(const widget&amp;) = delete;
+    widget&amp; operator=(widget&amp;&amp;); // defined in the implementation file
+    widget&amp; operator=(const widget&amp;) = delete;
+};
+ 
+// ---------------------------
+// implementation (widget.cpp)
+// #include "widget.hpp"
+ 
+class widget::impl
+{
+    int n; // private data
+public:
+    void draw(const widget&amp; w) const
+    {
+        if (w.shown()) // this call to public member function requires the back-reference 
+            std::cout &lt;&lt; "drawing a const widget " &lt;&lt; n &lt;&lt; '\n';
+    }
+ 
+    void draw(const widget&amp; w)
+    {
+        if (w.shown())
+            std::cout &lt;&lt; "drawing a non-const widget " &lt;&lt; n &lt;&lt; '\n';
+    }
+ 
+    impl(int n) : n(n) {}
+};
+ 
+void widget::draw() const { pImpl-&gt;draw(*this); }
+void widget::draw() { pImpl-&gt;draw(*this); }
+widget::widget() = default;
+widget::widget(int n) : pImpl{std::make_unique&lt;impl&gt;(n)} {}
+widget::widget(widget&amp;&amp;) = default;
+widget::~widget() = default;
+widget&amp; widget::operator=(widget&amp;&amp;) = default;
+ 
+// ---------------
+// user (main.cpp)
+// #include "widget.hpp"
+ 
+int main()
+{
+    widget w(7);
+    const widget w2(8);
+    w.draw();
+    w2.draw();
+}</pre></div> <p>Output:</p>
+<div class="text source-text"><pre data-language="c">drawing a non-const widget 7
+drawing a const widget 8</pre></div> </div>  <h3 id="External_links"> External links</h3> <table> <tr style="vertical-align:top;"> <td>1. </td> <td>
+<a rel="nofollow" class="external text" href="http://www.gotw.ca/gotw/028.htm">GotW #28</a> : The Fast Pimpl Idiom. </td>
+</tr> <tr style="vertical-align:top;"> <td>2. </td> <td>
+<a rel="nofollow" class="external text" href="https://herbsutter.com/gotw/_100/">GotW #100</a>: Compilation Firewalls. </td>
+</tr> <tr style="vertical-align:top;"> <td>3. </td> <td>
+<a rel="nofollow" class="external text" href="https://www.cppstories.com/2018/01/pimpl/">The Pimpl Pattern - what you should know.</a> </td>
+</tr>
+</table>           <div class="_attribution">
+  <p class="_attribution-p">
+    &copy; cppreference.com<br>Licensed under the Creative Commons Attribution-ShareAlike Unported License v3.0.<br>
+    <a href="https://en.cppreference.com/w/cpp/language/pimpl" class="_attribution-link">https://en.cppreference.com/w/cpp/language/pimpl</a>
+  </p>
+</div>
