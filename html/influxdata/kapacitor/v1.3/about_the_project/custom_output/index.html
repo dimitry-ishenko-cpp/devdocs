@@ -1,0 +1,308 @@
+<h1>How to contribute a new output to Kapacitor</h1>     <p>If you haven’t already check out <a href="https://github.com/influxdb/kapacitor/blob/master/CONTRIBUTING.md">this</a> information to get started contributing.</p> <h2 id="the-goal">The Goal</h2> <p>Add a new node to Kapacitor that can output data to a custom endpoint. For this guide assume we want to output data to a fictitous in-house database called HouseDB.</p> <h2 id="overview">Overview</h2> <p>Kapacitor processes data via a pipeline. A pipeline is formally a directed acyclic graph (<a href="https://en.wikipedia.org/wiki/Directed_acyclic_graph">DAG</a>). The basic idea is that each node in the graph represents some form of processing on the data and each edge passes the data between nodes. In order to add a new type of node there are two components that need to be written:</p> <ol> <li>The API (TICKscript) for creating and configuring the node, and</li> <li>The implementation of the data processing step.</li> </ol> <p>In our example the data processing step is outputting the data to HouseDB.</p> <p>The code mirrors these requirements with two Go packages.</p> <ol> <li>
+<code>pipeline</code> – this package defines what types of nodes are available and how they are configured.</li> <li>
+<code>kapacitor</code> – this package provides implementations of each of the nodes defined in the <code>pipeline</code> package.</li> </ol> <p>The reason for splitting out defining the node from the implementation of the node is to make the API (i.e. a TICKscript) clean and easy to follow.</p> <h3 id="updating-tickscript">Updating TICKscript</h3> <p>First things first, we need to update TICKscript so that users can define a our new node. What should the TICKscript look like to send data to HouseDB? To connect to a HouseDB instance we need both a URL and a database name, so we need a way to provide that information. How about this?</p> <pre data-language="javascript">    node
+        |houseDBOut()
+            .url('house://housedb.example.com')
+            .database('metrics')
+</pre> <p>In order to update TICKscript to support those new methods we need to write a Go type that implements the <code>pipeline.Node</code> interface. The interface can be found <a href="https://github.com/influxdb/kapacitor/blob/master/pipeline/node.go">here</a> as well as a complete implementation via the <code>pipeline.node</code> type. Since the implementation of the <code>Node</code> is done for us we just need to use it. First we need a name. <code>HouseDBOutNode</code> follows the naming convention. Let’s define a Go <code>struct</code> that will implement the interface via composition. Create a file in the <code>pipeline</code> directory called <code>housedb_out.go</code> with the following contents:</p> <pre data-language="go">package pipeline
+
+// A HouseDBOutNode will take the incoming data stream and store it in a
+// HouseDB instance.
+type HouseDBOutNode struct {
+    // Include the generic node implementation.
+    node
+}
+</pre> <p>Just like that we have a type in Go that implements the needed interface. In order to allow for the <code>.url</code> and <code>.database</code> methods we need, simply define fields on the type with the same name. The first letter needs to capitalized so that it is exported. It’s important that the fields be exported since they will be consumed by the node in the <code>kapacitor</code> package. The rest of the name should have the same capitaization as the method name. TICKscript will take care of matching the case at runtime. Update the <code>housedb_out.go</code> file.</p> <pre data-language="go">package pipeline
+
+// A HouseDBOutNode will take the incoming data stream and store it in a
+// HouseDB instance.
+type HouseDBOutNode struct {
+    // Include the generic node implementation.
+    node
+
+    // URL for connecting to HouseDB
+    Url string
+
+    // Database name
+    Database string
+}
+</pre> <p>Next we need a consistent way to create a new instance of our node. But to do so we need to think about how this node connects to other nodes. Since we are an output node as far as Kapacitor is concerned this is the end of the pipeline. We will not provide any outbound edges, the graph ends on this node. Our imaginary HouseDB is flexible and can store data in batches or as single data points. As a result we do not care what type of data the HouseDBOutNode node receives. With these facts in mind we can define a function to create a new HouseDBOutNode. Add this function to the end of the <code>housedb_out.go</code> file:</p> <pre data-language="go">// Create a new HouseDBOutNode that accepts any edge type.
+func newHouseDBOutNode(wants EdgeType) *HouseDBOutNode {
+    return &amp;HouseDBOutNode{
+        node: node{
+            desc: "housedb",
+            wants: wants,
+            provides: NoEdge,
+        }
+    }
+}
+</pre> <p>By explicitly stating the types of edges the node <code>wants</code> and <code>provides</code>, Kapacitor will do the necessary type checking to prevent invalid pipelines.</p> <p>Finally we need to add a new <code>chaining method</code> so that users can connect HouseDBOutNodes to their existing pipelines. A <code>chaining method</code> is one that creates a new node and adds it as a child of the calling node. In effect the method chains nodes together. The <code>pipeline.chainnode</code> type contains the set of all methods that can be used for chaining nodes. Once we add our method to that type any other node can now chain with a HouseDBOutNode. Add this function to the end of the <code>pipeline/node.go</code> file:</p> <pre data-language="go">// Create a new HouseDBOutNode as a child of the calling node.
+func (c *chainnode) HouseDBOut() *HouseDBOutNode {
+    h := newHouseDBOutNode(c.Provides())
+    c.linkChild(h)
+    return h
+}
+</pre> <p>We have now defined all the necessary pieces so that TICKscripts can define HouseDBOutNodes:</p> <pre data-language="javascript">    node
+        |houseDBOut() // added as a method to the 'chainnode' type
+            .url('house://housedb.example.com') // added as a field to the HouseDBOutNode
+            .database('metrics') // added as a field to the HouseDBOutNode
+</pre> <h3 id="implementing-the-housedb-output">Implementing the HouseDB output</h3> <p>Now that a TICKscript can define our new output node we need to actually provide an implementation so that Kapacitor knows what to do with the node. Each node in the <code>pipeline</code> package has a node of the same name in the <code>kapacitor</code> package. Create a file called <code>housedb_out.go</code> and put it in the root of the repo. Put the contents below in the file.</p> <pre data-language="go">package kapacitor
+
+import (
+    "github.com/influxdb/kapacitor/pipeline"
+)
+
+type HouseDBOutNode struct {
+    // Include the generic node implementation
+    node
+    // Keep a reference to the pipeline node
+    h    *pipeline.HouseDBOutNode
+}
+</pre> <p>The <code>kapacitor</code> package also defines an interface named <code>Node</code> and provides a default implementation via the <code>kapacitor.node</code> type. Again we use composition to implement the interface. Notice we also have a field that will contain an instance of the <code>pipeline.HouseDBOutNode</code> we just finished defining. This <code>pipeline.HouseDBOutNode</code> acts like a configuration struct telling the <code>kapacitor.HouseDBOutNode</code> what it needs to do its job.</p> <p>Now that we have a struct let’s define a function for creating an instance of our new struct. The <code>new*Node</code> methods in the <code>kapacitor</code> package follow a convention of:</p> <pre data-language="go">func newNodeName(et *ExecutingTask, n *pipeline.NodeName) (*NodeName, error) {}
+</pre> <p>In our case we want to define a function called <code>newHouseDBOutNode</code>. Add the following method to the <code>housedb_out.go</code> file.:</p> <pre data-language="go">func newHouseDBOutNode(et *ExecutingTask, n *pipeline.HouseDBOutNode) (*HouseDBOutNode, error) {
+    h := &amp;HouseDBOutNode{
+        // pass in necessary fields to the 'node' struct
+        node: node{Node: n, et: et},
+        // Keep a reference to the pipeline.HouseDBOutNode
+        h: n,
+    }
+    // Set the function to be called when running the node
+    // more on this in a bit.
+    h.node.runF = h.runOut
+    return h
+}
+</pre> <p>In order for an instance of our node to be created we need to associate it with the node from the <code>pipeline</code> package. This can be done via the switch statement in the <code>createNode</code> method in the <code>task.go</code> file. To continue our example:</p> <pre data-language="go">// Create a node from a given pipeline node.
+func (et *ExecutingTask) createNode(p pipeline.Node, l *log.Logger) (n Node, err error) {
+    switch t := p.(type) {
+    ...
+	case *pipeline.HouseDBOutNode:
+		n, err = newHouseDBOutNode(et, t, l)
+    ...
+}
+</pre> <p>Now that we have associated our two types let’s get back to implementing the output code. Notice the line <code>h.node.runF = h.runOut</code> in the <code>newHouseDBOutNode</code> function. This line sets the method of the <code>kapacitor.HouseDBOutNode</code> that will be called when the node starts execution. Now we need to define the <code>runOut</code> method. In the file <code>housedb_out.go</code> add this method:</p> <pre data-language="go">func (h *HouseDBOutNode) runOut() error {
+    return nil
+}
+</pre> <p>With that change the <code>HouseDBOutNode</code> is syntactically complete but doesn’t do anything yet. Let’s give it something to do!</p> <p>As we learned earlier nodes communicate via edges. There is a Go type <code>kapacitor.Edge</code> that handles this communication. All we want to do is read data from the edge and send it to HouseDB. Recall that we said that a <code>HouseDBOutNode</code> “wants” whatever edge type we give it. Because the node accepts any edge type, we must define how to read stream or batch data. Lets update the <code>runOut</code> method with an appropriate switch statement.</p> <pre data-language="go">func (h *HouseDBOutNode) runOut() error {
+    switch h.Wants() {
+    case pipeline.StreamEdge:
+        // Read stream data and send to HouseDB
+    case pipeline.BatchEdge:
+        // Read batch data and send to HouseDB
+    }
+    return nil
+}
+</pre> <p>The <code>node</code> type we included via composition in the <code>HouseDBOutNode</code> provides a list of edges in the field named <code>ins</code>. Since <code>HouseDBOutNode</code> can have only one parent, the edge we are concerned with is the 0th edge. The <code>Edge</code> type provides two methods:</p> <ul> <li>
+<code>NextPoint</code> for reading stream data.</li> <li>
+<code>NextBatch</code> for reading batch data.</li> </ul> <p>Let’s update the cases in the switch statements to loop through all data.</p> <pre data-language="go">func (h *HouseDBOutNode) runOut() error {
+    switch h.Wants() {
+    case pipeline.StreamEdge:
+        // Read stream data and send to HouseDB
+        for p, ok := h.ins[0].NextPoint(); ok; p, ok = h.ins[0].NextPoint() {
+            // Process a single point
+        }
+    case pipeline.BatchEdge:
+        // Read batch data and send to HouseDB
+        for b, ok := h.ins[0].NextBatch(); ok; b, ok = h.ins[0].NextBatch() {
+            // Process a batch of points
+        }
+    }
+    return nil
+}
+</pre> <p>To make it easy on ourselves we can convert the single point into a batch containing just that point. Then all we need to do is write a function that takes a batch of points and writes it to HouseDB.</p> <pre data-language="go">func (h *HouseDBOutNode) runOut() error {
+    switch h.Wants() {
+    case pipeline.StreamEdge:
+        // Read stream data and send to HouseDB
+        for p, ok := h.ins[0].NextPoint(); ok; p, ok = h.ins[0].NextPoint() {
+            // Turn the point into a batch with just one point.
+            batch := models.Batch{
+                Name:   p.Name,
+                Group:  p.Group,
+                Tags:   p.Tags,
+                Points: []models.TimeFields{{Time: p.Time, Fields: p.Fields}},
+            }
+            // Write the batch
+            err := h.write(batch)
+            if err != nil {
+                return err
+            }
+        }
+    case pipeline.BatchEdge:
+        // Read batch data and send to HouseDB
+        for b, ok := h.ins[0].NextBatch(); ok; b, ok = h.ins[0].NextBatch() {
+            // Write the batch
+            err := h.write(b)
+            if err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+
+// Write a batch of data to HouseDB
+func (h *HouseDBOutNode) write(batch models.Batch) error {
+    // Implement writing to HouseDB here...
+    return nil
+}
+</pre> <p>Once we have implemented the <code>write</code> method we are done. As the data arrives at the <code>HouseDBOutNode</code>, it will be written to the specified HouseDB instance.</p> <h3 id="summary">Summary</h3> <p>We first wrote a node in the <code>pipeline</code> package (filepath: <code>pipeline/housedb_out.go</code>) to define the TICKscript API for sending data to a HouseDB instance. We then wrote the implementation of that node in the <code>kapacitor</code> package (filepath: <code>housedb_out.go</code>). We also updated <code>pipeline/node.go</code> to add a new chaining method and <code>task.go</code> to associate the two types.</p> <p>Here are the complete file contents:</p> <p>pipeline/housedb_out.go:</p> <pre data-language="go">package pipeline
+
+// A HouseDBOutNode will take the incoming data stream and store it in a
+// HouseDB instance.
+type HouseDBOutNode struct {
+    // Include the generic node implementation.
+    node
+
+    // URL for connecting to HouseDB
+    Url string
+
+    // Database name
+    Database string
+}
+
+// Create a new HouseDBOutNode that accepts any edge type.
+func newHouseDBOutNode(wants EdgeType) *HouseDBOutNode {
+    return &amp;HouseDBOutNode{
+        node: node{
+            desc: "housedb",
+            wants: wants,
+            provides: NoEdge,
+        }
+    }
+}
+</pre> <p>housedb_out.go</p> <pre data-language="go">package kapacitor
+
+import (
+    "github.com/influxdb/kapacitor/pipeline"
+)
+
+type HouseDBOutNode struct {
+    // Include the generic node implementation
+    node
+    // Keep a reference to the pipeline node
+    h    *pipeline.HouseDBOutNode
+}
+
+func newHouseDBOutNode(et *ExecutingTask, n *pipeline.HouseDBOutNode) (*HouseDBOutNode, error) {
+    h := &amp;HouseDBOutNode{
+        // pass in necessary fields to the 'node' struct
+        node: node{Node: n, et: et},
+        // Keep a reference to the pipeline.HouseDBOutNode
+        h: n,
+    }
+    // Set the function to be called when running the node
+    h.node.runF = h.runOut
+    return h
+}
+
+func (h *HouseDBOutNode) runOut() error {
+    switch h.Wants() {
+    case pipeline.StreamEdge:
+        // Read stream data and send to HouseDB
+        for p, ok := h.ins[0].NextPoint(); ok; p, ok = h.ins[0].NextPoint() {
+            // Turn the point into a batch with just one point.
+        batch := models.Batch{
+                Name:   p.Name,
+                Group:  p.Group,
+                Tags:   p.Tags,
+                Points: []models.TimeFields{{Time: p.Time, Fields: p.Fields}},
+            }
+            // Write the batch
+            err := h.write(batch)
+            if err != nil {
+                return err
+            }
+        }
+    case pipeline.BatchEdge:
+        // Read batch data and send to HouseDB
+        for b, ok := h.ins[0].NextBatch(); ok; b, ok = h.ins[0].NextBatch() {
+            // Write the batch
+            err := h.write(b)
+            if err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+
+// Write a batch of data to HouseDB
+func (h *HouseDBOutNode) write(batch models.Batch) error {
+    // Implement writing to HouseDB here...
+    return nil
+}
+</pre> <p>pipeline/node.go (only the new chaining method is shown):</p> <pre data-language="go">...
+// Create a new HouseDBOutNode as a child of the calling node.
+func (c *chainnode) HouseDBOut() *HouseDBOutNode {
+    h := newHouseDBOutNode(c.Provides())
+    c.linkChild(h)
+    return h
+}
+...
+</pre> <p>task.go (only the new case is shown):</p> <pre data-language="go">...
+// Create a node from a given pipeline node.
+func (et *ExecutingTask) createNode(p pipeline.Node, l *log.Logger) (n Node, err error) {
+    switch t := p.(type) {
+    ...
+	case *pipeline.HouseDBOutNode:
+		n, err = newHouseDBOutNode(et, t, l)
+    ...
+}
+...
+</pre> <h3 id="documenting-your-new-node">Documenting your new node</h3> <p>Since TICKscript is its own language we have built a small utility similiar to <a href="https://godoc.org/golang.org/x/tools/cmd/godoc">godoc</a> named <a href="https://github.com/influxdb/kapacitor/tree/master/tick/cmd/tickdoc">tickdoc</a>. <code>tickdoc</code> generates documentation from comments in the code. The <code>tickdoc</code> utility understands two special comments to help it generate clean documentation.</p> <ol> <li>
+<code>tick:ignore</code> – can be added to any field, method, function or struct. <code>tickdoc</code> will skip it and not generate any documentation for it. This is most useful to ignore fields that are set via property methods.</li> <li>
+<code>tick:property</code> – only added to methods. Informs <code>tickdoc</code> that the method is a <code>property method</code> not a <code>chaining method</code>.</li> </ol> <p>Place one of these comments on a line all by itself and <code>tickdoc</code> will find it and behave accordingly. Otherwise document your code normaly and <code>tickdoc</code> will do the rest.</p> <h3 id="contributing-non-output-node">Contributing non output node.</h3> <p>Writing any node (not just an output node) is a very similar process and is left as an exercise to the reader. There are few things that can differ:</p> <p>The first difference is that your new node will want to use the <code>pipeline.chainnode</code> implementation of the <code>pipeline.Node</code> interface in the <code>pipeline</code> package if it can send data on to child nodes. For example:</p> <pre data-language="go">package pipeline
+
+type MyCustomNode struct {
+    // Include pipeline.chainnode so we have all the chaining methods available
+    // to our new node
+    chainnode
+
+}
+
+func newMyCustomNode(e EdgeType, n Node) *MyCustomNode {
+    m := &amp;MyCustomNode{
+        chainnode: newBasicChainNode("mycustom", e, e),
+    }
+    n.linkChild(m)
+    return m
+}
+</pre> <p>The second difference is that it is possible to define a method that sets fields on a pipeline Node and returns the same instance in order to create a <code>property method</code>. For example:</p> <pre data-language="go">package pipeline
+
+type MyCustomNode struct {
+    // Include pipeline.chainnode so we have all the chaining methods available
+    // to our new node
+    chainnode
+
+    // Mark this field as ignored for docs
+    // Since it is set via the Names method below
+    // tick:ignore
+    NameList []string `tick:"Names"`
+
+}
+
+func newMyCustomNode(e EdgeType, n Node) *MyCustomNode {
+    m := &amp;MyCustomNode{
+        chainnode: newBasicChainNode("mycustom", e, e),
+    }
+    n.linkChild(m)
+    return m
+}
+
+// Set the NameList field on the node via this method.
+//
+// Example:
+//    node.names('name0', 'name1')
+//
+// Use the tickdoc comment 'tick:property' to mark this method
+// as a 'property method'
+// tick:property
+func (m *MyCustomNode) Names(name ...string) *MyCustomNode {
+    m.NameList = name
+    return m
+}
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2015 InfluxData, Inc.<br>Licensed under the MIT license.<br>
+    <a href="https://docs.influxdata.com/kapacitor/v1.3/about_the_project/custom_output/" class="_attribution-link">https://docs.influxdata.com/kapacitor/v1.3/about_the_project/custom_output/</a>
+  </p>
+</div>

@@ -1,0 +1,97 @@
+<h1>Calculate Rates across joined series + Backfill</h1>     <p>Often times we have set of series where each series is counting a particular event. Using Kapacitor we can join those series and calculate a combined value.</p> <p>Let’s say we have two measurements:</p> <ul> <li>
+<code>errors</code> – the number of page views that had an error.</li> <li>
+<code>views</code> – the number of page views that had no errror.</li> </ul> <p>Both measurements exist in a database called <code>pages</code> and in the retention policy <code>autogen</code>.</p> <p>We want to know the percent of page views that resulted in an error. The process is to select both existing measurements join them and calculate the percentage. Then to store the data back into InfluxDB as a new measurement.</p> <h3 id="joining-with-batch-data">Joining with batch data</h3> <p>We need to query the two measurements, <code>errors</code> and <code>views</code>.</p> <pre data-language="javascript">// Get errors batch data
+var errors = batch
+    |query('SELECT sum(value) FROM "pages"."autogen".errors')
+        .period(1h)
+        .every(1h)
+        .groupBy(time(1m), *)
+        .fill(0)
+
+// Get views batch data
+var views = batch
+    |query('SELECT sum(value) FROM "pages"."autogen".views')
+        .period(1h)
+        .every(1h)
+        .groupBy(time(1m), *)
+        .fill(0)
+</pre> <p>The join process skips points that do not have a matching point in time from the other source. As a result it is important to both <code>groupBy</code> and <code>fill</code> the data while joining batch data. Grouping the data by time ensures that each source has data points at consistent time values. Filling the data ensures every point will have a match with a sane default.</p> <p>Now that we have two batch sources for each measurement we need to join them like so.</p> <pre data-language="javascript">// Join errors and views
+errors
+    |join(views)
+        .as('errors', 'views')
+</pre> <p>The data is joined by time, meaning that as pairs of batches arrive from each source they will be combined into a single batch. As a result the fields from each source need to be renamed to properly namespace the fields. This is done via the <code>.as('errors', 'views')</code> line. In this example each measurement has only one field named <code>sum</code>, the joined fields will be called <code>errors.sum</code> and <code>views.sum</code> respectively.</p> <p>Now that the data is joined we can calculate the percentage. Using the new names for the fields we can write this expression to calculate our desired percentage.</p> <pre data-language="javascript">    //Calculate percentage
+    |eval(lambda: "errors.sum" / ("views.sum" + "errors.sum"))
+        // Give the resulting field a name
+        .as('value')
+
+</pre> <p>Finally we want to store this data back into InfluxDB.</p> <pre data-language="javascript">    |influxDBOut()
+        .database('pages')
+        .measurement('error_percent')
+
+</pre> <p>Here is the complete TICKscript for the batch task:</p> <pre data-language="javascript">// Get errors batch data
+var errors = batch
+    |query('SELECT sum(value) FROM "pages"."autogen".errors')
+        .period(1h)
+        .every(1h)
+        .groupBy(time(1m), *)
+        .fill(0)
+
+// Get views batch data
+var views = batch
+    |query('SELECT sum(value) FROM "pages"."autogen".views')
+        .period(1h)
+        .every(1h)
+        .groupBy(time(1m), *)
+        .fill(0)
+
+// Join errors and views
+errors
+    |join(views)
+        .as('errors', 'views')
+    //Calculate percentage
+    |eval(lambda: "errors.sum" / ("views.sum" + "errors.sum"))
+        // Give the resulting field a name
+        .as('value')
+    |influxDBOut()
+        .database('pages')
+        .measurement('error_percent')
+
+</pre> <h3 id="backfill">Backfill</h3> <p>Now for a fun little trick. Using Kapacitor’s record/replay actions we can actually run this TICKscript on historical data. First save the above script as <code>error_percent.tick</code> and define it. Then create a recording for the past time frame we want.</p> <pre data-language="bash">kapacitor define error_percent \
+    -type batch \
+    -tick error_percent.tick \
+    -dbrp pages.autogen
+kapacitor record batch -task error_percent -past 1d
+</pre> <p>Grab the recording ID and replay the historical data against the task. Here we specify the <code>-rec-time</code> flag to instruct Kapacitor to use the actual time stored in the recording when processing the data instead of adjusting to the present time.</p> <pre data-language="bash">kapacitor replay -task error_percent -recording RECORDING_ID -rec-time
+</pre> <p>If the data set is too large to keep in one recording you can define a specific range of time to record and then replay each range individually.</p> <pre data-language="bash">rid=$(kapacitor record batch -task error_percent -start 2015-10-01 -stop 2015-10-02)
+echo $rid
+kapacitor replay -task error_percent -recording $rid -rec-time
+kapacitor delete recordings $rid
+</pre> <p>Just loop through the above script for each time window and reconstruct all the historical data you need. With that we now have the error_percent every minute backfilled for the historical data we had.</p> <p>If you would like to try out this example case there are scripts <a href="https://github.com/influxdb/kapacitor/blob/master/examples/error_percent/">here</a> that create test data and backfill the data using Kapacitor.</p> <h3 id="stream-method">Stream method</h3> <p>To do the same for the streaming case the TICKscript is very similar:</p> <pre data-language="javascript">// Get errors stream data
+var errors = stream
+    |from()
+        .measurement('errors')
+        .groupBy(*)
+
+// Get views stream data
+var views = stream
+    |from()
+        .measurement('views')
+        .groupBy(*)
+
+// Join errors and views
+errors
+    |join(views)
+        .as('errors', 'views')
+    //Calculate percentage
+    |eval(lambda: "errors.value" / "views.value")
+        // Give the resulting field a name
+        .as('error_percent')
+    |influxDBOut()
+        .database('pages')
+        .measurement('error_percent')
+</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2015 InfluxData, Inc.<br>Licensed under the MIT license.<br>
+    <a href="https://docs.influxdata.com/kapacitor/v1.3/guides/join_backfill/" class="_attribution-link">https://docs.influxdata.com/kapacitor/v1.3/guides/join_backfill/</a>
+  </p>
+</div>
