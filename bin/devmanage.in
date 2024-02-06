@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import re
 import shutil
-from sys import argv
+from sys import argv, stderr
 from tempfile import TemporaryDirectory as tempdir
 import urllib.request as request
 
@@ -40,10 +40,10 @@ def download(url, banner):
 
     return content
 
-def purge(path):
+def purge(path, rmdir=False):
     for child in path.iterdir():
         shutil.rmtree(child) if child.is_dir() else child.unlink()
-    path.rmdir()
+    if rmdir: path.rmdir()
 
 def save_db(path, db):
     for item, content in db.items():
@@ -61,49 +61,83 @@ def save_index(path, old_index):
     index_path = path / "index.json"
     with open(index_path, "w") as fp: json.dump(index, fp)
 
-def show_online():
-    online = download(docs_url, "Online topics")
-    for doc in online: print(doc["slug"])
+def get_online():
+    return download(docs_url, "Document index")
 
-def show_local():
-    print("Local topics:")
-    local = sorted([ path.name for path in html_path.iterdir() ])
-    for doc in local: print(doc)
+def get_local():
+    loc = { }
+    for path in html_path.iterdir():
+        if path.is_dir():
+            name = path.name
+            slug_path = path / "slug"
+            slug = slug_path.read_text() if slug_path.exists() else name
+            loc[slug] = name
+    # sort by name
+    return dict(sorted(loc.items(), key=lambda item: item[1]))
 
-def update():
-    local = sorted([ path.name for path in html_path.iterdir() ])
-    install(local, force=False)
+def install_update(loc, force):
+    for doc in get_online():
+        slug = doc["slug"]
 
-def install(names, force):
-    online = download(docs_url, "Document index")
+        if name := loc.get(slug):
+            path = html_path / name
+            slug_path = path / "slug"
 
-    for doc in online:
-        name = doc["slug"]
-        path = html_path / name
-
-        if name in names:
             mtime_path = path / "mtime"
             old_mtime = mtime_path.read_text() if mtime_path.exists() else ""
 
             mtime = str(doc["mtime"])
             if mtime != old_mtime or force:
-                index = download(doc_templ_url.format(name, "index.json"), name + "-index")
-                db = download(doc_templ_url.format(name, "db.json"), name + "-db")
+                index = download(doc_templ_url.format(slug, "index.json"), slug + "-index")
+                db = download(doc_templ_url.format(slug, "db.json"), slug + "-db")
 
-                if path.exists(): purge(path)
-                path.mkdir()
+                purge(path) if path.exists() else path.mkdir()
 
                 save_db(path, db)
                 save_index(path, index)
 
+                slug_path.write_text(slug)
                 mtime_path.write_text(mtime)
+
+def show_online():
+    for doc in get_online(): print(doc["slug"])
+
+def show_local():
+    print("Local topics:")
+    for slug, name in get_local().items():
+        print(name + ("" if name == slug else " [" + slug + "]"))
+
+def update():
+    install_update(get_local(), force=False)
+
+def install(docs):
+    loc = { }
+    for doc in docs:
+        name, _, slug = doc.partition("=")
+        if not slug:
+            slug_path = html_path / name / "slug"
+            slug = slug_path.read_text() if slug_path.exists() else name
+        loc[slug] = name
+
+    install_update(loc, force=True)
 
 def remove(names):
     print("Removing topics:")
+    loc = get_local()
+
     for name in names:
         path = html_path / name
         if path.exists():
-            print(name); purge(path)
+            print(name)
+            purge(path, rmdir=True)
+
+        else:
+            slug = name
+            if name := loc.get(slug):
+                path = html_path / name
+                if path.exists():
+                    print(slug)
+                    purge(path, rmdir=True)
 
 def usage():
     b = "\033[1m"
@@ -143,8 +177,7 @@ class ArgumentParser(argparse.ArgumentParser):
         group.add_argument("-r", "--remove" , metavar="topic", nargs="+")
 
     def error(self, message):
-        print("Error:", message)
-        usage()
+        print("Error:", message, file=stderr)
         exit(1)
 
 try:
@@ -164,7 +197,7 @@ try:
         update()
 
     elif args.install:
-        install(args.install, force=True)
+        install(args.install)
 
     elif args.remove:
         remove(args.remove)
@@ -172,5 +205,5 @@ try:
     else: usage()
 
 except Exception as error:
-    print("\nError:", error)
-    exit(2)
+    print("\nError:", error, file=stderr)
+    exit(1)
