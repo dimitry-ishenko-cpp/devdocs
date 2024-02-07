@@ -10,7 +10,7 @@ and _[w3m](https://w3m.sourceforge.net/)_ text-based browser?
 Stable version (requires [CMake](https://cmake.org/) >= 3.16):
 
 ```shell
-$ p=devdocs v=0.4
+$ p=devdocs v=0.4.1
 $ wget -O ${p}-${v}.tar.gz https://github.com/dimitry-ishenko-cpp/${p}/archive/refs/tags/v${v}.tar.gz
 $ tar xzf ${p}-${v}.tar.gz
 $ mkdir ${p}-${v}/build
