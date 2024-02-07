@@ -1,6 +1,15 @@
 #!/bin/bash
 set -e
 
+# slug -> name
+to_name()
+{
+    echo $1 | sed -re "s/~[0-9.]+//; s/~/-/; s/gcc_cpp/g++/; s/_cpp$/-c++/; s/^gnu_//; s/_lts$//;"
+}
+
+# get items unique to $2 (ie, not in $1)
+get_2_not_in_1() { echo $1 $1 $2 | tr ' ' '\n' | sort -V | uniq -u; }
+
 dir=$(dirname $(dirname $(realpath "$0")))
 cd "$dir"
 
@@ -8,30 +17,47 @@ cp bin/devmanage.in ./devmanage
 sed -i -e "s|@DEVDOCS_INSTALL_DATADIR@|$dir|g" ./devmanage
 
 all=$(./devmanage --all | tail -n+2 | sort -rV)
+[[ -n "$all" ]] || exit 1
 
-new=
+rem=
 declare -A had
 for doc in $all; do
-    mod=${doc//[~0-9.]*/}
-    [[ -n "${had[$mod]}" ]] || had[$mod]=1 new+=" $doc"
+    name=$(to_name $doc)
+    [[ -n "${had[$name]}" ]] || had[$name]=1 rem+=" $doc"
 done
 
-cd html
-del=$(echo $new $new $(ls -1) | tr ' ' '\n' | sort -V | uniq -u)
+loc=$(./devmanage --local | tail -n+2 | sed -re "s/^.*\[(.*)\]/\1/")
+
+del=$(get_2_not_in_1 "$rem" "$loc")
 if [[ -n "$del" ]]; then
     echo ABOUT TO DELETE ...
     echo $del
     sleep 3
-    rm -r $del
+    ./devmanage --remove $del
+    echo
 fi
-echo $new | xargs mkdir -p
-cd ..
 
+echo UPDATE
 ./devmanage --update
+echo
 
+new=
+for slug in $(get_2_not_in_1 "$loc" "$rem"); do
+    new+=" $(to_name $slug)=$slug"
+done
+if [[ -n "$new" ]]; then
+    echo INSTALL
+    ./devmanage --install $new
+    echo
+fi
+
+echo DEBIAN
 cp debian/control.in debian/control
-for doc in $new; do
-    deb="devdocs-data-${doc//[_~]/-}"
+rm debian/devdocs-data-*.install 2>/dev/null || true
+
+loc=$(./devmanage --local | tail -n+2 | cut -d' ' -f1)
+for doc in $loc; do
+    deb="devdocs-data-${doc//_/-}"
     cat <<EOF >> debian/control
 
 Package: $deb
