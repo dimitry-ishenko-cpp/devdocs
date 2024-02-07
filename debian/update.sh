@@ -4,7 +4,7 @@ set -e
 # slug -> name
 to_name()
 {
-    echo $1 | sed -re "s/~[0-9.]+//; s/~/-/; s/gcc_cpp/g++/; s/_cpp$/-c++/; s/^gnu_//; s/_lts$//;"
+    echo $1 | sed -re "s/~[0-9.]+//; s/[~_]/-/g; s/gcc-cpp/g++/; s/cpp$/c++/; s/^gnu-//; s/-lts$//;"
 }
 
 # get items unique to $2 (ie, not in $1)
@@ -57,7 +57,7 @@ rm debian/devdocs-data-*.install 2>/dev/null || true
 
 loc=$(./devmanage --local | tail -n+2 | cut -d' ' -f1)
 for doc in $loc; do
-    deb="devdocs-data-${doc//_/-}"
+    deb="devdocs-data-$doc"
     cat <<EOF >> debian/control
 
 Package: $deb
