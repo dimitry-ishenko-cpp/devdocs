@@ -1,14 +1,21 @@
-<h1 class="title">Nim Destructors and Move Semantics</h1>   <h2 id="about-this-document">About this document</h2>
-<p>This document describes the upcoming Nim runtime which does not use classical GC algorithms anymore but is based on destructors and move semantics. The new runtime's advantages are that Nim programs become oblivious to the involved heap sizes and programs are easier to write to make effective use of multi-core machines. As a nice bonus, files and sockets and the like will not require manual <code>close</code> calls anymore.</p> <p>This document aims to be a precise specification about how move semantics and destructors work in Nim.</p> <h2 id="motivating-example">Motivating example</h2>
-<p>With the language mechanisms described here, a custom seq could be written as:</p> <pre class="listing" data-language="nim">type
+<h1 class="title">Nim Destructors and Move Semantics</h1> <a href="https://github.com/nim-lang/Nim/tree/version-2-0/doc/destructors.md#L1" target="_blank">Source</a> <a href="https://github.com/nim-lang/Nim/edit/devel/doc/destructors.md#L1" target="_blank">Edit</a>   <h2 id="about-this-document">About this document</h2>
+<p>This document describes the ARC/ORC Nim runtime which does not use classical GC algorithms anymore but is based on destructors and move semantics. The advantages are that Nim programs become oblivious to the involved heap sizes and programs are easier to write to make effective use of multi-core machines. As a nice bonus, files and sockets and the like can be written not to require manual <code><span class="Identifier">close</span></code> calls anymore.</p> <p>This document aims to be a precise specification about how move semantics and destructors work in Nim.</p> <h2 id="motivating-example">Motivating example</h2>
+<p>With the language mechanisms described here, a custom seq could be written as:</p> 
+<pre class="listing" data-language="nim">type
   myseq*[T] = object
     len, cap: int
     data: ptr UncheckedArray[T]
 
-proc `=destroy`*[T](x: var myseq[T]) =
+proc `=destroy`*[T](x: myseq[T]) =
   if x.data != nil:
-    for i in 0..&lt;x.len: `=destroy`(x[i])
+    for i in 0..&lt;x.len: `=destroy`(x.data[i])
     dealloc(x.data)
+
+proc `=trace`[T](x: var myseq[T]; env: pointer) =
+  # `=trace` allows the cycle collector `--mm:orc`
+  # to understand how to trace the object graph.
+  if x.data != nil:
+    for i in 0..&lt;x.len: `=trace`(x.data[i], env)
 
 proc `=copy`*[T](a: var myseq[T]; b: myseq[T]) =
   # do nothing for self-assignments:
@@ -22,6 +29,16 @@ proc `=copy`*[T](a: var myseq[T]; b: myseq[T]) =
     for i in 0..&lt;a.len:
       a.data[i] = b.data[i]
 
+proc `=dup`*[T](a: myseq[T]): myseq[T] {.nodestroy.} =
+  # an optimized version of `=wasMoved(tmp); `=copy(tmp, src)`
+  # usually present if a custom `=copy` hook is overridden
+  result.len = a.len
+  result.cap = a.cap
+  if a.data != nil:
+    result.data = cast[typeof(result.data)](alloc(result.cap * sizeof(T)))
+    for i in 0..&lt;result.len:
+      result.data[i] = `=dup`(a.data[i])
+
 proc `=sink`*[T](a: var myseq[T]; b: myseq[T]) =
   # move assignment, optional.
   # Compiler is using `=destroy` and `copyMem` when not provided
@@ -32,7 +49,9 @@ proc `=sink`*[T](a: var myseq[T]; b: myseq[T]) =
   a.data = b.data
 
 proc add*[T](x: var myseq[T]; y: sink T) =
-  if x.len &gt;= x.cap: resize(x)
+  if x.len &gt;= x.cap:
+    x.cap = max(x.len + 1, x.cap * 2)
+    x.data = cast[typeof(x.data)](realloc(x.data, x.cap * sizeof(T)))
   x.data[x.len] = y
   inc x.len
 
@@ -51,50 +70,89 @@ proc createSeq*[T](elems: varargs[T]): myseq[T] =
   for i in 0..&lt;result.len: result.data[i] = elems[i]
 
 proc len*[T](x: myseq[T]): int {.inline.} = x.len</pre> <h2 id="lifetimeminustracking-hooks">Lifetime-tracking hooks</h2>
-<p>The memory management for Nim's standard <code>string</code> and <code>seq</code> types as well as other standard collections is performed via so-called "Lifetime-tracking hooks" or "type-bound operators". There are 3 different hooks for each (generic or concrete) object type <code>T</code> (<code>T</code> can also be a <code>distinct</code> type) that are called implicitly by the compiler.</p> <p>(Note: The word "hook" here does not imply any kind of dynamic binding or runtime indirections, the implicit calls are statically bound and potentially inlined.)</p> <h3 id="lifetimeminustracking-hooks-eqdestroy-hook">
-<code>=destroy</code> hook</h3>
-<p>A <code>=destroy</code> hook frees the object's associated memory and releases other associated resources. Variables are destroyed via this hook when they go out of scope or when the routine they were declared in is about to return.</p> <p>The prototype of this hook for a type <code>T</code> needs to be:</p> <pre class="listing" data-language="nim">proc `=destroy`(x: var T)</pre>
-<p>The general pattern in <code>=destroy</code> looks like:</p> <pre class="listing" data-language="nim">proc `=destroy`(x: var T) =
+<p>The memory management for Nim's standard <code><span class="Identifier">string</span></code> and <code><span class="Identifier">seq</span></code> types as well as other standard collections is performed via so-called "Lifetime-tracking hooks", which are particular <a href="manual.html#procedures-type-bound-operators">type bound operators</a>.</p> <p>There are 6 different hooks for each (generic or concrete) object type <code><span class="Identifier">T</span></code> (<code><span class="Identifier">T</span></code> can also be a <code><span class="Keyword">distinct</span></code> type) that are called implicitly by the compiler.</p> <p>(Note: The word "hook" here does not imply any kind of dynamic binding or runtime indirections, the implicit calls are statically bound and potentially inlined.)</p> <h3 id="lifetimeminustracking-hooks-nimeqdestroy-hook">
+<code><span class="Operator">=</span><span class="Identifier">destroy</span></code> hook</h3>
+<p>A <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> hook frees the object's associated memory and releases other associated resources. Variables are destroyed via this hook when they go out of scope or when the routine they were declared in is about to return.</p> <p>A <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> hook is allowed to have a parameter of a <code><span class="Keyword">var</span> <span class="Identifier">T</span></code> or <code><span class="Identifier">T</span></code> type. Taking a <code><span class="Keyword">var</span> <span class="Identifier">T</span></code> type is deprecated. The prototype of this hook for a type <code><span class="Identifier">T</span></code> needs to be:</p> 
+<pre class="listing" data-language="nim">proc `=destroy`(x: T)</pre> <p>The general pattern in <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> looks like:</p> 
+<pre class="listing" data-language="nim">proc `=destroy`(x: T) =
   # first check if 'x' was moved to somewhere else:
   if x.field != nil:
-    freeResource(x.field)</pre> <h3 id="lifetimeminustracking-hooks-eqsink-hook">
-<code>=sink</code> hook</h3>
-<p>A <code>=sink</code> hook moves an object around, the resources are stolen from the source and passed to the destination. It is ensured that the source's destructor does not free the resources afterward by setting the object to its default value (the value the object's state started in). Setting an object <code>x</code> back to its default value is written as <code>wasMoved(x)</code>. When not provided the compiler is using a combination of <code>=destroy</code> and <code>copyMem</code> instead. This is efficient hence users rarely need to implement their own <code>=sink</code> operator, it is enough to provide <code>=destroy</code> and <code>=copy</code>, compiler will take care of the rest.</p> <p>The prototype of this hook for a type <code>T</code> needs to be:</p> <pre class="listing" data-language="nim">proc `=sink`(dest: var T; source: T)</pre>
-<p>The general pattern in <code>=sink</code> looks like:</p> <pre class="listing" data-language="nim">proc `=sink`(dest: var T; source: T) =
+    freeResource(x.field)</pre> <p>A <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> is implicitly annotated with <code><span class="Operator">.</span><span class="Identifier">raises</span><span class="Punctuation">:</span> <span class="Punctuation">[</span><span class="Punctuation">]</span></code>; a destructor should not raise exceptions. For backwards compatibility the compiler produces a warning for a <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> that does raise.</p> <p>A <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> can explicitly list the exceptions it can raise, if any, but this of little utility as a raising destructor is implementation defined behavior. Later versions of the language specification might cover this case precisely.</p> <h3 id="lifetimeminustracking-hooks-nimeqsink-hook">
+<code><span class="Operator">=</span><span class="Identifier">sink</span></code> hook</h3>
+<p>A <code><span class="Operator">=</span><span class="Identifier">sink</span></code> hook moves an object around, the resources are stolen from the source and passed to the destination. It is ensured that the source's destructor does not free the resources afterward by setting the object to its default value (the value the object's state started in). Setting an object <code><span class="Identifier">x</span></code> back to its default value is written as <code><span class="Identifier">wasMoved</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span></code>. When not provided the compiler is using a combination of <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> and <code><span class="Identifier">copyMem</span></code> instead. This is efficient hence users rarely need to implement their own <code><span class="Operator">=</span><span class="Identifier">sink</span></code> operator, it is enough to provide <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> and <code><span class="Operator">=</span><span class="Identifier">copy</span></code>, the compiler will take care of the rest.</p> <p>The prototype of this hook for a type <code><span class="Identifier">T</span></code> needs to be:</p> 
+<pre class="listing" data-language="nim">proc `=sink`(dest: var T; source: T)</pre> <p>The general pattern in <code><span class="Operator">=</span><span class="Identifier">sink</span></code> looks like:</p> 
+<pre class="listing" data-language="nim">proc `=sink`(dest: var T; source: T) =
   `=destroy`(dest)
   wasMoved(dest)
-  dest.field = source.field</pre>
-<p><strong>Note</strong>: <code>=sink</code> does not need to check for self-assignments. How self-assignments are handled is explained later in this document.</p> <h3 id="lifetimeminustracking-hooks-eqcopy-hook">
-<code>=copy</code> hook</h3>
-<p>The ordinary assignment in Nim conceptually copies the values. The <code>=copy</code> hook is called for assignments that couldn't be transformed into <code>=sink</code> operations.</p> <p>The prototype of this hook for a type <code>T</code> needs to be:</p> <pre class="listing" data-language="nim">proc `=copy`(dest: var T; source: T)</pre>
-<p>The general pattern in <code>=copy</code> looks like:</p> <pre class="listing" data-language="nim">proc `=copy`(dest: var T; source: T) =
+  dest.field = source.field</pre> <p><strong>Note</strong>: <code><span class="Operator">=</span><span class="Identifier">sink</span></code> does not need to check for self-assignments. How self-assignments are handled is explained later in this document.</p> <h3 id="lifetimeminustracking-hooks-nimeqcopy-hook">
+<code><span class="Operator">=</span><span class="Identifier">copy</span></code> hook</h3>
+<p>The ordinary assignment in Nim conceptually copies the values. The <code><span class="Operator">=</span><span class="Identifier">copy</span></code> hook is called for assignments that couldn't be transformed into <code><span class="Operator">=</span><span class="Identifier">sink</span></code> operations.</p> <p>The prototype of this hook for a type <code><span class="Identifier">T</span></code> needs to be:</p> 
+<pre class="listing" data-language="nim">proc `=copy`(dest: var T; source: T)</pre> <p>The general pattern in <code><span class="Operator">=</span><span class="Identifier">copy</span></code> looks like:</p> 
+<pre class="listing" data-language="nim">proc `=copy`(dest: var T; source: T) =
   # protect against self-assignments:
   if dest.field != source.field:
     `=destroy`(dest)
     wasMoved(dest)
-    dest.field = duplicateResource(source.field)</pre>
-<p>The <code>=copy</code> proc can be marked with the <code>{.error.}</code> pragma. Then any assignment that otherwise would lead to a copy is prevented at compile-time. This looks like:</p> <pre class="listing" data-language="nim">proc `=copy`(dest: var T; source: T) {.error.}</pre>
-<p>but a custom error message (e.g., <code>{.error: "custom error".}</code>) will not be emitted by the compiler. Notice that there is no <code>=</code> before the <code>{.error.}</code> pragma.</p> <h2 id="move-semantics">Move semantics</h2>
-<p>A "move" can be regarded as an optimized copy operation. If the source of the copy operation is not used afterward, the copy can be replaced by a move. This document uses the notation <code>lastReadOf(x)</code> to describe that <code>x</code> is not used afterwards. This property is computed by a static control flow analysis but can also be enforced by using <code>system.move</code> explicitly.</p> <h2 id="swap">Swap</h2>
-<p>The need to check for self-assignments and also the need to destroy previous objects inside <code>=copy</code> and <code>=sink</code> is a strong indicator to treat <code>system.swap</code> as a builtin primitive of its own that simply swaps every field in the involved objects via <code>copyMem</code> or a comparable mechanism. In other words, <code>swap(a, b)</code> is <strong>not</strong> implemented as <code>let tmp = move(b); b = move(a); a = move(tmp)</code>.</p> <p>This has further consequences:</p> <ul class="simple">
-<li>Objects that contain pointers that point to the same object are not supported by Nim's model. Otherwise swapped objects would end up in an inconsistent state.</li> <li>Seqs can use <code>realloc</code> in the implementation.</li> </ul> <h2 id="sink-parameters">Sink parameters</h2>
-<p>To move a variable into a collection usually <code>sink</code> parameters are involved. A location that is passed to a <code>sink</code> parameter should not be used afterward. This is ensured by a static analysis over a control flow graph. If it cannot be proven to be the last usage of the location, a copy is done instead and this copy is then passed to the sink parameter.</p> <p>A sink parameter <em>may</em> be consumed once in the proc's body but doesn't have to be consumed at all. The reason for this is that signatures like <code>proc put(t: var Table; k: sink Key, v: sink Value)</code> should be possible without any further overloads and <code>put</code> might not take ownership of <code>k</code> if <code>k</code> already exists in the table. Sink parameters enable an affine type system, not a linear type system.</p> <p>The employed static analysis is limited and only concerned with local variables; however, object and tuple fields are treated as separate entities:</p> <pre class="listing" data-language="nim">proc consume(x: sink Obj) = discard "no implementation"
+    dest.field = duplicateResource(source.field)</pre> <p>The <code><span class="Operator">=</span><span class="Identifier">copy</span></code> proc can be marked with the <code><span class="Punctuation">{</span><span class="Operator">.</span><span class="Identifier">error</span><span class="Operator">.</span><span class="Punctuation">}</span></code> pragma. Then any assignment that otherwise would lead to a copy is prevented at compile-time. This looks like:</p> 
+<pre class="listing" data-language="nim">proc `=copy`(dest: var T; source: T) {.error.}</pre> <p>but a custom error message (e.g., <code><span class="Punctuation">{</span><span class="Operator">.</span><span class="Identifier">error</span><span class="Punctuation">:</span> <span class="StringLit">"custom error"</span><span class="Operator">.</span><span class="Punctuation">}</span></code>) will not be emitted by the compiler. Notice that there is no <code><span class="Operator">=</span></code> before the <code><span class="Punctuation">{</span><span class="Operator">.</span><span class="Identifier">error</span><span class="Operator">.</span><span class="Punctuation">}</span></code> pragma.</p> <h3 id="lifetimeminustracking-hooks-nimeqtrace-hook">
+<code><span class="Operator">=</span><span class="Identifier">trace</span></code> hook</h3>
+<p>A custom <strong>container</strong> type can support Nim's cycle collector <code><span class="Operator">--</span><span class="Identifier">mm</span><span class="Punctuation">:</span><span class="Identifier">orc</span></code> via the <code><span class="Operator">=</span><span class="Identifier">trace</span></code> hook. If the container does not implement <code><span class="Operator">=</span><span class="Identifier">trace</span></code>, cyclic data structures which are constructed with the help of the container might leak memory or resources, but memory safety is not compromised.</p> <p>The prototype of this hook for a type <code><span class="Identifier">T</span></code> needs to be:</p> 
+<pre class="listing" data-language="nim">proc `=trace`(dest: var T; env: pointer)</pre> <p><code><span class="Identifier">env</span></code> is used by ORC to keep track of its internal state, it should be passed around to calls of the built-in <code><span class="Operator">=</span><span class="Identifier">trace</span></code> operation.</p> <p>Usually there will only be a need for a custom <code><span class="Operator">=</span><span class="Identifier">trace</span></code> when a custom <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> that deallocates manually allocated resources is also used, and then only when there is a chance of cyclic references from items within the manually allocated resources when it is desired that <code><span class="Operator">--</span><span class="Identifier">mm</span><span class="Punctuation">:</span><span class="Identifier">orc</span></code> is able to break and collect these cyclic referenced resources. Currently however, there is a mutual use problem in that whichever of <code><span class="Operator">=</span><span class="Identifier">destroy</span></code>/<code><span class="Operator">=</span><span class="Identifier">trace</span></code> is used first will automatically create a version of the other which will then conflict with the creation of the second of the pair. The workaround for this problem is to forward declare the second of the "hooks" to prevent the automatic creation.</p> <p>The general pattern in using <code><span class="Operator">=</span><span class="Identifier">destroy</span></code> with <code><span class="Operator">=</span><span class="Identifier">trace</span></code> looks like:</p> 
+<pre class="listing" data-language="nim">type
+  Test[T] = object
+    size: Natural
+    arr: ptr UncheckedArray[T] # raw pointer field
+
+proc makeTest[T](size: Natural): Test[T] = # custom allocation...
+  Test[T](size: size, arr: cast[ptr UncheckedArray[T]](alloc0(sizeof(T) * size)))
+
+
+proc `=destroy`[T](dest: Test[T]) =
+  if dest.arr != nil:
+    for i in 0 ..&lt; dest.size: dest.arr[i].`=destroy`
+    dealloc dest.arr
+
+proc `=trace`[T](dest: var Test[T]; env: pointer) =
+  if dest.arr != nil:
+    # trace the `T`'s which may be cyclic
+    for i in 0 ..&lt; dest.size: `=trace`(dest.arr[i], env)
+
+# following may be other custom "hooks" as required...</pre> <p><strong>Note</strong>: The <code><span class="Operator">=</span><span class="Identifier">trace</span></code> hooks (which are only used by <code><span class="Operator">--</span><span class="Identifier">mm</span><span class="Punctuation">:</span><span class="Identifier">orc</span></code>) are currently more experimental and less refined than the other hooks.</p> <h3 id="lifetimeminustracking-hooks-nimeqwasmoved-hook">
+<code><span class="Operator">=</span><span class="Identifier">WasMoved</span></code> hook</h3>
+<p>A <code><span class="Identifier">wasMoved</span></code> hook resets the memory of an object to its initial (binary zero) value to signify it was "moved" and to signify its destructor should do nothing and ideally be optimized away.</p> <p>The prototype of this hook for a type <code><span class="Identifier">T</span></code> needs to be:</p> 
+<pre class="listing" data-language="nim">proc `=wasMoved`(x: var T)</pre> <h3 id="lifetimeminustracking-hooks-nimeqdup-hook">
+<code><span class="Operator">=</span><span class="Identifier">dup</span></code> hook</h3>
+<p>A <code><span class="Operator">=</span><span class="Identifier">dup</span></code> hook duplicates the memory of an object. <code><span class="Operator">=</span><span class="Identifier">dup</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span></code> can be regarded as an optimization replacing the <code><span class="Identifier">wasMoved</span><span class="Punctuation">(</span><span class="Identifier">dest</span><span class="Punctuation">)</span><span class="Punctuation">;</span> <span class="Operator">=</span><span class="Identifier">copy</span><span class="Punctuation">(</span><span class="Identifier">dest</span><span class="Punctuation">,</span> <span class="Identifier">x</span><span class="Punctuation">)</span></code> operation.</p> <p>The prototype of this hook for a type <code><span class="Identifier">T</span></code> needs to be:</p> 
+<pre class="listing" data-language="nim">proc `=dup`(x: T): T</pre> <p>The general pattern in implementing <code><span class="Operator">=</span><span class="Identifier">dup</span></code> looks like:</p> 
+<pre class="listing" data-language="nim">type
+  Ref[T] = object
+    data: ptr T
+    rc: ptr int
+
+proc `=dup`[T](x: Ref[T]): Ref[T] =
+  result = x
+  if x.rc != nil:
+    inc x.rc[]</pre> <h2 id="move-semantics">Move semantics</h2>
+<p>A "move" can be regarded as an optimized copy operation. If the source of the copy operation is not used afterward, the copy can be replaced by a move. This document uses the notation <code><span class="Identifier">lastReadOf</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span></code> to describe that <code><span class="Identifier">x</span></code> is not used afterward. This property is computed by a static control flow analysis but can also be enforced by using <code><span class="Identifier">system</span><span class="Operator">.</span><span class="Identifier">move</span></code> explicitly.</p> <h2 id="swap">Swap</h2>
+<p>The need to check for self-assignments and also the need to destroy previous objects inside <code><span class="Operator">=</span><span class="Identifier">copy</span></code> and <code><span class="Operator">=</span><span class="Identifier">sink</span></code> is a strong indicator to treat <code><span class="Identifier">system</span><span class="Operator">.</span><span class="Identifier">swap</span></code> as a builtin primitive of its own that simply swaps every field in the involved objects via <code><span class="Identifier">copyMem</span></code> or a comparable mechanism. In other words, <code><span class="Identifier">swap</span><span class="Punctuation">(</span><span class="Identifier">a</span><span class="Punctuation">,</span> <span class="Identifier">b</span><span class="Punctuation">)</span></code> is <strong>not</strong> implemented as <code><span class="Keyword">let</span> <span class="Identifier">tmp</span> <span class="Operator">=</span> <span class="Identifier">move</span><span class="Punctuation">(</span><span class="Identifier">b</span><span class="Punctuation">)</span><span class="Punctuation">;</span> <span class="Identifier">b</span> <span class="Operator">=</span> <span class="Identifier">move</span><span class="Punctuation">(</span><span class="Identifier">a</span><span class="Punctuation">)</span><span class="Punctuation">;</span> <span class="Identifier">a</span> <span class="Operator">=</span> <span class="Identifier">move</span><span class="Punctuation">(</span><span class="Identifier">tmp</span><span class="Punctuation">)</span></code>.</p> <p>This has further consequences:</p> <ul class="simple">
+<li>Objects that contain pointers that point to the same object are not supported by Nim's model. Otherwise swapped objects would end up in an inconsistent state.</li> <li>Seqs can use <code><span class="Identifier">realloc</span></code> in the implementation.</li> </ul> <h2 id="sink-parameters">Sink parameters</h2>
+<p>To move a variable into a collection usually <code><span class="Identifier">sink</span></code> parameters are involved. A location that is passed to a <code><span class="Identifier">sink</span></code> parameter should not be used afterward. This is ensured by a static analysis over a control flow graph. If it cannot be proven to be the last usage of the location, a copy is done instead and this copy is then passed to the sink parameter.</p> <p>A sink parameter <em>may</em> be consumed once in the proc's body but doesn't have to be consumed at all. The reason for this is that signatures like <code><span class="Keyword">proc</span> <span class="Identifier">put</span><span class="Punctuation">(</span><span class="Identifier">t</span><span class="Punctuation">:</span> <span class="Keyword">var</span> <span class="Identifier">Table</span><span class="Punctuation">;</span> <span class="Identifier">k</span><span class="Punctuation">:</span> <span class="Identifier">sink</span> <span class="Identifier">Key</span><span class="Punctuation">,</span> <span class="Identifier">v</span><span class="Punctuation">:</span> <span class="Identifier">sink</span> <span class="Identifier">Value</span><span class="Punctuation">)</span></code> should be possible without any further overloads and <code><span class="Identifier">put</span></code> might not take ownership of <code><span class="Identifier">k</span></code> if <code><span class="Identifier">k</span></code> already exists in the table. Sink parameters enable an affine type system, not a linear type system.</p> <p>The employed static analysis is limited and only concerned with local variables; however, object and tuple fields are treated as separate entities:</p> 
+<pre class="listing" data-language="nim">proc consume(x: sink Obj) = discard "no implementation"
 
 proc main =
   let tup = (Obj(), Obj())
   consume tup[0]
   # ok, only tup[0] was consumed, tup[1] is still alive:
-  echo tup[1]</pre>
-<p>Sometimes it is required to explicitly <code>move</code> a value into its final position:</p> <pre class="listing" data-language="nim">proc main =
+  echo tup[1]</pre> <p>Sometimes it is required to explicitly <code><span class="Identifier">move</span></code> a value into its final position:</p> 
+<pre class="listing" data-language="nim">proc main =
   var dest, src: array[10, string]
   # ...
-  for i in 0..high(dest): dest[i] = move(src[i])</pre>
-<p>An implementation is allowed, but not required to implement even more move optimizations (and the current implementation does not).</p> <h2 id="sink-parameter-inference">Sink parameter inference</h2>
-<p>The current implementation can do a limited form of sink parameter inference. But it has to be enabled via <code>--sinkInference:on</code>, either on the command line or via a <code>push</code> pragma.</p> <p>To enable it for a section of code, one can use <code>{.push sinkInference: on.}</code>...`{.pop.}`.</p> <p>The <span id="dotnosinks_1">.nosinks</span> pragma can be used to disable this inference for a single routine:</p> <pre class="listing" data-language="nim">proc addX(x: T; child: T) {.nosinks.} =
-  x.s.add child</pre>
-<p>The details of the inference algorithm are currently undocumented.</p> <h2 id="rewrite-rules">Rewrite rules</h2>
+  for i in 0..high(dest): dest[i] = move(src[i])</pre> <p>An implementation is allowed, but not required to implement even more move optimizations (and the current implementation does not).</p> <h2 id="sink-parameter-inference">Sink parameter inference</h2>
+<p>The current implementation can do a limited form of sink parameter inference. But it has to be enabled via <code>--sinkInference:on</code>, either on the command line or via a <code><span class="Identifier">push</span></code> pragma.</p> <p>To enable it for a section of code, one can use <code><span class="Punctuation">{</span><span class="Operator">.</span><span class="Identifier">push</span> <span class="Identifier">sinkInference</span><span class="Punctuation">:</span> <span class="Identifier">on</span><span class="Operator">.</span><span class="Punctuation">}</span></code> ... <code><span class="Punctuation">{</span><span class="Operator">.</span><span class="Identifier">pop</span><span class="Operator">.</span><span class="Punctuation">}</span></code>.</p> <p>The <span id="dotnosinks_1">.nosinks</span> pragma can be used to disable this inference for a single routine:</p> 
+<pre class="listing" data-language="nim">proc addX(x: T; child: T) {.nosinks.} =
+  x.s.add child</pre> <p>The details of the inference algorithm are currently undocumented.</p> <h2 id="rewrite-rules">Rewrite rules</h2>
 <p><strong>Note</strong>: There are two different allowed implementation strategies:</p> <ol class="simple">
-<li>The produced <code>finally</code> section can be a single section that is wrapped around the complete routine body.</li> <li>The produced <code>finally</code> section is wrapped around the enclosing scope.</li> </ol> <p>The current implementation follows strategy (2). This means that resources are destroyed at the scope exit.</p> <pre data-language="nim">var x: T; stmts
+<li>The produced <code><span class="Keyword">finally</span></code> section can be a single section that is wrapped around the complete routine body.</li> <li>The produced <code><span class="Keyword">finally</span></code> section is wrapped around the enclosing scope.</li> </ol> <p>The current implementation follows strategy (2). This means that resources are destroyed at the scope exit.</p> <pre data-language="nim">var x: T; stmts
 ---------------             (destroy-var)
 var x: T; try stmts
 finally: `=destroy`(x)
@@ -136,7 +194,7 @@ f_sink(g())
 
 f_sink(notLastReadOf y)
 --------------------------     (copy-to-sink)
-(let tmp; `=copy`(tmp, y);
+(let tmp = `=dup`(y);
 f_sink(tmp))
 
 
@@ -144,9 +202,14 @@ f_sink(lastReadOf y)
 -----------------------     (move-to-sink)
 f_sink(y)
 wasMoved(y)</pre> <h2 id="object-and-array-construction">Object and array construction</h2>
-<p>Object and array construction is treated as a function call where the function has <code>sink</code> parameters.</p> <h2 id="destructor-removal">Destructor removal</h2>
-<p><code>wasMoved(x);</code> followed by a <code>=destroy(x)</code> operation cancel each other out. An implementation is encouraged to exploit this in order to improve efficiency and code sizes. The current implementation does perform this optimization.</p> <h2 id="self-assignments">Self assignments</h2>
-<p><code>=sink</code> in combination with <code>wasMoved</code> can handle self-assignments but it's subtle.</p> <p>The simple case of <code>x = x</code> cannot be turned into <code>=sink(x, x); wasMoved(x)</code> because that would lose <code>x</code>'s value. The solution is that simple self-assignments are simply transformed into an empty statement that does nothing.</p> <p>The complex case looks like a variant of <code>x = f(x)</code>, we consider <code>x = select(rand() &lt; 0.5, x, y)</code> here:</p> <pre class="listing" data-language="nim">proc select(cond: bool; a, b: sink string): string =
+<p>Object and array construction is treated as a function call where the function has <code><span class="Identifier">sink</span></code> parameters.</p> <h2 id="destructor-removal">Destructor removal</h2>
+<p><code><span class="Identifier">wasMoved</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span><span class="Punctuation">;</span></code> followed by a <code><span class="Operator">=</span><span class="Identifier">destroy</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span></code> operation cancel each other out. An implementation is encouraged to exploit this in order to improve efficiency and code sizes. The current implementation does perform this optimization.</p> <h2 id="self-assignments">Self assignments</h2>
+<p><code><span class="Operator">=</span><span class="Identifier">sink</span></code> in combination with <code><span class="Identifier">wasMoved</span></code> can handle self-assignments but it's subtle.</p> <p>The simple case of <code><span class="Identifier">x</span> <span class="Operator">=</span> <span class="Identifier">x</span></code> cannot be turned into <code><span class="Operator">=</span><span class="Identifier">sink</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">,</span> <span class="Identifier">x</span><span class="Punctuation">)</span><span class="Punctuation">;</span> <span class="Identifier">wasMoved</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span></code> because that would lose <code><span class="Identifier">x</span></code>'s value. The solution is that simple self-assignments that consist of</p> <ul class="simple">
+<li>Symbols: <code><span class="Identifier">x</span> <span class="Operator">=</span> <span class="Identifier">x</span></code>
+</li> <li>Field access: <code><span class="Identifier">x</span><span class="Operator">.</span><span class="Identifier">f</span> <span class="Operator">=</span> <span class="Identifier">x</span><span class="Operator">.</span><span class="Identifier">f</span></code>
+</li> <li>Array, sequence or string access with indices known at compile-time: <code><span class="Identifier">x</span><span class="Punctuation">[</span><span class="DecNumber">0</span><span class="Punctuation">]</span> <span class="Operator">=</span> <span class="Identifier">x</span><span class="Punctuation">[</span><span class="DecNumber">0</span><span class="Punctuation">]</span></code>
+</li> </ul> <p>are transformed into an empty statement that does nothing. The compiler is free to optimize further cases.</p> <p>The complex case looks like a variant of <code><span class="Identifier">x</span> <span class="Operator">=</span> <span class="Identifier">f</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span></code>, we consider <code><span class="Identifier">x</span> <span class="Operator">=</span> <span class="Identifier">select</span><span class="Punctuation">(</span><span class="Identifier">rand</span><span class="Punctuation">(</span><span class="Punctuation">)</span> <span class="Operator">&lt;</span> <span class="FloatNumber">0.5</span><span class="Punctuation">,</span> <span class="Identifier">x</span><span class="Punctuation">,</span> <span class="Identifier">y</span><span class="Punctuation">)</span></code> here:</p> 
+<pre class="listing" data-language="nim">proc select(cond: bool; a, b: sink string): string =
   if cond:
     result = a # moves a into result
   else:
@@ -156,8 +219,8 @@ proc main =
   var x = "abc"
   var y = "xyz"
   # possible self-assignment:
-  x = select(true, x, y)</pre>
-<p>Is transformed into:</p> <pre class="listing" data-language="nim">proc select(cond: bool; a, b: sink string): string =
+  x = select(true, x, y)</pre> <p>Is transformed into:</p> 
+<pre class="listing" data-language="nim">proc select(cond: bool; a, b: sink string): string =
   try:
     if cond:
       `=sink`(result, a)
@@ -186,9 +249,9 @@ proc main =
     echo [x]
   finally:
     `=destroy`(y)
-    `=destroy`(x)</pre>
-<p>As can be manually verified, this transformation is correct for self-assignments.</p> <h2 id="lent-type">Lent type</h2>
-<p><code>proc p(x: sink T)</code> means that the proc <code>p</code> takes ownership of <code>x</code>. To eliminate even more creation/copy &lt;-&gt; destruction pairs, a proc's return type can be annotated as <code>lent T</code>. This is useful for "getter" accessors that seek to allow an immutable view into a container.</p> <p>The <code>sink</code> and <code>lent</code> annotations allow us to remove most (if not all) superfluous copies and destructions.</p> <p><code>lent T</code> is like <code>var T</code> a hidden pointer. It is proven by the compiler that the pointer does not outlive its origin. No destructor call is injected for expressions of type <code>lent T</code> or of type <code>var T</code>.</p> <pre class="listing" data-language="nim">type
+    `=destroy`(x)</pre> <p>As can be manually verified, this transformation is correct for self-assignments.</p> <h2 id="lent-type">Lent type</h2>
+<p><code><span class="Keyword">proc</span> <span class="Identifier">p</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">:</span> <span class="Identifier">sink</span> <span class="Identifier">T</span><span class="Punctuation">)</span></code> means that the proc <code><span class="Identifier">p</span></code> takes ownership of <code><span class="Identifier">x</span></code>. To eliminate even more creation/copy &lt;-&gt; destruction pairs, a proc's return type can be annotated as <code><span class="Identifier">lent</span> <span class="Identifier">T</span></code>. This is useful for "getter" accessors that seek to allow an immutable view into a container.</p> <p>The <code><span class="Identifier">sink</span></code> and <code><span class="Identifier">lent</span></code> annotations allow us to remove most (if not all) superfluous copies and destructions.</p> <p><code><span class="Identifier">lent</span> <span class="Identifier">T</span></code> is like <code><span class="Keyword">var</span> <span class="Identifier">T</span></code> a hidden pointer. It is proven by the compiler that the pointer does not outlive its origin. No destructor call is injected for expressions of type <code><span class="Identifier">lent</span> <span class="Identifier">T</span></code> or of type <code><span class="Keyword">var</span> <span class="Identifier">T</span></code>.</p> 
+<pre class="listing" data-language="nim">type
   Tree = object
     kids: seq[Tree]
 
@@ -201,7 +264,7 @@ proc construct(kids: sink seq[Tree]): Tree =
 proc `[]`*(x: Tree; i: int): lent Tree =
   result = x.kids[i]
   # borrows from 'x', this is transformed into:
-  result = addr x.kids[i]
+  # result = addr x.kids[i]
   # This means 'lent' is like 'var T' a hidden pointer.
   # Unlike 'var' this hidden pointer cannot be used to mutate the object.
 
@@ -211,23 +274,25 @@ iterator children*(t: Tree): lent Tree =
 proc main =
   # everything turned into moves:
   let t = construct(@[construct(@[]), construct(@[])])
-  echo t[0] # accessor does not copy the element!</pre> <h2 id="the-dotcursor-annotation">The .cursor annotation</h2>
-<p>Under the <code>--gc:arc|orc</code> modes Nim's <code>ref</code> type is implemented via the same runtime "hooks" and thus via reference counting. This means that cyclic structures cannot be freed immediately (<code>--gc:orc</code> ships with a cycle collector). With the <code>.cursor</code> annotation one can break up cycles declaratively:</p> <pre class="listing" data-language="nim">type
+  echo t[0] # accessor does not copy the element!</pre> <h2 id="the-cursor-pragma">The cursor pragma</h2>
+<p>Under the <code>--mm:arc|orc</code> modes Nim's <code><span class="Keyword">ref</span></code> type is implemented via the same runtime "hooks" and thus via reference counting. This means that cyclic structures cannot be freed immediately (<code>--mm:orc</code> ships with a cycle collector). With the <code><span class="Identifier">cursor</span></code> pragma one can break up cycles declaratively:</p> 
+<pre class="listing" data-language="nim">type
   Node = ref object
     left: Node # owning ref
-    right {.cursor.}: Node # non-owning ref</pre>
-<p>But please notice that this is not C++'s weak_ptr, it means the right field is not involved in the reference counting, it is a raw pointer without runtime checks.</p> <p>Automatic reference counting also has the disadvantage that it introduces overhead when iterating over linked structures. The <code>.cursor</code> annotation can also be used to avoid this overhead:</p> <pre class="listing" data-language="nim">var it {.cursor.} = listRoot
+    right {.cursor.}: Node # non-owning ref</pre> <p>But please notice that this is not C++'s weak_ptr, it means the right field is not involved in the reference counting, it is a raw pointer without runtime checks.</p> <p>Automatic reference counting also has the disadvantage that it introduces overhead when iterating over linked structures. The <code><span class="Identifier">cursor</span></code> pragma can also be used to avoid this overhead:</p> 
+<pre class="listing" data-language="nim">var it {.cursor.} = listRoot
 while it != nil:
   use(it)
-  it = it.next</pre>
-<p>In fact, <code>.cursor</code> more generally prevents object construction/destruction pairs and so can also be useful in other contexts. The alternative solution would be to use raw pointers (<code>ptr</code>) instead which is more cumbersome and also more dangerous for Nim's evolution: Later on, the compiler can try to prove <code>.cursor</code> annotations to be safe, but for <code>ptr</code> the compiler has to remain silent about possible problems.</p> <h2 id="cursor-inference-slash-copy-elision">Cursor inference / copy elision</h2>
-<p>The current implementation also performs <code>.cursor</code> inference. Cursor inference is a form of copy elision.</p> <p>To see how and when we can do that, think about this question: In <code>dest = src</code> when do we really have to <em>materialize</em> the full copy? - Only if <code>dest</code> or <code>src</code> are mutated afterward. If <code>dest</code> is a local variable that is simple to analyze. And if <code>src</code> is a location derived from a formal parameter, we also know it is not mutated! In other words, we do a compile-time copy-on-write analysis.</p> <p>This means that "borrowed" views can be written naturally and without explicit pointer indirections:</p> <pre class="listing" data-language="nim">proc main(tab: Table[string, string]) =
-  let v = tab["key"] # inferred as .cursor because 'tab' is not mutated.
+  it = it.next</pre> <p>In fact, <code><span class="Identifier">cursor</span></code> more generally prevents object construction/destruction pairs and so can also be useful in other contexts. The alternative solution would be to use raw pointers (<code><span class="Keyword">ptr</span></code>) instead which is more cumbersome and also more dangerous for Nim's evolution: Later on, the compiler can try to prove <code><span class="Identifier">cursor</span></code> pragmas to be safe, but for <code><span class="Keyword">ptr</span></code> the compiler has to remain silent about possible problems.</p> <h2 id="cursor-inference-slash-copy-elision">Cursor inference / copy elision</h2>
+<p>The current implementation also performs <code><span class="Identifier">cursor</span></code> inference. Cursor inference is a form of copy elision.</p> <p>To see how and when we can do that, think about this question: In <code><span class="Identifier">dest</span> <span class="Operator">=</span> <span class="Identifier">src</span></code> when do we really have to <em>materialize</em> the full copy? - Only if <code><span class="Identifier">dest</span></code> or <code><span class="Identifier">src</span></code> are mutated afterward. If <code><span class="Identifier">dest</span></code> is a local variable that is simple to analyze. And if <code><span class="Identifier">src</span></code> is a location derived from a formal parameter, we also know it is not mutated! In other words, we do a compile-time copy-on-write analysis.</p> <p>This means that "borrowed" views can be written naturally and without explicit pointer indirections:</p> 
+<pre class="listing" data-language="nim">proc main(tab: Table[string, string]) =
+  let v = tab["key"] # inferred as cursor because 'tab' is not mutated.
   # no copy into 'v', no destruction of 'v'.
   use(v)
   useItAgain(v)</pre> <h2 id="hook-lifting">Hook lifting</h2>
-<p>The hooks of a tuple type <code>(A, B, ...)</code> are generated by lifting the hooks of the involved types <code>A</code>, <code>B</code>, ... to the tuple type. In other words, a copy <code>x = y</code> is implemented as <code>x[0] = y[0]; x[1] = y[1]; ...</code>, likewise for <code>=sink</code> and <code>=destroy</code>.</p> <p>Other value-based compound types like <code>object</code> and <code>array</code> are handled correspondingly. For <code>object</code> however, the compiler-generated hooks can be overridden. This can also be important to use an alternative traversal of the involved data structure that is more efficient or in order to avoid deep recursions.</p> <h2 id="hook-generation">Hook generation</h2>
-<p>The ability to override a hook leads to a phase ordering problem:</p> <pre class="listing" data-language="nim">type
+<p>The hooks of a tuple type <code><span class="Punctuation">(</span><span class="Identifier">A</span><span class="Punctuation">,</span> <span class="Identifier">B</span><span class="Punctuation">,</span> <span class="Operator">...</span><span class="Punctuation">)</span></code> are generated by lifting the hooks of the involved types <code><span class="Identifier">A</span></code>, <code><span class="Identifier">B</span></code>, ... to the tuple type. In other words, a copy <code><span class="Identifier">x</span> <span class="Operator">=</span> <span class="Identifier">y</span></code> is implemented as <code><span class="Identifier">x</span><span class="Punctuation">[</span><span class="DecNumber">0</span><span class="Punctuation">]</span> <span class="Operator">=</span> <span class="Identifier">y</span><span class="Punctuation">[</span><span class="DecNumber">0</span><span class="Punctuation">]</span><span class="Punctuation">;</span> <span class="Identifier">x</span><span class="Punctuation">[</span><span class="DecNumber">1</span><span class="Punctuation">]</span> <span class="Operator">=</span> <span class="Identifier">y</span><span class="Punctuation">[</span><span class="DecNumber">1</span><span class="Punctuation">]</span><span class="Punctuation">;</span> <span class="Operator">...</span></code>, likewise for <code><span class="Operator">=</span><span class="Identifier">sink</span></code> and <code><span class="Operator">=</span><span class="Identifier">destroy</span></code>.</p> <p>Other value-based compound types like <code><span class="Keyword">object</span></code> and <code><span class="Identifier">array</span></code> are handled correspondingly. For <code><span class="Keyword">object</span></code> however, the compiler-generated hooks can be overridden. This can also be important to use an alternative traversal of the involved data structure that is more efficient or in order to avoid deep recursions.</p> <h2 id="hook-generation">Hook generation</h2>
+<p>The ability to override a hook leads to a phase ordering problem:</p> 
+<pre class="listing" data-language="nim">type
   Foo[T] = object
 
 proc main =
@@ -235,32 +300,41 @@ proc main =
   # error: destructor for 'f' called here before
   # it was seen in this module.
 
-proc `=destroy`[T](f: var Foo[T]) =
-  discard</pre>
-<p>The solution is to define <code>proc `=destroy`[T](f: var Foo[T])</code> before it is used. The compiler generates implicit hooks for all types in <em>strategic places</em> so that an explicitly provided hook that comes too "late" can be detected reliably. These <em>strategic places</em> have been derived from the rewrite rules and are as follows:</p> <ul class="simple">
-<li>In the construct <code>let/var x = ...</code> (var/let binding) hooks are generated for <code>typeof(x)</code>.</li> <li>In <code>x = ...</code> (assignment) hooks are generated for <code>typeof(x)</code>.</li> <li>In <code>f(...)</code> (function call) hooks are generated for <code>typeof(f(...))</code>.</li> <li>For every sink parameter <code>x: sink T</code> the hooks are generated for <code>typeof(x)</code>.</li> </ul> <h2 id="nodestroy-pragma">nodestroy pragma</h2>
-<p>The experimental <span id="nodestroy_1">nodestroy</span> pragma inhibits hook injections. This can be used to specialize the object traversal in order to avoid deep recursions:</p> <pre class="listing" data-language="nim">type Node = ref object
+proc `=destroy`[T](f: Foo[T]) =
+  discard</pre> <p>The solution is to define <code>proc `=destroy`[T](f: Foo[T])</code> before it is used. The compiler generates implicit hooks for all types in <em>strategic places</em> so that an explicitly provided hook that comes too "late" can be detected reliably. These <em>strategic places</em> have been derived from the rewrite rules and are as follows:</p> <ul class="simple">
+<li>In the construct <code><span class="Keyword">let</span><span class="Operator">/</span><span class="Keyword">var</span> <span class="Identifier">x</span> <span class="Operator">=</span> <span class="Operator">...</span></code> (var/let binding) hooks are generated for <code><span class="Identifier">typeof</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span></code>.</li> <li>In <code><span class="Identifier">x</span> <span class="Operator">=</span> <span class="Operator">...</span></code> (assignment) hooks are generated for <code><span class="Identifier">typeof</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span></code>.</li> <li>In <code><span class="Identifier">f</span><span class="Punctuation">(</span><span class="Operator">...</span><span class="Punctuation">)</span></code> (function call) hooks are generated for <code><span class="Identifier">typeof</span><span class="Punctuation">(</span><span class="Identifier">f</span><span class="Punctuation">(</span><span class="Operator">...</span><span class="Punctuation">)</span><span class="Punctuation">)</span></code>.</li> <li>For every sink parameter <code><span class="Identifier">x</span><span class="Punctuation">:</span> <span class="Identifier">sink</span> <span class="Identifier">T</span></code> the hooks are generated for <code><span class="Identifier">typeof</span><span class="Punctuation">(</span><span class="Identifier">x</span><span class="Punctuation">)</span></code>.</li> </ul> <h2 id="nodestroy-pragma">nodestroy pragma</h2>
+<p>The experimental <span id="nodestroy_1">nodestroy</span> pragma inhibits hook injections. This can be used to specialize the object traversal in order to avoid deep recursions:</p> 
+<pre class="listing" data-language="nim">type Node = ref object
   x, y: int32
   left, right: Node
 
 type Tree = object
   root: Node
 
-proc `=destroy`(t: var Tree) {.nodestroy.} =
+proc `=destroy`(t: Tree) {.nodestroy.} =
   # use an explicit stack so that we do not get stack overflows:
   var s: seq[Node] = @[t.root]
   while s.len &gt; 0:
     let x = s.pop
     if x.left != nil: s.add(x.left)
     if x.right != nil: s.add(x.right)
-    # free the memory explicit:
-    dispose(x)
+    # free the memory explicitly:
+    `=dispose`(x)
   # notice how even the destructor for 's' is not called implicitly
   # anymore thanks to .nodestroy, so we have to call it on our own:
-  `=destroy`(s)</pre>
-<p>As can be seen from the example, this solution is hardly sufficient and should eventually be replaced by a better solution. </p><div class="_attribution">
+  `=destroy`(s)</pre> <p>As can be seen from the example, this solution is hardly sufficient and should eventually be replaced by a better solution.</p> <h2 id="copy-on-write">Copy on write</h2>
+<p>String literals are implemented as "copy on write". When assigning a string literal to a variable, a copy of the literal won't be created. Instead the variable simply points to the literal. The literal is shared between different variables which are pointing to it. The copy operation is deferred until the first write.</p> <p>For example:</p> 
+<pre class="listing" data-language="nim">var x = "abc"  # no copy
+var y = x      # no copy
+y[0] = 'h'     # copy</pre> <p>The abstraction fails for <code><span class="Keyword">addr</span> <span class="Identifier">x</span></code> because whether the address is going to be used for mutations is unknown. <code><span class="Identifier">prepareMutation</span></code> needs to be called before the "address of" operation. For example:</p> 
+<pre class="listing" data-language="nim">var x = "abc"
+var y = x
+
+prepareMutation(y)
+moveMem(addr y[0], addr x[0], 3)
+assert y == "abc"</pre><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2006&ndash;2021 Andreas Rumpf<br>Licensed under the MIT License.<br>
+    &copy; 2006&ndash;2024 Andreas Rumpf<br>Licensed under the MIT License.<br>
     <a href="https://nim-lang.org/docs/destructors.html" class="_attribution-link">https://nim-lang.org/docs/destructors.html</a>
   </p>
 </div>

@@ -1,0 +1,95 @@
+<h1>std.experimental.allocator.building_blocks.kernighan_ritchie</h1>  <dl>
+<dt>Source</dt>
+<dd> <span class="phobos_src"><a class="https" href="https://github.com/dlang/phobos/blob/master/std/experimental/allocator/building_blocks/kernighan_ritchie.d">std/experimental/allocator/building_blocks/kernighan_ritchie.d</a></span>
+</dd>
+</dl> <dl>
+<dt class="d_decl" id="KRRegion">struct <strong id="KRRegion">KRRegion</strong>(ParentAllocator = NullAllocator); </dt> <dd>
+<p><code>KRRegion</code> draws inspiration from the <a href="std_experimental_allocator_building_blocks_region.html">region allocation strategy</a> and also the <a href="http://stackoverflow.com/questions/13159564/explain-this-implementation-of-malloc-from-the-kr-book">famed allocator</a> described by Brian Kernighan and Dennis Ritchie in section 8.7 of the book <a href="http://amazon.com/exec/obidos/ASIN/0131103628/classicempire">"The C Programming Language"</a>, Second Edition, Prentice Hall, 1988. </p>
+<p><h4>
+<code>KRRegion</code> = <code>Region</code> + Kernighan-Ritchie Allocator</h4> <br><br> Initially, <code>KRRegion</code> starts in "region" mode: allocations are served from the memory chunk in a region fashion. Thus, as long as there is enough memory left, <code>KRRegion.allocate</code> has the performance profile of a region allocator. Deallocation inserts (in <span class="bigoh">Ο(<code>1</code>)</span> time) the deallocated blocks in an unstructured freelist, which is not read in region mode. <br><br> Once the region cannot serve an <code>allocate</code> request, <code>KRRegion</code> switches to "free list" mode. It sorts the list of previously deallocated blocks by address and serves allocation requests off that free list. The allocation and deallocation follow the pattern described by Kernighan and Ritchie. <br><br> The recommended use of <code>KRRegion</code> is as a <i>region with deallocation</i>. If the <code>KRRegion</code> is dimensioned appropriately, it could often not enter free list mode during its lifetime. Thus it is as fast as a simple region, whilst offering deallocation at a small cost. When the region memory is exhausted, the previously deallocated memory is still usable, at a performance cost. If the region is not excessively large and fragmented, the linear allocation and deallocation cost may still be compensated for by the good locality characteristics. <br><br> If the chunk of memory managed is large, it may be desirable to switch management to free list from the beginning. That way, memory may be used in a more compact manner than region mode. To force free list mode, call <code>switchToFreeList</code> shortly after construction or when deemed appropriate. <br><br> The smallest size that can be allocated is two words (16 bytes on 64-bit systems, 8 bytes on 32-bit systems). This is because the free list management needs two words (one for the length, the other for the next pointer in the singly-linked list). <br><br> The <code>ParentAllocator</code> type parameter is the type of the allocator used to allocate the memory chunk underlying the <code>KRRegion</code> object. Choosing the default (<code>NullAllocator</code>) means the user is responsible for passing a buffer at construction (and for deallocating it if necessary). Otherwise, <code>KRRegion</code> automatically deallocates the buffer during destruction. For that reason, if <code>ParentAllocator</code> is not <code>NullAllocator</code>, then <code>KRRegion</code> is not copyable. <br><br> <h4>Implementation Details</h4> <br><br> In free list mode, <code>KRRegion</code> embeds a free blocks list onto the chunk of memory. The free list is circular, coalesced, and sorted by address at all times. Allocations and deallocations take time proportional to the number of previously deallocated blocks. (In practice the cost may be lower, e.g. if memory is deallocated in reverse order of allocation, all operations take constant time.) Memory utilization is good (small control structure and no per-allocation overhead). The disadvantages of freelist mode include proneness to fragmentation, a minimum allocation size of two words, and linear worst-case allocation and deallocation times. <br><br> Similarities of <code>KRRegion</code> (in free list mode) with the Kernighan-Ritchie allocator: <br><br> <ul>
+<li>Free blocks have variable size and are linked in a singly-linked list.</li> <li>The freelist is maintained in increasing address order, which makes coalescing easy.</li> <li>The strategy for finding the next available block is first fit.</li> <li>The free list is circular, with the last node pointing back to the first.</li> <li>Coalescing is carried during deallocation.</li> </ul> <br><br> Differences from the Kernighan-Ritchie allocator: <br><br> <ul>
+<li>Once the chunk is exhausted, the Kernighan-Ritchie allocator allocates another chunk using operating system primitives. For better composability, <code>KRRegion</code> just gets full (returns <code>null</code> on new allocation requests). The decision to allocate more blocks is deferred to a higher-level entity. For an example, see the example below using <code>AllocatorList</code> in conjunction with <code>KRRegion</code>.</li> <li>Allocated blocks do not hold a size prefix. This is because in D the size information is available in client code at deallocation time.</li> </ul></p> <dl>
+<dt>Examples:</dt>
+<dd>
+<code>KRRegion</code> is preferable to <code>Region</code> as a front for a general-purpose allocator if <code>deallocate</code> is needed, yet the actual deallocation traffic is relatively low. The example below shows a <code>KRRegion</code> using stack storage fronting the GC allocator. <pre data-language="d">import std.experimental.allocator.building_blocks.fallback_allocator
+    : fallbackAllocator;
+import std.experimental.allocator.gc_allocator : GCAllocator;
+import std.typecons : Ternary;
+// KRRegion fronting a general-purpose allocator
+ubyte[1024 * 128] buf;
+auto alloc = fallbackAllocator(KRRegion!()(buf), GCAllocator.instance);
+auto b = alloc.allocate(100);
+writeln(b.length); // 100
+writeln((() pure nothrow @safe @nogc =&gt; alloc.primary.owns(b))()); // Ternary.yes
+</pre> </dd>
+</dl> <dl>
+<dt>Examples:</dt>
+<dd>The code below defines a scalable allocator consisting of 1 MB (or larger) blocks fetched from the garbage-collected heap. Each block is organized as a KR-style heap. More blocks are allocated and freed on a need basis.  This is the closest example to the allocator introduced in the K&amp;R book. It should perform slightly better because instead of searching through one large free list, it searches through several shorter lists in LRU order. Also, it actually returns memory to the operating system when possible. <pre data-language="d">import std.algorithm.comparison : max;
+import std.experimental.allocator.building_blocks.allocator_list
+    : AllocatorList;
+import std.experimental.allocator.mmap_allocator : MmapAllocator;
+AllocatorList!(n =&gt; KRRegion!MmapAllocator(max(n * 16, 1024 * 1024))) alloc;
+</pre> </dd>
+</dl> <dl>
+<dt class="d_decl" id="KRRegion.parent">ParentAllocator <strong id="parent">parent</strong>; </dt> <dd>
+<p>If <code>ParentAllocator</code> holds state, <code>parent</code> is a public member of type <code>KRRegion</code>. Otherwise, <code>parent</code> is an <code>alias</code> for <code>ParentAllocator.instance</code>.</p> </dd> <dt class="d_decl" id="KRRegion.this">this(ubyte[] b); <br><br>this(size_t n); <br><br>this(ParentAllocator parent, size_t n); </dt> <dd>
+<p>Create a <code>KRRegion</code>. If <code>ParentAllocator</code> is not <code>NullAllocator</code>, <code>KRRegion</code>'s destructor will call <code>parent.deallocate</code>. </p>
+<dl>
+<dt>Parameters:</dt>
+<dd><table>
+<tr>
+<td>ubyte[] <code>b</code>
+</td> <td>Block of memory to serve as support for the allocator. Memory must be larger than two words and word-aligned.</td>
+</tr> <tr>
+<td>size_t <code>n</code>
+</td> <td>Capacity desired. This constructor is defined only if <code> ParentAllocator</code> is not <code>NullAllocator</code>.</td>
+</tr> </table></dd>
+</dl> </dd> <dt class="d_decl" id="KRRegion.switchToFreeList">void <strong id="switchToFreeList">switchToFreeList</strong>(); </dt> <dd>
+<p>Forces free list mode. If already in free list mode, does nothing. Otherwise, sorts the free list accumulated so far and switches strategy for future allocations to KR style.</p> </dd> <dt class="d_decl" id="KRRegion.alignment">enum auto <strong id="alignment">alignment</strong>; </dt> <dd>
+<p>Word-level alignment.</p> </dd> <dt class="d_decl" id="KRRegion.allocate">void[] <strong id="allocate">allocate</strong>(size_t n); </dt> <dd>
+<p>Allocates <code>n</code> bytes. Allocation searches the list of available blocks until a free block with <code>n</code> or more bytes is found (first fit strategy). The block is split (if larger) and returned. </p>
+<dl>
+<dt>Parameters:</dt>
+<dd><table>
+<tr>
+<td>size_t <code>n</code>
+</td> <td>number of bytes to allocate</td>
+</tr> </table></dd>
+</dl> <dl>
+<dt>Returns:</dt>
+<dd>A word-aligned buffer of <code>n</code> bytes, or <code>null</code>.</dd>
+</dl> </dd> <dt class="d_decl" id="KRRegion.deallocate">nothrow @nogc bool <strong id="deallocate">deallocate</strong>(void[] b); </dt> <dd>
+<p>Deallocates <code>b</code>, which is assumed to have been previously allocated with this allocator. Deallocation performs a linear search in the free list to preserve its sorting order. It follows that blocks with higher addresses in allocators with many free blocks are slower to deallocate. </p>
+<dl>
+<dt>Parameters:</dt>
+<dd><table>
+<tr>
+<td>void[] <code>b</code>
+</td> <td>block to be deallocated</td>
+</tr> </table></dd>
+</dl> </dd> <dt class="d_decl" id="KRRegion.allocateAll">void[] <strong id="allocateAll">allocateAll</strong>(); </dt> <dd>
+<p>Allocates all memory available to this allocator. If the allocator is empty, returns the entire available block of memory. Otherwise, it still performs a best-effort allocation: if there is no fragmentation (e.g. <code>allocate</code> has been used but not <code>deallocate</code>), allocates and returns the only available block of memory. </p>
+<p>The operation takes time proportional to the number of adjacent free blocks at the front of the free list. These blocks get coalesced, whether <code>allocateAll</code> succeeds or fails due to fragmentation.</p> <dl>
+<dt>Examples:</dt>
+<dd>
+<pre data-language="d">import std.experimental.allocator.gc_allocator : GCAllocator;
+auto alloc = KRRegion!GCAllocator(1024 * 64);
+const b1 = alloc.allocate(2048);
+writeln(b1.length); // 2048
+const b2 = alloc.allocateAll;
+writeln(b2.length); // 1024 * 62
+</pre> </dd>
+</dl> </dd> <dt class="d_decl" id="KRRegion.deallocateAll">pure nothrow @nogc bool <strong id="deallocateAll">deallocateAll</strong>(); </dt> <dd>
+<p>Deallocates all memory currently allocated, making the allocator ready for other allocations. This is a <span class="bigoh">Ο(<code>1</code>)</span> operation.</p> </dd> <dt class="d_decl" id="KRRegion.owns">pure nothrow @nogc @trusted Ternary <strong id="owns">owns</strong>(void[] b); </dt> <dd>
+<p>Checks whether the allocator is responsible for the allocation of <code>b</code>. It does a simple <span class="bigoh">Ο(<code>1</code>)</span> range check. <code>b</code> should be a buffer either allocated with <code>this</code> or obtained through other means.</p> </dd> <dt class="d_decl" id="KRRegion.goodAllocSize">static pure nothrow @nogc @safe size_t <strong id="goodAllocSize">goodAllocSize</strong>(size_t n); </dt> <dd>
+<p>Adjusts <code>n</code> to a size suitable for allocation (two words or larger, word-aligned).</p> </dd> <dt class="d_decl" id="KRRegion.empty">pure nothrow @nogc @safe Ternary <strong id="empty">empty</strong>(); </dt> <dd>
+<dl>
+<dt>Returns:</dt>
+<dd>
+<code>Ternary.yes</code> if the allocator is empty, <code>Ternary.no</code> otherwise. Never returns <code>Ternary.unknown</code>.</dd>
+</dl> </dd> </dl> </dd> </dl><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 1999&ndash;2021 The D Language Foundation<br>Licensed under the Boost License 1.0.<br>
+    <a href="https://dlang.org/phobos/std_experimental_allocator_building_blocks_kernighan_ritchie.html" class="_attribution-link">https://dlang.org/phobos/std_experimental_allocator_building_blocks_kernighan_ritchie.html</a>
+  </p>
+</div>

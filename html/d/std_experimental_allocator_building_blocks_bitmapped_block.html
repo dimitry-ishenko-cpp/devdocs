@@ -1,0 +1,215 @@
+<h1>std.experimental.allocator.building_blocks.bitmapped_block</h1>  <dl>
+<dt>Source</dt>
+<dd> <span class="phobos_src"><a class="https" href="https://github.com/dlang/phobos/blob/master/std/experimental/allocator/building_blocks/bitmapped_block.d">std/experimental/allocator/building_blocks/bitmapped_block.d</a></span>
+</dd>
+</dl> <dl>
+<dt class="d_decl" id="BitmappedBlock">struct <strong id="BitmappedBlock">BitmappedBlock</strong>(size_t theBlockSize, uint theAlignment = platformAlignment, ParentAllocator = NullAllocator, Flag!"multiblock" f = Yes.multiblock); </dt> <dd>
+<p><code>BitmappedBlock</code> implements a simple heap consisting of one contiguous area of memory organized in blocks, each of size <code>theBlockSize</code>. A block is a unit of allocation. A bitmap serves as bookkeeping data, more precisely one bit per block indicating whether that block is currently allocated or not. </p>
+<p>Passing <code>NullAllocator</code> as <code>ParentAllocator</code> (the default) means user code manages allocation of the memory block from the outside; in that case <code>BitmappedBlock</code> must be constructed with a <code>ubyte[]</code> preallocated block and has no responsibility regarding the lifetime of its support underlying storage. If another allocator type is passed, <code>BitmappedBlock</code> defines a destructor that uses the parent allocator to release the memory block. That makes the combination of <code>AllocatorList</code>, <code>BitmappedBlock</code>, and a back-end allocator such as <code>MmapAllocator</code> a simple and scalable solution for memory allocation. <br><br> There are advantages to storing bookkeeping data separated from the payload (as opposed to e.g. using <code>AffixAllocator</code> to store metadata together with each allocation). The layout is more compact (overhead is one bit per block), searching for a free block during allocation enjoys better cache locality, and deallocation does not touch memory around the payload being deallocated (which is often cold). <br><br> Allocation requests are handled on a first-fit basis. Although linear in complexity, allocation is in practice fast because of the compact bookkeeping representation, use of simple and fast bitwise routines, and caching of the first available block position. A known issue with this general approach is fragmentation, partially mitigated by coalescing. Since <code>BitmappedBlock</code> does not need to maintain the allocated size, freeing memory implicitly coalesces free blocks together. Also, tuning <code>blockSize</code> has a considerable impact on both internal and external fragmentation. <br><br> If the last template parameter is set to <code>No.multiblock</code>, the allocator will only serve allocations which require at most <code>theBlockSize</code>. The <code>BitmappedBlock</code> has a specialized implementation for single-block allocations which allows for greater performance, at the cost of not being able to allocate more than one block at a time. <br><br> The size of each block can be selected either during compilation or at run time. Statically-known block sizes are frequent in practice and yield slightly better performance. To choose a block size statically, pass it as the <code>blockSize</code> parameter as in <code>BitmappedBlock!(4096)</code>. To choose a block size parameter, use <code>BitmappedBlock!(chooseAtRuntime)</code> and pass the block size to the constructor. </p> <dl>
+<dt>Parameters:</dt>
+<dd><table>
+<tr>
+<td>theBlockSize</td> <td>the length of a block, which must be a multiple of <code>theAlignment</code>
+</td>
+</tr> <tr>
+<td>theAlignment</td> <td>alignment of each block</td>
+</tr> <tr>
+<td>ParentAllocator</td> <td>allocator from which the <code>BitmappedBlock</code> will draw memory. If set to <code>NullAllocator</code>, the storage must be passed via the constructor</td>
+</tr> <tr>
+<td>f</td> <td>
+<code>Yes.multiblock</code> to support allocations spanning across multiple blocks and <code>No.multiblock</code> to support single block allocations. Although limited by single block allocations, <code>No.multiblock</code> will generally provide higher performance.</td>
+</tr> </table></dd>
+</dl> <dl>
+<dt>Examples:</dt>
+<dd>
+<pre data-language="d">// Create a block allocator on top of a 10KB stack region.
+import std.experimental.allocator.building_blocks.region : InSituRegion;
+import std.traits : hasMember;
+InSituRegion!(10_240, 64) r;
+auto a = BitmappedBlock!(64, 64)(cast(ubyte[])(r.allocateAll()));
+static assert(hasMember!(InSituRegion!(10_240, 64), "allocateAll"));
+const b = a.allocate(100);
+writeln(b.length); // 100
+</pre> </dd>
+</dl> <dl>
+<dt>Examples:</dt>
+<dd>
+<pre data-language="d">import std.experimental.allocator.mallocator : Mallocator;
+import std.typecons : Flag, Yes;
+
+enum blockSize = 64;
+enum numBlocks = 10;
+
+// The 'BitmappedBlock' is implicitly instantiated with Yes.multiblock
+auto a = BitmappedBlock!(blockSize, 8, Mallocator, Yes.multiblock)(numBlocks * blockSize);
+
+// Instantiated with Yes.multiblock, can allocate more than one block at a time
+void[] buf = a.allocate(2 * blockSize);
+writeln(buf.length); // 2 * blockSize
+assert(a.deallocate(buf));
+
+// Can also allocate less than one block
+buf = a.allocate(blockSize / 2);
+writeln(buf.length); // blockSize / 2
+
+// Expands inside the same block
+assert(a.expand(buf, blockSize / 2));
+writeln(buf.length); // blockSize
+
+// If Yes.multiblock, can expand past the size of a single block
+assert(a.expand(buf, 3 * blockSize));
+writeln(buf.length); // 4 * blockSize
+assert(a.deallocate(buf));
+</pre> </dd>
+</dl> <dl>
+<dt>Examples:</dt>
+<dd>
+<pre data-language="d">import std.experimental.allocator.mallocator : Mallocator;
+import std.typecons : Flag, No;
+
+enum blockSize = 64;
+auto a = BitmappedBlock!(blockSize, 8, Mallocator, No.multiblock)(1024 * blockSize);
+
+// Since instantiated with No.multiblock, can only allocate at most the block size
+void[] buf = a.allocate(blockSize + 1);
+assert(buf is null);
+
+buf = a.allocate(blockSize);
+writeln(buf.length); // blockSize
+assert(a.deallocate(buf));
+
+// This is also fine, because it's less than the block size
+buf = a.allocate(blockSize / 2);
+writeln(buf.length); // blockSize / 2
+
+// Can expand the buffer until its length is at most 64
+assert(a.expand(buf, blockSize / 2));
+writeln(buf.length); // blockSize
+
+// Cannot expand anymore
+assert(!a.expand(buf, 1));
+assert(a.deallocate(buf));
+</pre> </dd>
+</dl> <dl>
+<dt class="d_decl" id="BitmappedBlock.this">this(ubyte[] data); <br><br>this(ubyte[] data, uint blockSize); <br><br>this(size_t capacity); <br><br>this(ParentAllocator parent, size_t capacity); <br><br>this(size_t capacity, uint blockSize); <br><br>this(ParentAllocator parent, size_t capacity, uint blockSize); </dt> <dd>
+<p>Constructs a block allocator given a hunk of memory, or a desired capacity in bytes. <ul> <li>If <code>ParentAllocator</code> is <a href="std_experimental_allocator_building_blocks_null_allocator.html#NullAllocator"><code>NullAllocator</code></a>, only the constructor taking <code>data</code> is defined and the user is responsible for freeing <code>data</code> if desired.</li> <li>Otherwise, both constructors are defined. The <code>data</code>-based constructor assumes memory has been allocated with the parent allocator. The <code>capacity</code>-based constructor uses <code>ParentAllocator</code> to allocate an appropriate contiguous hunk of memory. Regardless of the constructor used, the destructor releases the memory by using <code>ParentAllocator.deallocate</code>.</li> </ul></p> </dd> <dt class="d_decl" id="BitmappedBlock.blockSize">alias <strong id="blockSize">blockSize</strong> = theBlockSize; </dt> <dd>
+<p>If <code>blockSize == chooseAtRuntime</code>, <code>BitmappedBlock</code> offers a read/write property <code>blockSize</code>. It must be set before any use of the allocator. Otherwise (i.e. <code>theBlockSize</code> is a legit constant), <code>blockSize</code> is an alias for <code>theBlockSize</code>. Whether constant or variable, must also be a multiple of <code>alignment</code>. This constraint is <code>assert</code>ed statically and dynamically.</p> </dd> <dt class="d_decl" id="BitmappedBlock.alignment">alias <strong id="alignment">alignment</strong> = theAlignment; </dt> <dd>
+<p>The alignment offered is user-configurable statically through parameter <code>theAlignment</code>, defaulted to <code>platformAlignment</code>.</p> </dd> <dt class="d_decl" id="BitmappedBlock.parent">ParentAllocator <strong id="parent">parent</strong>; </dt> <dd>
+<p>The parent allocator. Depending on whether <code>ParentAllocator</code> holds state or not, this is a member variable or an alias for <code>ParentAllocator.instance</code>.</p> </dd> <dt class="d_decl" id="BitmappedBlock.goodAllocSize">pure nothrow @nogc @safe size_t <strong id="goodAllocSize">goodAllocSize</strong>(size_t n); </dt> <dd>
+<p>Returns the actual bytes allocated when <code>n</code> bytes are requested, i.e. <code>n.roundUpToMultipleOf(blockSize)</code>.</p> </dd> <dt class="d_decl" id="BitmappedBlock.owns">const pure nothrow @nogc @trusted Ternary <strong id="owns">owns</strong>(const void[] b); </dt> <dd>
+<p>Returns <code>Ternary.yes</code> if <code>b</code> belongs to the <code>BitmappedBlock</code> object, <code>Ternary.no</code> otherwise. Never returns <code>Ternary.unkown</code>. (This method is somewhat tolerant in that accepts an interior slice.)</p> </dd> <dt class="d_decl" id="BitmappedBlock.expand">pure nothrow @nogc @trusted bool <strong id="expand">expand</strong>(ref void[] b, immutable size_t delta); </dt> <dd>
+<p>Expands in place a buffer previously allocated by <code>BitmappedBlock</code>. If instantiated with <code>No.multiblock</code>, the expansion fails if the new length exceeds <code>theBlockSize</code>.</p> </dd> <dt class="d_decl" id="BitmappedBlock.deallocate">nothrow @nogc bool <strong id="deallocate">deallocate</strong>(void[] b); </dt> <dd>
+<p>Deallocates a block previously allocated with this allocator.</p> </dd> <dt class="d_decl" id="BitmappedBlock.allocate">pure nothrow @nogc @trusted void[] <strong id="allocate">allocate</strong>(const size_t s); </dt> <dd>
+<p>Allocates <code>s</code> bytes of memory and returns it, or <code>null</code> if memory could not be allocated. </p>
+<p>The following information might be of help with choosing the appropriate block size. Actual allocation occurs in sizes multiple of the block size. Allocating one block is the fastest because only one 0 bit needs to be found in the metadata. Allocating 2 through 64 blocks is the next cheapest because it affects a maximum of two <code>ulong</code> in the metadata. Allocations greater than 64 blocks require a multiword search through the metadata. <br><br> If instantiated with <code>No.multiblock</code>, it performs a search for the first zero bit in the bitmap and sets it.</p> </dd> <dt class="d_decl" id="BitmappedBlock.allocateFresh">@trusted void[] <strong id="allocateFresh">allocateFresh</strong>(const size_t s); </dt> <dd>
+<p>Allocates s bytes of memory and returns it, or <code>null</code> if memory could not be allocated. <code>allocateFresh</code> behaves just like allocate, the only difference being that this always returns unused(fresh) memory. Although there may still be available space in the <code>BitmappedBlock</code>, <code>allocateFresh</code> could still return null, because all the available blocks have been previously deallocated.</p> </dd> <dt class="d_decl" id="BitmappedBlock.allocateAll">void[] <strong id="allocateAll">allocateAll</strong>(); </dt> <dd>
+<p>If the <code>BitmappedBlock</code> object is empty (has no active allocation), allocates all memory within and returns a slice to it. Otherwise, returns <code>null</code> (i.e. no attempt is made to allocate the largest available block).</p> </dd> <dt class="d_decl" id="BitmappedBlock.empty">pure nothrow @nogc @safe Ternary <strong id="empty">empty</strong>(); </dt> <dd>
+<p>Returns <code>Ternary.yes</code> if no memory is currently allocated with this allocator, otherwise <code>Ternary.no</code>. This method never returns <code>Ternary.unknown</code>.</p> </dd> <dt class="d_decl" id="BitmappedBlock.deallocateAll">pure nothrow @nogc bool <strong id="deallocateAll">deallocateAll</strong>(); </dt> <dd>
+<p>Forcibly deallocates all memory allocated by this allocator, making it available for further allocations. Does not return memory to <code>ParentAllocator</code>.</p> </dd> <dt class="d_decl" id="BitmappedBlock.alignedReallocate">@system bool <strong id="alignedReallocate">alignedReallocate</strong>(ref void[] b, size_t newSize, uint a); </dt> <dd>
+<p>Reallocates a block previously allocated with <code>alignedAllocate</code>. Contractions do not occur in place.</p> </dd> <dt class="d_decl" id="BitmappedBlock.reallocate">@system bool <strong id="reallocate">reallocate</strong>(ref void[] b, size_t newSize); </dt> <dd>
+<p>Reallocates a previously-allocated block. Contractions occur in place.</p> </dd> <dt class="d_decl" id="BitmappedBlock.alignedAllocate">void[] <strong id="alignedAllocate">alignedAllocate</strong>(size_t n, uint a); </dt> <dd>
+<p>Allocates a block with specified alignment <code>a</code>. The alignment must be a power of 2. If <code>a &lt;= alignment</code>, function forwards to <code>allocate</code>. Otherwise, it attempts to overallocate and then adjust the result for proper alignment. In the worst case the slack memory is around two blocks.</p> </dd> </dl> </dd> <dt class="d_decl" id="SharedBitmappedBlock">struct <strong id="SharedBitmappedBlock">SharedBitmappedBlock</strong>(size_t theBlockSize, uint theAlignment = platformAlignment, ParentAllocator = NullAllocator, Flag!"multiblock" f = Yes.multiblock); </dt> <dd>
+<p>The threadsafe version of the <a href="#BitmappedBlock"><code>BitmappedBlock</code></a>. The semantics of the <code>SharedBitmappedBlock</code> are identical to the regular <a href="#BitmappedBlock"><code>BitmappedBlock</code></a>. </p>
+<dl>
+<dt>Parameters:</dt>
+<dd><table>
+<tr>
+<td>theBlockSize</td> <td>the length of a block, which must be a multiple of <code>theAlignment</code>
+</td>
+</tr> <tr>
+<td>theAlignment</td> <td>alignment of each block</td>
+</tr> <tr>
+<td>ParentAllocator</td> <td>allocator from which the <code>BitmappedBlock</code> will draw memory. If set to <code>NullAllocator</code>, the storage must be passed via the constructor</td>
+</tr> <tr>
+<td>f</td> <td>
+<code>Yes.multiblock</code> to support allocations spanning across multiple blocks and <code>No.multiblock</code> to support single block allocations. Although limited by single block allocations, <code>No.multiblock</code> will generally provide higher performance.</td>
+</tr> </table></dd>
+</dl> <dl>
+<dt>Examples:</dt>
+<dd>
+<pre data-language="d">import std.experimental.allocator.mallocator : Mallocator;
+import std.experimental.allocator.common : platformAlignment;
+import std.typecons : Flag, Yes, No;
+
+// Create 'numThreads' threads, each allocating in parallel a chunk of memory
+static void testAlloc(Allocator)(ref Allocator a, size_t allocSize)
+{
+    import core.thread : ThreadGroup;
+    import std.algorithm.sorting : sort;
+    import core.internal.spinlock : SpinLock;
+
+    SpinLock lock = SpinLock(SpinLock.Contention.brief);
+    enum numThreads = 10;
+    void[][numThreads] buf;
+    size_t count = 0;
+
+    // Each threads allocates 'allocSize'
+    void fun()
+    {
+        void[] b = a.allocate(allocSize);
+        writeln(b.length); // allocSize
+
+        lock.lock();
+        scope(exit) lock.unlock();
+
+        buf[count] = b;
+        count++;
+    }
+
+    auto tg = new ThreadGroup;
+    foreach (i; 0 .. numThreads)
+    {
+        tg.create(&amp;fun);
+    }
+    tg.joinAll();
+
+    // Sorting the allocations made by each thread, we expect the buffers to be
+    // adjacent inside the SharedBitmappedBlock
+    sort!((a, b) =&gt; a.ptr &lt; b.ptr)(buf[0 .. numThreads]);
+    foreach (i; 0 .. numThreads - 1)
+    {
+        assert(buf[i].ptr + a.goodAllocSize(buf[i].length) &lt;= buf[i + 1].ptr);
+    }
+
+    // Deallocate everything
+    foreach (i; 0 .. numThreads)
+    {
+        assert(a.deallocate(buf[i]));
+    }
+}
+
+enum blockSize = 64;
+auto alloc1 = SharedBitmappedBlock!(blockSize, platformAlignment, Mallocator, Yes.multiblock)(1024 * 1024);
+auto alloc2 = SharedBitmappedBlock!(blockSize, platformAlignment, Mallocator, No.multiblock)(1024 * 1024);
+testAlloc(alloc1, 2 * blockSize);
+testAlloc(alloc2, blockSize);
+</pre> </dd>
+</dl> <dl>
+<dt class="d_decl" id="SharedBitmappedBlock.this">this(ubyte[] data); <br><br>this(ubyte[] data, uint blockSize); <br><br>this(size_t capacity); <br><br>this(ParentAllocator parent, size_t capacity); <br><br>this(size_t capacity, uint blockSize); <br><br>this(ParentAllocator parent, size_t capacity, uint blockSize); </dt> <dd>
+<p>Constructs a block allocator given a hunk of memory, or a desired capacity in bytes. <ul> <li>If <code>ParentAllocator</code> is <a href="std_experimental_allocator_building_blocks_null_allocator.html#NullAllocator"><code>NullAllocator</code></a>, only the constructor taking <code>data</code> is defined and the user is responsible for freeing <code>data</code> if desired.</li> <li>Otherwise, both constructors are defined. The <code>data</code>-based constructor assumes memory has been allocated with the parent allocator. The <code>capacity</code>-based constructor uses <code>ParentAllocator</code> to allocate an appropriate contiguous hunk of memory. Regardless of the constructor used, the destructor releases the memory by using <code>ParentAllocator.deallocate</code>.</li> </ul></p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.blockSize">alias <strong id="blockSize">blockSize</strong> = theBlockSize; </dt> <dd>
+<p>If <code>blockSize == chooseAtRuntime</code>, <code>SharedBitmappedBlock</code> offers a read/write property <code>blockSize</code>. It must be set before any use of the allocator. Otherwise (i.e. <code>theBlockSize</code> is a legit constant), <code>blockSize</code> is an alias for <code>theBlockSize</code>. Whether constant or variable, must also be a multiple of <code>alignment</code>. This constraint is <code>assert</code>ed statically and dynamically.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.alignment">alias <strong id="alignment">alignment</strong> = theAlignment; </dt> <dd>
+<p>The alignment offered is user-configurable statically through parameter <code>theAlignment</code>, defaulted to <code>platformAlignment</code>.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.parent">ParentAllocator <strong id="parent">parent</strong>; </dt> <dd>
+<p>The parent allocator. Depending on whether <code>ParentAllocator</code> holds state or not, this is a member variable or an alias for <code>ParentAllocator.instance</code>.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.goodAllocSize">pure nothrow @nogc @safe size_t <strong id="goodAllocSize">goodAllocSize</strong>(size_t n); </dt> <dd>
+<p>Returns the actual bytes allocated when <code>n</code> bytes are requested, i.e. <code>n.roundUpToMultipleOf(blockSize)</code>.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.owns">const pure nothrow @nogc @trusted Ternary <strong id="owns">owns</strong>(const void[] b); </dt> <dd>
+<p>Returns <code>Ternary.yes</code> if <code>b</code> belongs to the <code>SharedBitmappedBlock</code> object, <code>Ternary.no</code> otherwise. Never returns <code>Ternary.unkown</code>. (This method is somewhat tolerant in that accepts an interior slice.)</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.expand">bool <strong id="expand">expand</strong>(ref void[] b, immutable size_t delta); </dt> <dd>
+<p>Expands in place a buffer previously allocated by <code>SharedBitmappedBlock</code>. Expansion fails if the new length exceeds the block size.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.deallocate">nothrow @nogc bool <strong id="deallocate">deallocate</strong>(void[] b); </dt> <dd>
+<p>Deallocates the given buffer <code>b</code>, by atomically setting the corresponding bit to <code>0</code>. <code>b</code> must be valid, and cannot contain multiple adjacent <code>blocks</code>.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.allocate">nothrow @nogc @trusted void[] <strong id="allocate">allocate</strong>(const size_t s); </dt> <dd>
+<p>Allocates <code>s</code> bytes of memory and returns it, or <code>null</code> if memory could not be allocated. </p>
+<p>The <code>SharedBitmappedBlock</code> cannot allocate more than the given block size. Allocations are satisfied by searching the first unset bit in the bitmap, and atomically setting it. In rare memory pressure scenarios, the allocation could fail.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.allocateFresh">@trusted void[] <strong id="allocateFresh">allocateFresh</strong>(const size_t s); </dt> <dd>
+<p>Allocates s bytes of memory and returns it, or <code>null</code> if memory could not be allocated. <code>allocateFresh</code> behaves just like allocate, the only difference being that this always returns unused(fresh) memory. Although there may still be available space in the <code>SharedBitmappedBlock</code>, <code>allocateFresh</code> could still return null, because all the available blocks have been previously deallocated.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.allocateAll">void[] <strong id="allocateAll">allocateAll</strong>(); </dt> <dd>
+<p>If the <code>SharedBitmappedBlock</code> object is empty (has no active allocation), allocates all memory within and returns a slice to it. Otherwise, returns <code>null</code> (i.e. no attempt is made to allocate the largest available block).</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.empty">nothrow @nogc @safe Ternary <strong id="empty">empty</strong>(); </dt> <dd>
+<p>Returns <code>Ternary.yes</code> if no memory is currently allocated with this allocator, otherwise <code>Ternary.no</code>. This method never returns <code>Ternary.unknown</code>.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.deallocateAll">nothrow @nogc bool <strong id="deallocateAll">deallocateAll</strong>(); </dt> <dd>
+<p>Forcibly deallocates all memory allocated by this allocator, making it available for further allocations. Does not return memory to <code>ParentAllocator</code>.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.alignedReallocate">@system bool <strong id="alignedReallocate">alignedReallocate</strong>(ref void[] b, size_t newSize, uint a); </dt> <dd>
+<p>Reallocates a block previously allocated with <code>alignedAllocate</code>. Contractions do not occur in place.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.reallocate">@system bool <strong id="reallocate">reallocate</strong>(ref void[] b, size_t newSize); </dt> <dd>
+<p>Reallocates a previously-allocated block. Contractions occur in place.</p> </dd> <dt class="d_decl" id="SharedBitmappedBlock.alignedAllocate">void[] <strong id="alignedAllocate">alignedAllocate</strong>(size_t n, uint a); </dt> <dd>
+<p>Allocates a block with specified alignment <code>a</code>. The alignment must be a power of 2. If <code>a &lt;= alignment</code>, function forwards to <code>allocate</code>. Otherwise, it attempts to overallocate and then adjust the result for proper alignment. In the worst case the slack memory is around two blocks.</p> </dd> </dl> </dd> <dt class="d_decl" id="BitmappedBlockWithInternalPointers">struct <strong id="BitmappedBlockWithInternalPointers">BitmappedBlockWithInternalPointers</strong>(size_t theBlockSize, uint theAlignment = platformAlignment, ParentAllocator = NullAllocator); </dt> <dd>
+<p>A <code>BitmappedBlock</code> with additional structure for supporting <code>resolveInternalPointer</code>. To that end, <code>BitmappedBlockWithInternalPointers</code> adds a bitmap (one bit per block) that marks object starts. The bitmap itself has variable size and is allocated together with regular allocations. </p>
+<p>The time complexity of <code>resolveInternalPointer</code> is <span class="bigoh">Ο(<code>k</code>)</span>, where <code>k</code> is the size of the object within which the internal pointer is looked up.</p> <dl>
+<dt class="d_decl" id="BitmappedBlockWithInternalPointers.this">this(ubyte[] data); <br><br>this(size_t capacity); <br><br>this(ParentAllocator parent, size_t capacity); </dt> <dd>
+<p>Constructors accepting desired capacity or a preallocated buffer, similar in semantics to those of <code>BitmappedBlock</code>.</p> </dd> <dt class="d_decl" id="BitmappedBlockWithInternalPointers.alignment">alias <strong id="alignment">alignment</strong> = theAlignment; <br><br>pure nothrow @nogc @safe size_t <strong id="goodAllocSize">goodAllocSize</strong>(size_t n); <br><br>void[] <strong id="allocate">allocate</strong>(size_t bytes); <br><br>void[] <strong id="allocateAll">allocateAll</strong>(); <br><br>bool <strong id="expand">expand</strong>(ref void[] b, size_t bytes); <br><br>bool <strong id="deallocate">deallocate</strong>(void[] b); <br><br>nothrow @nogc @safe Ternary <strong id="resolveInternalPointer">resolveInternalPointer</strong>(const void* p, ref void[] result); <br><br>Ternary <strong id="empty">empty</strong>(); </dt> <dd>
+<p>Allocator primitives.</p> </dd> </dl> </dd> </dl><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 1999&ndash;2021 The D Language Foundation<br>Licensed under the Boost License 1.0.<br>
+    <a href="https://dlang.org/phobos/std_experimental_allocator_building_blocks_bitmapped_block.html" class="_attribution-link">https://dlang.org/phobos/std_experimental_allocator_building_blocks_bitmapped_block.html</a>
+  </p>
+</div>

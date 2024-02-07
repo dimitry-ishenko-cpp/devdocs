@@ -1,0 +1,487 @@
+<h1 class="title">Asynchronous connections</h1> <div class="alg-content">
+<p>Certain RethinkDB drivers support asynchronous connections by integrating with popular async libraries. This is particularly useful with <a href="../changefeeds/index.html">changefeeds</a> and other real-time applications.</p> <p>Due to its event-driven nature, JavaScript can easily execute RethinkDB queries in an asynchronous fashion. The official RethinkDB drivers currently support integration with EventMachine for Ruby, and Tornado and Twisted for Python.</p> <div class="toc">  <ul id="markdown-toc"> <li><a href="#javascript" id="markdown-toc-javascript">JavaScript</a></li> <li><a href="#ruby-with-eventmachine" id="markdown-toc-ruby-with-eventmachine">Ruby with EventMachine</a></li> <li><a href="#python-with-tornado-or-twisted" id="markdown-toc-python-with-tornado-or-twisted">Python with Tornado or Twisted</a></li> </ul> </div> <h2 id="javascript">JavaScript</h2> <p>No special procedures or commands are necessary to execute RethinkDB queries asynchronously in JavaScript. Read about using callbacks and promises with RethinkDB in the documentation for the <a href="https://rethinkdb.com/api/javascript/run/">run</a> command.</p> <p>In addition, RethinkDB’s cursors and feeds implement an <a href="https://rethinkdb.com/api/javascript/ee-cursor/">EventEmitter interface</a> compatible with Node’s. This allows your application to set up listeners to receive data from queries as the data becomes available.</p> <h2 id="ruby-with-eventmachine">Ruby with EventMachine</h2> <p>The RethinkDB Ruby driver adds a new ReQL command, <a href="https://rethinkdb.com/api/ruby/em_run">em_run</a>, designed to work with <a href="http://rubyeventmachine.com">EventMachine</a>. In addition, it provides a superclass, <code class="language-plaintext highlighter-rouge">RethinkDB::Handler</code>, with event-specific methods (e.g., <code class="language-plaintext highlighter-rouge">on_open</code>, <code class="language-plaintext highlighter-rouge">on_close</code>) that may be overridden by a class your application defines and passes to <code class="language-plaintext highlighter-rouge">em_run</code>.</p> <h3 id="simple-usage">Simple usage</h3> <p>The easiest way to use RethinkDB with EventMachine is simply by passing a block to <code class="language-plaintext highlighter-rouge">em_run</code>. If RethinkDB returns a sequence (including a stream), the block will be called once with each element of the sequence. Otherwise, the block will be called just once with the returned value.</p> <p><strong>Example:</strong> Iterate over a stream</p> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">require 'eventmachine'
+require 'rethinkdb'
+include RethinkDB::Shortcuts
+
+conn = r.connect(host: 'localhost', port: 28015)
+
+EventMachine.run {
+  r.table('test').order_by(:index =&gt; 'id').em_run(conn) { |row|
+    # do something with returned row data
+    p row
+  }
+}
+</pre></div></div> <h3 id="explicitly-closing-a-query">Explicitly closing a query</h3> <p>The <code class="language-plaintext highlighter-rouge">em_run</code> command returns a <code class="language-plaintext highlighter-rouge">QueryHandle</code> instance. The <code class="language-plaintext highlighter-rouge">QueryHandle</code> will be closed when all results have been received, or when EventMachine stops running. You can explicitly close it with the <code class="language-plaintext highlighter-rouge">close</code> method.</p> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">EventMachine.run {
+  printed = 0
+  handle = r.table('test').order_by(:index =&gt; 'id').em_run(conn) { |row|
+    printed += 1
+    if printed &gt; 3
+      handle.close
+    else
+      p row
+    end
+  }
+}
+</pre></div></div> <h3 id="handling-errors">Handling errors</h3> <p>In the form above—with a block that accepts a single argument—RethinkDB’s EventMachine adapter will throw errors back up to your application for you to handle in the same fashion as you would using RethinkDB without EventMachine. If the table <code class="language-plaintext highlighter-rouge">test</code> did not exist in the database above, you would receive the standard <code class="language-plaintext highlighter-rouge">ReqlRunTimeError</code>:</p> <div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">RethinkDB::ReqlRunTimeError: Table `test.test` does not exist.
+Backtrace:
+r.table('test')
+^^^^^^^^^^^^^^^
+</pre></div></div> <p>You can also choose to receive errors in the block by accepting two arguments.</p> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">EventMachine.run {
+  r.table('test').order_by(:index =&gt; 'id').em_run(conn) { |err, row|
+  if err
+    p [:err, err.to_s]
+  else
+    p [:row, row]
+  end
+  }
+}
+</pre></div></div> <p>In this form, the block will receive <code class="language-plaintext highlighter-rouge">nil</code> as the first argument if there is no error. In the case of an error, the second argument will be <code class="language-plaintext highlighter-rouge">nil</code>.</p> <h3 id="using-rethinkdbhandler">Using RethinkDB::Handler</h3> <p>To gain more precise control, write a class that inherits from <code class="language-plaintext highlighter-rouge">RethinkDB::Handler</code> and override the event handling methods, then pass an instance of that class to <code class="language-plaintext highlighter-rouge">em_run</code>.</p> <p><strong>Example:</strong> Iterate over a stream using a handler</p> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">require 'eventmachine'
+require 'rethinkdb'
+include RethinkDB::Shortcuts
+
+conn = r.connect(host: 'localhost', port: 28015)
+
+class Printer &lt; RethinkDB::Handler
+
+  def on_open
+    p :open
+  end
+  
+  def on_close
+    p :closed
+  end
+  
+  def on_error(err)
+    p [:err, err.to_s]
+  end
+  
+  def on_val(val)
+    p [:val, val]
+  end
+
+end
+
+EventMachine.run {
+  r.table('test').order_by(:index =&gt; 'id').em_run(conn, Printer)
+}
+
+# Sample output
+:open
+[:val, {"id"=&gt;1}]
+[:val, {"id"=&gt;2}]
+[:val, {"id"=&gt;3}]
+:closed
+</pre></div></div> <h3 id="distinguishing-between-data-types">Distinguishing between data types</h3> <p>In addition to the simple <code class="language-plaintext highlighter-rouge">on_val</code> method, you can provide methods that specifically apply to arrays, streams and atoms.</p> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">class Printer &lt; RethinkDB::Handler
+
+  def on_open
+    p :open
+  end
+  
+  def on_close
+    p :closed
+  end
+  
+  def on_error(err)
+    p [:err, err.to_s]
+  end
+  
+  # Handle arrays
+  def on_array(array)
+    p [:array, array]
+  end
+  
+  # Handle atoms
+  def on_atom(atom)
+    p [:atom, atom]
+  end
+  
+  # Handle individual values received from streams
+  def on_stream_val(val)
+    p [:stream_val, val]
+  end
+  
+  def on_val(val)
+    p [:val, val]
+  end
+
+end
+
+EventMachine.run {
+  r.table('test').order_by(:index =&gt; 'id').em_run(conn, Printer)
+  # print an array
+  r.expr([1, 2, 3]).em_run(conn, Printer)
+  # print a single row
+  r.table('test').get(1).em_run(conn, Printer)
+}
+
+# Sample output
+:open
+[:stream_val, {"id"=&gt;0}]
+[:stream_val, {"id"=&gt;1}]
+[:stream_val, {"id"=&gt;2}]
+:closed
+:open
+[:array, [1, 2, 3]]
+:closed
+:open
+[:atom, {"id"=&gt;0}]
+:closed
+</pre></div></div> <p>The various <code class="language-plaintext highlighter-rouge">on_*</code> methods provide fallbacks for one another:</p> <ul> <li>an array will be handled by <code class="language-plaintext highlighter-rouge">on_array</code> if defined; otherwise it will be handled by <code class="language-plaintext highlighter-rouge">on_atom</code>. If neither of those are defined, the <em>individual elements</em> of the array will be handled by <code class="language-plaintext highlighter-rouge">on_stream_val</code> or, if that is not defined, <code class="language-plaintext highlighter-rouge">on_val</code>.</li> <li>a stream will be handled by <code class="language-plaintext highlighter-rouge">on_stream_val</code> if defined; otherwise it will be handled by <code class="language-plaintext highlighter-rouge">on_val</code>.</li> <li>data that is <em>not</em> a stream will be handled by <code class="language-plaintext highlighter-rouge">on_atom</code> if defined; otherwise it will be handled by <code class="language-plaintext highlighter-rouge">on_val</code>.</li> </ul> <p>Thus, <code class="language-plaintext highlighter-rouge">on_val</code> acts a “catch-all” for any data that is not handled by a more specific method.</p> <p>The order in which callbacks are called in the <code class="language-plaintext highlighter-rouge">EventMachine.run</code> block is not guaranteed; in the sample output above, <code class="language-plaintext highlighter-rouge">[:array, [1, 2, 3]]</code> might have printed first.</p> <h3 id="changefeeds">Changefeeds</h3> <p>A changefeed is handled like any other stream; when you pass a block to <code class="language-plaintext highlighter-rouge">em_run</code>, the block is called with each document received on the feed. If you pass a <code class="language-plaintext highlighter-rouge">Handler</code> that defines <code class="language-plaintext highlighter-rouge">on_stream_val</code> (or <code class="language-plaintext highlighter-rouge">on_val</code>), those methods will be called with each document.</p> <p>In addition, there are changefeed-specific methods that may be defined.</p> <ul> <li>
+<code class="language-plaintext highlighter-rouge">on_initial_val</code>: if the changefeed returns initial values (<code class="language-plaintext highlighter-rouge">include_initial</code> has been specified as an option to <a href="https://rethinkdb.com/api/ruby/changes/">changes</a>, those values will be passed to this method.</li> <li>
+<code class="language-plaintext highlighter-rouge">on_uninitial_val</code>: a changefeed that returns initial values may also return “uninitial” values to indicate a document already sent as an initial value has been changed (see the <code class="language-plaintext highlighter-rouge">changes</code> documentation for details); those values, if any, will be passed to this method.</li> <li>
+<code class="language-plaintext highlighter-rouge">on_change</code>: changes will be passed to this method.</li> <li>
+<code class="language-plaintext highlighter-rouge">on_change_error</code>: if the feed includes a document specifying errors that do not cause the feed to abort (for instance, a notification the server discarded some changes), those errors will be passed to this method.</li> <li>
+<code class="language-plaintext highlighter-rouge">on_state</code>: a feed may include documents specifying the state of the stream; those documents will be passed to this function if defined.</li> </ul> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">class FeedPrinter &lt; RethinkDB::Handler
+
+  def on_open
+    p :open
+  end
+  
+  def on_close
+    p :closed
+  end
+  
+  def on_error(err)
+    p [:err, err.to_s]
+  end
+  
+  def on_initial_val(val)
+    p [:initial, val]
+  end
+  
+  def on_state(state)
+    p [:state, state]
+  end
+  
+  def on_change(old, new)
+    p [:change, old, new]
+  end  
+
+end
+
+# Subscribe to changes on the documents with the two lowest ids
+EventMachine.run {
+  r.table('test').order_by(:index =&gt; 'id').limit(2).changes
+    .em_run(conn, FeedPrinter)
+}
+
+# Sample output
+:open
+[:state, "initializing"]
+[:initial_val, {"id"=&gt;1}]
+[:initial_val, {"id"=&gt;0}]
+[:state, "ready"]
+
+# Execute: r.table('test').insert({id: 0.5}).run(conn)
+[:change, {"id"=&gt;1}, {"id"=&gt;0.5}]
+
+# Execute: r.table_drop('test').run(conn)
+[:err, "Changefeed aborted (table unavailable).\nBacktrace..."]
+:closed
+</pre></div></div> <h3 id="using-one-handler-with-multiple-queries">Using one Handler with multiple queries</h3> <p>You can register multiple queries with the same <code class="language-plaintext highlighter-rouge">Handler</code> instance. If you define <code class="language-plaintext highlighter-rouge">Handler</code> methods with an additional argument (two arguments instead of one, or one argument instead of zero), that argument will receive the appropriate <code class="language-plaintext highlighter-rouge">QueryHandle</code> instance.</p> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">class MultiQueryPrinter &lt; RethinkDB::Handler
+  
+  def on_open(qh)
+    p [:open, names[qh]]
+  end
+  
+  def on_close(qh)
+    p [:close, names[qh]]
+    EventMachine.stop if @closed == 2
+  end
+  
+  def on_val(val, qh)
+    p [:val, val, names[qh]]
+  end
+  
+end
+
+EventMachine.run {
+  printer = Printer.new
+  h1 = r.expr(1).em_run(conn, printer)
+  h2 = r.expr(2).em_run(conn, printer)
+  names = { h1 =&gt; "h1", h2 =&gt; "h2" }
+}
+
+# Sample output
+[:open, "h1"]
+[:val, 1, "h1"]
+[:close, "h1"]
+[:open, "h2"]
+[:val, 2, "h2"]
+[:close, "h2"]
+</pre></div></div> <h3 id="stopping-a-handler">Stopping a Handler</h3> <p>If you call the <code class="language-plaintext highlighter-rouge">stop</code> method on a <code class="language-plaintext highlighter-rouge">Handler</code>, it will stop processing changes and open streams using that handler will be closed. Queries registered with that handler instance will not be interrupted if they are currently processing (e.g., a batch write), but will close rather than executing after the handler has been stopped.</p> <p><strong>Example:</strong> Print the first five changes to a table. After the handler has been stopped, the changefeed query will be closed on the next change to the table rather than returning a value.</p> <div class="language-rb highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">class FeedPrinter &lt; RethinkDB::Handler
+  
+  def initialize(max)
+    @counter = max
+    stop if @counter &lt;= 0
+  end
+  
+  def on_open
+    # Once the changefeed is open, insert 10 rows
+    r.table('test').insert([{}] * 10).run(conn, noreply: true)
+  end
+  
+  def on_val(val)
+    # Every time we print a change, decrement @counter and stop if we hit 0
+    p val
+    @counter -= 1
+    stop if @counter &lt;= 0
+  end
+  
+end
+
+EventMachine.run {
+  r.table('test').changes.em_run(conn, Printer.new(5))
+}
+</pre></div></div> <h2 id="python-with-tornado-or-twisted">Python with Tornado or Twisted</h2> <p>The RethinkDB Python driver integrates with both the <a href="http://www.tornadoweb.org/">Tornado web framework</a> and the <a href="http://twistedmatrix.com/">Twisted networking engine</a>. By using the <a href="https://rethinkdb.com/api/python/set_loop_type">set_loop_type</a> command, you can select either the <code class="language-plaintext highlighter-rouge">'tornado'</code> or <code class="language-plaintext highlighter-rouge">'twisted'</code> event loop model, returning Tornado <code class="language-plaintext highlighter-rouge">Future</code> objects or Twisted <code class="language-plaintext highlighter-rouge">Deferred</code> objects respectively.</p> <h3 id="tornado">Tornado</h3> <h4 id="basic-usage">Basic Usage</h4> <p>Before <code class="language-plaintext highlighter-rouge">connect</code>, use the <code class="language-plaintext highlighter-rouge">set_loop_type("tornado")</code> command to set RethinkDB to use asynchronous event loops compatible with Tornado.</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">from rethinkdb import RethinkDB
+from tornado import ioloop, gen
+from tornado.concurrent import Future, chain_future
+import functools
+
+r = RethinkDB()
+r.set_loop_type("tornado")
+connection = r.connect(host='localhost', port=28015)
+</pre></div></div> <p>After executing <code class="language-plaintext highlighter-rouge">set_loop_type</code>, <code class="language-plaintext highlighter-rouge">r.connect</code> will return a Tornado <code class="language-plaintext highlighter-rouge">Future</code>, as will <code class="language-plaintext highlighter-rouge">r.run</code>.</p> <p><strong>Example:</strong> Simple use</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@gen.coroutine
+def single_row(connection_future):
+    # Wait for the connection to be ready
+    connection = yield connection_future
+    # Insert some data
+    yield r.table('test').insert([{"id": 0}, {"id": 1}, {"id": 2}]).run(connection)
+    # Print the first row in the table
+    row = yield r.table('test').get(0).run(connection)
+    print(row)
+
+# Output
+{u'id': 0}
+</pre></div></div> <p><strong>Example:</strong> Using a cursor</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@gen.coroutine
+def use_cursor(connection_future):
+    # Wait for the connection to be ready
+    connection = yield connection_future
+    # Insert some data
+    yield r.table('test').insert([{"id": 0}, {"id": 1}, {"id": 2}]).run(connection)
+    # Print every row in the table.
+    cursor = yield r.table('test').order_by(index="id").run(connection)
+    while (yield cursor.fetch_next()):
+        item = yield cursor.next()
+        print(item)
+
+# Output
+{u'id': 0}
+{u'id': 1}
+{u'id': 2}
+</pre></div></div> <p>Note that looping over a cursor must be done with <code class="language-plaintext highlighter-rouge">while</code> and <code class="language-plaintext highlighter-rouge">fetch_next</code>, rather than using a <code class="language-plaintext highlighter-rouge">for x in cursor</code> loop.</p> <h4 id="error-handling">Error handling</h4> <p>If an error occurs during an asynchronous operation, the <code class="language-plaintext highlighter-rouge">yield</code> statement will throw an exception as normal. This may happen immediately (for example, you might reference a table that doesn’t exist), but your application might receive large amounts of data before the error (for example, your network might be disrupted after the connection is established).</p> <p>One error in particular is notable. If you have a coroutine set to consume a changefeed indefinitely, and the connection closes, the coroutine will experience a <code class="language-plaintext highlighter-rouge">ReqlRuntimeError</code>.</p> <p><strong>Example:</strong> Re-thrown errors</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@gen.coroutine
+def bad_table(connection):
+    yield r.table('non_existent').run(connection)
+
+Traceback (most recent call last):
+... elided ...
+rethinkdb.errors.ReqlRuntimeError: Table `test.non_existent` does not exist. in:
+r.table('non_existent')
+^^^^^^^^^^^^^^^^^^^^^^^
+</pre></div></div> <p><strong>Example:</strong> Catching errors in the coroutine</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@gen.coroutine
+def catch_bad_table(connection):
+    try:
+        yield r.table('non_existent').run(connection)
+    except r.ReqlRuntimeError:
+        print("Saw error")
+
+# Output
+Saw error
+</pre></div></div> <h4 id="subscribing-to-changefeeds">Subscribing to changefeeds</h4> <p>The asynchronous database API allows you to handle multiple changefeeds simultaneously by scheduling background coroutines. As an example, consider this changefeed handler:</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@gen.coroutine
+def print_cfeed_data(connection_future, table):
+    connection = yield connection_future
+    feed = yield r.table(table).changes().run(connection)
+    while (yield feed.fetch_next()):
+        item = yield feed.next()
+        print(item)
+</pre></div></div> <p>We can schedule it on the Tornado IO loop with this code:</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">ioloop.IOLoop.current().add_callback(print_cfeed_data, connection, table)
+</pre></div></div> <p>Now the coroutine will run in the background, printing out changes. When we alter the table, the changes will be noticed.</p> <p>Now, consider a larger example.</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">class ChangefeedNoticer(object):
+    def __init__(self, connection):
+        self._connection = connection
+        self._sentinel = object()
+        self._cancel_future = Future()
+    @gen.coroutine
+    def print_cfeed_data(self, table):
+        feed = yield r.table(table).changes().run(self._connection)
+        self._feeds_ready[table].set_result(True)
+        while (yield feed.fetch_next()):
+            cursor = feed.next()
+            chain_future(self._cancel_future, cursor)
+            item = yield cursor
+            if item is self._sentinel:
+                return
+            print("Seen on table %s: %s" % (table, item))
+    @gen.coroutine
+    def table_write(self, table):
+        for i in range(10):
+            yield r.table(table).insert({'id': i}).run(self._connection)
+    @gen.coroutine
+    def exercise_changefeeds(self):
+        self._feeds_ready = {'a': Future(), 'b': Future()}
+        loop = ioloop.IOLoop.current()
+        loop.add_callback(self.print_cfeed_data, 'a')
+        loop.add_callback(self.print_cfeed_data, 'b')
+        yield self._feeds_ready
+        yield [self.table_write('a'), self.table_write('b')]
+        self._cancel_future.set_result(self._sentinel)
+    @classmethod
+    @gen.coroutine
+    def run(cls, connection_future):
+        connection = yield connection_future
+        if 'a' in (yield r.table_list().run(connection)):
+            yield r.table_drop('a').run(connection)
+        yield r.table_create('a').run(connection)
+        if 'b' in (yield r.table_list().run(connection)):
+            yield r.table_drop('b').run(connection)
+        yield r.table_create('b').run(connection)
+        noticer = cls(connection)
+        yield noticer.exercise_changefeeds()
+
+# Output
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 0}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 0}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 1}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 1}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 2}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 2}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 3}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 3}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 4}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 4}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 5}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 6}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 5}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 7}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 6}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 8}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 7}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 9}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 8}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 9}}
+</pre></div></div> <p>Here, we listen for changes on multiple tables at once. We simultaneously write into the tables, and observe our writes appear in the changefeeds. We then cancel the changefeeds after we’ve written 10 items into each of the tables.</p> <h3 id="twisted">Twisted</h3> <h4 id="basic-usage-1">Basic Usage</h4> <p>Before <code class="language-plaintext highlighter-rouge">connect</code>, use the <code class="language-plaintext highlighter-rouge">set_loop_type("twisted")</code> command to set RethinkDB to use asynchronous event loops compatible with the Twisted reactor.</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">from rethinkdb import RethinkDB
+from twisted.internet import reactor, defer
+from twisted.internet.defer import inlineCallbacks, returnValue
+
+r = RethinkDB()
+r.set_loop_type('twisted')
+connection = r.connect(host='localhost', port=28015)
+</pre></div></div> <p>After executing <code class="language-plaintext highlighter-rouge">set_loop_type</code>, <code class="language-plaintext highlighter-rouge">r.connect</code> will return a Twisted <code class="language-plaintext highlighter-rouge">Deferred</code>, as will <code class="language-plaintext highlighter-rouge">r.run</code>.</p> <p><strong>Example:</strong> Simple use</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@inlineCallbacks
+def single_row(conn_deferred):
+    # Wait for the connection to be ready
+    conn = yield conn_deferred
+    # Insert some data
+    yield r.table('test').insert([{"id": 0}, {"id": 1}, {"id": 2}]).run(conn)
+    # Print the first row in the table
+    row = yield r.table('test').get(0).run(conn)
+    print(row)
+
+# Output
+{u'id': 0}
+</pre></div></div> <p><strong>Example:</strong> Using a cursor</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@inlineCallbacks
+def use_cursor(conn):
+    # Insert some data
+    yield r.table('test').insert([{"id": 0}, {"id": 1}, {"id": 2}]).run(conn)
+    # Print every row in the table.
+    cursor = yield r.table('test').order_by(index="id").run(conn)
+    while (yield cursor.fetch_next()):
+        item = yield cursor.next()
+        print(item)
+
+# Output:
+{u'id': 0}
+{u'id': 1}
+{u'id': 2}
+</pre></div></div> <p>Note that looping over a cursor must be done with <code class="language-plaintext highlighter-rouge">while</code> and <code class="language-plaintext highlighter-rouge">fetch_next</code>, rather than using a <code class="language-plaintext highlighter-rouge">for x in cursor</code> loop.</p> <h4 id="error-handling-1">Error handling</h4> <p>If an error occurs during an asynchronous operation, the <code class="language-plaintext highlighter-rouge">yield</code> statement will throw an exception as normal. This may happen immediately (for example, you might reference a table that doesn’t exist), but your application might receive large amounts of data before the error (for example, your network might be disrupted after the connection is established).</p> <p>One error in particular is notable. If you have a task that consumes a changefeed indefinitely, and the connection closes, the task will experience a <code class="language-plaintext highlighter-rouge">ReqlRuntimeError</code>.</p> <p><strong>Example:</strong> Re-thrown errors</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@inlineCallbacks
+def bad_table(conn):
+    yield r.table('non_existent').run(conn)
+
+Unhandled error in Deferred:
+Traceback (most recent call last):
+Failure: rethinkdb.errors.ReqlOpFailedError: Table `test.non_existent` does not exist in:
+r.table('non_existent')
+^^^^^^^^^^^^^^^^^^^^^^^
+
+</pre></div></div> <p><strong>Example:</strong> Catching runtime errors</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@inlineCallbacks
+def catch_bad_table(conn):
+    try:
+        yield r.table('non_existent').run(conn)
+    except r.ReqlRuntimeError:
+        print("Saw error")
+
+# Output
+Saw error
+</pre></div></div> <h4 id="subscribing-to-changefeeds-1">Subscribing to changefeeds</h4> <p>The asynchronous database API allows you to handle multiple changefeeds simultaneously by running multiple background tasks. As an example, consider this changefeed handler:</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@inlineCallbacks
+def print_feed(conn, table):
+    feed = yield r.table(table).changes().run(conn)
+    while (yield feed.fetch_next()):
+        item = yield feed.next()
+        print("Seen on table %s: %s" % (table, str(item)))
+</pre></div></div> <p>We can schedule it on the Twisted <code class="language-plaintext highlighter-rouge">reactor</code> with this code:</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">reactor.callLater(0, print_cfeed_data, conn, table)
+</pre></div></div> <p>Now the task will run in the background, printing out changes. When we alter the table, the changes will be noticed.</p> <p>Now consider a larger example:</p> <div class="language-py highlighter-rouge"><div class="highlight"><pre class="highlight" data-language="">@inlineCallbacks
+def print_feed(conn, table, ready, cancel):
+    def errback_feed(feed, err):
+        feed.close()
+        return err
+
+    feed = yield r.table(table).changes().run(conn)
+    cancel.addErrback(lambda err: errback_feed(feed, err))
+    ready.callback(None)
+    while (yield feed.fetch_next()):
+        item = yield feed.next()
+        print("Seen on table %s: %s" % (table, str(item)))
+
+@inlineCallbacks
+def table_write(conn, table):
+    for i in range(10):
+        yield r.table(table).insert({'id': i}).run(conn)
+
+@inlineCallbacks
+def notice_changes(conn, *tables):
+    # Reset the state of the tables on the server
+    if len(tables) &gt; 0:
+        table_list = yield r.table_list().run(conn)
+        yield defer.DeferredList([r.table_drop(t).run(conn) for t in tables if t in table_list])
+    yield defer.DeferredList([r.table_create(t).run(conn) for t in tables])
+
+    readies = [defer.Deferred() for t in tables]
+    cancel = defer.Deferred()
+    feeds = [print_feed(conn, table, ready, cancel) for table, ready in zip(tables, readies)]
+
+    # Wait for the feeds to become ready
+    yield defer.gatherResults(readies)
+    yield defer.gatherResults([table_write(conn, table) for table in tables])
+
+    # Cancel the feeds and wait for them to exit
+    cancel.addErrback(lambda err: None)
+    cancel.cancel()
+    yield defer.DeferredList(feeds)
+
+yield notice_changes(conn, 'a', 'b')
+
+# Output
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 0}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 0}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 1}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 1}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 2}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 2}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 3}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 3}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 4}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 4}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 5}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 5}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 6}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 6}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 7}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 7}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 8}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 8}}
+Seen on table a: {u'old_val': None, u'new_val': {u'id': 9}}
+Seen on table b: {u'old_val': None, u'new_val': {u'id': 9}}
+</pre></div></div> <p>Here, we listen for changes on multiple tables at once. We simultaneously write into the tables, and observe our writes appear in the changefeeds. We then cancel the changefeeds after we’ve written 10 items into each of the tables.</p> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; RethinkDB contributors<br>Licensed under the Creative Commons Attribution-ShareAlike 3.0 Unported License.<br>
+    <a href="https://rethinkdb.com/docs/async-connections/" class="_attribution-link">https://rethinkdb.com/docs/async-connections/</a>
+  </p>
+</div>

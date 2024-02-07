@@ -1,0 +1,277 @@
+<h1>Plug'n'Play</h1>
+
+<div class="css-elchao exirf770">
+<blockquote>
+<p><strong>PnP API</strong></p>
+<p>Are you a library author trying to make your library compatible with the Plug'n'Play installation strategy? Do you want to use the PnP API for something awesome? If the answer to any of these questions is yes, make sure to visit the <a href="../advanced/pnpapi.html">PnP API</a> page after reading the introduction!</p>
+</blockquote>
+<p>Unveiled in September 2018, Plug'n'Play is an innovative installation strategy for <a href="https://nodejs.org/">Node</a>. Based on prior work in other languages (for example <a href="https://getcomposer.org/doc/04-schema.md#autoload">autoload</a> for PHP), it presents interesting characteristics that build upon the regular <a href="https://en.wikipedia.org/wiki/CommonJS">CommonJS</a> <code class="language-text">require</code> workflow in an almost completely backward-compatible way.</p>
+<div class="toc"><ul>
+<li><p><a href="#the-node_modules-problem">The node_modules problem</a></p></li>
+<li><p><a href="#fixing-node_modules">Fixing node_modules</a></p></li>
+<li><p><a href="#initializing-pnp">Initializing PnP</a></p></li>
+<li>
+<p><a href="#pnp-loose-mode">PnP <code class="language-text">loose</code> mode</a></p>
+<ul><li><a href="#caveat">Caveat</a></li></ul>
+</li>
+<li>
+<p><a href="#alternatives">Alternatives</a></p>
+<ul><li>
+<p><a href="#compatibility-table">Compatibility Table</a></p>
+<ul>
+<li><a href="#native-support">Native support</a></li>
+<li><a href="#support-via-plugins">Support via plugins</a></li>
+<li><a href="#incompatible">Incompatible</a></li>
+</ul>
+</li></ul>
+</li>
+<li>
+<p><a href="#frequently-asked-questions">Frequently Asked Questions</a></p>
+<ul>
+<li><a href="#why-not-use-import-maps">Why not use import maps?</a></li>
+<li><a href="#packages-are-stored-inside-zip-archives-how-can-i-access-their-files">Packages are stored inside Zip archives: How can I access their files?</a></li>
+<li><a href="#fallback-mode">Fallback Mode</a></li>
+</ul>
+</li>
+</ul></div>
+<h2 id="the-node_modules-problem">
+The node_modules problem</h2>
+<p>The way installs used to work was simple: when running <code class="language-text">yarn install</code> Yarn would generate a <code class="language-text">node_modules</code> directory that Node was then able to consume thanks to its built-in <a href="https://nodejs.org/api/modules.html#modules_all_together">Node Resolution Algorithm</a>. In this context, Node didn't have to know the first thing about what a "package" was: it only reasoned in terms of files. "Does this file exist here? No: Ok, let's look in the parent <code class="language-text">node_modules</code> then. Does it exist here? Still no: Ok ...", and it kept going until it found the right one. This process was vastly inefficient for several reasons:</p>
+<ul>
+<li><p>The <code class="language-text">node_modules</code> directories typically contained gargantuan amounts of files. Generating them could make up for more than 70% of the time needed to run <code class="language-text">yarn install</code>. Even having preexisting installations wouldn't save you, as package managers still had to diff the contents of <code class="language-text">node_modules</code> with what it <em>should</em> contain.</p></li>
+<li><p>Because the <code class="language-text">node_modules</code> generation was an I/O-heavy operation, package managers didn't have much leeway to optimize it beyond just doing a simple file copy - and even though it could have used hardlinks or copy-on-write when possible, it would still have needed to diff the current state of the filesystem before making a bunch of syscalls to manipulate the disk.</p></li>
+<li><p>Because Node had no concept of packages, it also didn't know whether a file was <em>meant</em> to be accessed. It was entirely possible that the code you wrote worked one day in development but broke later in production because you forgot to list one of your dependencies in your <code class="language-text">package.json</code>.</p></li>
+<li><p>Even at runtime, the Node resolution had to make a bunch of <code class="language-text">stat</code> and <code class="language-text">readdir</code> calls to figure out where to load every single required file from. It was extremely wasteful and was part of why booting Node applications took so much time.</p></li>
+<li><p>Finally, the very design of the <code class="language-text">node_modules</code> folder was impractical in that it didn't allow package managers to properly de-duplicate packages. Even though some algorithms could be employed to optimize the tree layout (<a href="../advanced/lexicon.html#hoisting">hoisting</a>), we still ended up unable to optimize some particular patterns - causing not only the disk usage to be higher than needed, but also some packages to be instantiated multiple times in memory.</p></li>
+</ul>
+<h2 id="fixing-node_modules">
+Fixing node_modules</h2>
+<p>Yarn already knows everything there is to know about your dependency tree - it even installs it on the disk for you. So, why is it up to Node to find where your packages are? Instead, it should be the package manager's job to inform the interpreter about the location of the packages on the disk and manage any dependencies between packages and even versions of packages. This is why Plug'n'Play was created.</p>
+<p>In this install mode (the default starting from Yarn 2.0), Yarn generates a single <code class="language-text">.pnp.cjs</code> file instead of the usual <code class="language-text">node_modules</code> folder containing copies of various packages. The <code class="language-text">.pnp.cjs</code> file contains various maps: one linking package names and versions to their location on the disk and another one linking package names and versions to their list of dependencies. With these lookup tables, Yarn can instantly tell Node where to find any package it needs to access, as long as they are part of the dependency tree, and as long as this file is loaded within your environment (more on that in the next section).</p>
+<p>This approach has various benefits:</p>
+<ul>
+<li><p>Installs are now nearly instantaneous. Yarn only needs to generate a single text file (instead of potentially tens of thousands). The main bottleneck becomes the number of dependencies in a project rather than disk performance.</p></li>
+<li><p>Installs are more stable and reliable due to reduced I/O operations. Especially on Windows (where writing and removing files in batches may trigger various unintended interactions with Windows Defender and similar tools), I/O heavy <code class="language-text">node_modules</code> operations were more prone to failure.</p></li>
+<li><p>Perfect optimization of the dependency tree (aka perfect hoisting) and predictable package instantiations.</p></li>
+<li><p>The generated <code class="language-text">.pnp.cjs</code> file can be committed to your repository as part of the <a href="zero-installs.html">Zero-Installs</a> effort, removing the need to run <code class="language-text">yarn install</code> in the first place.</p></li>
+<li><p>Faster application startup! The Node resolution doesn't have to iterate over the filesystem hierarchy nearly as much as before (and soon won't have to do it at all!).</p></li>
+</ul>
+<h2 id="initializing-pnp">
+Initializing PnP</h2>
+<p>Yarn generates a single <code class="language-text">.pnp.cjs</code> file that needs to be installed for Node to know where to find the relevant packages. This registration is generally transparent: any direct or indirect <code class="language-text">node</code> command executed through one of your <code class="language-text">scripts</code> entries will automatically register the <code class="language-text">.pnp.cjs</code> file as a runtime dependency. For the vast majority of use cases, the following will work just as you would expect:</p>
+<div class="gatsby-highlight" data-language="json"><pre class="language-json"><code class="language-json"><span class="token punctuation">{</span>
+  <span class="token property">"scripts"</span><span class="token operator">:</span> <span class="token punctuation">{</span>
+    <span class="token property">"start"</span><span class="token operator">:</span> <span class="token string">"node ./server.js"</span><span class="token punctuation">,</span>
+    <span class="token property">"test"</span><span class="token operator">:</span> <span class="token string">"jest"</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span></code></pre></div>
+<p>For some remaining edge cases, a small setup may be required:</p>
+<ul><li>If you need to run an arbitrary Node script, use <a href="../cli/node.html"><code class="language-text">yarn node</code></a> as the interpreter, instead of <code class="language-text">node</code>. This will be enough to register the <code class="language-text">.pnp.cjs</code> file as a runtime dependency. </li></ul>
+<div class="gatsby-highlight" data-language="text"><pre class="language-text"><code class="language-text">yarn node ./server.js</code></pre></div>
+<ul><li>If you operate on a system that automatically executes a Node script (for instance on Google Cloud Platform (--reference needed here--)), simply require the PnP file at the top of your init script and call its <code class="language-text">setup</code> function.</li></ul>
+<div class="gatsby-highlight" data-language="text"><pre class="language-text"><code class="language-text">require('./.pnp.cjs').setup();</code></pre></div>
+<p>As a quick tip, all <code class="language-text">yarn node</code> typically does is set the <code class="language-text">NODE_OPTIONS</code> environment variable to use the <a href="https://nodejs.org/api/cli.html#cli_r_require_module"><code class="language-text">--require</code></a> option from Node, associated with the path of the <code class="language-text">.pnp.cjs</code> file. You can easily apply this operation yourself if you prefer:</p>
+<div class="gatsby-highlight" data-language="text"><pre class="language-text"><code class="language-text">node -r ./.pnp.cjs ./server.js
+NODE_OPTIONS="--require $(pwd)/.pnp.cjs" node ./server.js</code></pre></div>
+<h2 id="pnp-loose-mode">
+PnP <code class="language-text">loose</code> mode</h2>
+<p>Because the hoisting heuristics aren't standardized and predictable, PnP operating under strict mode will prevent packages from requiring dependencies that are not explicitly listed; even if other dependencies also depend on it. This may cause issues with some packages.</p>
+<p>To address this problem, Yarn ships with a "loose" mode which will cause the PnP linker to work in tandem with the <code class="language-text">node-modules</code> hoister - we will first generate the list of packages that would have been hoisted to the top level in a typical <code class="language-text">node_modules</code> install, then remember this list as what we call the "fallback pool".</p>
+<blockquote><p>Note that because the loose mode directly calls the <code class="language-text">node-modules</code> hoister, it follows the exact same implementation as the true algorithm used by the <a href="https://github.com/yarnpkg/berry/tree/master/packages/plugin-nm"><code class="language-text">node-modules</code> linker</a>!</p></blockquote>
+<p>At runtime, packages that require unlisted dependencies will still be allowed to access them if any version of the dependency ended up in the fallback pool (which packages exactly are allowed to rely on the fallback pool can be tweaked with <a href="../configuration/yarnrc.html#pnpFallbackMode">pnpFallbackMode</a>).</p>
+<p>Note that the content of the fallback pool is undetermined. If a dependency tree contains multiple versions of the same package, there is no means to determine which one will be hoisted to the top-level. Therefore, a package accessing the fallback pool will still generate a warning (via the <a href="https://nodejs.org/api/process.html#process_process_emitwarning_warning_type_code_ctor">process.emitWarning</a> API).</p>
+<p>This mode provides a compromise between the <code class="language-text">strict</code> PnP linker and the <code class="language-text">node_modules</code> linker.</p>
+<p>In order to enable <code class="language-text">loose</code> mode, make sure that the <a href="../configuration/yarnrc.html#nodeLinker"><code class="language-text">nodeLinker</code></a> option is set to <code class="language-text">pnp</code> (the default) and add the following into your local <a href="../configuration/yarnrc.html"><code class="language-text">.yarnrc.yml</code></a> file:</p>
+<div class="gatsby-highlight" data-language="yaml"><pre class="language-yaml"><code class="language-yaml"><span class="token key atrule">pnpMode</span><span class="token punctuation">:</span> loose</code></pre></div>
+<p><a href="../configuration/yarnrc.html#pnpMode">More information about the <code class="language-text">pnpMode</code> option.</a></p>
+<h3 id="caveat">
+Caveat</h3>
+<p>Because we <em>emit</em> warnings (instead of <em>throwing</em> errors) on resolution errors, applications can't <em>catch</em> them. This means that the common pattern of trying to <code class="language-text">require</code> an optional peer dependency inside a try/catch block will print a warning at runtime if the dependency is missing, even though it shouldn't. The only runtime implication is that such a warning can cause confusion, but it can safely be ignored.</p>
+<p>For this reason, PnP <code class="language-text">loose</code> mode <strong>won't be</strong> the default starting with version 2.1 (as we originally planned). It will continue to be supported as an alternative, hopefully easing the transition to the default and recommended workflow: PnP <code class="language-text">strict</code> mode.</p>
+<h2 id="alternatives">
+Alternatives</h2>
+<p>In the years leading up to Plug'n'Play being ratified as the main install strategy, other projects came up with alternative implementations of the Node Resolution Algorithm - usually to circumvent shortcomings of the <code class="language-text">require.resolve</code> API. Examples include Webpack (<code class="language-text">enhanced-resolve</code>), Babel (<code class="language-text">resolve</code>), Jest (<code class="language-text">jest-resolve</code>), and Metro (<code class="language-text">metro-resolver</code>). These alternatives should be considered as superseded by proper integration with Plug'n'Play.</p>
+<h3 id="compatibility-table">
+Compatibility Table</h3>
+<p>The following compatibility table gives you an idea of the integration status with various tools from the community. Note that only CLI tools are listed there, as frontend libraries (such as <code class="language-text">react</code>, <code class="language-text">vue</code>, <code class="language-text">lodash</code>, ...) don't reimplement the Node resolution and as such don't need any special logic to take advantage of Plug'n'Play:</p>
+<p><strong><a href="https://github.com/yarnpkg/berry/edit/master/packages/gatsby/content/features/plugnplay.md">Suggest an addition to this table</a></strong></p>
+<h4 id="native-support">
+Native support</h4>
+<p>Many common frontend tools now support Plug'n'Play natively!</p>
+<table>
+<thead><tr>
+<th><div>Project name</div></th>
+<th>Note</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>Babel</td>
+<td>Starting from <code class="language-text">resolve</code> 1.9</td>
+</tr>
+<tr>
+<td>Create-React-App</td>
+<td>Starting from 2.0+</td>
+</tr>
+<tr>
+<td>ESLint</td>
+<td>Some compatibility issues w/ shared configs</td>
+</tr>
+<tr>
+<td>Gatsby</td>
+<td>Supported with version ≥2.15.0, ≥3.7.0</td>
+</tr>
+<tr>
+<td>Gulp</td>
+<td>Supported with version 4.0+</td>
+</tr>
+<tr>
+<td>Husky</td>
+<td>Starting from 4.0.0-1+</td>
+</tr>
+<tr>
+<td>Jest</td>
+<td>Starting from 24.1+</td>
+</tr>
+<tr>
+<td>Next.js</td>
+<td>Starting from 9.1.2+</td>
+</tr>
+<tr>
+<td>Parcel</td>
+<td>Starting from 2.0.0-nightly.212+</td>
+</tr>
+<tr>
+<td>Preact CLI</td>
+<td>Starting from 3.1.0+</td>
+</tr>
+<tr>
+<td>Prettier</td>
+<td>Starting from 1.17+</td>
+</tr>
+<tr>
+<td>Rollup</td>
+<td>Starting from <code class="language-text">resolve</code> 1.9+</td>
+</tr>
+<tr>
+<td>Storybook</td>
+<td>Starting from 6.0+</td>
+</tr>
+<tr>
+<td>TypeScript</td>
+<td>Via <a href="https://github.com/yarnpkg/berry/tree/master/packages/plugin-compat"><code class="language-text">plugin-compat</code></a> (enabled by default)</td>
+</tr>
+<tr>
+<td>TypeScript-ESLint</td>
+<td>Starting from 2.12+</td>
+</tr>
+<tr>
+<td>WebStorm</td>
+<td>Starting from 2019.3+; See <a href="../getting-started/editor-sdks.html">Editor SDKs</a>
+</td>
+</tr>
+<tr>
+<td>Webpack</td>
+<td>Starting from 5+ (<a href="https://github.com/arcanis/pnp-webpack-plugin">plugin</a> available for 4.x)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="support-via-plugins">
+Support via plugins</h4>
+<table>
+<thead><tr>
+<th><div>Project name</div></th>
+<th>Note</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>ESBuild</td>
+<td>Via <a href="https://github.com/yarnpkg/berry/tree/master/packages/esbuild-plugin-pnp#yarnpkgesbuild-plugin-pnp"><code class="language-text">@yarnpkg/esbuild-plugin-pnp</code></a>
+</td>
+</tr>
+<tr>
+<td>VSCode-ESLint</td>
+<td>Follow <a href="../getting-started/editor-sdks.html">Editor SDKs</a>
+</td>
+</tr>
+<tr>
+<td>VSCode</td>
+<td>Follow <a href="../getting-started/editor-sdks.html">Editor SDKs</a>
+</td>
+</tr>
+<tr>
+<td>Webpack 4.x</td>
+<td>Via <a href="https://github.com/arcanis/pnp-webpack-plugin"><code class="language-text">pnp-webpack-plugin</code></a> (native starting from 5+)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="incompatible">
+Incompatible</h4>
+<p>The following tools cannot be used with pure Plug'n'Play install (even under loose mode).</p>
+<p><strong>Important:</strong> Even if a tool is incompatible with Plug'n'Play, you can still enable the <a href="https://github.com/yarnpkg/berry/tree/master/packages/plugin-nm"><code class="language-text">node-modules</code> plugin</a>. Just follow the <a href="../getting-started/migration.html#if-required-enable-the-node-modules-plugin">instructions</a> and you'll be ready to go in a minute 🙂</p>
+<table>
+<thead><tr>
+<th><div>Project name</div></th>
+<th>Note</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>Angular</td>
+<td>Follow <a href="https://github.com/angular/angular-cli/issues/16980">angular/angular-cli/#16980</a>
+</td>
+</tr>
+<tr>
+<td>Flow</td>
+<td>Follow <a href="https://github.com/yarnpkg/berry/issues/634">yarnpkg/berry#634</a>
+</td>
+</tr>
+<tr>
+<td>React Native</td>
+<td>Follow <a href="https://github.com/react-native-community/cli/issues/27">react-native-community/cli#27</a>
+</td>
+</tr>
+<tr>
+<td>Pulumi</td>
+<td>Follow <a href="https://github.com/pulumi/pulumi/issues/3586">pulumi/pulumi#3586</a>
+</td>
+</tr>
+<tr>
+<td>VSCode Extension Manager (vsce)</td>
+<td>Use the <a href="https://www.npmjs.com/package/vsce-yarn-patch">vsce-yarn-patch</a> fork with the <code class="language-text">node-modules</code> plugin enabled. The fork is required until <a href="https://github.com/microsoft/vscode-vsce/pull/493">microsoft/vscode-vsce#493</a> is merged, as <code class="language-text">vsce</code> currently uses the removed <code class="language-text">yarn list</code> command</td>
+</tr>
+<tr>
+<td>Hugo</td>
+<td>Hugo pipes expect a <code class="language-text">node-modules</code> dir. Enable the <code class="language-text">node-modules</code> plugin</td>
+</tr>
+<tr>
+<td>ReScript</td>
+<td>Follow <a href="https://github.com/rescript-lang/rescript-compiler/issues/3276">rescript-lang/rescript-compiler#3276</a>
+</td>
+</tr>
+</tbody>
+</table>
+<p>This list is kept up-to-date based on the latest release we've published starting from v2. In case you notice something off in your own project please try to upgrade Yarn and the problematic package first, then feel free to file an issue. And maybe a PR? 😊</p>
+<h2 id="frequently-asked-questions">
+Frequently Asked Questions</h2>
+<h3 id="why-not-use-import-maps">
+Why not use import maps?</h3>
+<p>Yarn Plug'n'Play provides semantic errors (explaining you the exact reason why a package isn't reachable from another) and a <a href="../advanced/pnpapi.html">sensible JS API</a> to solve various shortcomings with <code class="language-text">require.resolve</code>. These are features that import maps wouldn't solve by themselves. This is answered in more detail in <a href="https://github.com/nodejs/modules/issues/477#issuecomment-578091424">this thread</a>. </p>
+<p>A main reason we're in this mess today is that the original <code class="language-text">node_modules</code> design tried to abstract packages away in order to provide a generic system that would work without any notion of packages. This became a challenge that prompted many implementers to come up with their own interpretations. Import maps suffer from the same flaw.</p>
+<h3 id="packages-are-stored-inside-zip-archives-how-can-i-access-their-files">
+Packages are stored inside Zip archives: How can I access their files?</h3>
+<p>When using PnP, packages are stored and accessed directly inside the Zip archives from the cache. The PnP runtime (<code class="language-text">.pnp.cjs</code>) automatically patches Node's <code class="language-text">fs</code> module to add support for accessing files inside Zip archives. This way, you don't have to do anything special:</p>
+<div class="gatsby-highlight" data-language="js"><pre class="language-js"><code class="language-js"><span class="token keyword">const</span> <span class="token punctuation">{</span>readFileSync<span class="token punctuation">}</span> <span class="token operator">=</span> <span class="token function">require</span><span class="token punctuation">(</span><span class="token template-string"><span class="token template-punctuation string">`</span><span class="token string">fs</span><span class="token template-punctuation string">`</span></span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">// Looks similar to `/path/to/.yarn/cache/lodash-npm-4.17.11-1c592398b2-8b49646c65.zip/node_modules/lodash/ceil.js`</span>
+<span class="token keyword">const</span> lodashCeilPath <span class="token operator">=</span> require<span class="token punctuation">.</span><span class="token function">resolve</span><span class="token punctuation">(</span><span class="token template-string"><span class="token template-punctuation string">`</span><span class="token string">lodash/ceil</span><span class="token template-punctuation string">`</span></span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+console<span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token function">readFileSync</span><span class="token punctuation">(</span>lodashCeilPath<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span></code></pre></div>
+<h3 id="fallback-mode">
+Fallback Mode</h3>
+<p>Back when PnP was first implemented, the compatibility wasn't as good as it is now. To help with the transition, we designed a fallback mechanism: if a package tries to access an unlisted dependency, it's still allowed to resolve it <em>if the top-level package lists it as a dependency</em>. We allow this because there's no resolution ambiguity, as there's a single top-level package in any project. Unfortunately, this may cause confusing behaviors depending on how your project is set up. When that happens, PnP is always right, and the only reason it works when not in a workspace is due to some extra lax.</p>
+<p>This behavior was just a patch, and will eventually be removed to clear up any confusion. You can prepare for that now by setting <a href="../configuration/yarnrc.html#pnpFallbackMode"><code class="language-text">pnpFallbackMode</code></a> to <code class="language-text">none</code>, which will disable the fallback mechanism altogether.</p>
+</div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2016&ndash;present Yarn Contributors<br>Licensed under the BSD License.<br>
+    <a href="https://yarnpkg.com/features/pnp" class="_attribution-link">https://yarnpkg.com/features/pnp</a>
+  </p>
+</div>

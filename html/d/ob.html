@@ -1,0 +1,71 @@
+<h1>Live Functions</h1>       <b>Contents</b>  <ol> <li>
+<a href="#ob">Ownership/Borrowing</a><ol> <li><a href="#tracked">Tracked Pointers</a></li> <li><a href="#state">Pointer States</a></li> <li><a href="#lifetime">Lifetimes</a></li> <li><a href="#transition">Pointer State Transitions</a></li> <li><a href="#borrower">Borrowers can be Owners</a></li> <li><a href="#exception">Exceptions</a></li> <li><a href="#lazy">Lazy Parameters</a></li> <li><a href="#mempool">Mixing Memory Pools</a></li> <li><a href="#vargs">Variadic Function Arguments</a></li> </ol>
+</li> </ol>   <b>Experimental, Subject to Change</b>  <p>If a memory object has only one pointer to it, that pointer is the <i>owner</i> of the memory object. With the single owner, it becomes straightforward to manage the memory for the object. It also becomes trivial to synchronize access to that memory object among multiple threads, because it can only be accessed by the thread that controls that single pointer. </p>  <p>This can be generalized to a graph of memory objects interconnected by pointers, where only a single pointer connects to that graph from elsewhere. That single pointer becomes the <i>owner</i> of all the memory objects in that graph. </p>  <p>When the owner of the graph is no longer needed, then the graph of memory objects it points to is no longer needed and can be safely disposed of. If the owner itself is no longer in use (i.e. is no longer <i>live</i>) and the owned memory objects are not disposed of, an error can be diagnosed. </p>  <p>Hence, the following errors can be statically detected: </p>  <pre data-language="d">int* allocate();    // allocate a memory object
+void release(int*); // deallocate a memory object
+
+@live void test()
+{
+    auto p = allocate();
+}   // error: p is not disposed of
+
+@live void test()
+{
+    auto p = allocate();
+    release(p);
+    release(p); // error: p was already disposed of
+}
+
+@live void test()
+{
+    int* p = void;
+    release(p); // error, p does not have a defined value
+}
+
+@live void test()
+{
+    auto p = allocate();
+    p = allocate(); // error: p was not disposed of
+    release(p);
+}
+</pre>  <p>Functions with the <code>@live</code> attribute enable diagnosing these sorts of errors by tracking the status of owner pointers. </p>  <h2 id="ob">Ownership/Borrowing</h2>  <p>Tracking the ownership status of a pointer can be safely extended by adding the capability of temporarilly <i>borrowing</i> ownership of a pointer from the <i>owner</i>. The <i>owner</i> can no longer use the pointer as long as the <i>borrower</i> is still using the pointer value (i.e. is <i>live</i>). Once the <i>borrower</i> is no longer <i>live</i>, the <i>owner</i> and resume using it. Only one <i>borrower</i> can be live at any point. </p>  <p>Multiple <i>borrower</i> pointers can simultaneously exist if all of them are pointers to read only (<code>const</code> or <code>immutable</code>) data, i.e. none of them can modify the memory object(s) pointed to. </p>  <p>This is collectively called an <i>Ownership/Borrowing</i> system. It can be state as: </p>  <blockquote><p>At any point in the program, for each memory object, there is exactly one live mutable pointer to it or all the live pointers to it are read-only.</p></blockquote>  <p>Function declarations annotated with the <code>@live</code> attribute are checked for compliance with the Ownership/Borrowing rules. The checks are run after other semantic processing is complete. The checking does not influence code generation. </p>  <p>Whether a pointer is allocated memory using the GC or some other storage allocator is immaterial to OB, they are not distinguished and are handled identically. </p>  <p>Class references are assumed to be allocated using either the GC or are allocated on the stack as <code>scope</code> classes, and are not tracked. </p>  <p>If <code>@live</code> functions call non-<code>@live</code> functions, those called functions are expected to present an <code>@live</code> compatible interface, although it is not checked. if non-<code>@live</code> functions call <code>@live</code> functions, arguments passed are expected to follow <code>@live</code> conventions. </p>  <p>It will not detect attempts to dereference <code>null</code> pointers or possibly <code>null</code> pointers. This is unworkable because there is no current method of annotating a type as a non-<code>null</code> pointer. </p>  <h3 id="tracked">Tracked Pointers</h3>  <p>The only pointers that are tracked are those declared in the <code>@live</code> function as <code>this</code>, function parameters or local variables. Variables from other functions are not tracked, even <code>@live</code> ones, as the analysis of interactions with other functions depends entirely on that function signature, not its internals. Parameters that are <code>const</code> are not tracked. </p>   <h3 id="state">Pointer States</h3>  <p>Each tracked pointer is in one of the following states: </p>  <dl>
+<dt>Undefined</dt>  <dd>The pointer is in an invalid state. Dereferencing such a pointer is an error.</dd>  <dt>Owner</dt>  <dd>The owner is the sole pointer to a memory object graph. An Owner pointer normally does not have a <code>scope</code> attribute. If a pointer with the <code>scope</code> attribute is initialized with an expression not derived from a tracked pointer, it is an Owner.  If an Owner pointer is assigned to another Owner pointer, the former enters the Undefined state. </dd>  <dt>Borrowed</dt>  <dd>A Borrowed pointer is one that temporarily becomes the sole pointer to a memory object graph. It enters that state via assignment from an owner pointer, and stays in that state until its last use.  A Borrowed pointer must have the <code>scope</code> attribute and must be a pointer to mutable. </dd>  <dt>Readonly</dt>  <dd>A Readonly pointer acquires its value from an Owner. While the Readonly pointer is live, only Readonly pointers can be acquired from that Owner. A Readonly pointer must have the <code>scope</code> attribute and also must not be a pointer to mutable. </dd> </dl>  <h3 id="lifetime">Lifetimes</h3>  <p>The lifetime of a Borrowed or Readonly pointer value starts when it is assigned a value from an Owner or another Borrowed pointer, and ends at the last read of that value. </p>  <p>This is also known as <i>Non-Lexical Lifetimes</i>. </p>   <h3 id="transition">Pointer State Transitions</h3>  <p>A pointer changes its state when one of these operations is done to it: </p>  <ul>
+<li>storage is allocated for it (such as a local variable on the stack), which places the pointer in the Undefined state</li>  <li>initialization (treated as assignment)</li>  <li>assignment - the source and target pointers change state based on what states they are in and their types and storage classes</li>  <li>passed to an <code>out</code> function parameter (changes state after the function returns), treated the same as initialization</li>  <li>passed by <code>ref</code> to a function parameter, treated as an assignment to a Borrow or a Readonly depending on the storage class and type of the parameter</li>  <li>returned from a function</li>  <li>it is passed by value to a function parameter, which is treated as an assignment to that parameter.</li>  <li>it is implicitly passed by ref as a closure variable to a nested function</li>  <li>the address of the pointer is taken, which is treated as assignment to whoever receives the address</li>  <li>the address of any part of the memory object graph is taken, which is treated as assignment to whoever receives that address</li>  <li>a pointer value is read from any part of the memory object graph, which is treated as assignment to whoever receives that pointer</li>  <li>merging of control flow reconciles the state of each variable based on the states they have from each edge</li> </ul>  <h3 id="borrower">Borrowers can be Owners</h3>  <p>Borrowers are considered Owners if they are initialized from other than a pointer. </p>  <pre data-language="d">@live void uhoh()
+{
+    scope p = malloc();  // p is considered an Owner
+    scope const pc = malloc(); // pc is not considered an Owner
+} // dangling pointer pc is not detected on exit
+
+</pre>  <h3 id="exception">Exceptions</h3>  <p>The analysis assumes no exceptions are thrown. </p>  <pre data-language="d">@live void leaky()
+{
+    auto p = malloc();
+    pitcher();  // throws exception, p leaks
+    free(p);
+}
+</pre>  <p>One solution is to use <code>scope(exit)</code>: </p>  <pre data-language="d">@live void waterTight()
+{
+    auto p = malloc();
+    scope(exit) free(p);
+    pitcher();
+}
+</pre>  <p>or use RAII objects or call only <code>nothrow</code> functions. </p>  <h3 id="lazy">Lazy Parameters</h3>  <p>Lazy parameters are not considered. </p>  <h3 id="mempool">Mixing Memory Pools</h3>  <p>Conflation of different memory pools: </p>  <pre data-language="d">void* xmalloc(size_t);
+void xfree(void*);
+
+void* ymalloc(size_t);
+void yfree(void*);
+
+auto p = xmalloc(20);
+yfree(p);  // should call xfree() instead
+</pre> <p>is not detected. </p>  <p>This can be mitigated by using type-specific pools: </p>  <pre data-language="d">U* umalloc();
+void ufree(U*);
+
+V* vmalloc();
+void vfree(V*);
+
+auto p = umalloc();
+vfree(p);  // type mismatch
+</pre>  <p>and perhaps disabling implicit conversions to <code>void*</code> in <code>@live</code> functions. </p>  <h3 id="vargs">Variadic Function Arguments</h3>  <p>Arguments to variadic functions (such as <code>printf</code>) are considered to be consumed. </p>  <div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 1999&ndash;2021 The D Language Foundation<br>Licensed under the Boost License 1.0.<br>
+    <a href="https://dlang.org/spec/ob.html" class="_attribution-link">https://dlang.org/spec/ob.html</a>
+  </p>
+</div>
