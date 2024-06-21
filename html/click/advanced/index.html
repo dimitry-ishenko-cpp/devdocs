@@ -1,0 +1,185 @@
+<h1>Advanced Patterns</h1> <p>In addition to common functionality that is implemented in the library itself, there are countless patterns that can be implemented by extending Click. This page should give some insight into what can be accomplished.</p> <section id="command-aliases"> <h2 id="aliases">Command Aliases</h2> <p>Many tools support aliases for commands (see <a class="reference external" href="https://github.com/pallets/click/tree/main/examples/aliases">Command alias example</a>). For instance, you can configure <code>git</code> to accept <code>git ci</code> as alias for <code>git commit</code>. Other tools also support auto-discovery for aliases by automatically shortening them.</p> <p>Click does not support this out of the box, but it’s very easy to customize the <a class="reference internal" href="../api/index.html#click.Group" title="click.Group"><code>Group</code></a> or any other <a class="reference internal" href="../api/index.html#click.MultiCommand" title="click.MultiCommand"><code>MultiCommand</code></a> to provide this functionality.</p> <p>As explained in <a class="reference internal" href="../commands/index.html#custom-multi-commands"><span class="std std-ref">Custom Multi Commands</span></a>, a multi command can provide two methods: <a class="reference internal" href="../api/index.html#click.MultiCommand.list_commands" title="click.MultiCommand.list_commands"><code>list_commands()</code></a> and <a class="reference internal" href="../api/index.html#click.MultiCommand.get_command" title="click.MultiCommand.get_command"><code>get_command()</code></a>. In this particular case, you only need to override the latter as you generally don’t want to enumerate the aliases on the help page in order to avoid confusion.</p> <p>This following example implements a subclass of <a class="reference internal" href="../api/index.html#click.Group" title="click.Group"><code>Group</code></a> that accepts a prefix for a command. If there were a command called <code>push</code>, it would accept <code>pus</code> as an alias (so long as it was unique):</p> <pre data-language="python">class AliasedGroup(click.Group):
+    def get_command(self, ctx, cmd_name):
+        rv = click.Group.get_command(self, ctx, cmd_name)
+        if rv is not None:
+            return rv
+        matches = [x for x in self.list_commands(ctx)
+                   if x.startswith(cmd_name)]
+        if not matches:
+            return None
+        elif len(matches) == 1:
+            return click.Group.get_command(self, ctx, matches[0])
+        ctx.fail(f"Too many matches: {', '.join(sorted(matches))}")
+
+    def resolve_command(self, ctx, args):
+        # always return the full command name
+        _, cmd, args = super().resolve_command(ctx, args)
+        return cmd.name, cmd, args
+</pre> <p>And it can then be used like this:</p> <pre data-language="python">@click.command(cls=AliasedGroup)
+def cli():
+    pass
+
+@cli.command()
+def push():
+    pass
+
+@cli.command()
+def pop():
+    pass
+</pre> </section> <section id="parameter-modifications"> <h2>Parameter Modifications</h2> <p>Parameters (options and arguments) are forwarded to the command callbacks as you have seen. One common way to prevent a parameter from being passed to the callback is the <code>expose_value</code> argument to a parameter which hides the parameter entirely. The way this works is that the <a class="reference internal" href="../api/index.html#click.Context" title="click.Context"><code>Context</code></a> object has a <a class="reference internal" href="../api/index.html#click.Context.params" title="click.Context.params"><code>params</code></a> attribute which is a dictionary of all parameters. Whatever is in that dictionary is being passed to the callbacks.</p> <p>This can be used to make up additional parameters. Generally this pattern is not recommended but in some cases it can be useful. At the very least it’s good to know that the system works this way.</p> <pre data-language="python">import urllib
+
+def open_url(ctx, param, value):
+    if value is not None:
+        ctx.params['fp'] = urllib.urlopen(value)
+        return value
+
+@click.command()
+@click.option('--url', callback=open_url)
+def cli(url, fp=None):
+    if fp is not None:
+        click.echo(f"{url}: {fp.code}")
+</pre> <p>In this case the callback returns the URL unchanged but also passes a second <code>fp</code> value to the callback. What’s more recommended is to pass the information in a wrapper however:</p> <pre data-language="python">import urllib
+
+class URL(object):
+
+    def __init__(self, url, fp):
+        self.url = url
+        self.fp = fp
+
+def open_url(ctx, param, value):
+    if value is not None:
+        return URL(value, urllib.urlopen(value))
+
+@click.command()
+@click.option('--url', callback=open_url)
+def cli(url):
+    if url is not None:
+        click.echo(f"{url.url}: {url.fp.code}")
+</pre> </section> <section id="token-normalization"> <h2>Token Normalization</h2> <details class="changelog"> <summary>Changelog</summary><div class="versionadded"> <p><span class="versionmodified added">New in version 2.0.</span></p> </div> </details><p>Starting with Click 2.0, it’s possible to provide a function that is used for normalizing tokens. Tokens are option names, choice values, or command values. This can be used to implement case insensitive options, for instance.</p> <p>In order to use this feature, the context needs to be passed a function that performs the normalization of the token. For instance, you could have a function that converts the token to lowercase:</p> <pre data-language="python">CONTEXT_SETTINGS = dict(token_normalize_func=lambda x: x.lower())
+
+@click.command(context_settings=CONTEXT_SETTINGS)
+@click.option('--name', default='Pete')
+def cli(name):
+    click.echo(f"Name: {name}")
+</pre> <p>And how it works on the command line:</p> <pre data-language="shell">$ cli --NAME=Pete
+Name: Pete
+</pre> </section> <section id="invoking-other-commands"> <h2>Invoking Other Commands</h2> <p>Sometimes, it might be interesting to invoke one command from another command. This is a pattern that is generally discouraged with Click, but possible nonetheless. For this, you can use the <a class="reference internal" href="../api/index.html#click.Context.invoke" title="click.Context.invoke"><code>Context.invoke()</code></a> or <a class="reference internal" href="../api/index.html#click.Context.forward" title="click.Context.forward"><code>Context.forward()</code></a> methods.</p> <p>They work similarly, but the difference is that <a class="reference internal" href="../api/index.html#click.Context.invoke" title="click.Context.invoke"><code>Context.invoke()</code></a> merely invokes another command with the arguments you provide as a caller, whereas <a class="reference internal" href="../api/index.html#click.Context.forward" title="click.Context.forward"><code>Context.forward()</code></a> fills in the arguments from the current command. Both accept the command as the first argument and everything else is passed onwards as you would expect.</p> <p>Example:</p> <pre data-language="python">cli = click.Group()
+
+@cli.command()
+@click.option('--count', default=1)
+def test(count):
+    click.echo(f'Count: {count}')
+
+@cli.command()
+@click.option('--count', default=1)
+@click.pass_context
+def dist(ctx, count):
+    ctx.forward(test)
+    ctx.invoke(test, count=42)
+</pre> <p>And what it looks like:</p> <pre data-language="shell">$ cli dist
+Count: 1
+Count: 42
+</pre> </section> <section id="callback-evaluation-order"> <h2 id="id1">Callback Evaluation Order</h2> <p>Click works a bit differently than some other command line parsers in that it attempts to reconcile the order of arguments as defined by the programmer with the order of arguments as defined by the user before invoking any callbacks.</p> <p>This is an important concept to understand when porting complex patterns to Click from optparse or other systems. A parameter callback invocation in optparse happens as part of the parsing step, whereas a callback invocation in Click happens after the parsing.</p> <p>The main difference is that in optparse, callbacks are invoked with the raw value as it happens, whereas a callback in Click is invoked after the value has been fully converted.</p> <p>Generally, the order of invocation is driven by the order in which the user provides the arguments to the script; if there is an option called <code>--foo</code> and an option called <code>--bar</code> and the user calls it as <code>--bar
+--foo</code>, then the callback for <code>bar</code> will fire before the one for <code>foo</code>.</p> <p>There are three exceptions to this rule which are important to know:</p> <dl> <dt>Eagerness:</dt>
+<dd>
+<p>An option can be set to be “eager”. All eager parameters are evaluated before all non-eager parameters, but again in the order as they were provided on the command line by the user.</p> <p>This is important for parameters that execute and exit like <code>--help</code> and <code>--version</code>. Both are eager parameters, but whatever parameter comes first on the command line will win and exit the program.</p> </dd> <dt>Repeated parameters:</dt>
+<dd>
+<p>If an option or argument is split up on the command line into multiple places because it is repeated – for instance, <code>--exclude foo --include
+baz --exclude bar</code> – the callback will fire based on the position of the first option. In this case, the callback will fire for <code>exclude</code> and it will be passed both options (<code>foo</code> and <code>bar</code>), then the callback for <code>include</code> will fire with <code>baz</code> only.</p> <p>Note that even if a parameter does not allow multiple versions, Click will still accept the position of the first, but it will ignore every value except the last. The reason for this is to allow composability through shell aliases that set defaults.</p> </dd> <dt>Missing parameters:</dt>
+<dd>
+<p>If a parameter is not defined on the command line, the callback will still fire. This is different from how it works in optparse where undefined values do not fire the callback. Missing parameters fire their callbacks at the very end which makes it possible for them to default to values from a parameter that came before.</p> </dd> </dl> <p>Most of the time you do not need to be concerned about any of this, but it is important to know how it works for some advanced cases.</p> </section> <section id="forwarding-unknown-options"> <h2 id="id2">Forwarding Unknown Options</h2> <p>In some situations it is interesting to be able to accept all unknown options for further manual processing. Click can generally do that as of Click 4.0, but it has some limitations that lie in the nature of the problem. The support for this is provided through a parser flag called <code>ignore_unknown_options</code> which will instruct the parser to collect all unknown options and to put them to the leftover argument instead of triggering a parsing error.</p> <p>This can generally be activated in two different ways:</p> <ol class="arabic simple"> <li>It can be enabled on custom <a class="reference internal" href="../api/index.html#click.Command" title="click.Command"><code>Command</code></a> subclasses by changing the <a class="reference internal" href="../api/index.html#click.BaseCommand.ignore_unknown_options" title="click.BaseCommand.ignore_unknown_options"><code>ignore_unknown_options</code></a> attribute.</li> <li>It can be enabled by changing the attribute of the same name on the context class (<a class="reference internal" href="../api/index.html#click.Context.ignore_unknown_options" title="click.Context.ignore_unknown_options"><code>Context.ignore_unknown_options</code></a>). This is best changed through the <code>context_settings</code> dictionary on the command.</li> </ol> <p>For most situations the easiest solution is the second. Once the behavior is changed something needs to pick up those leftover options (which at this point are considered arguments). For this again you have two options:</p> <ol class="arabic simple"> <li>You can use <a class="reference internal" href="../api/index.html#click.pass_context" title="click.pass_context"><code>pass_context()</code></a> to get the context passed. This will only work if in addition to <a class="reference internal" href="../api/index.html#click.Context.ignore_unknown_options" title="click.Context.ignore_unknown_options"><code>ignore_unknown_options</code></a> you also set <a class="reference internal" href="../api/index.html#click.Context.allow_extra_args" title="click.Context.allow_extra_args"><code>allow_extra_args</code></a> as otherwise the command will abort with an error that there are leftover arguments. If you go with this solution, the extra arguments will be collected in <a class="reference internal" href="../api/index.html#click.Context.args" title="click.Context.args"><code>Context.args</code></a>.</li> <li>You can attach an <a class="reference internal" href="../api/index.html#click.argument" title="click.argument"><code>argument()</code></a> with <code>nargs</code> set to <code>-1</code> which will eat up all leftover arguments. In this case it’s recommended to set the <code>type</code> to <a class="reference internal" href="../api/index.html#click.UNPROCESSED" title="click.UNPROCESSED"><code>UNPROCESSED</code></a> to avoid any string processing on those arguments as otherwise they are forced into unicode strings automatically which is often not what you want.</li> </ol> <p>In the end you end up with something like this:</p> <pre data-language="python">import sys
+from subprocess import call
+
+@click.command(context_settings=dict(
+    ignore_unknown_options=True,
+))
+@click.option('-v', '--verbose', is_flag=True, help='Enables verbose mode')
+@click.argument('timeit_args', nargs=-1, type=click.UNPROCESSED)
+def cli(verbose, timeit_args):
+    """A fake wrapper around Python's timeit."""
+    cmdline = ['echo', 'python', '-mtimeit'] + list(timeit_args)
+    if verbose:
+        click.echo(f"Invoking: {' '.join(cmdline)}")
+    call(cmdline)
+</pre> <p>And what it looks like:</p> <pre data-language="shell">$ cli --help
+Usage: cli [OPTIONS] [TIMEIT_ARGS]...
+
+  A fake wrapper around Python's timeit.
+
+Options:
+  -v, --verbose  Enables verbose mode
+  --help         Show this message and exit.
+
+$ cli -n 100 'a = 1; b = 2; a * b'
+python -mtimeit -n 100 a = 1; b = 2; a * b
+
+$ cli -v 'a = 1; b = 2; a * b'
+Invoking: echo python -mtimeit a = 1; b = 2; a * b
+python -mtimeit a = 1; b = 2; a * b
+</pre> <p>As you can see the verbosity flag is handled by Click, everything else ends up in the <code>timeit_args</code> variable for further processing which then for instance, allows invoking a subprocess. There are a few things that are important to know about how this ignoring of unhandled flag happens:</p> <ul class="simple"> <li>Unknown long options are generally ignored and not processed at all. So for instance if <code>--foo=bar</code> or <code>--foo bar</code> are passed they generally end up like that. Note that because the parser cannot know if an option will accept an argument or not, the <code>bar</code> part might be handled as an argument.</li> <li>Unknown short options might be partially handled and reassembled if necessary. For instance in the above example there is an option called <code>-v</code> which enables verbose mode. If the command would be ignored with <code>-va</code> then the <code>-v</code> part would be handled by Click (as it is known) and <code>-a</code> would end up in the leftover parameters for further processing.</li> <li>Depending on what you plan on doing you might have some success by disabling interspersed arguments (<a class="reference internal" href="../api/index.html#click.Context.allow_interspersed_args" title="click.Context.allow_interspersed_args"><code>allow_interspersed_args</code></a>) which instructs the parser to not allow arguments and options to be mixed. Depending on your situation this might improve your results.</li> </ul> <p>Generally though the combined handling of options and arguments from your own commands and commands from another application are discouraged and if you can avoid it, you should. It’s a much better idea to have everything below a subcommand be forwarded to another application than to handle some arguments yourself.</p> </section> <section id="global-context-access"> <h2>Global Context Access</h2> <details class="changelog"> <summary>Changelog</summary><div class="versionadded"> <p><span class="versionmodified added">New in version 5.0.</span></p> </div> </details><p>Starting with Click 5.0 it is possible to access the current context from anywhere within the same thread through the use of the <a class="reference internal" href="../api/index.html#click.get_current_context" title="click.get_current_context"><code>get_current_context()</code></a> function which returns it. This is primarily useful for accessing the context bound object as well as some flags that are stored on it to customize the runtime behavior. For instance the <a class="reference internal" href="../api/index.html#click.echo" title="click.echo"><code>echo()</code></a> function does this to infer the default value of the <code>color</code> flag.</p> <p>Example usage:</p> <pre data-language="python">def get_current_command_name():
+    return click.get_current_context().info_name
+</pre> <p>It should be noted that this only works within the current thread. If you spawn additional threads then those threads will not have the ability to refer to the current context. If you want to give another thread the ability to refer to this context you need to use the context within the thread as a context manager:</p> <pre data-language="python">def spawn_thread(ctx, func):
+    def wrapper():
+        with ctx:
+            func()
+    t = threading.Thread(target=wrapper)
+    t.start()
+    return t
+</pre> <p>Now the thread function can access the context like the main thread would do. However if you do use this for threading you need to be very careful as the vast majority of the context is not thread safe! You are only allowed to read from the context, but not to perform any modifications on it.</p> </section> <section id="detecting-the-source-of-a-parameter"> <h2>Detecting the Source of a Parameter</h2> <p>In some situations it’s helpful to understand whether or not an option or parameter came from the command line, the environment, the default value, or <code>Context.default_map</code>. The <a class="reference internal" href="../api/index.html#click.Context.get_parameter_source" title="click.Context.get_parameter_source"><code>Context.get_parameter_source()</code></a> method can be used to find this out. It will return a member of the <a class="reference internal" href="../api/index.html#click.core.ParameterSource" title="click.core.ParameterSource"><code>ParameterSource</code></a> enum.</p> <pre data-language="python">@click.command()
+@click.argument('port', nargs=1, default=8080, envvar="PORT")
+@click.pass_context
+def cli(ctx, port):
+    source = ctx.get_parameter_source("port")
+    click.echo(f"Port came from {source.name}")
+</pre> <pre data-language="shell">$ cli 8080
+Port came from COMMANDLINE
+
+$ export PORT=8080
+$ cli
+Port came from ENVIRONMENT
+
+$ cli
+Port came from DEFAULT
+</pre> </section> <section id="managing-resources"> <h2>Managing Resources</h2> <p>It can be useful to open a resource in a group, to be made available to subcommands. Many types of resources need to be closed or otherwise cleaned up after use. The standard way to do this in Python is by using a context manager with the <code>with</code> statement.</p> <p>For example, the <code>Repo</code> class from <a class="reference internal" href="../complex/index.html"><span class="doc">Complex Applications</span></a> might actually be defined as a context manager:</p> <pre data-language="python">class Repo:
+    def __init__(self, home=None):
+        self.home = os.path.abspath(home or ".")
+        self.db = None
+
+    def __enter__(self):
+        path = os.path.join(self.home, "repo.db")
+        self.db = open_database(path)
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.db.close()
+</pre> <p>Ordinarily, it would be used with the <code>with</code> statement:</p> <pre data-language="python">with Repo() as repo:
+    repo.db.query(...)
+</pre> <p>However, a <code>with</code> block in a group would exit and close the database before it could be used by a subcommand.</p> <p>Instead, use the context’s <a class="reference internal" href="../api/index.html#click.Context.with_resource" title="click.Context.with_resource"><code>with_resource()</code></a> method to enter the context manager and return the resource. When the group and any subcommands finish, the context’s resources are cleaned up.</p> <pre data-language="python">@click.group()
+@click.option("--repo-home", default=".repo")
+@click.pass_context
+def cli(ctx, repo_home):
+    ctx.obj = ctx.with_resource(Repo(repo_home))
+
+@cli.command()
+@click.pass_obj
+def log(obj):
+    # obj is the repo opened in the cli group
+    for entry in obj.db.query(...):
+        click.echo(entry)
+</pre> <p>If the resource isn’t a context manager, usually it can be wrapped in one using something from <a class="reference external" href="https://docs.python.org/3/library/contextlib.html#module-contextlib" title="(in Python v3.12)"><code>contextlib</code></a>. If that’s not possible, use the context’s <a class="reference internal" href="../api/index.html#click.Context.call_on_close" title="click.Context.call_on_close"><code>call_on_close()</code></a> method to register a cleanup function.</p> <pre data-language="python">@click.group()
+@click.option("--name", default="repo.db")
+@click.pass_context
+def cli(ctx, repo_home):
+    ctx.obj = db = open_db(repo_home)
+
+    @ctx.call_on_close
+    def close_db():
+        db.record_use()
+        db.save()
+        db.close()
+</pre> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Copyright 2014 Pallets.<br>Licensed under the BSD 3-Clause License.<br>We are not supported nor endorsed by Pallets.<br>
+    <a href="https://click.palletsprojects.com/en/8.1.x/advanced/" class="_attribution-link">https://click.palletsprojects.com/en/8.1.x/advanced/</a>
+  </p>
+</div>
