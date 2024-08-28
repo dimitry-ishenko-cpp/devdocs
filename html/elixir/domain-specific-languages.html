@@ -1,0 +1,152 @@
+<div id="top-content"> <h1> <a href="https://github.com/elixir-lang/elixir/blob/v1.17.2/lib/elixir/pages/meta-programming/domain-specific-languages.md#L1" title="View Source" class="source" rel="help">Source</a> <span>Domain-Specific Languages (DSLs)</span> </h1> <p><a href="https://en.wikipedia.org/wiki/Domain-specific_language">Domain-specific Languages (DSLs)</a> are languages tailored to a specific application domain. You don't need macros in order to have a DSL: every data structure and every function you define in your module is part of your domain-specific language.</p>
+<p>For example, imagine we want to implement a <code class="inline">Validator</code> module which provides a data validation domain-specific language. We could implement it using data structures, functions, or macros. Let's see what those different DSLs would look like:</p>
+<pre data-language="elixir"># 1. Data structures
+import Validator
+validate user, name: [length: 1..100], email: [matches: ~r/@/]
+
+# 2. Functions
+import Validator
+user
+|&gt; validate_length(:name, 1..100)
+|&gt; validate_matches(:email, ~r/@/)
+
+# 3. Macros + modules
+defmodule MyValidator do
+  use Validator
+  validate_length :name, 1..100
+  validate_matches :email, ~r/@/
+end
+
+MyValidator.validate(user)</pre>
+<p>Of all the approaches above, the first is definitely the most flexible. If our domain rules can be encoded with data structures, they are by far the easiest to compose and implement, as Elixir's standard library is filled with functions for manipulating different data types.</p>
+<p>The second approach uses function calls which better suits more complex APIs (for example, if you need to pass many options) and reads nicely in Elixir thanks to the pipe operator.</p>
+<p>The third approach uses macros, and is by far the most complex. It will take more lines of code to implement, it is hard and expensive to test (compared to testing simple functions), and it limits how the user may use the library since all validations need to be defined inside a module.</p>
+<p>To drive the point home, imagine you want to validate a certain attribute only if a given condition is met. We could easily achieve it with the first solution, by manipulating the data structure accordingly, or with the second solution by using conditionals (if/else) before invoking the function. However, it is impossible to do so with the macros approach unless its DSL is augmented.</p>
+<p>In other words:</p>
+<pre data-language="elixir">data &gt; functions &gt; macros</pre>
+<p>That said, there are still cases where using macros and modules to build domain-specific languages is useful. Since we have explored data structures and function definitions in the Getting Started guide, this chapter will explore how to use macros and module attributes to tackle more complex DSLs.</p>
+<h2 id="building-our-own-test-case" class="section-heading">  <span class="text">Building our own test case</span> </h2> <p>The goal in this chapter is to build a module named <code class="inline">TestCase</code> that allows us to write the following:</p>
+<pre data-language="elixir">defmodule MyTest do
+  use TestCase
+
+  test "arithmetic operations" do
+    4 = 2 + 2
+  end
+
+  test "list operations" do
+    [1, 2, 3] = [1, 2] ++ [3]
+  end
+end
+
+MyTest.run()</pre>
+<p>In the example above, by using <code class="inline">TestCase</code>, we can write tests using the <code class="inline">test</code> macro, which defines a function named <code class="inline">run</code> to automatically run all tests for us. Our prototype will rely on the match operator (<code class="inline">=</code>) as a mechanism to do assertions.</p>
+<h2 id="the-test-macro" class="section-heading">  <span class="text">The <code class="inline">test</code> macro</span> </h2> <p>Let's start by creating a module that defines and imports the <code class="inline">test</code> macro when used:</p>
+<pre data-language="elixir">defmodule TestCase do
+  # Callback invoked by `use`.
+  #
+  # For now it returns a quoted expression that
+  # imports the module itself into the user code.
+  @doc false
+  defmacro __using__(_opts) do
+    quote do
+      import TestCase
+    end
+  end
+
+  @doc """
+  Defines a test case with the given description.
+
+  ## Examples
+
+      test "arithmetic operations" do
+        4 = 2 + 2
+      end
+
+  """
+  defmacro test(description, do: block) do
+    function_name = String.to_atom("test " &lt;&gt; description)
+    quote do
+      def unquote(function_name)(), do: unquote(block)
+    end
+  end
+end</pre>
+<p>Assuming we defined <code class="inline">TestCase</code> in a file named <code class="inline">tests.exs</code>, we can open it up by running <code class="inline">iex tests.exs</code> and define our first tests:</p>
+<pre data-language="elixir">iex&gt; defmodule MyTest do
+...&gt;   use TestCase
+...&gt;
+...&gt;   test "hello" do
+...&gt;     "hello" = "world"
+...&gt;   end
+...&gt; end</pre>
+<p>For now, we don't have a mechanism to run tests, but we know that a function named <code class="inline">test hello</code> was defined behind the scenes. When we invoke it, it should fail:</p>
+<pre data-language="elixir">iex&gt; MyTest."test hello"()
+** (MatchError) no match of right hand side value: "world"</pre>
+<h2 id="storing-information-with-attributes" class="section-heading">  <span class="text">Storing information with attributes</span> </h2> <p>In order to finish our <code class="inline">TestCase</code> implementation, we need to be able to access all defined test cases. One way of doing this is by retrieving the tests at runtime via <code class="inline">__MODULE__.__info__(:functions)</code>, which returns a list of all functions in a given module. However, considering that we may want to store more information about each test besides the test name, a more flexible approach is required.</p>
+<p>When discussing module attributes in earlier chapters, we mentioned how they can be used as temporary storage. That's exactly the property we will apply in this section.</p>
+<p>In the <code class="inline">__using__/1</code> implementation, we will initialize a module attribute named <code class="inline">@tests</code> to an empty list, then store the name of each defined test in this attribute so the tests can be invoked from the <code class="inline">run</code> function.</p>
+<p>Here is the updated code for the <code class="inline">TestCase</code> module:</p>
+<pre data-language="elixir">defmodule TestCase do
+  @doc false
+  defmacro __using__(_opts) do
+    quote do
+      import TestCase
+
+      # Initialize @tests to an empty list
+      @tests []
+
+      # Invoke TestCase.__before_compile__/1 before the module is compiled
+      @before_compile TestCase
+    end
+  end
+
+  @doc """
+  Defines a test case with the given description.
+
+  ## Examples
+
+      test "arithmetic operations" do
+        4 = 2 + 2
+      end
+
+  """
+  defmacro test(description, do: block) do
+    function_name = String.to_atom("test " &lt;&gt; description)
+    quote do
+      # Prepend the newly defined test to the list of tests
+      @tests [unquote(function_name) | @tests]
+      def unquote(function_name)(), do: unquote(block)
+    end
+  end
+
+  # This will be invoked right before the target module is compiled
+  # giving us the perfect opportunity to inject the `run/0` function
+  @doc false
+  defmacro __before_compile__(_env) do
+    quote do
+      def run do
+        Enum.each(@tests, fn name -&gt;
+          IO.puts("Running #{name}")
+          apply(__MODULE__, name, [])
+        end)
+      end
+    end
+  end
+end</pre>
+<p>By starting a new IEx session, we can now define our tests and run them:</p>
+<pre data-language="elixir">iex&gt; defmodule MyTest do
+...&gt;   use TestCase
+...&gt;
+...&gt;   test "hello" do
+...&gt;     "hello" = "world"
+...&gt;   end
+...&gt; end
+iex&gt; MyTest.run()
+Running test hello
+** (MatchError) no match of right hand side value: "world"</pre>
+<p>Although we have overlooked some details, this is the main idea behind creating domain-specific languages in Elixir via modules and macros. Macros enable us to return quoted expressions that are executed in the caller, which we can then use to transform code and store relevant information in the target module via module attributes. Finally, callbacks such as <code class="inline">@before_compile</code> allow us to inject code into the module when its definition is complete.</p>
+<p>Besides <code class="inline">@before_compile</code>, there are other useful module attributes like <code class="inline">@on_definition</code> and <code class="inline">@after_compile</code>, which you can read more about in the docs for <a href="module.html"><code class="inline">Module</code></a>. You can also find useful information about macros and the compilation environment in the documentation for the <a href="macro.html"><code class="inline">Macro</code></a> and <a href="macro.env.html"><code class="inline">Macro.Env</code></a>.</p> </div> <div class="bottom-actions" id="bottom-actions"> <div class="bottom-actions-item"> <a href="macros.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Macros </span> </a> </div> <div class="bottom-actions-item"> <a href="introduction-to-mix.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Introduction to Mix </span> </a> </div> </div> <footer class="footer"> <p> <span class="line"> <button class="a-main footer-button display-quick-switch" title="Search HexDocs packages"> Search HexDocs </button> <a href="elixir.epub.html" title="ePub version"> Download ePub version </a> </span> </p> <p class="built-using"> Built using <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener" translate="no">ExDoc</a> (v0.34.1) for the <a href="https://elixir-lang.org" title="Elixir" target="_blank" translate="no">Elixir programming language</a> </p> </footer><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012-2024 The Elixir Team<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/elixir/1.17.2/domain-specific-languages.html" class="_attribution-link">https://hexdocs.pm/elixir/1.17.2/domain-specific-languages.html</a>
+  </p>
+</div>

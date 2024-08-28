@@ -1,0 +1,265 @@
+<h1>pmfault(3) — Linux manual page</h1>   <pre>
+<span class="headline"><i>PMFAULT</i>(3)              Library Functions Manual              <i>PMFAULT</i>(3)</span>
+</pre> <h2>
+NAME </h2>
+<pre>
+       <b>__pmFaultInject</b>, <b>__pmFaultSummary</b>, <b>PM_FAULT_POINT</b>,
+       <b>PM_FAULT_RETURN</b>, <b>PM_FAULT_CHECK</b>, <b>PM_FAULT_CLEAR </b>- Fault Injection
+       Infrastructure for QA
+</pre> <h2>
+C SYNOPSIS </h2>
+<pre>
+       <b>#include &lt;pcp/pmapi.h&gt;</b>
+       <b>#include &lt;pcp/fault.h&gt;</b>
+
+       <b>void __pmFaultInject(const char *</b><i>ident</i><b>, int </b><i>class</i><b>);</b>
+       <b>void __pmFaultSummary(FILE *</b><i>f</i><b>);</b>
+
+       <b>PM_FAULT_POINT(</b><i>ident</i><b>, </b><i>class</i><b>);</b>
+       <b>PM_FAULT_RETURN(</b><i>retvalue</i><b>);</b>
+       <b>PM_FAULT_CHECK;</b>
+       <b>PM_FAULT_CLEAR;</b>
+
+       <b>cc -DPM_FAULT_INJECTION=1 ... -lpcp_fault</b>
+</pre> <h2>
+DESCRIPTION </h2>
+<pre>
+       As part of the coverage-driven changes to QA in PCP 3.6, it
+       became apparent that we needed someway to exercise the
+       ``uncommon'' code paths associated with error detection and
+       recovery.
+
+       The facilities described below provide a basic fault injection
+       infrastructure (for <i>libpcp</i> only at this stage, although the
+       mechanism is far more general and could easily be extended).
+
+       A special build is required to create <i>libpcp_fault</i> and the
+       associated <i>&lt;pcp/fault.h&gt;</i> header file.  Once this has been done,
+       new QA applications may be built with <b>-DPM_FAULT_INJECTION=1</b>
+       and/or existing applications can be exercised in presence of
+       fault injection by forcing <i>libpcp_fault</i> to be used in preference
+       to <i>libpcp</i> as described below.
+
+       In the code to be tested, <b>__pmFaultInject </b>defines a fault point
+       at which a fault of type <i>class</i> may be injected.  <i>ident</i> is a
+       string to uniquely identify the fault point across all of the PCP
+       source code, so something like "libpcp/" __FILE__ ":&lt;number&gt;"
+       works just fine.  The <i>ident</i> string also determines if a fault
+       will be injected at run-time or not - refer to the <b>RUN-TIME</b>
+       <b>CONTROL </b>section below.  <i>class</i> selects a failure type, using one
+       of the following defined values (this list may well grow over
+       time):
+
+       <b>PM_FAULT_ALLOC</b>
+              Will cause the <b>next </b>call to <a href="malloc.3.html">malloc(3)</a>, <a href="realloc.3.html">realloc(3)</a> or
+              <a href="strdup.3.html">strdup(3)</a> to fail, returning NULL and setting <i><a href="errno.3.html">errno</a></i> to
+              <b>ENOMEM</b>.  We could extend the coverage to all of the
+              malloc-related routines, but these three are sufficient to
+              cover the vast majority of the uses within <i>libpcp</i>.
+
+       <b>PM_FAULT_CALL</b>
+              Will cause the <b>next </b>call to an instrumented routine to
+              fail by returning an error code (possibly the new
+              <b>PM_ERR_FAULT </b>code).  The actual error code is defined in
+              the <b>PM_FAULT_RETURN </b>macro at the head of an instrumented
+              routine.  Initially, only <b>__pmRegisterAnon</b>(3) (returns
+              <b>PM_ERR_FAULT</b>), <b>__pmGetPDU</b>(3) (returns <b>PM_ERR_TIMEOUT</b>) and
+              <b>__pmAllocResult</b>(3) (returns <b>NULL</b>) were instrumented as a
+              proof of concept for this part of the facility, however
+              other routines may have this fault injection capability
+              added over time.
+
+       <b>PM_FAULT_MISC</b>
+              The ``other'' class, currently used with <b>PM_FAULT_CHECK </b>as
+              described below.
+
+       To allow fault injection to co-exist within the production source
+       code, <b>PM_FAULT_POINT </b>is a macro that emits no code by default,
+       but when <b>PM_FAULT_INJECTION </b>is defined this becomes a call to
+       <b>__pmFaultInject</b>.  Throughout <i>libpcp</i> we use <b>PM_FAULT_POINT </b>and <b>not</b>
+       <b>__pmFaultInject </b>so that both <i>libpcp</i> and <i>libpcp_fault</i> can be built
+       from the same source code.
+
+       Similarly, the macro <b>PM_FAULT_RETURN </b>emits no code unless
+       <b>PM_FAULT_INJECTION </b>is defined, in which case if a fault of type
+       <b>PM_FAULT_CALL </b>has been armed with <b>__pmFaultInject </b>then, the
+       enclosing routine return with the function value <i>retvalue</i>.
+
+       The <b>PM_FAULT_CHECK </b>macro returns a value that may be 0 or 1.  If
+       <b>PM_FAULT_INJECTION </b>is defined then if a fault of type
+       <b>PM_FAULT_MISC </b>has been armed with <b>__pmFaultInject </b>then the value
+       is 1 else it is 0.
+
+       <b>PM_FAULT_CHECK </b>is most often used in concert with the
+       <b>PM_FAULT_POINT </b>macro with the <b>PM_FAULT_MISC </b>class to potentially
+       arm a trigger, then test <b>PM_FAULT_CHECK </b>and if this has the value
+       1, then the <b>PM_FAULT_CLEAR </b>macro is used to clear any armed
+       faults, and the fault injection code is executed.
+
+       This is illustrated in the example below from
+       <i>src/libpcp/src/exec.c</i>:
+
+           pid = fork();
+
+           /* begin fault-injection block */
+           PM_FAULT_POINT("libpcp/" __FILE__ ":4", PM_FAULT_MISC);
+           if (PM_FAULT_CHECK) {
+            PM_FAULT_CLEAR;
+            if (pid &gt; (pid_t)0)
+                kill(pid, SIGKILL);
+            setoserror(EAGAIN);
+            pid = -1;
+           }
+           /* end fault-injection block */
+
+       A summary of fault points seen and faults injected is produced on
+       stdio stream <i>f</i> by <b>__pmFaultSummary</b>.
+
+       Additional tracing (via <b>-Dfault </b>or <b>pmDebugOptions.fault</b>) and a
+       new PMAPI error code (<b>PM_ERR_FAULT</b>) are also defined, although
+       these will only ever be seen or used in <i>libpcp_fault</i>.  If
+       <b>pmDebugOptions.fault </b>is set the first time <b>__pmFaultInject </b>is
+       called, then <b>__pmFaultSummary </b>will be called automatically to
+       report on <i>stderr</i> when the application exits (via <a href="atexit.3.html">atexit(3)</a>).
+
+       Fault injection cannot be nested.  Each call to <b>__pmFaultInject</b>
+       clears any previous fault injection that has been armed, but not
+       yet executed.
+
+       The fault injection infrastructure is <b>not </b>thread-safe and should
+       only be used with applications that are known to be single-
+       threaded.
+</pre> <h2>
+RUN-TIME CONTROL </h2>
+<pre>
+       By default, no fault injection is enabled at run-time, even when
+       <b>__pmFaultInject </b>is called.
+
+       Faults are selectively enabled using a control file, identified
+       by the environment variable <b>$PM_FAULT_CONTROL</b>; if this is not
+       set, no faults are enabled.
+
+       The control file (if it exists) is read the first time
+       <b>__pmFaultInject </b>is called, and contains lines of the form:
+               <i>ident op number</i>
+       that define fault injection guards.
+
+       <i>ident</i> is a fault point string (as defined by a call to
+       <b>__pmFaultInject</b>, or more usually the <b>PM_FAULT_POINT </b>macro).  So
+       one needs access to the <i>libpcp</i> source code to determine the
+       available <i>ident</i> strings and their semantics.
+
+       <i>op</i> is one of the C-style operators <b>&gt;=</b>, <b>&gt;</b>, <b>==</b>, <b>&lt;</b>, <b>&lt;=</b>, <b>!= </b>or <b>% </b>and
+       <i>number</i> is an unsigned integer.  <i>op number</i> is optional and the
+       default is <b>&gt;0</b>
+
+       The semantics of the fault injection guards are that each time
+       <b>__pmFaultInject </b>is called for a particular <i>ident</i>, a trip count is
+       incremented (the first trip is 1); if the C-style expression
+       <i>tripcount op number</i> has the value 1 (so <b>true </b>for most <i>op</i>s, or the
+       remainder equals 1 for the <b>% </b><i>op</i>), then a fault of the <i>class</i>
+       defined for the fault point associated with <i>ident</i> will be armed,
+       and executed as soon as possible.
+
+       Within the control file, blank lines are ignored and lines
+       beginning with # are treated as comments.
+
+       For an existing application linked with <i>libpcp</i> fault injection
+       may still be used by forcing <i>libpcp_fault</i> to be used in the place
+       of <i>libpcp</i>.  The following example shows how this might be done.
+
+       $ export PM_FAULT_CONTROL=/tmp/control
+       $ cat $PM_FAULT_CONTROL
+       # ok for 2 trips, then inject errors
+       libpcp/events.c:1  &gt;2
+
+       $ export LD_PRELOAD=/usr/lib/libpcp_fault.so
+       $ pmevent -Dfault -s 3 sample.event.records
+       host:      localhost
+       samples:   3
+       interval:  1.00 sec
+       sample.event.records[fungus]: 0 event records
+       __pmFaultInject(libpcp/events.c:1) ntrip=1 SKIP
+       sample.event.records[bogus]: 2 event records
+         10:46:12.413 --- event record [0] flags 0x1 (point) ---
+           sample.event.param_string "fetch #0"
+         10:46:12.413 --- event record [1] flags 0x1 (point) ---
+           sample.event.param_string "bingo!"
+       __pmFaultInject(libpcp/events.c:1) ntrip=2 SKIP
+       sample.event.records[fungus]: 1 event records
+         10:46:03.416 --- event record [0] flags 0x1 (point) ---
+       __pmFaultInject(libpcp/events.c:1) ntrip=3 INJECT
+       sample.event.records[bogus]: pmUnpackEventRecords: Cannot allocate memory
+       __pmFaultInject(libpcp/events.c:1) ntrip=4 INJECT
+       sample.event.records[fungus]: pmUnpackEventRecords: Cannot allocate memory
+       __pmFaultInject(libpcp/events.c:1) ntrip=5 INJECT
+       sample.event.records[bogus]: pmUnpackEventRecords: Cannot allocate memory
+       === Fault Injection Summary Report ===
+       libpcp/events.c:1: guard trip&gt;2, 5 trips, 3 faults
+</pre> <h2>
+EXAMPLES </h2>
+<pre>
+       Refer to the PCP and PCP QA source code.
+
+       The macro definitions are in <i>src/include/pcp/fault.h</i>.
+
+       <i>src/libpcp/src/fault.c</i> contains all of the the underlying
+       implementation.
+
+       <i>src/libpcp_fault</i> and <i>src/libpcp_fault/src</i> contains the recipe and
+       Makefiles for creating and installing <i>libpcp_fault.so</i> and
+       <i>&lt;pcp/fault.h&gt;</i>.
+
+       <b>PM_FAULT_RETURN </b>was initiallly used in the following <i>libpcp</i>
+       source files: <i>derive_parser.y.in</i>, <i>pdu.c</i> and <i>result.c</i>.
+
+       <b>PM_FAULT_POINT</b>.  was initiallly used in the following <i>libpcp</i>
+       source files: <i>derive_parser.y.in</i>, <i>desc.c</i>, <i>e_indom.c</i>, <i>e_labels.c</i>,
+       <i>err.c</i>, <i>events.c</i>, <i>exec.c</i>, <i>fetch.c</i>, <i>help.c</i>, <i>instance.c</i>, <i>interp.c</i>,
+       <i>labels.c</i>, <i>logmeta.c</i>, <i>pmns.c</i>, <i>p_profile.c</i> and <i>store.c</i>.
+
+       The ``fault'' group of QA tests show examples of control file
+       use.  To see which tests are involved
+
+       $ cd qa
+       $ check -n -g fault
+</pre> <h2>
+DIAGNOSTICS </h2>
+<pre>
+       Some non-recoverable errors are reported on <i>stderr</i>.
+</pre> <h2>
+ENVIRONMENT </h2>
+<pre>
+       <b>PM_FAULT_CONTROL</b>
+              Full path to the fault injection control file.
+
+       <b>LD_PRELOAD</b>
+              Force <i>libpcp_fault</i> to be used in preference to <i>libpcp</i>.
+</pre> <h2>
+SEE ALSO </h2>
+<pre>
+       <a href="pmapi.3.html">PMAPI(3)</a>
+</pre> <h2>
+COLOPHON </h2>
+<pre>
+       This page is part of the <i>PCP</i> (Performance Co-Pilot) project.
+       Information about the project can be found at 
+       ⟨<a href="http://www.pcp.io/">http://www.pcp.io/</a>⟩.  If you have a bug report for this manual
+       page, send it to pcp@groups.io.  This page was obtained from the
+       project's upstream Git repository
+       ⟨<a href="https://github.com/performancecopilot/pcp.git">https://github.com/performancecopilot/pcp.git</a>⟩ on 2024-06-14.
+       (At that time, the date of the most recent commit that was found
+       in the repository was 2024-06-14.)  If you discover any rendering
+       problems in this HTML version of the page, or you believe there
+       is a better or more up-to-date source for the page, or you have
+       corrections or improvements to the information in this COLOPHON
+       (which is <i>not</i> part of the original manual page), send a mail to
+       man-pages@man7.org
+
+<span class="footline">Performance Co-Pilot                                          <i>PMFAULT</i>(3)</span>
+</pre>          <div class="_attribution">
+  <p class="_attribution-p">
+    ...<br>
+    <a href="https://man7.org/linux/man-pages/man3/__pmFaultSummary.3.html" class="_attribution-link">https://man7.org/linux/man-pages/man3/__pmFaultSummary.3.html</a>
+  </p>
+</div>

@@ -1,0 +1,225 @@
+<div id="top-content"> <h1> <a href="https://github.com/elixir-lang/elixir/blob/v1.17.2/lib/elixir/pages/mix-and-otp/distributed-tasks.md#L1" title="View Source" class="source" rel="help">Source</a> <span>Distributed tasks and tags</span> </h1> <p>In this chapter, we will go back to the <code class="inline">:kv</code> application and add a routing layer that will allow us to distribute requests between nodes based on the bucket name.</p>
+<p>The routing layer will receive a routing table of the following format:</p>
+<pre data-language="elixir">[
+  {?a..?m, :"foo@computer-name"},
+  {?n..?z, :"bar@computer-name"}
+]</pre>
+<p>The router will check the first byte of the bucket name against the table and dispatch to the appropriate node based on that. For example, a bucket starting with the letter "a" (<code class="inline">?a</code> represents the Unicode codepoint of the letter "a") will be dispatched to node <code class="inline">foo@computer-name</code>.</p>
+<p>If the matching entry points to the node evaluating the request, then we've finished routing, and this node will perform the requested operation. If the matching entry points to a different node, we'll pass the request to said node, which will look at its own routing table (which may be different from the one in the first node) and act accordingly. If no entry matches, an error will be raised.</p>
+<blockquote><p>Note: we will be using two nodes in the same machine throughout this chapter. You are free to use two (or more) different machines on the same network but you need to do some prep work. First of all, you need to ensure all machines have a <code class="inline">~/.erlang.cookie</code> file with exactly the same value. Then you need to guarantee <a href="http://www.erlang.org/doc/man/epmd.html">epmd</a> is running on a port that is not blocked (you can run <code class="inline">epmd -d</code> for debug info).</p></blockquote>
+<h2 id="our-first-distributed-code" class="section-heading">  <span class="text">Our first distributed code</span> </h2> <p>Elixir ships with facilities to connect nodes and exchange information between them. In fact, we use the same concepts of processes, message passing and receiving messages when working in a distributed environment because Elixir processes are <em>location transparent</em>. This means that when sending a message, it doesn't matter if the recipient process is on the same node or on another node, the VM will be able to deliver the message in both cases.</p>
+<p>In order to run distributed code, we need to start the VM with a name. The name can be short (when in the same network) or long (requires the full computer address). Let's start a new IEx session:</p>
+<pre data-language="elixir">$ iex --sname foo
+</pre>
+<p>You can see now the prompt is slightly different and shows the node name followed by the computer name:</p>
+<pre data-language="elixir">Interactive Elixir - press Ctrl+C to exit (type h() ENTER for help)
+iex(foo@jv)1&gt;</pre>
+<p>My computer is named <code class="inline">jv</code>, so I see <code class="inline">foo@jv</code> in the example above, but you will get a different result. We will use <code class="inline">foo@computer-name</code> in the following examples and you should update them accordingly when trying out the code.</p>
+<p>Let's define a module named <code class="inline">Hello</code> in this shell:</p>
+<pre data-language="elixir">iex&gt; defmodule Hello do
+...&gt;   def world, do: IO.puts "hello world"
+...&gt; end</pre>
+<p>If you have another computer on the same network with both Erlang and Elixir installed, you can start another shell on it. If you don't, you can start another IEx session in another terminal. In either case, give it the short name of <code class="inline">bar</code>:</p>
+<pre data-language="elixir">$ iex --sname bar
+</pre>
+<p>Note that inside this new IEx session, we cannot access <code class="inline">Hello.world/0</code>:</p>
+<pre data-language="elixir">iex&gt; Hello.world
+** (UndefinedFunctionError) function Hello.world/0 is undefined (module Hello is not available)
+    Hello.world()</pre>
+<p>However, we can spawn a new process on <code class="inline">foo@computer-name</code> from <code class="inline">bar@computer-name</code>! Let's give it a try (where <code class="inline">@computer-name</code> is the one you see locally):</p>
+<pre data-language="elixir">iex&gt; Node.spawn_link(:"foo@computer-name", fn -&gt; Hello.world() end)
+#PID&lt;9014.59.0&gt;
+hello world</pre>
+<p>Elixir spawned a process on another node and returned its PID. The code then executed on the other node where the <code class="inline">Hello.world/0</code> function exists and invoked that function. Note that the result of "hello world" was printed on the current node <code class="inline">bar</code> and not on <code class="inline">foo</code>. In other words, the message to be printed was sent back from <code class="inline">foo</code> to <code class="inline">bar</code>. This happens because the process spawned on the other node (<code class="inline">foo</code>) knows all the output should be sent back to the original node!</p>
+<p>We can send and receive messages from the PID returned by <a href="node.html#spawn_link/2"><code class="inline">Node.spawn_link/2</code></a> as usual. Let's try a quick ping-pong example:</p>
+<pre data-language="elixir">iex&gt; pid = Node.spawn_link(:"foo@computer-name", fn -&gt;
+...&gt;   receive do
+...&gt;     {:ping, client} -&gt; send(client, :pong)
+...&gt;   end
+...&gt; end)
+#PID&lt;9014.59.0&gt;
+iex&gt; send(pid, {:ping, self()})
+{:ping, #PID&lt;0.73.0&gt;}
+iex&gt; flush()
+:pong
+:ok</pre>
+<p>From our quick exploration, we could conclude that we should use <a href="node.html#spawn_link/2"><code class="inline">Node.spawn_link/2</code></a> to spawn processes on a remote node every time we need to do a distributed computation. However, we have learned throughout this guide that spawning processes outside of supervision trees should be avoided if possible, so we need to look for other options.</p>
+<p>There are three better alternatives to <a href="node.html#spawn_link/2"><code class="inline">Node.spawn_link/2</code></a> that we could use in our implementation:</p>
+<ol>
+<li><p>We could use Erlang's <a href="http://www.erlang.org/doc/man/erpc.html">:erpc</a> module to execute functions on a remote node. Inside the <code class="inline">bar@computer-name</code> shell above, you can call <code class="inline">:erpc.call(:"foo@computer-name", Hello, :world, [])</code> and it will print "hello world"</p></li>
+<li><p>We could have a server running on the other node and send requests to that node via the <a href="genserver.html"><code class="inline">GenServer</code></a> API. For example, you can call a server on a remote node by using <code class="inline">GenServer.call({name, node}, arg)</code> or passing the remote process PID as the first argument</p></li>
+<li><p>We could use <a href="task.html">tasks</a>, which we have learned about in <a href="task-and-gen-tcp.html">a previous chapter</a>, as they can be spawned on both local and remote nodes</p></li>
+</ol>
+<p>The options above have different properties. The GenServer would serialize your requests on a single server, while tasks are effectively running asynchronously on the remote node, with the only serialization point being the spawning done by the supervisor.</p>
+<p>For our routing layer, we are going to use tasks, but feel free to explore the other alternatives too.</p>
+<h2 id="async-await" class="section-heading">  <span class="text">async/await</span> </h2> <p>So far we have explored tasks that are started and run in isolation, without regard to their return value. However, sometimes it is useful to run a task to compute a value and read its result later on. For this, tasks also provide the <code class="inline">async/await</code> pattern:</p>
+<pre data-language="elixir">task = Task.async(fn -&gt; compute_something_expensive() end)
+res  = compute_something_else()
+res + Task.await(task)</pre>
+<p><code class="inline">async/await</code> provides a very simple mechanism to compute values concurrently. Not only that, <code class="inline">async/await</code> can also be used with the same <a href="task.supervisor.html"><code class="inline">Task.Supervisor</code></a> we have used in previous chapters. We just need to call <a href="task.supervisor.html#async/2"><code class="inline">Task.Supervisor.async/2</code></a> instead of <a href="task.supervisor.html#start_child/2"><code class="inline">Task.Supervisor.start_child/2</code></a> and use <a href="task.html#await/2"><code class="inline">Task.await/2</code></a> to read the result later on.</p>
+<h2 id="distributed-tasks" class="section-heading">  <span class="text">Distributed tasks</span> </h2> <p>Distributed tasks are exactly the same as supervised tasks. The only difference is that we pass the node name when spawning the task on the supervisor. Open up <code class="inline">lib/kv/supervisor.ex</code> from the <code class="inline">:kv</code> application. Let's add a task supervisor as the last child of the tree:</p>
+<pre data-language="elixir">{Task.Supervisor, name: KV.RouterTasks},</pre>
+<p>Now, let's start two named nodes again, but inside the <code class="inline">:kv</code> application:</p>
+<pre data-language="elixir">$ iex --sname foo -S mix
+$ iex --sname bar -S mix
+</pre>
+<p>From inside <code class="inline">bar@computer-name</code>, we can now spawn a task directly on the other node via the supervisor:</p>
+<pre data-language="elixir">iex&gt; task = Task.Supervisor.async({KV.RouterTasks, :"foo@computer-name"}, fn -&gt;
+...&gt;   {:ok, node()}
+...&gt; end)
+%Task{
+  mfa: {:erlang, :apply, 2},
+  owner: #PID&lt;0.122.0&gt;,
+  pid: #PID&lt;12467.88.0&gt;,
+  ref: #Reference&lt;0.0.0.400&gt;
+}
+iex&gt; Task.await(task)
+{:ok, :"foo@computer-name"}</pre>
+<p>Our first distributed task retrieves the name of the node the task is running on. Notice we have given an anonymous function to <a href="task.supervisor.html#async/2"><code class="inline">Task.Supervisor.async/2</code></a> but, in distributed cases, it is preferable to give the module, function, and arguments explicitly:</p>
+<pre data-language="elixir">iex&gt; task = Task.Supervisor.async({KV.RouterTasks, :"foo@computer-name"}, Kernel, :node, [])
+%Task{
+  mfa: {Kernel, :node, 0},
+  owner: #PID&lt;0.122.0&gt;,
+  pid: #PID&lt;12467.89.0&gt;,
+  ref: #Reference&lt;0.0.0.404&gt;
+}
+iex&gt; Task.await(task)
+:"foo@computer-name"</pre>
+<p>The difference is that anonymous functions require the target node to have exactly the same code version as the caller. Using module, function, and arguments is more robust because you only need to find a function with matching arity in the given module.</p>
+<p>With this knowledge in hand, let's finally write the routing code.</p>
+<h2 id="routing-layer" class="section-heading">  <span class="text">Routing layer</span> </h2> <p>Create a file at <code class="inline">lib/kv/router.ex</code> with the following contents:</p>
+<pre data-language="elixir">defmodule KV.Router do
+  @doc """
+  Dispatch the given `mod`, `fun`, `args` request
+  to the appropriate node based on the `bucket`.
+  """
+  def route(bucket, mod, fun, args) do
+    # Get the first byte of the binary
+    first = :binary.first(bucket)
+
+    # Try to find an entry in the table() or raise
+    entry =
+      Enum.find(table(), fn {enum, _node} -&gt;
+        first in enum
+      end) || no_entry_error(bucket)
+
+    # If the entry node is the current node
+    if elem(entry, 1) == node() do
+      apply(mod, fun, args)
+    else
+      {KV.RouterTasks, elem(entry, 1)}
+      |&gt; Task.Supervisor.async(KV.Router, :route, [bucket, mod, fun, args])
+      |&gt; Task.await()
+    end
+  end
+
+  defp no_entry_error(bucket) do
+    raise "could not find entry for #{inspect bucket} in table #{inspect table()}"
+  end
+
+  @doc """
+  The routing table.
+  """
+  def table do
+    # Replace computer-name with your local machine name
+    [{?a..?m, :"foo@computer-name"}, {?n..?z, :"bar@computer-name"}]
+  end
+end</pre>
+<p>Let's write a test to verify our router works. Create a file named <code class="inline">test/kv/router_test.exs</code> containing:</p>
+<pre data-language="elixir">defmodule KV.RouterTest do
+  use ExUnit.Case, async: true
+
+  test "route requests across nodes" do
+    assert KV.Router.route("hello", Kernel, :node, []) ==
+             :"foo@computer-name"
+    assert KV.Router.route("world", Kernel, :node, []) ==
+             :"bar@computer-name"
+  end
+
+  test "raises on unknown entries" do
+    assert_raise RuntimeError, ~r/could not find entry/, fn -&gt;
+      KV.Router.route(&lt;&lt;0&gt;&gt;, Kernel, :node, [])
+    end
+  end
+end</pre>
+<p>The first test invokes <a href="kernel.html#node/0"><code class="inline">Kernel.node/0</code></a>, which returns the name of the current node, based on the bucket names "hello" and "world". According to our routing table so far, we should get <code class="inline">foo@computer-name</code> and <code class="inline">bar@computer-name</code> as responses, respectively.</p>
+<p>The second test checks that the code raises for unknown entries.</p>
+<p>In order to run the first test, we need to have two nodes running. Move into <code class="inline">apps/kv</code> and let's restart the node named <code class="inline">bar</code> which is going to be used by tests.</p>
+<pre data-language="elixir">$ iex --sname bar -S mix
+</pre>
+<p>And now run tests with:</p>
+<pre data-language="elixir">$ elixir --sname foo -S mix test
+</pre>
+<p>The test should pass.</p>
+<h2 id="test-filters-and-tags" class="section-heading">  <span class="text">Test filters and tags</span> </h2> <p>Although our tests pass, our testing structure is getting more complex. In particular, running tests with only <a href="https://hexdocs.pm/mix/Mix.Tasks.Test.html"><code class="inline">mix test</code></a> causes failures in our suite, since our test requires a connection to another node.</p>
+<p>Luckily, ExUnit ships with a facility to tag tests, allowing us to run specific callbacks or even filter tests altogether based on those tags. We have already used the <code class="inline">:capture_log</code> tag in the previous chapter, which has its semantics specified by ExUnit itself.</p>
+<p>This time let's add a <code class="inline">:distributed</code> tag to <code class="inline">test/kv/router_test.exs</code>:</p>
+<pre data-language="elixir">@tag :distributed
+test "route requests across nodes" do</pre>
+<p>Writing <code class="inline">@tag :distributed</code> is equivalent to writing <code class="inline">@tag distributed: true</code>.</p>
+<p>With the test properly tagged, we can now check if the node is alive on the network and, if not, we can exclude all distributed tests. Open up <code class="inline">test/test_helper.exs</code> inside the <code class="inline">:kv</code> application and add the following:</p>
+<pre data-language="elixir">exclude =
+  if Node.alive?(), do: [], else: [distributed: true]
+
+ExUnit.start(exclude: exclude)</pre>
+<p>Now run tests with <a href="https://hexdocs.pm/mix/Mix.Tasks.Test.html"><code class="inline">mix test</code></a>:</p>
+<pre data-language="elixir">$ mix test
+Excluding tags: [distributed: true]
+
+.......
+
+Finished in 0.05 seconds
+9 tests, 0 failures, 1 excluded
+</pre>
+<p>This time all tests passed and ExUnit warned us that distributed tests were being excluded. If you run tests with <code class="inline">$ elixir --sname foo -S mix test</code>, one extra test should run and successfully pass as long as the <code class="inline">bar@computer-name</code> node is available.</p>
+<p>The <a href="https://hexdocs.pm/mix/Mix.Tasks.Test.html"><code class="inline">mix test</code></a> command also allows us to dynamically include and exclude tags. For example, we can run <code class="inline">$ mix test --include distributed</code> to run distributed tests regardless of the value set in <code class="inline">test/test_helper.exs</code>. We could also pass <code class="inline">--exclude</code> to exclude a particular tag from the command line. Finally, <code class="inline">--only</code> can be used to run only tests with a particular tag:</p>
+<pre data-language="elixir">$ elixir --sname foo -S mix test --only distributed
+</pre>
+<p>You can read more about filters, tags, and the default tags in the <a href="https://hexdocs.pm/ex_unit/ExUnit.Case.html"><code class="inline">ExUnit.Case</code></a> module documentation.</p>
+<h2 id="wiring-it-all-up" class="section-heading">  <span class="text">Wiring it all up</span> </h2> <p>Now with our routing system in place, let's change <code class="inline">KVServer</code> to use the router. Replace the <code class="inline">lookup/2</code> function in <code class="inline">KVServer.Command</code> from this:</p>
+<pre data-language="elixir">defp lookup(bucket, callback) do
+  case KV.Registry.lookup(KV.Registry, bucket) do
+    {:ok, pid} -&gt; callback.(pid)
+    :error -&gt; {:error, :not_found}
+  end
+end</pre>
+<p>by this:</p>
+<pre data-language="elixir">defp lookup(bucket, callback) do
+  case KV.Router.route(bucket, KV.Registry, :lookup, [KV.Registry, bucket]) do
+    {:ok, pid} -&gt; callback.(pid)
+    :error -&gt; {:error, :not_found}
+  end
+end</pre>
+<p>Instead of directly looking up the registry, we are using the router instead to match a specific node. Then we get a <code class="inline">pid</code> that can be from any process in our cluster. From now on, <code class="inline">GET</code>, <code class="inline">PUT</code> and <code class="inline">DELETE</code> requests are all routed to the appropriate node.</p>
+<p>Let's also make sure that when a new bucket is created it ends up on the correct node. Replace the <code class="inline">run/1</code> function in <code class="inline">KVServer.Command</code>, the one that matches the <code class="inline">:create</code> command, with the following:</p>
+<pre data-language="elixir">def run({:create, bucket}) do
+  case KV.Router.route(bucket, KV.Registry, :create, [KV.Registry, bucket]) do
+    pid when is_pid(pid) -&gt; {:ok, "OK\r\n"}
+    _ -&gt; {:error, "FAILED TO CREATE BUCKET"}
+  end
+end</pre>
+<p>Now if you run the tests, you will see that an existing test that checks the server interaction will fail, as it will attempt to use the routing table. To address this failure, change the <code class="inline">test_helper.exs</code> for <code class="inline">:kv_server</code> application as we did for <code class="inline">:kv</code> and add <code class="inline">@tag :distributed</code> to this test too:</p>
+<pre data-language="elixir">@tag :distributed
+test "server interaction", %{socket: socket} do</pre>
+<p>However, keep in mind that by making the test distributed, we will likely run it less frequently, since we may not do the distributed setup on every test run. We will learn how to address this in the next chapter, by effectively learning how to make the routing table configurable.</p>
+<h2 id="summing-up" class="section-heading">  <span class="text">Summing up</span> </h2> <p>We have only scratched the surface of what is possible when it comes to distribution.</p>
+<p>In all of our examples, we relied on Erlang's ability to automatically connect nodes whenever there is a request. For example, when we invoked <code class="inline">Node.spawn_link(:"foo@computer-name", fn -&gt; Hello.world() end)</code>, Erlang automatically connected to said node and started a new process. However, you may also want to take a more explicit approach to connections, by using <a href="node.html#connect/1"><code class="inline">Node.connect/1</code></a> and <a href="node.html#disconnect/1"><code class="inline">Node.disconnect/1</code></a>.</p>
+<p>By default, Erlang establishes a fully meshed network, which means all nodes are connected to each other. Under this topology, the Erlang distribution is known to scale to several dozens of nodes in the same cluster. Erlang also has the concept of hidden nodes, which can allow developers to assemble custom topologies as seen in projects such as <a href="https://github.com/lasp-lang/partisan">Partisan</a>.</p>
+<p>In production, you may have nodes connecting and disconnecting at any time. In such scenarios, you need to provide <em>node discoverability</em>. Libraries such as <a href="https://github.com/bitwalker/libcluster/">libcluster</a> and <a href="https://github.com/phoenixframework/dns_cluster">dns_cluster</a> provide several strategies for node discoverability using DNS, Kubernetes, etc.</p>
+<p>Distributed key-value stores, used in real-life, need to consider the fact nodes may go up and down at any time and also migrate the bucket across nodes. Even further, buckets often need to be duplicated between nodes, so a failure in a node does not lead to the whole bucket being lost. This process is called <em>replication</em>. Our implementation won't attempt to tackle such problems. Instead, we assume there is a fixed number of nodes and therefore use a fixed routing table.</p>
+<p>These topics can be daunting at first but remember that most Elixir frameworks abstract those concerns for you. For example, when using <a href="https://phoenixframework.org">the Phoenix web framework</a>, its plug-and-play abstractions take care of sending messages and tracking how users join and leave a cluster. However, if you are interested in distributed systems after all, there is much to explore. Here are some additional references:</p>
+<ul>
+<li><a href="http://learnyousomeerlang.com/distribunomicon">The excellent Distribunomicon chapter from Learn You Some Erlang</a></li>
+<li>
+<a href="https://www.erlang.org/doc/man/global.html">Erlang's global module</a>, which can provide global names and global locks, allowing unique names and unique locks in a whole cluster of machines</li>
+<li>
+<a href="https://www.erlang.org/doc/man/pg.html">Erlang's pg module</a>, which allows process to join different groups shared across the whole cluster</li>
+<li>
+<a href="https://github.com/phoenixframework/phoenix_pubsub">Phoenix PubSub project</a>, which provides a distributed messaging system and a distributed presence system for tracking users and processes in a cluster</li>
+</ul>
+<p>You will also find many libraries for building distributed systems within the overall Erlang ecosystem. For now, it is time to go back to our simple distributed key-value store and learn how to configure and package it for production.</p> </div> <div class="bottom-actions" id="bottom-actions"> <div class="bottom-actions-item"> <a href="docs-tests-and-with.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Doctests, patterns, and with </span> </a> </div> <div class="bottom-actions-item"> <a href="config-and-releases.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Configuration and releases </span> </a> </div> </div> <footer class="footer"> <p> <span class="line"> <button class="a-main footer-button display-quick-switch" title="Search HexDocs packages"> Search HexDocs </button> <a href="elixir.epub.html" title="ePub version"> Download ePub version </a> </span> </p> <p class="built-using"> Built using <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener" translate="no">ExDoc</a> (v0.34.1) for the <a href="https://elixir-lang.org" title="Elixir" target="_blank" translate="no">Elixir programming language</a> </p> </footer><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012-2024 The Elixir Team<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://hexdocs.pm/elixir/1.17.2/distributed-tasks.html" class="_attribution-link">https://hexdocs.pm/elixir/1.17.2/distributed-tasks.html</a>
+  </p>
+</div>

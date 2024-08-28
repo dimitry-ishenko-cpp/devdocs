@@ -1,0 +1,162 @@
+<section id="boilerplate-reduction-and-templating"> <h1 id="f2py-boilerplating">Boilerplate reduction and templating</h1> <section id="using-fypp-for-binding-generic-interfaces"> <h2>Using FYPP for binding generic interfaces</h2> <p><code>f2py</code> doesn’t currently support binding interface blocks. However, there are workarounds in use. Perhaps the best known is the usage of <code>tempita</code> for using <code>.pyf.src</code> files as is done in the bindings which <a class="reference external" href="https://github.com/scipy/scipy/blob/c93da6f46dbed8b3cc0ccd2495b5678f7b740a03/scipy/linalg/clapack.pyf.src">are part of scipy</a>. <code>tempita</code> support has been removed and is no longer recommended in any case.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>The reason interfaces cannot be supported within <code>f2py</code> itself is because they don’t correspond to exported symbols in compiled libraries.</p> <pre data-language="sh">❯ nm gen.o
+ 0000000000000078 T __add_mod_MOD_add_complex
+ 0000000000000000 T __add_mod_MOD_add_complex_dp
+ 0000000000000150 T __add_mod_MOD_add_integer
+ 0000000000000124 T __add_mod_MOD_add_real
+ 00000000000000ee T __add_mod_MOD_add_real_dp
+</pre> </div> <p>Here we will discuss a few techniques to leverage <code>f2py</code> in conjunction with <a class="reference external" href="https://fypp.readthedocs.io/en/stable/fypp.html">fypp</a> to emulate generic interfaces and to ease the binding of multiple (similar) functions.</p> <section id="basic-example-addition-module"> <h3>Basic example: Addition module</h3> <p>Let us build on the example (from the user guide, <a class="reference internal" href="../f2py-examples.html#f2py-examples"><span class="std std-ref">F2PY examples</span></a>) of a subroutine which takes in two arrays and returns its sum.</p> <pre data-language="fortran">C
+      SUBROUTINE ZADD(A,B,C,N)
+C
+      DOUBLE COMPLEX A(*)
+      DOUBLE COMPLEX B(*)
+      DOUBLE COMPLEX C(*)
+      INTEGER N
+      DO 20 J = 1, N
+         C(J) = A(J)+B(J)
+ 20   CONTINUE
+      END
+</pre> <p>We will recast this into modern fortran:</p> <pre data-language="fortran">module adder
+    implicit none
+contains
+
+    subroutine zadd(a, b, c, n)
+        integer, intent(in) :: n
+        double complex, intent(in) :: a(n), b(n)
+        double complex, intent(out) :: c(n)
+        integer :: j
+        do j = 1, n
+            c(j) = a(j) + b(j)
+        end do
+    end subroutine zadd
+
+end module adder
+</pre> <p>We could go on as in the original example, adding intents by hand among other things, however in production often there are other concerns. For one, we can template via FYPP the construction of similar functions:</p> <pre data-language="python">module adder
+    implicit none
+contains
+
+#:def add_subroutine(dtype_prefix, dtype)
+    subroutine ${dtype_prefix}$add(a, b, c, n)
+        integer, intent(in) :: n
+        ${dtype}$, intent(in) :: a(n), b(n)
+        ${dtype}$ :: c(n)
+        integer :: j
+        do j = 1, n
+            c(j) = a(j) + b(j)
+        end do
+    end subroutine ${dtype_prefix}$add
+
+#:enddef
+
+#:for dtype_prefix, dtype in [('i', 'integer'), ('s', 'real'), ('d', 'real(kind=8)'), ('c', 'complex'), ('z', 'double complex')]
+    @:add_subroutine(${dtype_prefix}$, ${dtype}$)
+#:endfor
+
+end module adder
+</pre> <p>This can be pre-processed to generate the full fortran code:</p> <pre data-language="sh">❯ fypp gen_adder.f90.fypp &gt; adder.f90
+</pre> <p>As to be expected, this can be wrapped by <code>f2py</code> subsequently.</p> <p>Now we will consider maintaining the bindings in a separate file. Note the following basic <code>.pyf</code> which can be generated for a single subroutine via <code>f2py -m adder adder_base.f90 -h adder.pyf</code>:</p> <pre data-language="fortran">!    -*- f90 -*-
+! Note: the context of this file is case sensitive.
+
+python module adder ! in
+    interface  ! in :adder
+        module adder ! in :adder:adder_base.f90
+            subroutine zadd(a,b,c,n) ! in :adder:adder_base.f90:adder
+                double complex dimension(n),intent(in) :: a
+                double complex dimension(n),intent(in),depend(n) :: b
+                double complex dimension(n),intent(out),depend(n) :: c
+                integer, optional,intent(in),check(shape(a, 0) == n),depend(a) :: n=shape(a, 0)
+            end subroutine zadd
+        end module adder
+    end interface
+end python module adder
+
+! This file was auto-generated with f2py (version:2.0.0.dev0+git20240101.bab7280).
+! See:
+! https://web.archive.org/web/20140822061353/http://cens.ioc.ee/projects/f2py2e
+</pre> <p>With the docstring:</p> <pre data-language="reST">c = zadd(a,b,[n])
+
+Wrapper for ``zadd``.
+
+Parameters
+----------
+a : input rank-1 array('D') with bounds (n)
+b : input rank-1 array('D') with bounds (n)
+
+Other Parameters
+----------------
+n : input int, optional
+    Default: shape(a, 0)
+
+Returns
+-------
+c : rank-1 array('D') with bounds (n)
+</pre> <p>Which is already pretty good. However, <code>n</code> should never be passed in the first place so we will make some minor adjustments.</p> <pre data-language="fortran">!    -*- f90 -*-
+! Note: the context of this file is case sensitive.
+
+python module adder ! in
+    interface  ! in :adder
+        module adder ! in :adder:adder_base.f90
+            subroutine zadd(a,b,c,n) ! in :adder:adder_base.f90:adder
+                integer intent(hide),depend(a) :: n=len(a)
+                double complex dimension(n),intent(in) :: a
+                double complex dimension(n),intent(in),depend(n) :: b
+                double complex dimension(n),intent(out),depend(n) :: c
+            end subroutine zadd
+        end module adder
+    end interface
+end python module adder
+
+! This file was auto-generated with f2py (version:2.0.0.dev0+git20240101.bab7280).
+! See:
+! https://numpy.org/doc/stable/f2py/
+</pre> <p>Which corresponds to:</p> <pre data-language="reST">In [3]: ?adder.adder.zadd
+Call signature: adder.adder.zadd(*args, **kwargs)
+Type:           fortran
+String form:    &lt;fortran function zadd&gt;
+Docstring:
+c = zadd(a,b)
+
+Wrapper for ``zadd``.
+
+Parameters
+----------
+a : input rank-1 array('D') with bounds (n)
+b : input rank-1 array('D') with bounds (n)
+
+Returns
+-------
+c : rank-1 array('D') with bounds (n)
+</pre> <p>Finally, we can template over this in a similar manner, to attain the original goal of having bindings which make use of <code>f2py</code> directives and have minimal spurious repetition.</p> <pre data-language="python">!    -*- f90 -*-
+! Note: the context of this file is case sensitive.
+
+python module adder ! in
+    interface  ! in :adder
+        module adder ! in :adder:adder_base.f90
+#:def add_subroutine(dtype_prefix, dtype)
+            subroutine ${dtype_prefix}$add(a,b,c,n) ! in :adder:adder_base.f90:adder
+                integer intent(hide),depend(a) :: n=len(a)
+                ${dtype}$ dimension(n),intent(in) :: a
+                ${dtype}$ dimension(n),intent(in),depend(n) :: b
+                ${dtype}$ dimension(n),intent(out),depend(n) :: c
+            end subroutine ${dtype_prefix}$add
+
+#:enddef
+
+#:for dtype_prefix, dtype in [('i', 'integer'), ('s', 'real'), ('d', 'real(kind=8)'), ('c', 'complex'), ('z', 'complex(kind=8)')]
+    @:add_subroutine(${dtype_prefix}$, ${dtype}$)
+#:endfor
+        end module adder
+    end interface
+end python module adder
+
+! This file was auto-generated with f2py (version:2.0.0.dev0+git20240101.bab7280).
+! See:
+! https://numpy.org/doc/stable/f2py/
+</pre> <p>Usage boils down to:</p> <pre data-language="sh">fypp gen_adder.f90.fypp &gt; adder.f90
+fypp adder.pyf.fypp &gt; adder.pyf
+f2py -m adder -c adder.pyf adder.f90 --backend meson
+</pre> </section> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2005&ndash;2024 NumPy Developers<br>Licensed under the 3-clause BSD License.<br>
+    <a href="https://numpy.org/doc/2.0/f2py/advanced/boilerplating.html" class="_attribution-link">https://numpy.org/doc/2.0/f2py/advanced/boilerplating.html</a>
+  </p>
+</div>

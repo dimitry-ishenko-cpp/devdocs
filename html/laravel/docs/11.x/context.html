@@ -1,0 +1,147 @@
+<h1>Context</h1> <ul> <li> <a href="#introduction">Introduction</a> <ul> <li> <a href="#how-it-works">How it Works</a> </li> </ul> </li> <li> <a href="#capturing-context">Capturing Context</a> <ul> <li> <a href="#stacks">Stacks</a> </li> </ul> </li> <li> <a href="#retrieving-context">Retrieving Context</a> <ul> <li> <a href="#determining-item-existence">Determining Item Existence</a> </li> </ul> </li> <li> <a href="#removing-context">Removing Context</a> </li> <li> <a href="#hidden-context">Hidden Context</a> </li> <li> <a href="#events">Events</a> <ul> <li> <a href="#dehydrating">Dehydrating</a> </li> <li> <a href="#hydrated">Hydrated</a> </li> </ul> </li> </ul>  <h2 id="introduction">Introduction</h2> <p>Laravel's "context" capabilities enable you to capture, retrieve, and share information throughout requests, jobs, and commands executing within your application. This captured information is also included in logs written by your application, giving you deeper insight into the surrounding code execution history that occurred before a log entry was written and allowing you to trace execution flows throughout a distributed system.</p>  <h3 id="how-it-works">How it Works</h3> <p>The best way to understand Laravel's context capabilities is to see it in action using the built-in logging features. To get started, you may <a href="#capturing-context">add information to the context</a> using the <code>Context</code> facade. In this example, we will use a <a href="middleware.html">middleware</a> to add the request URL and a unique trace ID to the context on every incoming request:</p> <div class="code-container"> <pre data-language="php">&lt;?php
+ 
+namespace App\Http\Middleware;
+ 
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Context;
+use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\Response;
+ 
+class AddContext
+{
+    /**
+     * Handle an incoming request.
+     */
+    public function handle(Request $request, Closure $next): Response
+    {
+        Context::add('url', $request-&gt;url());
+        Context::add('trace_id', Str::uuid()-&gt;toString());
+ 
+        return $next($request);
+    }
+}</pre> </div> <p>Information added to the context is automatically appended as metadata to any <a href="logging.html">log entries</a> that are written throughout the request. Appending context as metadata allows information passed to individual log entries to be differentiated from the information shared via <code>Context</code>. For example, imagine we write the following log entry:</p> <div class="code-container"> <pre data-language="php">Log::info('User authenticated.', ['auth_id' =&gt; Auth::id()]);</pre> </div> <p>The written log will contain the <code>auth_id</code> passed to the log entry, but it will also contain the context's <code>url</code> and <code>trace_id</code> as metadata:</p> <div class="code-container"> <pre data-language="php">User authenticated. {"auth_id":27} {"url":"https://example.com/login","trace_id":"e04e1a11-e75c-4db3-b5b5-cfef4ef56697"}</pre> </div> <p>Information added to the context is also made available to jobs dispatched to the queue. For example, imagine we dispatch a <code>ProcessPodcast</code> job to the queue after adding some information to the context:</p> <div class="code-container"> <pre data-language="php">// In our middleware...
+Context::add('url', $request-&gt;url());
+Context::add('trace_id', Str::uuid()-&gt;toString());
+ 
+// In our controller...
+ProcessPodcast::dispatch($podcast);</pre> </div> <p>When the job is dispatched, any information currently stored in the context is captured and shared with the job. The captured information is then hydrated back into the current context while the job is executing. So, if our job's handle method was to write to the log:</p> <div class="code-container"> <pre data-language="php">class ProcessPodcast implements ShouldQueue
+{
+    use Queueable;
+ 
+    // ...
+ 
+    /**
+     * Execute the job.
+     */
+    public function handle(): void
+    {
+        Log::info('Processing podcast.', [
+            'podcast_id' =&gt; $this-&gt;podcast-&gt;id,
+        ]);
+ 
+        // ...
+    }
+}</pre> </div> <p>The resulting log entry would contain the information that was added to the context during the request that originally dispatched the job:</p> <div class="code-container"> <pre data-language="php">Processing podcast. {"podcast_id":95} {"url":"https://example.com/login","trace_id":"e04e1a11-e75c-4db3-b5b5-cfef4ef56697"}</pre> </div> <p>Although we have focused on the built-in logging related features of Laravel's context, the following documentation will illustrate how context allows you to share information across the HTTP request / queued job boundary and even how to add <a href="#hidden-context">hidden context data</a> that is not written with log entries.</p>  <h2 id="capturing-context">Capturing Context</h2> <p>You may store information in the current context using the <code>Context</code> facade's <code>add</code> method:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Support\Facades\Context;
+ 
+Context::add('key', 'value');</pre> </div> <p>To add multiple items at once, you may pass an associative array to the <code>add</code> method:</p> <div class="code-container"> <pre data-language="php">Context::add([
+    'first_key' =&gt; 'value',
+    'second_key' =&gt; 'value',
+]);</pre> </div> <p>The <code>add</code> method will override any existing value that shares the same key. If you only wish to add information to the context if the key does not already exist, you may use the <code>addIf</code> method:</p> <div class="code-container"> <pre data-language="php">Context::add('key', 'first');
+ 
+Context::get('key');
+// "first"
+ 
+Context::addIf('key', 'second');
+ 
+Context::get('key');
+// "first"</pre> </div>  <h4 id="conditional-context">Conditional Context</h4> <p>The <code>when</code> method may be used to add data to the context based on a given condition. The first closure provided to the <code>when</code> method will be invoked if the given condition evaluates to <code>true</code>, while the second closure will be invoked if the condition evaluates to <code>false</code>:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Context;
+ 
+Context::when(
+    Auth::user()-&gt;isAdmin(),
+    fn ($context) =&gt; $context-&gt;add('permissions', Auth::user()-&gt;permissions),
+    fn ($context) =&gt; $context-&gt;add('permissions', []),
+);</pre> </div>  <h3 id="stacks">Stacks</h3> <p>Context offers the ability to create "stacks", which are lists of data stored in the order that they were added. You can add information to a stack by invoking the <code>push</code> method:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Support\Facades\Context;
+ 
+Context::push('breadcrumbs', 'first_value');
+ 
+Context::push('breadcrumbs', 'second_value', 'third_value');
+ 
+Context::get('breadcrumbs');
+// [
+//     'first_value',
+//     'second_value',
+//     'third_value',
+// ]</pre> </div> <p>Stacks can be useful to capture historical information about a request, such as events that are happening throughout your application. For example, you could create an event listener to push to a stack every time a query is executed, capturing the query SQL and duration as a tuple:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Support\Facades\Context;
+use Illuminate\Support\Facades\DB;
+ 
+DB::listen(function ($event) {
+    Context::push('queries', [$event-&gt;time, $event-&gt;sql]);
+});</pre> </div>  <h2 id="retrieving-context">Retrieving Context</h2> <p>You may retrieve information from the context using the <code>Context</code> facade's <code>get</code> method:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Support\Facades\Context;
+ 
+$value = Context::get('key');</pre> </div> <p>The <code>only</code> method may be used to retrieve a subset of the information in the context:</p> <div class="code-container"> <pre data-language="php">$data = Context::only(['first_key', 'second_key']);</pre> </div> <p>The <code>pull</code> method may be used to retrieve information from the context and immediately remove it from the context:</p> <div class="code-container"> <pre data-language="php">$value = Context::pull('key');</pre> </div> <p>If you would like to retrieve all of the information stored in the context, you may invoke the <code>all</code> method:</p> <div class="code-container"> <pre data-language="php">$data = Context::all();</pre> </div>  <h3 id="determining-item-existence">Determining Item Existence</h3> <p>You may use the <code>has</code> method to determine if the context has any value stored for the given key:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Support\Facades\Context;
+ 
+if (Context::has('key')) {
+    // ...
+}</pre> </div> <p>The <code>has</code> method will return <code>true</code> regardless of the value stored. So, for example, a key with a <code>null</code> value will be considered present:</p> <div class="code-container"> <pre data-language="php">Context::add('key', null);
+ 
+Context::has('key');
+// true</pre> </div>  <h2 id="removing-context">Removing Context</h2> <p>The <code>forget</code> method may be used to remove a key and its value from the current context:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Support\Facades\Context;
+ 
+Context::add(['first_key' =&gt; 1, 'second_key' =&gt; 2]);
+ 
+Context::forget('first_key');
+ 
+Context::all();
+ 
+// ['second_key' =&gt; 2]</pre> </div> <p>You may forget several keys at once by providing an array to the <code>forget</code> method:</p> <div class="code-container"> <pre data-language="php">Context::forget(['first_key', 'second_key']);</pre> </div>  <h2 id="hidden-context">Hidden Context</h2> <p>Context offers the ability to store "hidden" data. This hidden information is not appended to logs, and is not accessible via the data retrieval methods documented above. Context provides a different set of methods to interact with hidden context information:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Support\Facades\Context;
+ 
+Context::addHidden('key', 'value');
+ 
+Context::getHidden('key');
+// 'value'
+ 
+Context::get('key');
+// null</pre> </div> <p>The "hidden" methods mirror the functionality of the non-hidden methods documented above:</p> <div class="code-container"> <pre data-language="php">Context::addHidden(/* ... */);
+Context::addHiddenIf(/* ... */);
+Context::pushHidden(/* ... */);
+Context::getHidden(/* ... */);
+Context::pullHidden(/* ... */);
+Context::onlyHidden(/* ... */);
+Context::allHidden(/* ... */);
+Context::hasHidden(/* ... */);
+Context::forgetHidden(/* ... */);</pre> </div>  <h2 id="events">Events</h2> <p>Context dispatches two events that allow you to hook into the hydration and dehydration process of the context.</p> <p>To illustrate how these events may be used, imagine that in a middleware of your application you set the <code>app.locale</code> configuration value based on the incoming HTTP request's <code>Accept-Language</code> header. Context's events allow you to capture this value during the request and restore it on the queue, ensuring notifications sent on the queue have the correct <code>app.locale</code> value. We can use context's events and <a href="#hidden-context">hidden</a> data to achieve this, which the following documentation will illustrate.</p>  <h3 id="dehydrating">Dehydrating</h3> <p>Whenever a job is dispatched to the queue the data in the context is "dehydrated" and captured alongside the job's payload. The <code>Context::dehydrating</code> method allows you to register a closure that will be invoked during the dehydration process. Within this closure, you may make changes to the data that will be shared with the queued job.</p> <p>Typically, you should register <code>dehydrating</code> callbacks within the <code>boot</code> method of your application's <code>AppServiceProvider</code> class:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Log\Context\Repository;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Context;
+ 
+/**
+ * Bootstrap any application services.
+ */
+public function boot(): void
+{
+    Context::dehydrating(function (Repository $context) {
+        $context-&gt;addHidden('locale', Config::get('app.locale'));
+    });
+}</pre> </div> <div class="mb-10 max-w-2xl mx-auto px-4 py-8 shadow-lg lg:flex lg:items-center callout"> <div class="w-20 h-20 mb-6 flex items-center justify-center shrink-0 lg:mb-0 bg-purple-600"> <div class="opacity-75"><svg width="28" height="40" viewbox="0 0 28 40" xmlns="http://www.w3.org/2000/svg"><title>lightbulb</title>
+</svg></div> </div> <p class="mb-0 lg:ml-6 callout"> You should not use the <code>Context</code> facade within the <code>dehydrating</code> callback, as that will change the context of the current process. Ensure you only make changes to the repository passed to the callback.</p> </div>  <h3 id="hydrated">Hydrated</h3> <p>Whenever a queued job begins executing on the queue, any context that was shared with the job will be "hydrated" back into the current context. The <code>Context::hydrated</code> method allows you to register a closure that will be invoked during the hydration process.</p> <p>Typically, you should register <code>hydrated</code> callbacks within the <code>boot</code> method of your application's <code>AppServiceProvider</code> class:</p> <div class="code-container"> <pre data-language="php">use Illuminate\Log\Context\Repository;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Context;
+ 
+/**
+ * Bootstrap any application services.
+ */
+public function boot(): void
+{
+    Context::hydrated(function (Repository $context) {
+        if ($context-&gt;hasHidden('locale')) {
+            Config::set('app.locale', $context-&gt;getHidden('locale'));
+        }
+    });
+}</pre> </div> <div class="mb-10 max-w-2xl mx-auto px-4 py-8 shadow-lg lg:flex lg:items-center callout"> <div class="w-20 h-20 mb-6 flex items-center justify-center shrink-0 lg:mb-0 bg-purple-600"> <div class="opacity-75"><svg width="28" height="40" viewbox="0 0 28 40" xmlns="http://www.w3.org/2000/svg"><title>lightbulb</title>
+</svg></div> </div> <p class="mb-0 lg:ml-6 callout"> You should not use the <code>Context</code> facade within the <code>hydrated</code> callback and instead ensure you only make changes to the repository passed to the callback.</p> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Taylor Otwell<br>Licensed under the MIT License.<br>Laravel is a trademark of Taylor Otwell.<br>
+    <a href="https://laravel.com/docs/11.x/context" class="_attribution-link">https://laravel.com/docs/11.x/context</a>
+  </p>
+</div>
