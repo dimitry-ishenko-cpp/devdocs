@@ -1,7 +1,7 @@
 <h1 id="module-ActiveRecord::DelegatedType" class="module"> module ActiveRecord::DelegatedType </h1> <section class="description"> <h1 id="module-ActiveRecord::DelegatedType-label-Delegated+types">Delegated types</h1> <p><a href="../class.html"><code>Class</code></a> hierarchies can map to relational database tables in many ways. Active Record, for example, offers purely abstract classes, where the superclass doesn’t persist any attributes, and single-table inheritance, where all attributes from all levels of the hierarchy are represented in a single table. Both have their places, but neither are without their drawbacks.</p> <p>The problem with purely abstract classes is that all concrete subclasses must persist all the shared attributes themselves in their own tables (also known as class-table inheritance). This makes it hard to do queries across the hierarchy. For example, imagine you have the following hierarchy:</p> <pre class="ruby" data-language="ruby">Entry &lt; ApplicationRecord
 Message &lt; Entry
 Comment &lt; Entry
-</pre> <p>How do you show a feed that has both <code>Message</code> and <code>Comment</code> records, which can be easily paginated? Well, you can’t! Messages are backed by a messages table and comments by a comments table. You can’t pull from both tables at once and use a consistent OFFSET/LIMIT scheme.</p> <p>You can get around the pagination problem by using single-table inheritance, but now you’re forced into a single mega table with all the attributes from all subclasses. No matter how divergent. If a Message has a subject, but the comment does not, well, now the comment does anyway! So STI works best when there’s little divergence between the subclasses and their attributes.</p> <p>But there’s a third way: Delegated types. With this approach, the “superclass” is a concrete class that is represented by its own table, where all the superclass attributes that are shared amongst all the “subclasses” are stored. And then each of the subclasses have their own individual tables for additional attributes that are particular to their implementation. This is similar to what’s called multi-table inheritance in Django, but instead of actual inheritance, this approach uses delegation to form the hierarchy and share responsibilities.</p> <p>Let’s look at that entry/message/comment example using delegated types:</p> <pre class="ruby" data-language="ruby"># Schema: entries[ id, account_id, creator_id, created_at, updated_at, entryable_type, entryable_id ]
+</pre> <p>How do you show a feed that has both <code>Message</code> and <code>Comment</code> records, which can be easily paginated? Well, you can’t! Messages are backed by a messages table and comments by a comments table. You can’t pull from both tables at once and use a consistent OFFSET/LIMIT scheme.</p> <p>You can get around the pagination problem by using single-table inheritance, but now you’re forced into a single mega table with all the attributes from all subclasses. No matter how divergent. If a Message has a subject, but the comment does not, well, now the comment does anyway! So STI works best when there’s little divergence between the subclasses and their attributes.</p> <p>But there’s a third way: Delegated types. With this approach, the “superclass” is a concrete class that is represented by its own table, where all the superclass attributes that are shared amongst all the “subclasses” are stored. And then each of the subclasses have their own individual tables for additional attributes that are particular to their implementation. This is similar to what’s called multi-table inheritance in Django, but instead of actual inheritance, this approach uses delegation to form the hierarchy and share responsibilities.</p> <p>Let’s look at that entry/message/comment example using delegated types:</p> <pre class="ruby" data-language="ruby"># Schema: entries[ id, account_id, creator_id, entryable_type, entryable_id, created_at, updated_at ]
 class Entry &lt; ApplicationRecord
   belongs_to :account
   belongs_to :creator
@@ -16,12 +16,12 @@ module Entryable
   end
 end
 
-# Schema: messages[ id, subject, body ]
+# Schema: messages[ id, subject, body, created_at, updated_at ]
 class Message &lt; ApplicationRecord
   include Entryable
 end
 
-# Schema: comments[ id, content ]
+# Schema: comments[ id, content, created_at, updated_at ]
 class Comment &lt; ApplicationRecord
   include Entryable
 end
@@ -42,12 +42,17 @@ end
 &lt;/div&gt;</pre> <h2 id="module-ActiveRecord::DelegatedType-label-Sharing+behavior+with+concerns+and+controllers">Sharing behavior with concerns and controllers</h2> <p>The entry “superclass” also serves as a perfect place to put all that shared logic that applies to both messages and comments, and which acts primarily on the shared attributes. Imagine:</p> <pre class="ruby" data-language="ruby">class Entry &lt; ApplicationRecord
   include Eventable, Forwardable, Redeliverable
 end
-</pre> <p>Which allows you to have controllers for things like <code>ForwardsController</code> and <code>RedeliverableController</code> that both act on entries, and thus provide the shared functionality to both messages and comments.</p> <h2 id="module-ActiveRecord::DelegatedType-label-Creating+new+records">Creating new records</h2> <p>You create a new record that uses delegated typing by creating the delegator and delegatee at the same time, like so:</p> <pre class="ruby" data-language="ruby">Entry.create! entryable: Comment.new(content: "Hello!"), creator: Current.user
+</pre> <p>Which allows you to have controllers for things like <code>ForwardsController</code> and <code>RedeliverableController</code> that both act on entries, and thus provide the shared functionality to both messages and comments.</p> <h2 id="module-ActiveRecord::DelegatedType-label-Creating+new+records">Creating new records</h2> <p>You create a new record that uses delegated typing by creating the delegator and delegatee at the same time, like so:</p> <pre class="ruby" data-language="ruby">Entry.create! entryable: Comment.new(content: "Hello!"), creator: Current.user, account: Current.account
 </pre> <p>If you need more complicated composition, or you need to perform dependent validation, you should build a factory method or class to take care of the complicated needs. This could be as simple as:</p> <pre class="ruby" data-language="ruby">class Entry &lt; ApplicationRecord
-  def self.create_with_comment(content, creator: Current.user)
-    create! entryable: Comment.new(content: content), creator: creator
+  def self.create_with_comment(content, creator: Current.user, account: Current.account)
+    create! entryable: Comment.new(content: content), creator: creator, account: account
   end
 end
+</pre> <h2 id="module-ActiveRecord::DelegatedType-label-Querying+across+records">
+<a href="querying.html"><code>Querying</code></a> across records</h2> <p>A consequence of delegated types is that querying attributes spread across multiple classes becomes slightly more tricky, but not impossible.</p> <p>The simplest method is to join the “superclass” to the “subclass” and apply the query parameters (i.e. <code>#where</code>) in appropriate places:</p> <pre class="ruby" data-language="ruby">Comment.joins(:entry).where(comments: { content: 'Hello!' }, entry: { creator: Current.user } )
+</pre> <p>For convenience, add a scope on the concern. Now all classes that implement the concern will automatically include the method:</p> <pre class="ruby" data-language="ruby"># app/models/concerns/entryable.rb
+scope :with_entry, -&gt;(attrs) { joins(:entry).where(entry: attrs) }
+</pre> <p>Now the query can be shortened significantly:</p> <pre class="ruby" data-language="ruby">Comment.where(content: 'Hello!').with_entry(creator: Current.user)
 </pre> <h2 id="module-ActiveRecord::DelegatedType-label-Adding+further+delegation">Adding further delegation</h2> <p>The delegated type shouldn’t just answer the question of what the underlying class is called. In fact, that’s an anti-pattern most of the time. The reason you’re building this hierarchy is to take advantage of polymorphism. So here’s a simple example of that:</p> <pre class="ruby" data-language="ruby">class Entry &lt; ApplicationRecord
   delegated_type :entryable, types: %w[ Message Comment ]
   delegate :title, to: :entryable
@@ -64,8 +69,7 @@ class Comment &lt; ApplicationRecord
     content.truncate(20)
   end
 end
-</pre> <p>Now you can list a bunch of entries, call <code>Entry#title</code>, and polymorphism will provide you with the answer.</p> <h2 id="module-ActiveRecord::DelegatedType-label-Nested+Attributes">Nested <a href="attributes.html"><code>Attributes</code></a>
-</h2> <p>Enabling nested attributes on a <a href="delegatedtype.html#method-i-delegated_type"><code>delegated_type</code></a> association allows you to create the entry and message in one go:</p> <pre class="ruby" data-language="ruby">class Entry &lt; ApplicationRecord
+</pre> <p>Now you can list a bunch of entries, call <code>Entry#title</code>, and polymorphism will provide you with the answer.</p> <h2 id="module-ActiveRecord::DelegatedType-label-Nested+Attributes">Nested Attributes</h2> <p>Enabling nested attributes on a <a href="delegatedtype.html#method-i-delegated_type"><code>delegated_type</code></a> association allows you to create the entry and message in one go:</p> <pre class="ruby" data-language="ruby">class Entry &lt; ApplicationRecord
   delegated_type :entryable, types: %w[ Message Comment ]
   accepts_nested_attributes_for :entryable
 end
@@ -75,7 +79,7 @@ entry = Entry.create(params[:entry])
 entry.entryable.id # =&gt; 2
 entry.entryable.subject # =&gt; 'Smiling'
 </pre> </section> <section id="5Buntitled-5D" class="documentation-section"> <section id="public-instance-5Buntitled-5D-method-details" class="method-section"> <header> <h3>Public Instance Methods</h3> </header> <div class="method-detail "> <div class="method-header"> <div class="method-heading" id="method-i-delegated_type"> <span class="method-name">delegated_type</span><span class="method-args">(role, types:, **options)</span> <a class="method-click-advice">Show source</a> </div> </div> <div class="method-description">
-<div class="method-source-code" id="delegated_type-source"> <pre class="ruby" data-language="ruby"># File activerecord/lib/active_record/delegated_type.rb, line 211
+<div class="method-source-code" id="delegated_type-source"> <pre class="ruby" data-language="ruby"># File activerecord/lib/active_record/delegated_type.rb, line 231
 def delegated_type(role, types:, **options)
   belongs_to role, options.delete(:scope), **options.merge(polymorphic: true)
   define_delegated_type_methods role, types: types, options: options
