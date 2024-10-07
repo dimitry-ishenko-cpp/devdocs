@@ -45,7 +45,7 @@ $ make
 $ make install
 ```
 
-To install system-wide, change the above commands to:
+To install system-wide, change the last 3 commands above to:
 ```shell
 $ cmake -DSYSTEM_INSTALL=ON ..
 $ make
