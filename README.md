@@ -35,7 +35,7 @@ $ sudo apt install devdocs
 Stable version (requires _[CMake](https://cmake.org/)_ >= 3.16, _[elinks](http://elinks.or.cz)_ >= 0.17.1, _[fzf](https://github.com/junegunn/fzf)_, _[python3](https://www.python.org/)_ with _[Pygments](https://pygments.org)_ and _[lxml](https://lxml.de)_).
 
 ```shell
-$ p=devdocs v=1.0
+$ p=devdocs v=1.1
 $ wget https://github.com/dimitry-ishenko-cpp/${p}/archive/v${v}.tar.gz
 $ tar xzf v${v}.tar.gz
 $ mkdir ${p}-${v}/build
