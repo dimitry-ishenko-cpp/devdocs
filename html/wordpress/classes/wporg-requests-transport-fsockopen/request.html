@@ -1,0 +1,302 @@
+<h1 class="wp-block-wporg-code-reference-title">Fsockopen::request( <span class="arg-type">string|WpOrgRequestsTransportStringable</span> <span class="arg-name">$url</span>, <span class="arg-type">array</span> <span class="arg-name">$headers</span> = <span class="arg-default">array()</span>, <span class="arg-type">string|array</span> <span class="arg-name">$data</span> = <span class="arg-default">array()</span>, <span class="arg-type">array</span> <span class="arg-name">$options</span> = <span class="arg-default">array()</span> ): <span class="return-type">string</span>
+</h1> <section><p>Perform a request</p> </section> <section><h2 id="parameters">Parameters</h2> <dl>
+<dt>
+<code>$url</code><span class="type"><span class="string">string</span>|<span class="WpOrgRequestsTransportStringable">WpOrgRequestsTransportStringable</span></span><span class="required">required</span>
+</dt>
+<dd><div class="desc"><span class="description">URL to request</span></div></dd>
+<dt>
+<code>$headers</code><span class="type"><span class="array">array</span></span><span class="required">optional</span>
+</dt>
+<dd>
+<div class="desc"><span class="description">Associative array of request headers</span></div>
+<p class="default">Default:<code>array()</code></p>
+</dd>
+<dt>
+<code>$data</code><span class="type"><span class="string">string</span>|<span class="array">array</span></span><span class="required">optional</span>
+</dt>
+<dd>
+<div class="desc"><span class="description">Data to send either as the POST body, or as parameters in the URL for a GET/HEAD</span></div>
+<p class="default">Default:<code>array()</code></p>
+</dd>
+<dt>
+<code>$options</code><span class="type"><span class="array">array</span></span><span class="required">optional</span>
+</dt>
+<dd>
+<div class="desc"><span class="description">Request options, see <a href="../wporgrequestsrequests/response.html">WpOrgRequestsRequests::response()</a> for documentation</span></div>
+<p class="default">Default:<code>array()</code></p>
+</dd>
+</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">string</span> Raw HTTP result</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="77" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function request($url, $headers = [], $data = [], $options = []) {
+	if (InputValidator::is_string_or_stringable($url) === false) {
+		throw InvalidArgument::create(1, '$url', 'string|Stringable', gettype($url));
+	}
+
+	if (is_array($headers) === false) {
+		throw InvalidArgument::create(2, '$headers', 'array', gettype($headers));
+	}
+
+	if (!is_array($data) &amp;&amp; !is_string($data)) {
+		if ($data === null) {
+			$data = '';
+		} else {
+			throw InvalidArgument::create(3, '$data', 'array|string', gettype($data));
+		}
+	}
+
+	if (is_array($options) === false) {
+		throw InvalidArgument::create(4, '$options', 'array', gettype($options));
+	}
+
+	$options['hooks']-&gt;dispatch('fsockopen.before_request');
+
+	$url_parts = parse_url($url);
+	if (empty($url_parts)) {
+		throw new Exception('Invalid URL.', 'invalidurl', $url);
+	}
+
+	$host                     = $url_parts['host'];
+	$context                  = stream_context_create();
+	$verifyname               = false;
+	$case_insensitive_headers = new CaseInsensitiveDictionary($headers);
+
+	// HTTPS support
+	if (isset($url_parts['scheme']) &amp;&amp; strtolower($url_parts['scheme']) === 'https') {
+		$remote_socket = 'ssl://' . $host;
+		if (!isset($url_parts['port'])) {
+			$url_parts['port'] = Port::HTTPS;
+		}
+
+		$context_options = [
+			'verify_peer'       =&gt; true,
+			'capture_peer_cert' =&gt; true,
+		];
+		$verifyname      = true;
+
+		// SNI, if enabled (OpenSSL &gt;=0.9.8j)
+		// phpcs:ignore PHPCompatibility.Constants.NewConstants.openssl_tlsext_server_nameFound
+		if (defined('OPENSSL_TLSEXT_SERVER_NAME') &amp;&amp; OPENSSL_TLSEXT_SERVER_NAME) {
+			$context_options['SNI_enabled'] = true;
+			if (isset($options['verifyname']) &amp;&amp; $options['verifyname'] === false) {
+				$context_options['SNI_enabled'] = false;
+			}
+		}
+
+		if (isset($options['verify'])) {
+			if ($options['verify'] === false) {
+				$context_options['verify_peer']      = false;
+				$context_options['verify_peer_name'] = false;
+				$verifyname                          = false;
+			} elseif (is_string($options['verify'])) {
+				$context_options['cafile'] = $options['verify'];
+			}
+		}
+
+		if (isset($options['verifyname']) &amp;&amp; $options['verifyname'] === false) {
+			$context_options['verify_peer_name'] = false;
+			$verifyname                          = false;
+		}
+
+		// Handle the PHP 8.4 deprecation (PHP 9.0 removal) of the function signature we use for stream_context_set_option().
+		// Ref: https://wiki.php.net/rfc/deprecate_functions_with_overloaded_signatures#stream_context_set_option
+		if (function_exists('stream_context_set_options')) {
+			// PHP 8.3+.
+			stream_context_set_options($context, ['ssl' =&gt; $context_options]);
+		} else {
+			// PHP &lt; 8.3.
+			stream_context_set_option($context, ['ssl' =&gt; $context_options]);
+		}
+	} else {
+		$remote_socket = 'tcp://' . $host;
+	}
+
+	$this-&gt;max_bytes = $options['max_bytes'];
+
+	if (!isset($url_parts['port'])) {
+		$url_parts['port'] = Port::HTTP;
+	}
+
+	$remote_socket .= ':' . $url_parts['port'];
+
+	// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_set_error_handler
+	set_error_handler([$this, 'connect_error_handler'], E_WARNING | E_NOTICE);
+
+	$options['hooks']-&gt;dispatch('fsockopen.remote_socket', [&amp;$remote_socket]);
+
+	$socket = stream_socket_client($remote_socket, $errno, $errstr, ceil($options['connect_timeout']), STREAM_CLIENT_CONNECT, $context);
+
+	restore_error_handler();
+
+	if ($verifyname &amp;&amp; !$this-&gt;verify_certificate_from_context($host, $context)) {
+		throw new Exception('SSL certificate did not match the requested domain name', 'ssl.no_match');
+	}
+
+	if (!$socket) {
+		if ($errno === 0) {
+			// Connection issue
+			throw new Exception(rtrim($this-&gt;connect_error), 'fsockopen.connect_error');
+		}
+
+		throw new Exception($errstr, 'fsockopenerror', null, $errno);
+	}
+
+	$data_format = $options['data_format'];
+
+	if ($data_format === 'query') {
+		$path = self::format_get($url_parts, $data);
+		$data = '';
+	} else {
+		$path = self::format_get($url_parts, []);
+	}
+
+	$options['hooks']-&gt;dispatch('fsockopen.remote_host_path', [&amp;$path, $url]);
+
+	$request_body = '';
+	$out          = sprintf("%s %s HTTP/%.1F\r\n", $options['type'], $path, $options['protocol_version']);
+
+	if ($options['type'] !== Requests::TRACE) {
+		if (is_array($data)) {
+			$request_body = http_build_query($data, '', '&amp;');
+		} else {
+			$request_body = $data;
+		}
+
+		// Always include Content-length on POST requests to prevent
+		// 411 errors from some servers when the body is empty.
+		if (!empty($data) || $options['type'] === Requests::POST) {
+			if (!isset($case_insensitive_headers['Content-Length'])) {
+				$headers['Content-Length'] = strlen($request_body);
+			}
+
+			if (!isset($case_insensitive_headers['Content-Type'])) {
+				$headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
+			}
+		}
+	}
+
+	if (!isset($case_insensitive_headers['Host'])) {
+		$out         .= sprintf('Host: %s', $url_parts['host']);
+		$scheme_lower = strtolower($url_parts['scheme']);
+
+		if (($scheme_lower === 'http' &amp;&amp; $url_parts['port'] !== Port::HTTP) || ($scheme_lower === 'https' &amp;&amp; $url_parts['port'] !== Port::HTTPS)) {
+			$out .= ':' . $url_parts['port'];
+		}
+
+		$out .= "\r\n";
+	}
+
+	if (!isset($case_insensitive_headers['User-Agent'])) {
+		$out .= sprintf("User-Agent: %s\r\n", $options['useragent']);
+	}
+
+	$accept_encoding = $this-&gt;accept_encoding();
+	if (!isset($case_insensitive_headers['Accept-Encoding']) &amp;&amp; !empty($accept_encoding)) {
+		$out .= sprintf("Accept-Encoding: %s\r\n", $accept_encoding);
+	}
+
+	$headers = Requests::flatten($headers);
+
+	if (!empty($headers)) {
+		$out .= implode("\r\n", $headers) . "\r\n";
+	}
+
+	$options['hooks']-&gt;dispatch('fsockopen.after_headers', [&amp;$out]);
+
+	if (substr($out, -2) !== "\r\n") {
+		$out .= "\r\n";
+	}
+
+	if (!isset($case_insensitive_headers['Connection'])) {
+		$out .= "Connection: Close\r\n";
+	}
+
+	$out .= "\r\n" . $request_body;
+
+	$options['hooks']-&gt;dispatch('fsockopen.before_send', [&amp;$out]);
+
+	fwrite($socket, $out);
+	$options['hooks']-&gt;dispatch('fsockopen.after_send', [$out]);
+
+	if (!$options['blocking']) {
+		fclose($socket);
+		$fake_headers = '';
+		$options['hooks']-&gt;dispatch('fsockopen.after_request', [&amp;$fake_headers]);
+		return '';
+	}
+
+	$timeout_sec = (int) floor($options['timeout']);
+	if ($timeout_sec === $options['timeout']) {
+		$timeout_msec = 0;
+	} else {
+		$timeout_msec = self::SECOND_IN_MICROSECONDS * $options['timeout'] % self::SECOND_IN_MICROSECONDS;
+	}
+
+	stream_set_timeout($socket, $timeout_sec, $timeout_msec);
+
+	$response   = '';
+	$body       = '';
+	$headers    = '';
+	$this-&gt;info = stream_get_meta_data($socket);
+	$size       = 0;
+	$doingbody  = false;
+	$download   = false;
+	if ($options['filename']) {
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors -- Silenced the PHP native warning in favour of throwing an exception.
+		$download = @fopen($options['filename'], 'wb');
+		if ($download === false) {
+			$error = error_get_last();
+			throw new Exception($error['message'], 'fopen');
+		}
+	}
+
+	while (!feof($socket)) {
+		$this-&gt;info = stream_get_meta_data($socket);
+		if ($this-&gt;info['timed_out']) {
+			throw new Exception('fsocket timed out', 'timeout');
+		}
+
+		$block = fread($socket, Requests::BUFFER_SIZE);
+		if (!$doingbody) {
+			$response .= $block;
+			if (strpos($response, "\r\n\r\n")) {
+				list($headers, $block) = explode("\r\n\r\n", $response, 2);
+				$doingbody             = true;
+			}
+		}
+
+		// Are we in body mode now?
+		if ($doingbody) {
+			$options['hooks']-&gt;dispatch('request.progress', [$block, $size, $this-&gt;max_bytes]);
+			$data_length = strlen($block);
+			if ($this-&gt;max_bytes) {
+				// Have we already hit a limit?
+				if ($size === $this-&gt;max_bytes) {
+					continue;
+				}
+
+				if (($size + $data_length) &gt; $this-&gt;max_bytes) {
+					// Limit the length
+					$limited_length = ($this-&gt;max_bytes - $size);
+					$block          = substr($block, 0, $limited_length);
+				}
+			}
+
+			$size += strlen($block);
+			if ($download) {
+				fwrite($download, $block);
+			} else {
+				$body .= $block;
+			}
+		}
+	}
+
+	$this-&gt;headers = $headers;
+
+	if ($download) {
+		fclose($download);
+	} else {
+</code></pre>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/requests/src/transport/fsockopen.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/Requests/src/Transport/Fsockopen.php#L77">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/Requests/src/Transport/Fsockopen.php#L77-L344">View on GitHub</a></p></section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wporg-requests-transport-fsockopen/request" class="_attribution-link">https://developer.wordpress.org/reference/classes/wporg-requests-transport-fsockopen/request</a>
+  </p>
+</div>

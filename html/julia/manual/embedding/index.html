@@ -135,10 +135,10 @@ jl_value_t *ret = jl_call1(func, argument);</pre>
 <p>In the first step, a handle to the Julia function <code>sqrt</code> is retrieved by calling <code>jl_get_function</code>. The first argument passed to <code>jl_get_function</code> is a pointer to the <code>Base</code> module in which <code>sqrt</code> is defined. Then, the double value is boxed using <code>jl_box_float64</code>. Finally, in the last step, the function is called using <code>jl_call1</code>. <code>jl_call0</code>, <code>jl_call2</code>, and <code>jl_call3</code> functions also exist, to conveniently handle different numbers of arguments. To pass more arguments, use <code>jl_call</code>:</p>
 <pre data-language="julia">jl_value_t *jl_call(jl_function_t *f, jl_value_t **args, int32_t nargs)</pre>
 <p>Its second argument <code>args</code> is an array of <code>jl_value_t*</code> arguments and <code>nargs</code> is the number of arguments.</p>
-<p>There is also an alternative, possibly simpler, way of calling Julia functions and that is via <a href="../../base/c/index.html#Base.@cfunction"><code>@cfunction</code></a>. Using <code>@cfunction</code> allows you to do the type conversions on the Julia side which typically is easier than doing it on the C side. The <code>sqrt</code> example above would with <code>@cfunction</code> be written as:</p>
+<p>There is also an alternative, possibly simpler, way of calling Julia functions and that is via <a href="../../base/c/index.html#Base.@cfunction"><code>@cfunction</code></a>. Using <code>@cfunction</code> allows you to do the type conversions on the Julia side, which is typically easier than doing it on the C side. The <code>sqrt</code> example above would with <code>@cfunction</code> be written as:</p>
 <pre data-language="julia">double (*sqrt_jl)(double) = jl_unbox_voidpointer(jl_eval_string("@cfunction(sqrt, Float64, (Float64,))"));
 double ret = sqrt_jl(2.0);</pre>
-<p>where we first define a C callable function in Julia, extract the function pointer from it and finally call it.</p>
+<p>where we first define a C callable function in Julia, extract the function pointer from it, and finally call it. In addition to simplifying type conversions by doing them in the higher-level language, calling Julia functions via <code>@cfunction</code> pointers eliminates the dynamic-dispatch overhead required by <code>jl_call</code> (for which all of the arguments are "boxed"), and should have performance equivalent to native C function pointers.</p>
 <h2 id="Memory-Management">
 <a class="docs-heading-anchor" href="#Memory-Management">Memory Management</a>
 </h2>
@@ -228,7 +228,7 @@ jl_call2(delete, refs, rvar);</pre>
 <p>As an alternative for very simple cases, it is possible to just create a global container of type <code>Vector{Any}</code> and fetch the elements from that when necessary, or even to create one global variable per pointer using</p>
 <pre data-language="julia">jl_module_t *mod = jl_main_module;
 jl_sym_t *var = jl_symbol("var");
-jl_binding_t *bp = jl_get_binding_wr(mod, var);
+jl_binding_t *bp = jl_get_binding_wr(mod, var, 1);
 jl_checked_assignment(bp, mod, var, val);</pre>
 <h3 id="Updating-fields-of-GC-managed-objects">
 <a class="docs-heading-anchor" href="#Updating-fields-of-GC-managed-objects">Updating fields of GC-managed objects</a>
@@ -238,12 +238,12 @@ jl_checked_assignment(bp, mod, var, val);</pre>
 ((some_specific_type*)parent)-&gt;field = child;
 jl_gc_wb(parent, child);</pre>
 <p>It is in general impossible to predict which values will be old at runtime, so the write barrier must be inserted after all explicit stores. One notable exception is if the <code>parent</code> object has just been allocated and no garbage collection has run since then. Note that most <code>jl_...</code> functions can sometimes invoke garbage collection.</p>
-<p>The write barrier is also necessary for arrays of pointers when updating their data directly. For example:</p>
+<p>The write barrier is also necessary for arrays of pointers when updating their data directly. Calling <code>jl_array_ptr_set</code> is usually much preferred. But direct updates can be done. For example:</p>
 <pre data-language="julia">jl_array_t *some_array = ...; // e.g. a Vector{Any}
-void **data = (void**)jl_array_data(some_array);
+void **data = jl_array_data(some_array, void*);
 jl_value_t *some_value = ...;
 data[0] = some_value;
-jl_gc_wb(some_array, some_value);</pre>
+jl_gc_wb(jl_array_owner(some_array), some_value);</pre>
 <h3 id="Controlling-the-Garbage-Collector">
 <a class="docs-heading-anchor" href="#Controlling-the-Garbage-Collector">Controlling the Garbage Collector</a>
 </h3>
@@ -288,9 +288,9 @@ jl_array_t* x          = jl_alloc_array_1d(array_type, 10);</pre>
 jl_array_t *x = jl_ptr_to_array_1d(array_type, existingArray, 10, 0);</pre>
 <p>The last argument is a boolean indicating whether Julia should take ownership of the data. If this argument is non-zero, the GC will call <code>free</code> on the data pointer when the array is no longer referenced.</p>
 <p>In order to access the data of <code>x</code>, we can use <code>jl_array_data</code>:</p>
-<pre data-language="julia">double *xData = (double*)jl_array_data(x);</pre>
+<pre data-language="julia">double *xData = jl_array_data(x, double);</pre>
 <p>Now we can fill the array:</p>
-<pre data-language="julia">for(size_t i=0; i&lt;jl_array_len(x); i++)
+<pre data-language="julia">for (size_t i = 0; i &lt; jl_array_nrows(x); i++)
     xData[i] = i;</pre>
 <p>Now let us call a Julia function that performs an in-place operation on <code>x</code>:</p>
 <pre data-language="julia">jl_function_t *func = jl_get_function(jl_base_module, "reverse!");
@@ -309,10 +309,11 @@ jl_array_t *y = (jl_array_t*)jl_call1(func, (jl_value_t*)x);</pre>
 <p>Julia's multidimensional arrays are stored in memory in column-major order. Here is some code that creates a 2D array and accesses its properties:</p>
 <pre data-language="julia">// Create 2D array of float64 type
 jl_value_t *array_type = jl_apply_array_type((jl_value_t*)jl_float64_type, 2);
-jl_array_t *x  = jl_alloc_array_2d(array_type, 10, 5);
+int dims[] = {10,5};
+jl_array_t *x  = jl_alloc_array_nd(array_type, dims, 2);
 
 // Get array pointer
-double *p = (double*)jl_array_data(x);
+double *p = jl_array_data(x, double);
 // Get number of dimensions
 int ndims = jl_array_ndims(x);
 // Get the size of the i-th dim
@@ -439,7 +440,7 @@ int main()
 [J 2] i = 5 -&gt; 2.23606797749979</pre>
 <p>As can be seen, Julia thread 1 corresponds to pthread ID 3bfd9c00, and Julia thread 2 corresponds to ID 23938640, showing that indeed multiple threads are used at the C level, and that we can safely call Julia C API routines from those threads.</p><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2009&ndash;2023 Jeff Bezanson, Stefan Karpinski, Viral B. Shah, and other contributors<br>Licensed under the MIT License.<br>
-    <a href="https://docs.julialang.org/en/v1.10/manual/embedding/" class="_attribution-link">https://docs.julialang.org/en/v1.10/manual/embedding/</a>
+    &copy; 2009&ndash;2024 Jeff Bezanson, Stefan Karpinski, Viral B. Shah, and other contributors<br>Licensed under the MIT License.<br>
+    <a href="https://docs.julialang.org/en/v1.11/manual/embedding/" class="_attribution-link">https://docs.julialang.org/en/v1.11/manual/embedding/</a>
   </p>
 </div>

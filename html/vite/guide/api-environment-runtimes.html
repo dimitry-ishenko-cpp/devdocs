@@ -1,0 +1,343 @@
+<h1 id="environment-api-for-runtimes" tabindex="-1">Environment API for Runtimes </h1>
+<div class="warning custom-block">
+<strong class="custom-block-title">Experimental</strong><p>Environment API is experimental. We'll keep the APIs stable during Vite 6 to let the ecosystem experiment and build on top of it. We're planning to stabilize these new APIs with potential breaking changes in Vite 7.</p>
+<p>Resources:</p>
+<ul>
+<li>
+<a href="https://github.com/vitejs/vite/discussions/16358" target="_blank" rel="noreferrer">Feedback discussion</a> where we are gathering feedback about the new APIs.</li>
+<li>
+<a href="https://github.com/vitejs/vite/pull/16471" target="_blank" rel="noreferrer">Environment API PR</a> where the new API were implemented and reviewed.</li>
+</ul>
+<p>Please share your feedback with us.</p>
+</div>
+<h2 id="environment-factories" tabindex="-1">Environment Factories </h2>
+<p>Environments factories are intended to be implemented by Environment providers like Cloudflare, and not by end users. Environment factories return a <code>EnvironmentOptions</code> for the most common case of using the target runtime for both dev and build environments. The default environment options can also be set so the user doesn't need to do it.</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">function createWorkerdEnvironment(
+  userConfig: EnvironmentOptions,
+): EnvironmentOptions {
+  return mergeConfig(
+    {
+      resolve: {
+        conditions: [
+          /*...*/
+        ],
+      },
+      dev: {
+        createEnvironment(name, config) {
+          return createWorkerdDevEnvironment(name, config, {
+            hot: true,
+            transport: customHotChannel(),
+          })
+        },
+      },
+      build: {
+        createEnvironment(name, config) {
+          return createWorkerdBuildEnvironment(name, config)
+        },
+      },
+    },
+    userConfig,
+  )
+}</pre>
+</div>
+<p>Then the config file can be written as:</p>
+<div class="language-js vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">import { createWorkerdEnvironment } from 'vite-environment-workerd'
+
+export default {
+  environments: {
+    ssr: createWorkerdEnvironment({
+      build: {
+        outDir: '/dist/ssr',
+      },
+    }),
+    rsc: createWorkerdEnvironment({
+      build: {
+        outDir: '/dist/rsc',
+      },
+    }),
+  },
+}</pre>
+</div>
+<p>and frameworks can use an environment with the workerd runtime to do SSR using:</p>
+<div class="language-js vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">const ssrEnvironment = server.environments.ssr</pre>
+</div>
+<h2 id="creating-a-new-environment-factory" tabindex="-1">Creating a New Environment Factory </h2>
+<p>A Vite dev server exposes two environments by default: a <code>client</code> environment and an <code>ssr</code> environment. The client environment is a browser environment by default, and the module runner is implemented by importing the virtual module <code>/@vite/client</code> to client apps. The SSR environment runs in the same Node runtime as the Vite server by default and allows application servers to be used to render requests during dev with full HMR support.</p>
+<p>The transformed source code is called a module, and the relationships between the modules processed in each environment are kept in a module graph. The transformed code for these modules is sent to the runtimes associated with each environment to be executed. When a module is evaluated in the runtime, its imported modules will be requested triggering the processing of a section of the module graph.</p>
+<p>A Vite Module Runner allows running any code by processing it with Vite plugins first. It is different from <code>server.ssrLoadModule</code> because the runner implementation is decoupled from the server. This allows library and framework authors to implement their layer of communication between the Vite server and the runner. The browser communicates with its corresponding environment using the server Web Socket and through HTTP requests. The Node Module runner can directly do function calls to process modules as it is running in the same process. Other environments could run modules connecting to a JS runtime like workerd, or a Worker Thread as Vitest does.</p>
+<p>One of the goals of this feature is to provide a customizable API to process and run code. Users can create new environment factories using the exposed primitives.</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">import { DevEnvironment, HotChannel } from 'vite'
+
+function createWorkerdDevEnvironment(
+  name: string,
+  config: ResolvedConfig,
+  context: DevEnvironmentContext
+) {
+  const connection = /* ... */
+  const transport: HotChannel = {
+    on: (listener) =&gt; { connection.on('message', listener) },
+    send: (data) =&gt; connection.send(data),
+  }
+
+  const workerdDevEnvironment = new DevEnvironment(name, config, {
+    options: {
+      resolve: { conditions: ['custom'] },
+      ...context.options,
+    },
+    hot: true,
+    transport,
+  })
+  return workerdDevEnvironment
+}</pre>
+</div>
+<h2 id="modulerunner" tabindex="-1">
+<code>ModuleRunner</code> </h2>
+<p>A module runner is instantiated in the target runtime. All APIs in the next section are imported from <code>vite/module-runner</code> unless stated otherwise. This export entry point is kept as lightweight as possible, only exporting the minimal needed to create module runners.</p>
+<p><strong>Type Signature:</strong></p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">export class ModuleRunner {
+  constructor(
+    public options: ModuleRunnerOptions,
+    public evaluator: ModuleEvaluator = new ESModulesEvaluator(),
+    private debug?: ModuleRunnerDebugger,
+  ) {}
+  /**
+   * URL to execute.
+   * Accepts file path, server path, or id relative to the root.
+   */
+  public async import&lt;T = any&gt;(url: string): Promise&lt;T&gt;
+  /**
+   * Clear all caches including HMR listeners.
+   */
+  public clearCache(): void
+  /**
+   * Clear all caches, remove all HMR listeners, reset sourcemap support.
+   * This method doesn't stop the HMR connection.
+   */
+  public async close(): Promise&lt;void&gt;
+  /**
+   * Returns `true` if the runner has been closed by calling `close()`.
+   */
+  public isClosed(): boolean
+}</pre>
+</div>
+<p>The module evaluator in <code>ModuleRunner</code> is responsible for executing the code. Vite exports <code>ESModulesEvaluator</code> out of the box, it uses <code>new AsyncFunction</code> to evaluate the code. You can provide your own implementation if your JavaScript runtime doesn't support unsafe evaluation.</p>
+<p>Module runner exposes <code>import</code> method. When Vite server triggers <code>full-reload</code> HMR event, all affected modules will be re-executed. Be aware that Module Runner doesn't update <code>exports</code> object when this happens (it overrides it), you would need to run <code>import</code> or get the module from <code>evaluatedModules</code> again if you rely on having the latest <code>exports</code> object.</p>
+<p><strong>Example Usage:</strong></p>
+<div class="language-js vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">import { ModuleRunner, ESModulesEvaluator } from 'vite/module-runner'
+import { transport } from './rpc-implementation.js'
+
+const moduleRunner = new ModuleRunner(
+  {
+    transport,
+  },
+  new ESModulesEvaluator(),
+)
+
+await moduleRunner.import('/src/entry-point.js')</pre>
+</div>
+<h2 id="modulerunneroptions" tabindex="-1">
+<code>ModuleRunnerOptions</code> </h2>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code twoslash lsp" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">interface ModuleRunnerOptions {
+  /**
+   * A set of methods to communicate with the server.
+   */
+  transport: ModuleRunnerTransport
+  /**
+   * Configure how source maps are resolved.
+   * Prefers `node` if `process.setSourceMapsEnabled` is available.
+   * Otherwise it will use `prepareStackTrace` by default which overrides
+   * `Error.prepareStackTrace` method.
+   * You can provide an object to configure how file contents and
+   * source maps are resolved for files that were not processed by Vite.
+   */
+  sourcemapInterceptor?:
+    | false
+    | 'node'
+    | 'prepareStackTrace'
+    | InterceptorOptions
+  /**
+   * Disable HMR or configure HMR options.
+   *
+   * @default true
+   */
+  hmr?: boolean | ModuleRunnerHmr
+  /**
+   * Custom module cache. If not provided, it creates a separate module
+   * cache for each module runner instance.
+   */
+  evaluatedModules?: EvaluatedModules
+}</pre>
+</div>
+<h2 id="moduleevaluator" tabindex="-1">
+<code>ModuleEvaluator</code> </h2>
+<p><strong>Type Signature:</strong></p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code twoslash lsp" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">export interface ModuleEvaluator {
+  /**
+   * Number of prefixed lines in the transformed code.
+   */
+  startOffset?: number
+  /**
+   * Evaluate code that was transformed by Vite.
+   * @param context Function context
+   * @param code Transformed code
+   * @param id ID that was used to fetch the module
+   */
+  runInlinedModule(
+    context: ModuleRunnerContext,
+    code: string,
+    id: string,
+  ): Promise&lt;any&gt;
+  /**
+   * evaluate externalized module.
+   * @param file File URL to the external module
+   */
+  runExternalModule(file: string): Promise&lt;any&gt;
+}</pre>
+</div>
+<p>Vite exports <code>ESModulesEvaluator</code> that implements this interface by default. It uses <code>new AsyncFunction</code> to evaluate code, so if the code has inlined source map it should contain an <a href="https://tc39.es/ecma262/#sec-createdynamicfunction" target="_blank" rel="noreferrer">offset of 2 lines</a> to accommodate for new lines added. This is done automatically by the <code>ESModulesEvaluator</code>. Custom evaluators will not add additional lines.</p>
+<h2 id="modulerunnertransport" tabindex="-1">
+<code>ModuleRunnerTransport</code> </h2>
+<p><strong>Type Signature:</strong></p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code twoslash lsp" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">interface ModuleRunnerTransport {
+  connect?(handlers: ModuleRunnerTransportHandlers): Promise&lt;void&gt; | void
+  disconnect?(): Promise&lt;void&gt; | void
+  send?(data: HotPayload): Promise&lt;void&gt; | void
+  invoke?(data: HotPayload): Promise&lt;{ result: any } | { error: any }&gt;
+  timeout?: number
+}</pre>
+</div>
+<p>Transport object that communicates with the environment via an RPC or by directly calling the function. When <code>invoke</code> method is not implemented, the <code>send</code> method and <code>connect</code> method is required to be implemented. Vite will construct the <code>invoke</code> internally.</p>
+<p>You need to couple it with the <code>HotChannel</code> instance on the server like in this example where module runner is created in the worker thread:</p>
+<div class="vp-code-group vp-adaptive-theme">
+<div class="tabs">
+<input type="radio" name="group-rwRym" id="tab-0v4GVxi" checked><label data-title="worker.js" for="tab-0v4GVxi">worker.js</label><input type="radio" name="group-rwRym" id="tab-DWlOWiP"><label data-title="server.js" for="tab-DWlOWiP">server.js</label>
+</div>
+<div class="blocks">
+<div class="language-js vp-adaptive-theme active">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">import { parentPort } from 'node:worker_threads'
+import { fileURLToPath } from 'node:url'
+import { ESModulesEvaluator, ModuleRunner } from 'vite/module-runner'
+
+/** @type {import('vite/module-runner').ModuleRunnerTransport} */
+const transport = {
+  connect({ onMessage, onDisconnection }) {
+    parentPort.on('message', onMessage)
+    parentPort.on('close', onDisconnection)
+  },
+  send(data) {
+    parentPort.postMessage(data)
+  },
+}
+
+const runner = new ModuleRunner(
+  {
+    transport,
+  },
+  new ESModulesEvaluator(),
+)</pre>
+</div>
+<div class="language-js vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">import { BroadcastChannel } from 'node:worker_threads'
+import { createServer, RemoteEnvironmentTransport, DevEnvironment } from 'vite'
+
+function createWorkerEnvironment(name, config, context) {
+  const worker = new Worker('./worker.js')
+  const handlerToWorkerListener = new WeakMap()
+
+  const workerHotChannel = {
+    send: (data) =&gt; worker.postMessage(data),
+    on: (event, handler) =&gt; {
+      if (event === 'connection') return
+
+      const listener = (value) =&gt; {
+        if (value.type === 'custom' &amp;&amp; value.event === event) {
+          const client = {
+            send(payload) {
+              worker.postMessage(payload)
+            },
+          }
+          handler(value.data, client)
+        }
+      }
+      handlerToWorkerListener.set(handler, listener)
+      worker.on('message', listener)
+    },
+    off: (event, handler) =&gt; {
+      if (event === 'connection') return
+      const listener = handlerToWorkerListener.get(handler)
+      if (listener) {
+        worker.off('message', listener)
+        handlerToWorkerListener.delete(handler)
+      }
+    },
+  }
+
+  return new DevEnvironment(name, config, {
+    transport: workerHotChannel,
+  })
+}
+
+await createServer({
+  environments: {
+    worker: {
+      dev: {
+        createEnvironment: createWorkerEnvironment,
+      },
+    },
+  },
+})</pre>
+</div>
+</div>
+</div>
+<p>A different example using an HTTP request to communicate between the runner and the server:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">import { ESModulesEvaluator, ModuleRunner } from 'vite/module-runner'
+
+export const runner = new ModuleRunner(
+  {
+    transport: {
+      async invoke(data) {
+        const response = await fetch(`http://my-vite-server/invoke`, {
+          method: 'POST',
+          body: JSON.stringify(data),
+        })
+        return response.json()
+      },
+    },
+    hmr: false, // disable HMR as HMR requires transport.connect
+  },
+  new ESModulesEvaluator(),
+)
+
+await runner.import('/entry.js')</pre>
+</div>
+<p>In this case, the <code>handleInvoke</code> method in the <code>NormalizedHotChannel</code> can be used:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes github-light github-dark vp-code" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" data-language="javascript">const customEnvironment = new DevEnvironment(name, config, context)
+
+server.onRequest((request: Request) =&gt; {
+  const url = new URL(request.url)
+  if (url.pathname === '/invoke') {
+    const payload = (await request.json()) as HotPayload
+    const result = customEnvironment.hot.handleInvoke(payload)
+    return new Response(JSON.stringify(result))
+  }
+  return Response.error()
+})</pre>
+</div>
+<p>But note that for HMR support, <code>send</code> and <code>connect</code> methods are required. The <code>send</code> method is usually called when the custom event is triggered (like, <code>import.meta.hot.send("my-event")</code>).</p>
+<p>Vite exports <code>createServerHotChannel</code> from the main entry point to support HMR during Vite SSR.</p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2019–present, Yuxi (Evan) You and Vite contributors<br>Licensed under the MIT License.<br>
+    <a href="https://vite.dev/guide/api-environment-runtimes" class="_attribution-link">https://vite.dev/guide/api-environment-runtimes</a>
+  </p>
+</div>

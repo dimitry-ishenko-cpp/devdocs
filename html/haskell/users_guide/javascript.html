@@ -1,0 +1,156 @@
+<h1 id="ffi-javascript">14. FFI and the JavaScript Backend</h1>
+<div class="_sphinx"> <div itemprop="articleBody"> <section id="ffi-and-the-javascript-backend">  <p id="index-0">GHC’s JavaScript backend supports its own calling convention for JavaScript-specific foreign imports. Any unapplied function is supported, including function names. Commonly, JavaScript foreign imports are written as an unapplied JavaScript <a class="reference external" href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Functions/Arrow_functions">arrow function</a>, but <code>function</code> keyword anonymous functions are also supported.</p> <p>By treating an import string as an unapplied function, arbitrary JavaScript can be included in an import, so a simple example might look like:</p> <pre data-language="haskell">foreign import javascript "((x,y) =&gt; { return x + y; })"
+  js_add :: Int -&gt; Int -&gt; Int
+</pre> <section id="javascript-ffi-types"> <h2 id="id1">
+<span class="section-number">14.1. </span>JavaScript FFI Types</h2> <p>Some types are able to be used directly in the type signatures of foreign exports, without conversion to a <code>JSVal</code>. We saw in the first example that <code>Int</code> is one of these.</p> <p>There are a number of supported types that can be passed directly in this way, and they act as primitives within GHC’s JavaScript RTS. This is in comparison to data structures that are implemented in Haskell, such as <code>String</code> - being a list, this doesn’t have a primitive JavaScript implementation, and isn’t equivalent to a JavaScript string.</p> <p>The following types are supported in this way:</p> <ul class="simple"> <li>
+<code>Int</code>, including <code>Int32</code> and other sized numerical values.</li> <li>
+<code>Int64</code>, and other 64 bit numbers are passed as two variables to the function, where the first includes the sign and the higher bits</li> <li><code>Bool</code></li> <li><code>Char</code></li> <li><code>Any</code></li> <li><code>ByteArray#</code></li> <li>
+<code>Double</code> and <code>Float</code>
+</li> <li>
+<code>MVar#</code>, and other RTS objects</li> <li>Unboxed tuples (e.g. <code>(# a, b #)</code>) can appear in the return type, and are constructed in JavaScript using macros such as <code>RETURN_UBX_TUP2(x, y)</code>.</li> </ul> <p>As in the C FFI, types in the JavaScript FFI can’t be type checked against the foreign code, so the following example would compile successfully - despite <code>5</code> not being a valid JavaScript value for the Haskell <code>Bool</code> type:</p> <pre data-language="haskell">foreign import javascript "((x) =&gt; { return 5; })"
+  type_error :: Bool -&gt; Bool
+</pre> <section id="jsval"> <h3>
+<span class="section-number">14.1.1. </span>JSVal</h3> <p>The JavaScript backend has a concept of an untyped ‘plain’ JavaScript value, under the guise of the type <code>JSVal</code>. Values having this type are mostly opaque to Haskell codes: you can think of <code>JSVal</code> as a data type whose data constructors aren’t exposed. Its main use case is to pass opaque JavaScript values from one FFI call to another.</p> <p>Nevertheless the module <code>GHC.JS.Prim</code> from <code>base</code> contains functions for working with foreign <code>JSVal</code> objects. Currently, it provides the following conversions:</p> <ul class="simple"> <li>
+<code>Int</code> &lt;-&gt; <code>JSVal</code> (<code>toJSInt</code>, <code>fromJSInt</code>)</li> <li>
+<code>String</code> &lt;-&gt; <code>JSVal</code> (<code>toJSString</code>, <code>fromJSString</code>)</li> <li>
+<code>[JSVal]</code> &lt;-&gt; <code>JSVal</code> (<code>toJSArray</code>, <code>fromJSArray</code>)</li> </ul> <p>It also contains functions for working with objects:</p> <ul class="simple"> <li>
+<code>jsNull :: JSVal</code> - the JavaScript <code>null</code>
+</li> <li>
+<code>isNull :: JSVal -&gt; Bool</code> - test for the JavaScript <code>null</code>
+</li> <li>
+<code>isUndefined :: JSVal -&gt; Bool</code> - test for the JavaScript <code>undefined</code>
+</li> <li>
+<code>getProp :: JSVal -&gt; String -&gt; JSVal</code> - object field access</li> </ul> </section> <section id="javascript-callbacks"> <h3>
+<span class="section-number">14.1.2. </span>JavaScript Callbacks</h3> <p>The JavaScript execution model is based around callback functions, and GHC’s JavaScript backend implements these as a type in order to support useful browser programs, and programs interacting with JavaScript libraries.</p> <p>The module <code>GHC.JS.Foreign.Callback</code> in <code>base</code> defines the type <code>Callback a</code>, as well as several functions to construct callbacks from Haskell functions of up to three <code>JSVal</code> arguments. Unlike a regular function, a <code>Callback</code> function is passed in the FFI as a plain JavaScript function - enabling us to call these functions from within JavaScript:</p> <pre data-language="haskell">foreign import javascript "((f) =&gt; { f('Example!'); })"
+  callback_example :: Callback (JSVal -&gt; IO ()) -&gt; IO ()
+
+printJSValAsString :: JSVal -&gt; IO ()
+printJSValAsString = putStrLn . fromJSString
+
+main :: IO ()
+main = do
+  printJS &lt;- syncCallback1 ThrowWouldBlock printJSValAsString
+  callback_example printJS
+  releaseCallback printJS
+</pre> <p>This example will call our <code>printJSValAsString</code> function, via JavaScript, with the JavaScript string <code>Example!</code> as an argument. On the last line, the callback memory is freed. Since there’s no way for the Haskell JS runtime to know if a function is still being referenced by JavaScript code, the memory must be manually released when no longer needed.</p> <p>On the first line of <code>main</code>, we see where the <code>Callback</code> is actually created, by <code>syncCallback1</code>. <code>syncCallback</code> has versions up to three, including a zero-argument version with no suffix. To use callbacks with more than three pieces of data, it’s recommended to package data into JavaScript objects or arrays as required.</p> <p>There are three categories of functions that create callbacks, with the arity-1 type signatures shown here for demonstration:</p> <ul class="simple"> <li>
+<code>syncCallback1 :: OnBlocked -&gt; (JSVal -&gt; IO ()) -&gt; IO (Callback (JSVal -&gt; IO ()))</code>: Synchronous callbacks that don’t return a value. These take an additional <code>data OnBlocked = ThrowWouldBlock | ContinueAsync</code> argument for use in the case that the thread becomes blocked on e.g. an <code>MVar</code> transaction.</li> <li>
+<code>syncCallback1' :: (JSVal -&gt; IO JSVal) -&gt; IO (Callback (JSVal -&gt; IO JSVal))</code>: Synchronous callbacks that return a value. Because of the return value, there is no possibility of continuing asynchronously, so no <code>OnBlocked</code> argument is taken.</li> <li>
+<code>asyncCallback1 :: (JSVal -&gt; IO ()) -&gt; IO (Callback (JSVal -&gt; IO ()))</code>: Asynchronous callbacks that immediately start in a new thread. Cannot return a value.</li> </ul> <p>There is no checking that the passed arguments match the callback, so the following example compiles and correctly prints 10, despite the argument being passed as an <code>Int</code> to a <code>Callback</code> that accepts a <code>JSVal</code>:</p> <pre data-language="haskell">foreign import javascript "((f,x) =&gt; { return f(x); })"
+  apply_int :: Callback (JSVal -&gt; IO JSVal) -&gt; Int -&gt; IO Int
+
+main :: IO ()
+main = do
+  add3 &lt;- syncCallback1' (return . (+3))
+  print =&lt;&lt; apply_int add3 7
+  releaseCallback add3
+</pre> </section> <section id="callbacks-as-foreign-exports"> <h3>
+<span class="section-number">14.1.3. </span>Callbacks as Foreign Exports</h3> <p>JavaScript callbacks allow for a sort of FFI exports via FFI imports. To do this, a global JavaScript variable is set, and that global variable can then be called from use cases that access plain JavaScript functions - such as interactive HTML elements. This would look like:</p> <pre data-language="haskell">foreign import javascript "((f) =&gt; { globalF = f })"
+  setF :: Callback (JSVal -&gt; IO ()) -&gt; IO ()
+
+main :: IO ()
+main = do
+  log &lt;- syncCallback1 ThrowWouldBlock (print . fromJSString)
+  setF log
+  -- don't releaseCallback log
+</pre> <pre data-language="html">&lt;button onClick="globalF('Button pressed!")&gt;Example&lt;/button&gt;
+</pre> <p>We have to make sure not to use <code>releaseCallback</code> on any functions that are to be available in HTML, because we want these functions to be in memory indefinitely.</p> </section> </section> <section id="writing-replacement-implementations-for-libraries-with-c-ffi-functions"> <h2>
+<span class="section-number">14.2. </span>Writing Replacement Implementations for Libraries with C FFI Functions</h2> <p>Many libraries make use of C FFI functions to accomplish low-level or performance sensitive operations - known as <code>cbits</code> and often kept in a folder with this name. For such a library to support the JavaScript backend, the <code>cbits</code> must have replacement implementations.</p> <p>In principle, it is possible for the JavaScript backend to automatically compile <code>cbits</code> using Emscripten, but this requires wrappers to convert data between the JS backend’s RTS data format, and the format expected by Emscripten-compiled functions. Since C functions are often used where performance is more critical, there’s potential for the data conversions to negate this purpose.</p> <p>Instead, it is more effective for a library to provide an alternate implementation for functions using the C FFI - either by providing direct one-to-one replacement JavaScript functions, or by using C preprocessor directives to replace C FFI imports with some combination of JS FFI imports and pure-Haskell implementation.</p> <section id="direct-implementation-of-c-ffi-imports-in-javascript-as-jsbits"> <h3>
+<span class="section-number">14.2.1. </span>Direct Implementation of C FFI Imports in JavaScript as <code>jsbits</code>
+</h3> <p>When the JavaScript backend generates code for a C FFI import, it will call the function named in the import string, prepended by <code>h$</code> - so the imported C function <code>open</code> will look for the JavaScript function <code>h$open</code>. No verification is done to ensure that these functions are actually implemented in the linked JavaScript files, so there can be runtime errors when a missing JavaScript function is called.</p> <p>Based on this, implementing a C function in JavaScript is a matter of providing a function of the correct shape (based on the C FFI import type signature) in any of the linked JavaScript sources. External JavaScript sources are linked by either providing them as an argument to GHC, or listing them in the <code>js-sources</code> field of the cabal file - in which case it would usually be inside a predicate to detect the <code>javascript</code> architecture, such as:</p> <pre data-language="cabal">library
+
+  if arch(javascript)
+    js-sources:
+      jsbits/example.js
+</pre> <p>Note that <code>js-sources</code> requires Cabal 3.10 to be used with library targets, and Cabal 3.12 to be used with executable targets.</p> <p>The shape required of the JavaScript function will depend on the particular C types used:</p> <ul class="simple"> <li>primitives, such as <code>CInt</code> will map directly to a single JavaScript argument using JavaScript primitives. In the case of <code>CInt</code>, this will be a JavaScript number. Note that in the case of return values, a JavaScript number will usually need to be rounded or cast back to an integral value in cases where mathematical operations are used</li> <li>pointer values, including <code>CString</code>, are passed as an unboxed <code>(ptr, offset)</code> pair. For arguments, being unboxed will mean these are passed as two top-level arguments to the function. For return values, unboxed values should be returned from JavaScript functions by using a special C preprocessor macro, <code>RETURN_UBX_TUP2(ptr, offset)</code>
+</li> <li>
+<code>CString</code>, in addition to the above pointer handling, will need to be decoded and encoded to convert them between character arrays and JavaScript strings.</li> <li>other RTS primitive types are discussed previously in <a class="reference internal" href="#javascript-ffi-types">JavaScript FFI Types</a>.</li> </ul> <p>As an example, let’s consider the implementation of <code>getcwd</code>:</p> <pre data-language="haskell">-- unix:System.Posix.Directory
+
+foreign import ccall unsafe "getcwd" c_getcwd :: Ptr CChar -&gt; CSize -&gt; IO (Ptr CChar)
+</pre> <pre data-language="javascript">// libraries/base/jsbits/base.js
+
+//#OPTIONS: CPP
+
+function h$getcwd(buf, off, buf_size) {
+  try {
+    var cwd = h$encodeUtf8(process.cwd());
+    if (buf_size &lt; cwd.len &amp;&amp; buf_size !== 0) {
+      h$setErrno("ERANGE");
+      RETURN_UBX_TUP2(null, 0);
+    } else if (buf !== null) {
+      h$copyMutableByteArray(cwd, 0, buf, off, cwd.len);
+      RETURN_UBX_TUP2(buf, off);
+    } else if (buf_size === 0) {
+      RETURN_UBX_TUP2(cwd, 0);
+    } else {
+      var out = h$newByteArray(buf_size);
+      h$copyMutableByteArray(cwd, 0, out, off, cwd.len);
+    }
+  } catch (e) {
+    h$setErrno(e);
+    RETURN_UBX_TUP2(null, 0);
+  }
+}
+</pre> <p>Here, the C function <code>getcwd</code> maps to the JavaScript function <code>h$getcwd</code>, which exists in a <code>.js</code> file within <code>base</code>’s <code>jsbits</code> subdirectory. <code>h$getcwd</code> expects a <code>CString</code> (passed as the equivalent <code>Ptr CChar</code>) and a <code>CSize</code> argument. This results in three arguments to the JavaScript function - two for the string’s pointer and offset, and one for the size, which will be passed as a JavaScript number.</p> <p>Next, the JavaScript <code>h$getcwd</code> function demonstrates several details:</p> <ul class="simple"> <li>In the try clause, the <code>cwd</code> value is first accessed using a NodeJS-provided method. This value is immediately encoded using <code>h$encodeUtf8</code>, which is provided by the JavaScript backend. This function will only return the pointer for the encoded value, and the offset will always be 0</li> <li>Next, we select one of several cases - based on the specification of the C function that we’re trying to immitate</li> <li>In the first case where the given buffer size is too small, but not zero, the function must set the <code>ERANGE</code> error code, which we do here with <code>h$setErrno</code>, and return <code>null</code>. As we saw in the function arguments, pointers are passed as a <code>(ptr, offset)</code> pair - meaning <code>null</code> is represented by returning the unboxed pair <code>(null, 0)</code>
+</li> <li>In the second case where there is enough space in <code>buf</code> to successfully copy the bytes, we do so using <code>h$copyMutableByteArray</code> - a function supplied by GHC’s JavaScript RTS</li> <li>In the third case where <code>buf_size</code> is 0, this indicates in the C function’s specification that we can allocate a new buffer of the appropriate size to return. We already have this in the form of the previously encoded <code>cwd</code>, so we can just return it, along with the 0 offset</li> <li>In the last case where <code>buf</code> is null, and <code>buf_size</code> is large enough, we allocate a new buffer, this time with <code>buf_size</code> bytes of space using <code>h$newByteArray</code>, and we again perform a mutable copy</li> <li>To use C preprocessor macros in linked JavaScript files, the file must open with the <code>//#OPTIONS: CPP</code> line, as is shown towards the start of this snippet</li> <li>If an error occurs, the catch clause will pass it to <code>h$setErrno</code> and return the <code>(null, 0)</code> pointer and offset pair - which is a behaviour expected by the C function in the error case.</li> </ul> </section> <section id="writing-javascript-functions-to-be-nodejs-and-browser-aware"> <h3>
+<span class="section-number">14.2.2. </span>Writing JavaScript Functions to be NodeJS and Browser Aware</h3> <p>In the above example of implementing <code>getcwd</code>, the function we use in the JavaScript implementation is from NodeJS, and the behaviour doesn’t make sense to implement in a browser. Therefore, the actual implementation will include a C preprocessor condition to check if we’re compiling for the browser, in which case <code>h$unsupported(-1)</code> will be called. There can be multiple non-browser JavaScript runtimes, so we’ll also have to check at runtime to make sure that NodeJS is in use.</p> <pre data-language="javascript">function h$getcwd(buf, off, buf_size) {
+#ifndef GHCJS_BROWSER
+  if (h$isNode()) {
+    try {
+      var cwd = h$encodeUtf8(process.cwd());
+      if (buf_size &lt; cwd.len &amp;&amp; buf_size !== 0) {
+        h$setErrno("ERANGE");
+        return (null, 0);
+      } else if (buf !== null) {
+        h$copyMutableByteArray(cwd, 0, buf, off, cwd.len);
+        RETURN_UBX_TUP2(buf, off);
+      } else if (buf_size === 0) {
+        RETURN_UBX_TUP2(cwd, 0);
+      } else {
+        var out = h$newByteArray(buf_size);
+        h$copyMutableByteArray(cwd, 0, out, off, cwd.len);
+      }
+    } catch (e) {
+      h$setErrno(e);
+      RETURN_UBX_TUP2(null, 0);
+    }
+  } else
+#endif
+    h$unsupported();
+    RETURN_UBX_TUP2(null, 0);
+}
+</pre> </section> <section id="replacing-c-ffi-imports-with-pure-haskell-and-javascript"> <h3>
+<span class="section-number">14.2.3. </span>Replacing C FFI Imports with Pure Haskell and JavaScript</h3> <p>Instead of providing a direct JavaScript implementation for each C FFI import, we can instead use the C preprocessor to conditionally remove these C imports (and possibly use sites as well). Then, some combination of JavaScript FFI imports and Haskell implementation can be added instead. As in the direct implementation section, any linked JavaScript files should usually be in a <code>if arch(javascript)</code> condition in the cabal file.</p> <p>As an example of a mixed Haskell and JavaScript implementation replacing a C implementation, consider <code>base:GHC.Clock</code>:</p> <pre data-language="haskell">#if defined(javascript_HOST_ARCH)
+getMonotonicTimeNSec :: IO Word64
+getMonotonicTimeNSec = do
+  w &lt;- getMonotonicTimeMSec
+  return (floor w * 1000000)
+
+foreign import javascript unsafe "performance.now"
+  getMonotonicTimeMSec :: IO Double
+
+#else
+foreign import ccall unsafe "getMonotonicNSec"
+  getMonotonicTimeNSec :: IO Word64
+#endif
+</pre> <p>Here, the <code>getMonotonicTimeNSec</code> C FFI import is replaced by the JavaScript FFI import <code>getMonotonicTimeMSec</code>, which imports the standard JavaScript function <code>performance.now</code>. However, because this JavaScript implementation returns the time as a <code>Double</code> of floating point milliseconds, it must be wrapped by a Haskell function to extract the integral value that’s expected.</p> <p>In this case, the choice of using a mixed Haskell and JavaScript replacement implementation was caused by the limitation of clocks being system calls. In a lot of cases, C functions are used for similar system-level functionality. In such cases, it’s recommended to import the required system functions from standard JavaScript libraries (or from the runtime, as was required for <code>getcwd</code>), and use Haskell wrapper functions to convert the imported functions to the appropriate format.</p> <p>In other cases, C functions are used for performance. For these cases, pure-Haskell implementations are the preferred first step for compatibility with the JavaScript backend since it would be more future-proof against changes to the RTS data format. Depending on the use case, compiler-optimised JS code might be hard to complete with using hand-written JavaScript. Generally, the most likely performance gains from hand-written JavaScript come from functions with data that stays as JavaScript primitive types for a long time, especially strings. For this, <code>JSVal</code> allows values to be passed between <code>Haskell</code> and <code>JavaScript</code> without a marshalling penalty.</p> </section> </section> <section id="linking-with-c-sources"> <h2>
+<span class="section-number">14.3. </span>Linking with C sources</h2> <p>GHC supports compiling C sources into JavaScript (using Emscripten) and linking them with the rest of the JavaScript code (generated from Haskell codes and from the RTS).</p> <p>C functions compiled with Emscripten get a “_” prepended to their name in JavaScript. For example, C “malloc” becomes “_malloc” in JavaScript.</p> <section id="emcc-pragmas"> <h3>
+<span class="section-number">14.3.1. </span>EMCC pragmas</h3> <p>By default the EMCC linker drops code considered dead and it has no way to know which code is alive due to some call from Haskell or from a JavaScript wrapper. As such, you must explicitly add some pragmas at the top of one of your <code>.js</code> files to indicate which functions are alive:</p> <p><code>`
+//#OPTIONS:EMCC:EXPORTED_RUNTIME_METHODS=foo,bar
+`</code></p> <p>Enable methods <code>foo</code> and <code>bar</code> from the Emscripten runtime system. This is used for methods such as <code>ccall</code>, <code>cwrap</code>, <code>addFunction</code>, <code>removeFunction</code>… that are described in Emscripten documentation.</p> <p><code>`
+//#OPTIONS:EMCC:EXPORTED_FUNCTIONS=_foo,_bar
+`</code></p> <p>Enable C functions <code>foo</code> and <code>bar</code> to be exported respectively as <code>_foo</code> and <code>_bar</code> (<code>_</code> prepended). This is used for C library functions (e.g. <code>_malloc</code>, <code>_free</code>, etc.) and for the C code compiled with your project (e.g. <code>_sqlite3_open</code> and others for the <code>sqlite</code> C library).</p> <p>You can use both pragmas as many times as you want. Ultimately all the entries end up in sets of functions passed to the Emscripten linker via <code>-sEXPORTED_RUNTIME_METHODS</code> and <code>-sEXPORTED_FUNCTIONS</code> (which can only be passed once; the latter argument overrides the former ones).</p> <p><code>`
+//#OPTIONS:EMCC:EXTRA=-foo,-bar
+`</code></p> <p>This pragma allows additional options to be passed to Emscripten if need be. We already pass:</p> <ul class="simple"> <li>
+<code>-sSINGLE_FILE=1</code>: required to create a single <code>.js</code> file as artefact (otherwise <code>.wasm</code> files corresponding to C codes need to be present in the current working directory when invoking the resulting <code>.js</code> file).</li> <li>
+<code>-sALLOW_TABLE_GROWTH</code>: required to support <code>addFunction</code>
+</li> <li>
+<code>-sEXPORTED_RUNTIME_METHODS</code> and <code>-sEXPORTED_FUNCTIONS</code>: see above.</li> </ul> <p>Be careful because some extra arguments may break the build in unsuspected ways.</p> </section> <section id="wrappers"> <h3>
+<span class="section-number">14.3.2. </span>Wrappers</h3> <p>The JavaScript backend doesn’t generate wrappers for foreign imports to call directly into the compiled C code. I.e. given the following foreign import:</p> <p><code>`haskell
+foreign import ccall "foo" foo :: ...
+`</code></p> <p>The JavaScript backend will replace calls to <code>foo</code> with calls to the JavaScript function <code>h$foo</code>. It’s still up to the programmer to call <code>_foo</code> or not from <code>h$foo</code> on a case by case basis. If <code>h$foo</code> calls the generated from C function <code>_foo</code>, then we say that <code>h$foo</code> is a wrapper function. These wrapper functions are used to marshal arguments and returned values between the JS heap and the Emscripten heap.</p> <p>On one hand, GHC’s JavaScript backend creates a different array of bytes per allocation (in order to make use of the garbage collector of the JavaScript engine). On the other hand, Emscripten’s C heap consists in a single array of bytes. To call C functions converted to JavaScript that have pointer arguments, wrapper functions have to:</p> <ol class="arabic simple"> <li>allocate some buffer in the Emscripten heap (using <code>_malloc</code>) to get a valid Emscripten pointer</li> <li>copy the bytes from the JS object to the buffer in the Emscripten heap</li> <li>use the Emscripten pointer to make the call to the C function</li> <li>optionally copy back the bytes from the Emscripten heap if the call may have changed the contents of the buffer</li> <li>free the Emscripten buffer (with <code>_free</code>)</li> </ol> <p>GHC’s JavaScript rts provides helper functions for this in <code>rts/js/mem.js</code>. See <code>h$copyFromHeap</code>, <code>h$copyToHeap</code>, <code>h$initHeapBuffer</code>, etc.</p> </section> <section id="callbacks"> <h3>
+<span class="section-number">14.3.3. </span>Callbacks</h3> <p>Some C functions take function pointers as arguments (e.g. callbacks). This is supported by the JavaScript backend but requires some work from the wrapper functions.</p> <ol class="arabic simple"> <li>On the Haskell side it is possible to create a pointer to an Haskell function (a <code>FunPtr</code>) by using a “wrapper” foreign import. See the documentation of <code>base:Foreign.Ptr.FunPtr</code>.</li> <li>This <code>FunPtr</code> can be passed to a JavaScript wrapper function. However it’s implemented as a <code>StablePtr</code> and needs to be converted into a function pointer that Emscripten understands. This can be done with <code>h$registerFunPtrOnHeap</code>.</li> <li>When a callback is no longer needed, it can be freed with <code>h$unregisterFunPtrFromHeap</code>.</li> </ol> <p>Note that in some circumstances you may not want to register an Haskell function directly as a callback. It is perfectly possible to register/free regular JavaScript function as Emscripten functions using <code>Module.addFunction</code> and <code>Module.removeFunction</code>. That’s what the helper functions mentioned above do.</p> </section> </section> </section> </div> </div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2002&ndash;2007 The University Court of the University of Glasgow. All rights reserved.<br>Licensed under the Glasgow Haskell Compiler License.<br>
+    <a href="https://downloads.haskell.org/~ghc/9.12.1/docs/users_guide/javascript.html" class="_attribution-link">https://downloads.haskell.org/~ghc/9.12.1/docs/users_guide/javascript.html</a>
+  </p>
+</div>

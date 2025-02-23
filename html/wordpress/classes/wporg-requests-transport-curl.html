@@ -1,0 +1,679 @@
+<h1 class="wp-block-wporg-code-reference-title">
+<span class="keyword">class</span> Curl {}</h1> <section><p>cURL HTTP transport</p> </section> <section><h2 id="methods">Methods</h2> <section style="margin-top:var(--wp--preset--spacing--20);" id="uses"><figure class="wp-block-table "><table>
+<thead><tr>
+<th scope="col">Name</th>
+<th scope="col">Description</th>
+</tr></thead>
+<tbody>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/__construct.html">Curl::__construct</a></td>
+<td>Constructor</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/__destruct.html">Curl::__destruct</a></td>
+<td>Destructor</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/format_get.html">Curl::format_get</a></td>
+<td>Format a URL given GET data</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/get_expect_header.html">Curl::get_expect_header</a></td>
+<td>Get the correct “Expect” header for the given request data.</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/get_subrequest_handle.html">Curl::get_subrequest_handle</a></td>
+<td>Get the cURL handle for use in a multi-request</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/process_response.html">Curl::process_response</a></td>
+<td>Process a response</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/request.html">Curl::request</a></td>
+<td>Perform a request</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/request_multiple.html">Curl::request_multiple</a></td>
+<td>Send multiple requests simultaneously</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/setup_handle.html">Curl::setup_handle</a></td>
+<td>Setup the cURL handle for the given data</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/stream_body.html">Curl::stream_body</a></td>
+<td>Collect data as it’s received</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/stream_headers.html">Curl::stream_headers</a></td>
+<td>Collect the headers as they are received</td>
+</tr>
+<tr class="">
+<td><a href="wporg-requests-transport-curl/test.html">Curl::test</a></td>
+<td>Self-test whether the transport can be used.</td>
+</tr>
+</tbody>
+</table></figure></section> </section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="25" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">final class Curl implements Transport {
+	const CURL_7_10_5 = 0x070A05;
+	const CURL_7_16_2 = 0x071002;
+
+	/**
+	 * Raw HTTP data
+	 *
+	 * @var string
+	 */
+	public $headers = '';
+
+	/**
+	 * Raw body data
+	 *
+	 * @var string
+	 */
+	public $response_data = '';
+
+	/**
+	 * Information on the current request
+	 *
+	 * @var array cURL information array, see <a href="https://www.php.net/curl_getinfo">https://www.php.net/curl_getinfo</a>
+	 */
+	public $info;
+
+	/**
+	 * cURL version number
+	 *
+	 * @var int
+	 */
+	public $version;
+
+	/**
+	 * cURL handle
+	 *
+	 * @var resource|\CurlHandle Resource in PHP &lt; 8.0, Instance of CurlHandle in PHP &gt;= 8.0.
+	 */
+	private $handle;
+
+	/**
+	 * Hook dispatcher instance
+	 *
+	 * @var \WpOrg\Requests\Hooks
+	 */
+	private $hooks;
+
+	/**
+	 * Have we finished the headers yet?
+	 *
+	 * @var boolean
+	 */
+	private $done_headers = false;
+
+	/**
+	 * If streaming to a file, keep the file pointer
+	 *
+	 * @var resource
+	 */
+	private $stream_handle;
+
+	/**
+	 * How many bytes are in the response body?
+	 *
+	 * @var int
+	 */
+	private $response_bytes;
+
+	/**
+	 * What's the maximum number of bytes we should keep?
+	 *
+	 * @var int|bool Byte count, or false if no limit.
+	 */
+	private $response_byte_limit;
+
+	/**
+	 * Constructor
+	 */
+	public function __construct() {
+		$curl          = curl_version();
+		$this-&gt;version = $curl['version_number'];
+		$this-&gt;handle  = curl_init();
+
+		curl_setopt($this-&gt;handle, CURLOPT_HEADER, false);
+		curl_setopt($this-&gt;handle, CURLOPT_RETURNTRANSFER, 1);
+		if ($this-&gt;version &gt;= self::CURL_7_10_5) {
+			curl_setopt($this-&gt;handle, CURLOPT_ENCODING, '');
+		}
+
+		if (defined('CURLOPT_PROTOCOLS')) {
+			// phpcs:ignore PHPCompatibility.Constants.NewConstants.curlopt_protocolsFound
+			curl_setopt($this-&gt;handle, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+		}
+
+		if (defined('CURLOPT_REDIR_PROTOCOLS')) {
+			// phpcs:ignore PHPCompatibility.Constants.NewConstants.curlopt_redir_protocolsFound
+			curl_setopt($this-&gt;handle, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+		}
+	}
+
+	/**
+	 * Destructor
+	 */
+	public function __destruct() {
+		if (is_resource($this-&gt;handle)) {
+			curl_close($this-&gt;handle);
+		}
+	}
+
+	/**
+	 * Perform a request
+	 *
+	 * @param string|Stringable $url URL to request
+	 * @param array $headers Associative array of request headers
+	 * @param string|array $data Data to send either as the POST body, or as parameters in the URL for a GET/HEAD
+	 * @param array $options Request options, see <a href="wporgrequestsrequests/response.html">\WpOrg\Requests\Requests::response()</a> for documentation
+	 * @return string Raw HTTP result
+	 *
+	 * @throws \WpOrg\Requests\Exception\InvalidArgument When the passed $url argument is not a string or Stringable.
+	 * @throws \WpOrg\Requests\Exception\InvalidArgument When the passed $headers argument is not an array.
+	 * @throws \WpOrg\Requests\Exception\InvalidArgument When the passed $data parameter is not an array or string.
+	 * @throws \WpOrg\Requests\Exception\InvalidArgument When the passed $options argument is not an array.
+	 * @throws \WpOrg\Requests\Exception       On a cURL error (`curlerror`)
+	 */
+	public function request($url, $headers = [], $data = [], $options = []) {
+		if (InputValidator::is_string_or_stringable($url) === false) {
+			throw InvalidArgument::create(1, '$url', 'string|Stringable', gettype($url));
+		}
+
+		if (is_array($headers) === false) {
+			throw InvalidArgument::create(2, '$headers', 'array', gettype($headers));
+		}
+
+		if (!is_array($data) &amp;&amp; !is_string($data)) {
+			if ($data === null) {
+				$data = '';
+			} else {
+				throw InvalidArgument::create(3, '$data', 'array|string', gettype($data));
+			}
+		}
+
+		if (is_array($options) === false) {
+			throw InvalidArgument::create(4, '$options', 'array', gettype($options));
+		}
+
+		$this-&gt;hooks = $options['hooks'];
+
+		$this-&gt;setup_handle($url, $headers, $data, $options);
+
+		$options['hooks']-&gt;dispatch('curl.before_send', [&amp;$this-&gt;handle]);
+
+		if ($options['filename'] !== false) {
+			// phpcs:ignore WordPress.PHP.NoSilencedErrors -- Silenced the PHP native warning in favour of throwing an exception.
+			$this-&gt;stream_handle = @fopen($options['filename'], 'wb');
+			if ($this-&gt;stream_handle === false) {
+				$error = error_get_last();
+				throw new Exception($error['message'], 'fopen');
+			}
+		}
+
+		$this-&gt;response_data       = '';
+		$this-&gt;response_bytes      = 0;
+		$this-&gt;response_byte_limit = false;
+		if ($options['max_bytes'] !== false) {
+			$this-&gt;response_byte_limit = $options['max_bytes'];
+		}
+
+		if (isset($options['verify'])) {
+			if ($options['verify'] === false) {
+				curl_setopt($this-&gt;handle, CURLOPT_SSL_VERIFYHOST, 0);
+				curl_setopt($this-&gt;handle, CURLOPT_SSL_VERIFYPEER, 0);
+			} elseif (is_string($options['verify'])) {
+				curl_setopt($this-&gt;handle, CURLOPT_CAINFO, $options['verify']);
+			}
+		}
+
+		if (isset($options['verifyname']) &amp;&amp; $options['verifyname'] === false) {
+			curl_setopt($this-&gt;handle, CURLOPT_SSL_VERIFYHOST, 0);
+		}
+
+		curl_exec($this-&gt;handle);
+		$response = $this-&gt;response_data;
+
+		$options['hooks']-&gt;dispatch('curl.after_send', []);
+
+		if (curl_errno($this-&gt;handle) === CURLE_WRITE_ERROR || curl_errno($this-&gt;handle) === CURLE_BAD_CONTENT_ENCODING) {
+			// Reset encoding and try again
+			curl_setopt($this-&gt;handle, CURLOPT_ENCODING, 'none');
+
+			$this-&gt;response_data  = '';
+			$this-&gt;response_bytes = 0;
+			curl_exec($this-&gt;handle);
+			$response = $this-&gt;response_data;
+		}
+
+		$this-&gt;process_response($response, $options);
+
+		// Need to remove the $this reference from the curl handle.
+		// Otherwise \WpOrg\Requests\Transport\Curl won't be garbage collected and the curl_close() will never be called.
+		curl_setopt($this-&gt;handle, CURLOPT_HEADERFUNCTION, null);
+		curl_setopt($this-&gt;handle, CURLOPT_WRITEFUNCTION, null);
+
+		return $this-&gt;headers;
+	}
+
+	/**
+	 * Send multiple requests simultaneously
+	 *
+	 * @param array $requests Request data
+	 * @param array $options Global options
+	 * @return array Array of \WpOrg\Requests\Response objects (may contain \WpOrg\Requests\Exception or string responses as well)
+	 *
+	 * @throws \WpOrg\Requests\Exception\InvalidArgument When the passed $requests argument is not an array or iterable object with array access.
+	 * @throws \WpOrg\Requests\Exception\InvalidArgument When the passed $options argument is not an array.
+	 */
+	public function request_multiple($requests, $options) {
+		// If you're not requesting, we can't get any responses ¯\_(ツ)_/¯
+		if (empty($requests)) {
+			return [];
+		}
+
+		if (InputValidator::has_array_access($requests) === false || InputValidator::is_iterable($requests) === false) {
+			throw InvalidArgument::create(1, '$requests', 'array|ArrayAccess&amp;Traversable', gettype($requests));
+		}
+
+		if (is_array($options) === false) {
+			throw InvalidArgument::create(2, '$options', 'array', gettype($options));
+		}
+
+		$multihandle = curl_multi_init();
+		$subrequests = [];
+		$subhandles  = [];
+
+		$class = get_class($this);
+		foreach ($requests as $id =&gt; $request) {
+			$subrequests[$id] = new $class();
+			$subhandles[$id]  = $subrequests[$id]-&gt;get_subrequest_handle($request['url'], $request['headers'], $request['data'], $request['options']);
+			$request['options']['hooks']-&gt;dispatch('curl.before_multi_add', [&amp;$subhandles[$id]]);
+			curl_multi_add_handle($multihandle, $subhandles[$id]);
+		}
+
+		$completed       = 0;
+		$responses       = [];
+		$subrequestcount = count($subrequests);
+
+		$request['options']['hooks']-&gt;dispatch('curl.before_multi_exec', [&amp;$multihandle]);
+
+		do {
+			$active = 0;
+
+			do {
+				$status = curl_multi_exec($multihandle, $active);
+			} while ($status === CURLM_CALL_MULTI_PERFORM);
+
+			$to_process = [];
+
+			// Read the information as needed
+			while ($done = curl_multi_info_read($multihandle)) {
+				$key = array_search($done['handle'], $subhandles, true);
+				if (!isset($to_process[$key])) {
+					$to_process[$key] = $done;
+				}
+			}
+
+			// Parse the finished requests before we start getting the new ones
+			foreach ($to_process as $key =&gt; $done) {
+				$options = $requests[$key]['options'];
+				if ($done['result'] !== CURLE_OK) {
+					//get error string for handle.
+					$reason          = curl_error($done['handle']);
+					$exception       = new CurlException(
+						$reason,
+						CurlException::EASY,
+						$done['handle'],
+						$done['result']
+					);
+					$responses[$key] = $exception;
+					$options['hooks']-&gt;dispatch('transport.internal.parse_error', [&amp;$responses[$key], $requests[$key]]);
+				} else {
+					$responses[$key] = $subrequests[$key]-&gt;process_response($subrequests[$key]-&gt;response_data, $options);
+
+					$options['hooks']-&gt;dispatch('transport.internal.parse_response', [&amp;$responses[$key], $requests[$key]]);
+				}
+
+				curl_multi_remove_handle($multihandle, $done['handle']);
+				curl_close($done['handle']);
+
+				if (!is_string($responses[$key])) {
+					$options['hooks']-&gt;dispatch('multiple.request.complete', [&amp;$responses[$key], $key]);
+				}
+
+				$completed++;
+			}
+		} while ($active || $completed &lt; $subrequestcount);
+
+		$request['options']['hooks']-&gt;dispatch('curl.after_multi_exec', [&amp;$multihandle]);
+
+		curl_multi_close($multihandle);
+
+		return $responses;
+	}
+
+	/**
+	 * Get the cURL handle for use in a multi-request
+	 *
+	 * @param string $url URL to request
+	 * @param array $headers Associative array of request headers
+	 * @param string|array $data Data to send either as the POST body, or as parameters in the URL for a GET/HEAD
+	 * @param array $options Request options, see <a href="wporgrequestsrequests/response.html">\WpOrg\Requests\Requests::response()</a> for documentation
+	 * @return resource|\CurlHandle Subrequest's cURL handle
+	 */
+	public function &amp;get_subrequest_handle($url, $headers, $data, $options) {
+		$this-&gt;setup_handle($url, $headers, $data, $options);
+
+		if ($options['filename'] !== false) {
+			$this-&gt;stream_handle = fopen($options['filename'], 'wb');
+		}
+
+		$this-&gt;response_data       = '';
+		$this-&gt;response_bytes      = 0;
+		$this-&gt;response_byte_limit = false;
+		if ($options['max_bytes'] !== false) {
+			$this-&gt;response_byte_limit = $options['max_bytes'];
+		}
+
+		$this-&gt;hooks = $options['hooks'];
+
+		return $this-&gt;handle;
+	}
+
+	/**
+	 * Setup the cURL handle for the given data
+	 *
+	 * @param string $url URL to request
+	 * @param array $headers Associative array of request headers
+	 * @param string|array $data Data to send either as the POST body, or as parameters in the URL for a GET/HEAD
+	 * @param array $options Request options, see <a href="wporgrequestsrequests/response.html">\WpOrg\Requests\Requests::response()</a> for documentation
+	 */
+	private function setup_handle($url, $headers, $data, $options) {
+		$options['hooks']-&gt;dispatch('curl.before_request', [&amp;$this-&gt;handle]);
+
+		// Force closing the connection for old versions of cURL (&lt;7.22).
+		if (!isset($headers['Connection'])) {
+			$headers['Connection'] = 'close';
+		}
+
+		/**
+		 * Add "Expect" header.
+		 *
+		 * By default, cURL adds a "Expect: 100-Continue" to most requests. This header can
+		 * add as much as a second to the time it takes for cURL to perform a request. To
+		 * prevent this, we need to set an empty "Expect" header. To match the behaviour of
+		 * Guzzle, we'll add the empty header to requests that are smaller than 1 MB and use
+		 * HTTP/1.1.
+		 *
+		 * https://curl.se/mail/lib-2017-07/0013.html
+		 */
+		if (!isset($headers['Expect']) &amp;&amp; $options['protocol_version'] === 1.1) {
+			$headers['Expect'] = $this-&gt;get_expect_header($data);
+		}
+
+		$headers = Requests::flatten($headers);
+
+		if (!empty($data)) {
+			$data_format = $options['data_format'];
+
+			if ($data_format === 'query') {
+				$url  = self::format_get($url, $data);
+				$data = '';
+			} elseif (!is_string($data)) {
+				$data = http_build_query($data, '', '&amp;');
+			}
+		}
+
+		switch ($options['type']) {
+			case Requests::POST:
+				curl_setopt($this-&gt;handle, CURLOPT_POST, true);
+				curl_setopt($this-&gt;handle, CURLOPT_POSTFIELDS, $data);
+				break;
+			case Requests::HEAD:
+				curl_setopt($this-&gt;handle, CURLOPT_CUSTOMREQUEST, $options['type']);
+				curl_setopt($this-&gt;handle, CURLOPT_NOBODY, true);
+				break;
+			case Requests::TRACE:
+				curl_setopt($this-&gt;handle, CURLOPT_CUSTOMREQUEST, $options['type']);
+				break;
+			case Requests::PATCH:
+			case Requests::PUT:
+			case Requests::DELETE:
+			case Requests::OPTIONS:
+			default:
+				curl_setopt($this-&gt;handle, CURLOPT_CUSTOMREQUEST, $options['type']);
+				if (!empty($data)) {
+					curl_setopt($this-&gt;handle, CURLOPT_POSTFIELDS, $data);
+				}
+		}
+
+		// cURL requires a minimum timeout of 1 second when using the system
+		// DNS resolver, as it uses `alarm()`, which is second resolution only.
+		// There's no way to detect which DNS resolver is being used from our
+		// end, so we need to round up regardless of the supplied timeout.
+		//
+		// https://github.com/curl/curl/blob/4f45240bc84a9aa648c8f7243be7b79e9f9323a5/lib/hostip.c#L606-L609
+		$timeout = max($options['timeout'], 1);
+
+		if (is_int($timeout) || $this-&gt;version &lt; self::CURL_7_16_2) {
+			curl_setopt($this-&gt;handle, CURLOPT_TIMEOUT, ceil($timeout));
+		} else {
+			// phpcs:ignore PHPCompatibility.Constants.NewConstants.curlopt_timeout_msFound
+			curl_setopt($this-&gt;handle, CURLOPT_TIMEOUT_MS, round($timeout * 1000));
+		}
+
+		if (is_int($options['connect_timeout']) || $this-&gt;version &lt; self::CURL_7_16_2) {
+			curl_setopt($this-&gt;handle, CURLOPT_CONNECTTIMEOUT, ceil($options['connect_timeout']));
+		} else {
+			// phpcs:ignore PHPCompatibility.Constants.NewConstants.curlopt_connecttimeout_msFound
+			curl_setopt($this-&gt;handle, CURLOPT_CONNECTTIMEOUT_MS, round($options['connect_timeout'] * 1000));
+		}
+
+		curl_setopt($this-&gt;handle, CURLOPT_URL, $url);
+		curl_setopt($this-&gt;handle, CURLOPT_USERAGENT, $options['useragent']);
+		if (!empty($headers)) {
+			curl_setopt($this-&gt;handle, CURLOPT_HTTPHEADER, $headers);
+		}
+
+		if ($options['protocol_version'] === 1.1) {
+			curl_setopt($this-&gt;handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+		} else {
+			curl_setopt($this-&gt;handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+		}
+
+		if ($options['blocking'] === true) {
+			curl_setopt($this-&gt;handle, CURLOPT_HEADERFUNCTION, [$this, 'stream_headers']);
+			curl_setopt($this-&gt;handle, CURLOPT_WRITEFUNCTION, [$this, 'stream_body']);
+			curl_setopt($this-&gt;handle, CURLOPT_BUFFERSIZE, Requests::BUFFER_SIZE);
+		}
+	}
+
+	/**
+	 * Process a response
+	 *
+	 * @param string $response Response data from the body
+	 * @param array $options Request options
+	 * @return string|false HTTP response data including headers. False if non-blocking.
+	 * @throws \WpOrg\Requests\Exception If the request resulted in a cURL error.
+	 */
+	public function process_response($response, $options) {
+		if ($options['blocking'] === false) {
+			$fake_headers = '';
+			$options['hooks']-&gt;dispatch('curl.after_request', [&amp;$fake_headers]);
+			return false;
+		}
+
+		if ($options['filename'] !== false &amp;&amp; $this-&gt;stream_handle) {
+			fclose($this-&gt;stream_handle);
+			$this-&gt;headers = trim($this-&gt;headers);
+		} else {
+			$this-&gt;headers .= $response;
+		}
+
+		if (curl_errno($this-&gt;handle)) {
+			$error = sprintf(
+				'cURL error %s: %s',
+				curl_errno($this-&gt;handle),
+				curl_error($this-&gt;handle)
+			);
+			throw new Exception($error, 'curlerror', $this-&gt;handle);
+		}
+
+		$this-&gt;info = curl_getinfo($this-&gt;handle);
+
+		$options['hooks']-&gt;dispatch('curl.after_request', [&amp;$this-&gt;headers, &amp;$this-&gt;info]);
+		return $this-&gt;headers;
+	}
+
+	/**
+	 * Collect the headers as they are received
+	 *
+	 * @param resource|\CurlHandle $handle cURL handle
+	 * @param string $headers Header string
+	 * @return integer Length of provided header
+	 */
+	public function stream_headers($handle, $headers) {
+		// Why do we do this? cURL will send both the final response and any
+		// interim responses, such as a 100 Continue. We don't need that.
+		// (We may want to keep this somewhere just in case)
+		if ($this-&gt;done_headers) {
+			$this-&gt;headers      = '';
+			$this-&gt;done_headers = false;
+		}
+
+		$this-&gt;headers .= $headers;
+
+		if ($headers === "\r\n") {
+			$this-&gt;done_headers = true;
+		}
+
+		return strlen($headers);
+	}
+
+	/**
+	 * Collect data as it's received
+	 *
+	 * @since 1.6.1
+	 *
+	 * @param resource|\CurlHandle $handle cURL handle
+	 * @param string $data Body data
+	 * @return integer Length of provided data
+	 */
+	public function stream_body($handle, $data) {
+		$this-&gt;hooks-&gt;dispatch('request.progress', [$data, $this-&gt;response_bytes, $this-&gt;response_byte_limit]);
+		$data_length = strlen($data);
+
+		// Are we limiting the response size?
+		if ($this-&gt;response_byte_limit) {
+			if ($this-&gt;response_bytes === $this-&gt;response_byte_limit) {
+				// Already at maximum, move on
+				return $data_length;
+			}
+
+			if (($this-&gt;response_bytes + $data_length) &gt; $this-&gt;response_byte_limit) {
+				// Limit the length
+				$limited_length = ($this-&gt;response_byte_limit - $this-&gt;response_bytes);
+				$data           = substr($data, 0, $limited_length);
+			}
+		}
+
+		if ($this-&gt;stream_handle) {
+			fwrite($this-&gt;stream_handle, $data);
+		} else {
+			$this-&gt;response_data .= $data;
+		}
+
+		$this-&gt;response_bytes += strlen($data);
+		return $data_length;
+	}
+
+	/**
+	 * Format a URL given GET data
+	 *
+	 * @param string       $url  Original URL.
+	 * @param array|object $data Data to build query using, see <a href="https://www.php.net/http_build_query">https://www.php.net/http_build_query</a>
+	 * @return string URL with data
+	 */
+	private static function format_get($url, $data) {
+		if (!empty($data)) {
+			$query     = '';
+			$url_parts = parse_url($url);
+			if (empty($url_parts['query'])) {
+				$url_parts['query'] = '';
+			} else {
+				$query = $url_parts['query'];
+			}
+
+			$query .= '&amp;' . http_build_query($data, '', '&amp;');
+			$query  = trim($query, '&amp;');
+
+			if (empty($url_parts['query'])) {
+				$url .= '?' . $query;
+			} else {
+				$url = str_replace($url_parts['query'], $query, $url);
+			}
+		}
+
+		return $url;
+	}
+
+	/**
+	 * Self-test whether the transport can be used.
+	 *
+	 * The available capabilities to test for can be found in <a href="../functions/wporgrequestscapability.html">\WpOrg\Requests\Capability</a>.
+	 *
+	 * @codeCoverageIgnore
+	 * @param array&lt;string, bool&gt; $capabilities Optional. Associative array of capabilities to test against, i.e. `['&lt;capability&gt;' =&gt; true]`.
+	 * @return bool Whether the transport can be used.
+	 */
+	public static function test($capabilities = []) {
+		if (!function_exists('curl_init') || !function_exists('curl_exec')) {
+			return false;
+		}
+
+		// If needed, check that our installed curl version supports SSL
+		if (isset($capabilities[Capability::SSL]) &amp;&amp; $capabilities[Capability::SSL]) {
+			$curl_version = curl_version();
+			if (!(CURL_VERSION_SSL &amp; $curl_version['features'])) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Get the correct "Expect" header for the given request data.
+	 *
+	 * @param string|array $data Data to send either as the POST body, or as parameters in the URL for a GET/HEAD.
+	 * @return string The "Expect" header.
+	 */
+	private function get_expect_header($data) {
+		if (!is_array($data)) {
+			return strlen((string) $data) &gt;= 1048576 ? '100-Continue' : '';
+		}
+
+		$bytesize = 0;
+		$iterator = new RecursiveIteratorIterator(new RecursiveArrayIterator($data));
+
+		foreach ($iterator as $datum) {
+			$bytesize += strlen((string) $datum);
+
+			if ($bytesize &gt;= 1048576) {
+				return '100-Continue';
+			}
+		}
+
+		return '';
+	}
+}
+</code></pre>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/requests/src/transport/curl.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/Requests/src/Transport/Curl.php#L25">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/Requests/src/Transport/Curl.php#L25-L641">View on GitHub</a></p></section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wporg-requests-transport-curl" class="_attribution-link">https://developer.wordpress.org/reference/classes/wporg-requests-transport-curl</a>
+  </p>
+</div>

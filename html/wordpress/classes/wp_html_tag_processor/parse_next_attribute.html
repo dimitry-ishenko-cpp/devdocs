@@ -1,0 +1,142 @@
+<h1 class="wp-block-wporg-code-reference-title">WP_HTML_Tag_Processor::parse_next_attribute(): <span class="return-type">bool</span>
+</h1> <section><p>Parses the next attribute.</p> </section> <section><h2 id="return">Return</h2> <span class="return-type">bool</span> Whether an attribute was found before the end of the document.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="1924" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">	/*
+	 * &lt;/&gt; is a missing end tag name, which is ignored.
+	 *
+	 * This was also known as the "presumptuous empty tag"
+	 * in early discussions as it was proposed to close
+	 * the nearest previous opening tag.
+	 *
+	 * See https://html.spec.whatwg.org/#parse-error-missing-end-tag-name
+	 */
+	if ( '&gt;' === $html[ $at + 1 ] ) {
+		// `&lt;&gt;` is interpreted as plaintext.
+		if ( ! $this-&gt;is_closing_tag ) {
+			++$at;
+			continue;
+		}
+
+		$this-&gt;parser_state         = self::STATE_PRESUMPTUOUS_TAG;
+		$this-&gt;token_length         = $at + 2 - $this-&gt;token_starts_at;
+		$this-&gt;bytes_already_parsed = $at + 2;
+		return true;
+	}
+
+	/*
+	 * `&lt;?` transitions to a bogus comment state – skip to the nearest &gt;
+	 * See https://html.spec.whatwg.org/multipage/parsing.html#tag-open-state
+	 */
+	if ( ! $this-&gt;is_closing_tag &amp;&amp; '?' === $html[ $at + 1 ] ) {
+		$closer_at = strpos( $html, '&gt;', $at + 2 );
+		if ( false === $closer_at ) {
+			$this-&gt;parser_state = self::STATE_INCOMPLETE_INPUT;
+
+			return false;
+		}
+
+		$this-&gt;parser_state         = self::STATE_COMMENT;
+		$this-&gt;comment_type         = self::COMMENT_AS_INVALID_HTML;
+		$this-&gt;token_length         = $closer_at + 1 - $this-&gt;token_starts_at;
+		$this-&gt;text_starts_at       = $this-&gt;token_starts_at + 2;
+		$this-&gt;text_length          = $closer_at - $this-&gt;text_starts_at;
+		$this-&gt;bytes_already_parsed = $closer_at + 1;
+
+		/*
+		 * Identify a Processing Instruction node were HTML to have them.
+		 *
+		 * This section must occur after identifying the bogus comment end
+		 * because in an HTML parser it will span to the nearest `&gt;`, even
+		 * if there's no `?&gt;` as would be required in an XML document. It
+		 * is therefore not possible to parse a Processing Instruction node
+		 * containing a `&gt;` in the HTML syntax.
+		 *
+		 * XML allows for more target names, but this code only identifies
+		 * those with ASCII-representable target names. This means that it
+		 * may identify some Processing Instruction nodes as bogus comments,
+		 * but it will not misinterpret the HTML structure. By limiting the
+		 * identification to these target names the Tag Processor can avoid
+		 * the need to start parsing UTF-8 sequences.
+		 *
+		 * &gt; NameStartChar ::= ":" | [A-Z] | "_" | [a-z] | [#xC0-#xD6] | [#xD8-#xF6] | [#xF8-#x2FF] |
+		 *                     [#x370-#x37D] | [#x37F-#x1FFF] | [#x200C-#x200D] | [#x2070-#x218F] |
+		 *                     [#x2C00-#x2FEF] | [#x3001-#xD7FF] | [#xF900-#xFDCF] | [#xFDF0-#xFFFD] |
+		 *                     [#x10000-#xEFFFF]
+		 * &gt; NameChar      ::= NameStartChar | "-" | "." | [0-9] | #xB7 | [#x0300-#x036F] | [#x203F-#x2040]
+		 *
+		 * @todo Processing instruction nodes in SGML may contain any kind of markup. XML defines a
+		 *       special case with `&lt;?xml ... ?&gt;` syntax, but the `?` is part of the bogus comment.
+		 *
+		 * @see https://www.w3.org/TR/2006/REC-xml11-20060816/#NT-PITarget
+		 */
+		if ( $this-&gt;token_length &gt;= 5 &amp;&amp; '?' === $html[ $closer_at - 1 ] ) {
+			$comment_text     = substr( $html, $this-&gt;token_starts_at + 2, $this-&gt;token_length - 4 );
+			$pi_target_length = strspn( $comment_text, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ:_' );
+
+			if ( 0 &lt; $pi_target_length ) {
+				$pi_target_length += strspn( $comment_text, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:_-.', $pi_target_length );
+
+				$this-&gt;comment_type       = self::COMMENT_AS_PI_NODE_LOOKALIKE;
+				$this-&gt;tag_name_starts_at = $this-&gt;token_starts_at + 2;
+				$this-&gt;tag_name_length    = $pi_target_length;
+				$this-&gt;text_starts_at    += $pi_target_length;
+				$this-&gt;text_length       -= $pi_target_length + 1;
+			}
+		}
+
+		return true;
+	}
+
+	/*
+	 * If a non-alpha starts the tag name in a tag closer it's a comment.
+	 * Find the first `&gt;`, which closes the comment.
+	 *
+	 * This parser classifies these particular comments as special "funky comments"
+	 * which are made available for further processing.
+	 *
+	 * See https://html.spec.whatwg.org/#parse-error-invalid-first-character-of-tag-name
+	 */
+	if ( $this-&gt;is_closing_tag ) {
+		// No chance of finding a closer.
+		if ( $at + 3 &gt; $doc_length ) {
+			$this-&gt;parser_state = self::STATE_INCOMPLETE_INPUT;
+
+			return false;
+		}
+
+		$closer_at = strpos( $html, '&gt;', $at + 2 );
+		if ( false === $closer_at ) {
+			$this-&gt;parser_state = self::STATE_INCOMPLETE_INPUT;
+
+			return false;
+		}
+
+		$this-&gt;parser_state         = self::STATE_FUNKY_COMMENT;
+		$this-&gt;token_length         = $closer_at + 1 - $this-&gt;token_starts_at;
+		$this-&gt;text_starts_at       = $this-&gt;token_starts_at + 2;
+		$this-&gt;text_length          = $closer_at - $this-&gt;text_starts_at;
+		$this-&gt;bytes_already_parsed = $closer_at + 1;
+		return true;
+	}
+
+	++$at;
+}
+
+/*
+ * This does not imply an incomplete parse; it indicates that there
+ * can be nothing left in the document other than a #text node.
+ */
+</code></pre>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/html-api/class-wp-html-tag-processor.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/html-api/class-wp-html-tag-processor.php#L1924">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/html-api/class-wp-html-tag-processor.php#L1924-L2048">View on GitHub</a></p></section> <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+<thead><tr>
+<th scope="col">Version</th>
+<th scope="col">Description</th>
+</tr></thead>
+<tbody><tr class="">
+<td><a href="https://developer.wordpress.org/reference/since/6.2.0/">6.2.0</a></td>
+<td>Introduced.</td>
+</tr></tbody>
+</table></figure></section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_html_tag_processor/parse_next_attribute" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_html_tag_processor/parse_next_attribute</a>
+  </p>
+</div>
