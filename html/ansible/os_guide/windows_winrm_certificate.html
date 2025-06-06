@@ -1,0 +1,237 @@
+<section id="winrm-certificate-authentication"> <h1 id="windows-winrm-certificate">WinRM Certificate Authentication</h1> <p>WinRM certificate authentication is a method of authenticating to a Windows host using X.509 certificates instead of a username and password.</p>  <ul class="simple"> <li><a class="reference internal" href="#ansible-configuration" id="id1">Ansible Configuration</a></li> <li><a class="reference internal" href="#certificate-generation" id="id2">Certificate Generation</a></li> <li>
+<p><a class="reference internal" href="#windows-configuration" id="id3">Windows Configuration</a></p> <ul> <li><a class="reference internal" href="#import-certificate-to-the-certificate-store" id="id4">Import Certificate to the Certificate Store</a></li> <li><a class="reference internal" href="#mapping-certificate-to-a-local-account" id="id5">Mapping Certificate to a Local Account</a></li> <li><a class="reference internal" href="#using-ansible" id="id6">Using Ansible</a></li> </ul> </li> </ul>  <p>Certificate authentication does have some disadvantages compared to SSH key based authentication such as:</p> <ul class="simple"> <li>it can only be mapped to a local Windows user, no domain accounts</li> <li>the username and password must be mapped to the certificate, if the password changes, the cert will need to be re-mapped</li> <li>an administrator on the Windows host can retrieve the local user password through the certificate mapping</li> <li>Ansible cannot use encrypted private keys, they must be stored without encryption</li> <li>Ansible cannot use the certs and private keys stored as a var, they must be a file</li> </ul> <section id="ansible-configuration"> <h2>Ansible Configuration</h2> <p>Certificate authentication uses certificates as keys similar to SSH key pairs. The public and private key is stored on the Ansible control node to use for authentication. The following example shows the hostvars configured for certificate authentication:</p> <pre data-language="yaml+jinja"># psrp
+ansible_connection: psrp
+ansible_psrp_auth: certificate
+ansible_psrp_certificate_pem: /path/to/certificate/public_key.pem
+ansible_psrp_certificate_key_pem: /path/to/certificate/private_key.pem
+
+# winrm
+ansible_connection: winrm
+ansible_winrm_transport: certificate
+ansible_winrm_cert_pem: /path/to/certificate/public_key.pem
+ansible_winrm_cert_key_pem: /path/to/certificate/private_key.pem
+</pre> <p>Certificate authentication is not enabled by default on a Windows host but can be enabled by running the following in PowerShell:</p> <pre data-language="powershell">Set-Item -Path WSMan:\localhost\Service\Auth\Certificate -Value $true
+</pre> <p>The private key cannot be encrypted due to a limitation of the underlying Python library used by Ansible.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>For enabling certificate authentication with a TLS 1.3 connection, Python 3.8+, 3.7.1, or 3.6.7 and Python package urllib3&gt;=2.0.7 or newer are required.</p> </div> </section> <section id="certificate-generation"> <h2>Certificate Generation</h2> <p>The first step of using certificate authentication is to generate a certificate and private key. The certificate must be generated with the following properties:</p> <ul class="simple"> <li>
+<code>Extended Key Usage</code> must include <code>clientAuth (1.3.6.1.5.5.7.3.2)</code>
+</li> <li>
+<code>Subject Alternative Name</code> must include <code>otherName</code> entry for <code>userPrincipalName (1.3.6.1.4.1.311.20.2.3)</code>
+</li> </ul> <p>The <code>userPrincipalName</code> value can be anything but in this guide we will use the value <code>$USERNAME@localhost</code> where <code>$USERNAME</code> is the name of the user that the certificate will be mapped to.</p> <p>This can be done through a variety of methods, such as OpenSSL, PowerShell, or Active Directory Certificate Services. The following example shows how to generate a certificate using OpenSSL:</p> <pre data-language="bash"># Set the username to the name of the user the certificate will be mapped to
+USERNAME="local-user"
+
+cat &gt; openssl.conf &lt;&lt; EOL
+distinguished_name = req_distinguished_name
+
+[req_distinguished_name]
+[v3_req_client]
+extendedKeyUsage = clientAuth
+subjectAltName = otherName:1.3.6.1.4.1.311.20.2.3;UTF8:${USERNAME}@localhost
+EOL
+
+openssl req \
+    -new \
+    -sha256 \
+    -subj "/CN=${USERNAME}" \
+    -newkey rsa:2048 \
+    -nodes \
+    -keyout cert.key \
+    -out cert.csr \
+    -config openssl.conf \
+    -reqexts v3_req_client
+
+openssl x509 \
+    -req \
+    -in cert.csr \
+    -sha256 \
+    -out cert.pem \
+    -days 365 \
+    -extfile openssl.conf \
+    -extensions v3_req_client \
+    -key cert.key
+
+rm openssl.conf cert.csr
+</pre> <p>The following example shows how to generate a certificate using PowerShell:</p> <pre data-language="powershell"># Set the username to the name of the user the certificate will be mapped to
+$username = 'local-user'
+
+$clientParams = @{
+    CertStoreLocation = 'Cert:\CurrentUser\My'
+    NotAfter          = (Get-Date).AddYears(1)
+    Provider          = 'Microsoft Software Key Storage Provider'
+    Subject           = "CN=$username"
+    TextExtension     = @("2.5.29.37={text}1.3.6.1.5.5.7.3.2","2.5.29.17={text}upn=$username@localhost")
+    Type              = 'Custom'
+}
+$cert = New-SelfSignedCertificate @clientParams
+$certKeyName = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey(
+    $cert).Key.UniqueName
+
+# Exports the public cert.pem and key cert.pfx
+Set-Content -Path "cert.pem" -Value @(
+    "-----BEGIN CERTIFICATE-----"
+    [Convert]::ToBase64String($cert.RawData) -replace ".{64}", "$&amp;`n"
+    "-----END CERTIFICATE-----"
+)
+$certPfxBytes = $cert.Export('Pfx', '')
+[System.IO.File]::WriteAllBytes("$pwd\cert.pfx", $certPfxBytes)
+
+# Removes the private key and cert from the store after exporting
+$keyPath = [System.IO.Path]::Combine($env:AppData, 'Microsoft', 'Crypto', 'Keys', $certKeyName)
+Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force
+Remove-Item -LiteralPath $keyPath -Force
+</pre> <p>As PowerShell cannot generate a PKCS8 PEM private key, we need to use OpenSSL to convert the <code>cert.pfx</code> file to a PEM private key:</p> <pre data-language="bash">openssl pkcs12 \
+    -in cert.pfx \
+    -nocerts \
+    -nodes \
+    -passin pass: |
+    sed -ne '/-BEGIN PRIVATE KEY-/,/-END PRIVATE KEY-/p' &gt; cert.key
+</pre> <p>The <code>cert.pem</code> is the public key and the <code>cert.key</code> is the plaintext private key. These files must be accessible by the Ansible control node to use for authentication. The private key does not need to be present on the Windows node.</p> </section> <section id="windows-configuration"> <h2>Windows Configuration</h2> <p>Once the public and private key has been generated we need to import and trust the public key and configure the user mapping on the Windows host. The Windows host does not need access to the private key, only the public key <code>cert.pem</code> needs to be accessible to configure the certificate authentication.</p> <section id="import-certificate-to-the-certificate-store"> <h3>Import Certificate to the Certificate Store</h3> <p>For Windows to trust the certificate it must be imported into the <code>LocalMachine\TrustedPeople</code> certificate store. You can do this by running the following:</p> <pre data-language="powershell">$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new("cert.pem")
+
+$store = Get-Item -LiteralPath Cert:\LocalMachine\TrustedPeople
+$store.Open('ReadWrite')
+$store.Add($cert)
+$store.Dispose()
+</pre> <p>If the cert is self-signed, or issued by a CA that is not trusted by the host, you will need to import the CA certificate into the trusted root store. As our example uses a self-signed cert, we will import that certificate as a trusted CA but in a production environment you would import the CA that signed the certificate.</p> <pre data-language="powershell">$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new("cert.pem")
+
+$store = Get-Item -LiteralPath Cert:\LocalMachine\Root
+$store.Open('ReadWrite')
+$store.Add($cert)
+$store.Dispose()
+</pre> </section> <section id="mapping-certificate-to-a-local-account"> <h3>Mapping Certificate to a Local Account</h3> <p>Once the certificate has been imported into the <code>LocalMachine\TrustedPeople</code> store, the WinRM service can create the mapping between the certificate and a local account. This is done by running the following:</p> <pre data-language="powershell"># Will prompt for the password of the user.
+$credential = Get-Credential local-user
+
+$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new("cert.pem")
+$certChain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+[void]$certChain.Build($cert)
+$caThumbprint = $certChain.ChainElements.Certificate[-1].Thumbprint
+
+$certMapping = @{
+    Path       = 'WSMan:\localhost\ClientCertificate'
+    Subject    = $cert.GetNameInfo('UpnName', $false)
+    Issuer     = $caThumbprint
+    Credential = $credential
+    Force      = $true
+}
+New-Item @certMapping
+</pre> <p>The <code>Subject</code> is the value of the <code>userPrincipalName</code> in the certificate SAN entry. The <code>Issuer</code> is the thumbprint of the CA certificate that issued our certificate. The <code>Credential</code> is the username and password of the local user we are mapping the certificate to.</p> </section> <section id="using-ansible"> <h3>Using Ansible</h3> <p>The following Ansible playbook can be used to create a local user and map the certificate provided to use for certificate authentication. It needs to be called <code>username</code> and <code>cert_pem</code> variable set to the name of the user to create and the path to the public key PEM file that was generated. This playbook expects <code>cert_pem</code> to be a self signed certificate, if using a certificate issued by a CA, you will have to edit it so it copies that across and imports it to the <code>LocalMachine\Root</code> store instead.</p> <pre data-language="yaml">- name: Setup WinRM Client Cert Authentication
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+  - name: Verify required facts are setup
+    ansible.builtin.assert:
+      that:
+      - cert_pem is defined
+      - username is defined
+
+  - name: Check that the required files are present
+    ansible.builtin.stat:
+      path: '{{ cert_pem }}'
+    delegate_to: localhost
+    run_once: true
+    register: local_cert_stat
+
+  - name: Fail if cert PEM is not present
+    ansible.builtin.assert:
+    that:
+    - local_cert_stat.stat.exists
+
+  - name: Generate local user password
+    ansible.builtin.set_fact:
+      user_password: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/user_password', length=15) }}"
+
+  - name: Create local user
+    ansible.windows.win_user:
+      name: '{{ username }}'
+      groups:
+      - Administrators
+      - Users
+      update_password: always
+      password: '{{ user_password }}'
+      user_cannot_change_password: true
+      password_never_expires: true
+
+  - name: Copy across client certificate
+    ansible.windows.win_copy:
+      src: '{{ cert_pem }}'
+      dest: C:\Windows\TEMP\cert.pem
+
+  - name: Import client certificate
+    ansible.windows.win_certificate_store:
+      path: C:\Windows\TEMP\cert.pem
+      state: present
+      store_location: LocalMachine
+      store_name: '{{ item }}'
+    register: client_cert_info
+    loop:
+    - Root
+    - TrustedPeople
+
+  - name: Enable WinRM Certificate auth
+    ansible.windows.win_powershell:
+      script: |
+        $ErrorActionPreference = 'Stop'
+        $Ansible.Changed = $false
+
+        $authPath = 'WSMan:\localhost\Service\Auth\Certificate'
+        if ((Get-Item -LiteralPath $authPath).Value -ne 'true') {
+            Set-Item -LiteralPath $authPath -Value true
+            $Ansible.Changed = $true
+        }
+
+  - name: Setup Client Certificate Mapping
+    ansible.windows.win_powershell:
+      parameters:
+        Thumbprint: '{{ client_cert_info.results[0].thumbprints[0] }}'
+      sensitive_parameters:
+      - name: Credential
+        username: '{{ username }}'
+        password: '{{ user_password }}'
+      script: |
+        param(
+            [Parameter(Mandatory)]
+            [PSCredential]
+            $Credential,
+
+            [Parameter(Mandatory)]
+            [string]
+            $Thumbprint
+        )
+
+        $ErrorActionPreference = 'Stop'
+        $Ansible.Changed = $false
+
+        $userCert = Get-Item -LiteralPath "Cert:\LocalMachine\TrustedPeople\$Thumbprint"
+        $subject = $userCert.GetNameInfo('UpnName', $false)  # SAN userPrincipalName
+
+        $certChain = New-Object -TypeName Security.Cryptography.X509Certificates.X509Chain
+        [void]$certChain.Build($userCert)
+        $caThumbprint = $certChain.ChainElements.Certificate[-1].Thumbprint
+
+        $mappings = Get-ChildItem -LiteralPath WSMan:\localhost\ClientCertificate |
+            Where-Object {
+                $mapping = $_ | Get-Item
+                "Subject=$subject" -in $mapping.Keys
+            }
+
+        if ($mappings -and "issuer=$($caThumbprint)" -notin $mappings.Keys) {
+            $null = $mappings | Remove-Item -Force -Recurse
+            $mappings = $null
+            $Ansible.Changed = $true
+        }
+
+        if (-not $mappings) {
+            $certMapping = @{
+                Path = 'WSMan:\localhost\ClientCertificate'
+                Subject = $subject
+                Issuer = $caThumbprint
+                Credential = $Credential
+                Force = $true
+            }
+            $null = New-Item @certMapping
+            $Ansible.Changed = $true
+        }
+</pre> </section> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012&ndash;2018 Michael DeHaan<br>&copy; 2018&ndash;2025 Red Hat, Inc.<br>Licensed under the GNU General Public License version 3.<br>
+    <a href="https://docs.ansible.com/ansible/latest/os_guide/windows_winrm_certificate.html" class="_attribution-link">https://docs.ansible.com/ansible/latest/os_guide/windows_winrm_certificate.html</a>
+  </p>
+</div>

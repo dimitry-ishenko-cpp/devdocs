@@ -1,0 +1,151 @@
+<h1 id="aotinductor-ahead-of-time-compilation-for-torch-export-ed-models">AOTInductor: Ahead-Of-Time Compilation for Torch.Export-ed Models</h1> <div class="admonition warning"> <p class="admonition-title">Warning</p> <p>AOTInductor and its related features are in prototype status and are subject to backwards compatibility breaking changes.</p> </div> <p>AOTInductor is a specialized version of <a class="reference external" href="https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747">TorchInductor</a> , designed to process exported PyTorch models, optimize them, and produce shared libraries as well as other relevant artifacts. These compiled artifacts are specifically crafted for deployment in non-Python environments, which are frequently employed for inference deployments on the server side.</p> <p>In this tutorial, you will gain insight into the process of taking a PyTorch model, exporting it, compiling it into an artifact, and conducting model predictions using C++.</p>  <h2 id="model-compilation">Model Compilation</h2> <p>To compile a model using AOTInductor, we first need to use <a class="reference internal" href="export.html#torch.export.export" title="torch.export.export"><code>torch.export.export()</code></a> to capture a given PyTorch model into a computational graph. <a class="reference internal" href="export.html#torch-export"><span class="std std-ref">torch.export</span></a> provides soundness guarantees and a strict specification on the IR captured, which AOTInductor relies on.</p> <p>We will then use <a class="reference internal" href="#torch._inductor.aoti_compile_and_package" title="torch._inductor.aoti_compile_and_package"><code>torch._inductor.aoti_compile_and_package()</code></a> to compile the exported program using TorchInductor, and save the compiled artifacts into one package.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>If you have a CUDA-enabled device on your machine and you installed PyTorch with CUDA support, the following code will compile the model into a shared library for CUDA execution. Otherwise, the compiled artifact will run on CPU. For better performance during CPU inference, it is suggested to enable freezing by setting <code>export TORCHINDUCTOR_FREEZING=1</code> before running the Python script below. The same behavior works in an environment with Intel® GPU as well.</p> </div> <pre data-language="python">import os
+import torch
+
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(10, 16)
+        self.relu = torch.nn.ReLU()
+        self.fc2 = torch.nn.Linear(16, 1)
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.sigmoid(x)
+        return x
+
+with torch.no_grad():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = Model().to(device=device)
+    example_inputs=(torch.randn(8, 10, device=device),)
+    batch_dim = torch.export.Dim("batch", min=1, max=1024)
+    # [Optional] Specify the first dimension of the input x as dynamic.
+    exported = torch.export.export(model, example_inputs, dynamic_shapes={"x": {0: batch_dim}})
+    # [Note] In this example we directly feed the exported module to aoti_compile_and_package.
+    # Depending on your use case, e.g. if your training platform and inference platform
+    # are different, you may choose to save the exported model using torch.export.save and
+    # then load it back using torch.export.load on your inference platform to run AOT compilation.
+    output_path = torch._inductor.aoti_compile_and_package(
+        exported,
+        # [Optional] Specify the generated shared library path. If not specified,
+        # the generated artifact is stored in your system temp directory.
+        package_path=os.path.join(os.getcwd(), "model.pt2"),
+    )
+</pre> <p>In this illustrative example, the <code>Dim</code> parameter is employed to designate the first dimension of the input variable “x” as dynamic. Notably, the path and name of the compiled library remain unspecified, resulting in the shared library being stored in a temporary directory. To access this path from the C++ side, we save it to a file for later retrieval within the C++ code.</p>   <h2 id="inference-in-python">Inference in Python</h2> <p>There are multiple ways to deploy the compiled artifact for inference, and one of that is using Python. We have provided a convinient utility API in Python <a class="reference internal" href="#torch._inductor.aoti_load_package" title="torch._inductor.aoti_load_package"><code>torch._inductor.aoti_load_package()</code></a> for loading and running the artifact, as shown in the following example:</p> <pre data-language="python">import os
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = torch._inductor.aoti_load_package(os.path.join(os.getcwd(), "model.pt2"))
+print(model(torch.randn(8, 10, device=device)))
+</pre> <p>The input at inference time should have the same size, dtype, and stride as the input at export time.</p>   <h2 id="inference-in-c">Inference in C++</h2> <p>Next, we use the following example C++ file <code>inference.cpp</code> to load the compiled artifact, enabling us to conduct model predictions directly within a C++ environment.</p> <pre data-language="cpp">#include &lt;iostream&gt;
+#include &lt;vector&gt;
+
+#include &lt;torch/torch.h&gt;
+#include &lt;torch/csrc/inductor/aoti_package/model_package_loader.h&gt;
+
+int main() {
+    c10::InferenceMode mode;
+
+    torch::inductor::AOTIModelPackageLoader loader("model.pt2");
+    // Assume running on CUDA
+    std::vector&lt;torch::Tensor&gt; inputs = {torch::randn({8, 10}, at::kCUDA)};
+    std::vector&lt;torch::Tensor&gt; outputs = loader.run(inputs);
+    std::cout &lt;&lt; "Result from the first inference:"&lt;&lt; std::endl;
+    std::cout &lt;&lt; outputs[0] &lt;&lt; std::endl;
+
+    // The second inference uses a different batch size and it works because we
+    // specified that dimension as dynamic when compiling model.pt2.
+    std::cout &lt;&lt; "Result from the second inference:"&lt;&lt; std::endl;
+    // Assume running on CUDA
+    std::cout &lt;&lt; loader.run({torch::randn({1, 10}, at::kCUDA)})[0] &lt;&lt; std::endl;
+
+    return 0;
+}
+</pre> <p>For building the C++ file, you can make use of the provided <code>CMakeLists.txt</code> file, which automates the process of invoking <code>python model.py</code> for AOT compilation of the model and compiling <code>inference.cpp</code> into an executable binary named <code>aoti_example</code>.</p> <pre data-language="cmake">cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
+project(aoti_example)
+
+find_package(Torch REQUIRED)
+
+add_executable(aoti_example inference.cpp model.pt2)
+
+add_custom_command(
+    OUTPUT model.pt2
+    COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/model.py
+    DEPENDS model.py
+)
+
+target_link_libraries(aoti_example "${TORCH_LIBRARIES}")
+set_property(TARGET aoti_example PROPERTY CXX_STANDARD 17)
+</pre> <p>Provided the directory structure resembles the following, you can execute the subsequent commands to construct the binary. It is essential to note that the <code>CMAKE_PREFIX_PATH</code> variable is crucial for CMake to locate the LibTorch library, and it should be set to an absolute path. Please be mindful that your path may vary from the one illustrated in this example.</p> <pre data-language="shell">aoti_example/
+    CMakeLists.txt
+    inference.cpp
+    model.py
+</pre> <pre data-language="shell">$ mkdir build
+$ cd build
+$ CMAKE_PREFIX_PATH=/path/to/python/install/site-packages/torch/share/cmake cmake ..
+$ cmake --build . --config Release
+</pre> <p>After the <code>aoti_example</code> binary has been generated in the <code>build</code> directory, executing it will display results akin to the following:</p> <pre data-language="shell">$ ./aoti_example
+Result from the first inference:
+0.4866
+0.5184
+0.4462
+0.4611
+0.4744
+0.4811
+0.4938
+0.4193
+[ CUDAFloatType{8,1} ]
+Result from the second inference:
+0.4883
+0.4703
+[ CUDAFloatType{2,1} ]
+</pre>   <h2 id="troubleshooting">Troubleshooting</h2> <p>Below are some useful tools for debugging AOT Inductor.</p>  <p class="caption" role="heading"><span class="caption-text">Debugging Tools</span></p> <ul> <li class="toctree-l1"><a class="reference internal" href="logging.html">torch._logging</a></li> <li class="toctree-l1"><a class="reference internal" href="torch.compiler_aot_inductor_minifier.html">AOTInductor Minifier</a></li> </ul>  <p>To enable runtime checks on inputs, set the environment variable <code>AOTI_RUNTIME_CHECK_INPUTS</code> to 1. This will raise a <code>RuntimeError</code> if the inputs to the compiled model differ in size, data type, or strides from those used during export.</p>   <h2 id="api-reference">API Reference</h2> <dl class="py function"> <dt class="sig sig-object py" id="torch._inductor.aoti_compile_and_package">
+<code>torch._inductor.aoti_compile_and_package(exported_program, _deprecated_unused_args=None, _deprecated_unused_kwargs=None, *, package_path=None, inductor_configs=None)</code> <a class="reference internal" href="https://docs.pytorch.org/docs/2.7/_modules/torch/_inductor.html#aoti_compile_and_package"><span class="viewcode-link">[source]</span></a><a class="reference external" href="https://github.com/pytorch/pytorch/blob/v2.7.0/torch/_inductor/__init__.py#L51"><span class="viewcode-link">[source]</span></a>
+</dt> <dd>
+<p>Compiles the exported program with AOTInductor, and packages it into a .pt2 artifact specified by the input package_path. To load the package, you can call <code>torch._inductor.aoti_load_package(package_path)</code>.</p> <p>An example usage is as follows:</p> <pre data-language="python">ep = torch.export.export(M(), ...)
+aoti_file = torch._inductor.aoti_compile_and_package(
+    ep, package_path="my_package.pt2"
+)
+compiled_model = torch._inductor.aoti_load_package("my_package.pt2")
+</pre> <p>To compile and save multiple models into a single <code>.pt2</code> artifact, you can do the following:</p> <pre data-language="python">ep1 = torch.export.export(M1(), ...)
+aoti_file1 = torch._inductor.aot_compile(
+    ep1, ..., options={"aot_inductor.package": True}
+)
+ep2 = torch.export.export(M2(), ...)
+aoti_file2 = torch._inductor.aot_compile(
+    ep2, ..., options={"aot_inductor.package": True}
+)
+
+from torch._inductor.package import package_aoti, load_package
+
+package_aoti("my_package.pt2", {"model1": aoti_file1, "model2": aoti_file2})
+
+compiled_model1 = load_package("my_package.pt2", "model1")
+compiled_model2 = load_package("my_package.pt2", "model2")
+</pre> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>exported_program</strong> (<a class="reference internal" href="export.html#torch.export.ExportedProgram" title="torch.export.ExportedProgram">ExportedProgram</a>) – An exported program created through a call from torch.export</li> <li>
+<strong>package_path</strong> (<em>Optional</em><em>[</em><em>FileLike</em><em>]</em>) – Optional specified path to the generated .pt2 artifact.</li> <li>
+<strong>inductor_configs</strong> (<em>Optional</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#dict" title="(in Python v3.13)">dict</a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.13)">str</a><em>, </em><em>Any</em><em>]</em><em>]</em>) – Optional dictionary of configs to control inductor.</li> </ul> </dd> <dt class="field-even">Returns</dt> <dd class="field-even">
+<p>Path to the generated artifact</p> </dd> <dt class="field-odd">Return type</dt> <dd class="field-odd">
+<p><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.13)">str</a></p> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch._inductor.aoti_load_package">
+<code>torch._inductor.aoti_load_package(path, run_single_threaded=False)</code> <a class="reference internal" href="https://docs.pytorch.org/docs/2.7/_modules/torch/_inductor.html#aoti_load_package"><span class="viewcode-link">[source]</span></a><a class="reference external" href="https://github.com/pytorch/pytorch/blob/v2.7.0/torch/_inductor/__init__.py#L235"><span class="viewcode-link">[source]</span></a>
+</dt> <dd>
+<p>Loads the model from the PT2 package.</p> <p>If multiple models were packaged into the PT2, this will load the default model. To load a specific model, you can directly call the load API</p> <pre data-language="python">from torch._inductor.package import load_package
+
+compiled_model1 = load_package("my_package.pt2", "model1")
+compiled_model2 = load_package("my_package.pt2", "model2")
+</pre> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>path</strong> (<em>FileLike</em>) – Path to the .pt2 package</li> <li>
+<strong>run_single_threaded</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.13)">bool</a>) – Whether the model should be run without thread synchronization logic. This is useful to avoid conflicts with CUDAGraphs.</li> </ul> </dd> <dt class="field-even">Return type</dt> <dd class="field-even">
+<p>Any</p> </dd> </dl> </dd>
+</dl><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2025, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.7/torch.compiler_aot_inductor.html" class="_attribution-link">https://docs.pytorch.org/docs/2.7/torch.compiler_aot_inductor.html</a>
+  </p>
+</div>

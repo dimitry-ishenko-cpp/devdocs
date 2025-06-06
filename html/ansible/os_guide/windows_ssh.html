@@ -1,0 +1,94 @@
+<section id="windows-ssh"> <h1 id="id1">Windows SSH</h1> <p>On newer Windows versions, you can use SSH to connect to a Windows host. This is an alternative connection option to <a class="reference internal" href="windows_winrm.html#windows-winrm"><span class="std std-ref">WinRM</span></a>.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>While Ansible could use the SSH connection plugin with Windows nodes since Ansible 2.8, official support was only added in version 2.18.</p> </div>  <ul class="simple"> <li>
+<p><a class="reference internal" href="#ssh-setup" id="id2">SSH Setup</a></p> <ul> <li><a class="reference internal" href="#default-shell-configuration" id="id3">Default Shell Configuration</a></li> </ul> </li> <li><a class="reference internal" href="#ansible-configuration" id="id4">Ansible Configuration</a></li> <li>
+<p><a class="reference internal" href="#ssh-authentication" id="id5">SSH Authentication</a></p> <ul> <li><a class="reference internal" href="#key-authentication" id="id6">Key Authentication</a></li> <li><a class="reference internal" href="#gssapi-authentication" id="id7">GSSAPI Authentication</a></li> <li><a class="reference internal" href="#password-authentication" id="id8">Password Authentication</a></li> </ul> </li> </ul>  <section id="ssh-setup"> <h2>SSH Setup</h2> <p>Microsoft provides an OpenSSH implementation with Windows since Windows Server 2019 as a Windows capability. It can also be installed through an upstream package under <a class="reference external" href="https://github.com/PowerShell/Win32-OpenSSH">Win32-OpenSSH</a>. Ansible officially only supports the OpenSSH implementation shipped with Windows, not the upstream package. The OpenSSH version must be version <code>7.9.0.0</code> at a minimum. This effectively means official support starts with Windows Server 2022 because Server 2019 ships with version <code>7.7.2.1</code>. Using older Windows versions or the upstream package might work but is not supported.</p> <p>To install the OpenSSH feature on Windows Server 2022 and later, use the following PowerShell command:</p> <pre data-language="powershell">Get-WindowsCapability -Name OpenSSH.Server* -Online |
+    Add-WindowsCapability -Online
+Set-Service -Name sshd -StartupType Automatic -Status Running
+
+$firewallParams = @{
+    Name        = 'sshd-Server-In-TCP'
+    DisplayName = 'Inbound rule for OpenSSH Server (sshd) on TCP port 22'
+    Action      = 'Allow'
+    Direction   = 'Inbound'
+    Enabled     = 'True'  # This is not a boolean but an enum
+    Profile     = 'Any'
+    Protocol    = 'TCP'
+    LocalPort   = 22
+}
+New-NetFirewallRule @firewallParams
+
+$shellParams = @{
+    Path         = 'HKLM:\SOFTWARE\OpenSSH'
+    Name         = 'DefaultShell'
+    Value        = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+    PropertyType = 'String'
+    Force        = $true
+}
+New-ItemProperty @shellParams
+</pre> <section id="default-shell-configuration"> <h3>Default Shell Configuration</h3> <p>By default, OpenSSH on Windows uses <code>cmd.exe</code> as the default shell. While Ansible can work with this default shell it is recommended to change this to <code>powershell.exe</code> as it is better tested and should be faster than having <code>cmd.exe</code> as the default. To change the default shell you can use the following PowerShell script:</p> <pre data-language="powershell"># Set default to powershell.exe
+$shellParams = @{
+    Path         = 'HKLM:\SOFTWARE\OpenSSH'
+    Name         = 'DefaultShell'
+    Value        = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+    PropertyType = 'String'
+    Force        = $true
+}
+New-ItemProperty @shellParams
+
+# Set default back to cmd.exe
+Remove-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell
+</pre> <p>The new default shell setting will apply to the next SSH connection, there is no need to restart the <code>sshd</code> service. You can also use Ansible to configure the default shell:</p> <pre data-language="yaml">- name: set the default shell to PowerShell
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\OpenSSH
+    name: DefaultShell
+    data: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+    type: string
+    state: present
+
+- name: reset SSH connection after shell change
+  ansible.builtin.meta: reset_connection
+
+- name: set the default shell to cmd
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\OpenSSH
+    name: DefaultShell
+    state: absent
+
+- name: reset SSH connection after shell change
+  ansible.builtin.meta: reset_connection
+</pre> <p>The <code>meta: reset_connection</code> is important to ensure the subsequent tasks will use the new default shell.</p> </section> </section> <section id="ansible-configuration"> <h2>Ansible Configuration</h2> <p>To configure Ansible to use SSH for Windows hosts, you must set two connection variables:</p> <ul class="simple"> <li>set <code>ansible_connection</code> to <code>ssh</code>
+</li> <li>set <code>ansible_shell_type</code> to <code>powershell</code> or <code>cmd</code>
+</li> </ul> <p>The <code>ansible_shell_type</code> variable should reflect the <code>DefaultShell</code> configured on the Windows host. Other SSH options as documented under the <a class="reference internal" href="../collections/ansible/builtin/ssh_connection.html#ssh-connection"><span class="std std-ref">ssh</span></a> can also be set for the Windows host.</p> </section> <section id="ssh-authentication"> <h2>SSH Authentication</h2> <p>Win32-OpenSSH authentication with Windows is similar to SSH authentication on Unix/Linux hosts. While there are many authentication methods that can be used there are typically three used on Windows:</p> <table class="docutils align-default"> <thead> <tr>
+<th class="head"><p>Option</p></th> <th class="head"><p>Local Accounts</p></th> <th class="head"><p>Active Directory Accounts</p></th> <th class="head"><p>Credential Delegation</p></th> </tr> </thead>  <tr>
+<td><p>Key</p></td> <td><p>Yes</p></td> <td><p>Yes</p></td> <td><p>No</p></td> </tr> <tr>
+<td><p>GSSAPI</p></td> <td><p>No</p></td> <td><p>Yes</p></td> <td><p>Yes</p></td> </tr> <tr>
+<td><p>Password</p></td> <td><p>Yes</p></td> <td><p>Yes</p></td> <td><p>Yes</p></td> </tr>  </table> <p>In most cases it is recommended to use key or GSSAPI authentication over password authentication.</p> <section id="key-authentication"> <h3>Key Authentication</h3> <p>SSH key authentication on Windows works in the same way as SSH key authentication for POSIX nodes. You can generate a key pair using the <code>ssh-keygen</code> command and add the public key to the <code>authorized_keys</code> file in the user’s profile directory. The private key should be kept secure and not shared.</p> <p>One difference is that the <code>authorized_keys</code> file for admin users is not located in the <code>.ssh</code> folder in the user’s profile directory but in <code>C:\ProgramData\ssh\administrators_authorized_keys</code>. It is possible to change the location of the <code>authorized_keys</code> file for admin users back to the user profile directory by removing, or commenting, the lines in <code>C:\ProgramData\ssh\sshd_config</code> and restarting the <code>sshd</code> service.</p> <pre data-language="text">Match Group administrators
+    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+</pre> <p>SSH keys work with both local and domain accounts but suffer from the double-hop issue. This means that when using SSH key authentication with Ansible, the remote session will not have access to user credentials and will fail when attempting to access a network resource. To work around this problem, you can use <a class="reference internal" href="../playbook_guide/playbooks_privilege_escalation.html#become"><span class="std std-ref">become</span></a> on the task with the credentials of the user that needs access to the remote resource.</p> </section> <section id="gssapi-authentication"> <h3>GSSAPI Authentication</h3> <p>GSSAPI authentication will use Kerberos to authenticate the user with the Windows host. To use GSSAPI authentication with Ansible, the Windows server must be configured to allow GSSAPI authentication by editing the <code>C:\ProgramData\ssh\sshd_config</code> file. Either add in the following line or edit the existing line:</p> <pre data-language="text">GSSAPIAuthentication yes
+</pre> <p>Once edited restart the <code>sshd</code> service with <code>Restart-Service -Name sshd</code>.</p> <p>On the Ansible control node, you need to have Kerberos installed and configured with the domain the Windows host is a member of. How to set this up and configure is outside the scope of this document. Once the Kerberos realm is configured you can use the <code>kinit</code> command to get a ticket for the user you are connecting with and <code>klist</code> to verify what tickets are available:</p> <pre data-language="bash">&gt; kinit username@REALM.COM
+Password for username@REALM.COM
+
+&gt; klist
+Ticket cache: KCM:1000
+Default principal: username@REALM.COM
+
+Valid starting     Expires            Service principal
+29/08/24 13:54:51  29/08/24 23:54:51  krbtgt/REALM.COM@REALM.COM
+        renew until 05/09/24 13:54:48
+</pre> <p>Once you have a valid ticket you can use the <code>ansible_user</code> hostvar to specify the UPN username and Ansible will automatically use the Kerberos ticket for that user when using SSH.</p> <p>It is also possible to enable unconstrained delegation through GSSAPI authentication to have the Windows node access network resources. For GSSAPI delegation to work the ticket retrieved by <code>kinit</code> must be forwardable and <code>ssh</code> must be called with the <code>-o GSSAPIDelegateCredentials=yes</code> option. To retrieve a forwardable ticket either use the <code>-f</code> flag with <code>kinit</code> or add <code>forwardable = true</code> under <code>[libdefaults]</code> in the <code>/etc/krb5.conf</code> file.</p> <pre data-language="bash">&gt; kinit -f username@REALM.COM
+Password for username@REALM.COM
+
+# -f will show the ticket flags, we want to see F
+&gt; klist -f
+Ticket cache: KCM:1000
+Default principal: username@REALM.COM
+
+Valid starting     Expires            Service principal
+29/08/24 13:54:51  29/08/24 23:54:51  krbtgt/REALM.COM@REALM.COM
+        renew until 05/09/24 13:54:48, Flags: FRIA
+</pre> <p>The <code>GSSAPIDelegateCredentials=yes</code> option can either be set in the <code>~/.ssh/config</code> file or as a hostvar variable in the inventory:</p> <pre data-language="yaml+jinja">ansible_ssh_common_args: -o GSSAPIDelegateCredentials=yes
+</pre> <p>Unlike the <code>psrp</code> or <code>winrm</code> connection plugins, the SSH connection plugin cannot get a Kerberos TGT ticket when provided with an explicit username and password. This means that the user must have a valid Kerberos ticket before running the playbook.</p> <p>See <a class="reference internal" href="windows_winrm_kerberos.html#windows-winrm-kerberos"><span class="std std-ref">Kerberos Authentication</span></a> for more information on how to configure, use, and troubleshoot Kerberos authentication.</p> </section> <section id="password-authentication"> <h3>Password Authentication</h3> <p>Password authentication is the least secure method of authentication and is not recommended. However, it is possible to use password authentication with Windows SSH. To use password authentication with Ansible, set the <code>ansible_password</code> variable in the inventory file or in the playbook. Using password authentication requires the <code>sshpass</code> package to be installed on the Ansible control node.</p> <p>Password authentication works like WinRM CredSSP authentication where the username and password is given to the Windows host and it will perform unconstrained delegation to access network resources.</p> </section> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012&ndash;2018 Michael DeHaan<br>&copy; 2018&ndash;2025 Red Hat, Inc.<br>Licensed under the GNU General Public License version 3.<br>
+    <a href="https://docs.ansible.com/ansible/latest/os_guide/windows_ssh.html" class="_attribution-link">https://docs.ansible.com/ansible/latest/os_guide/windows_ssh.html</a>
+  </p>
+</div>
