@@ -11,7 +11,7 @@ What happens when you combine _[devdocs](https://devdocs.io)_ API documentation,
 Debian/Ubuntu/etc:
 
 ```shell
-$ sudo add-apt-repository ppa:ppa-verse/dev
+$ sudo add-apt-repository ppa:ppa-verse/devdocs
 $ sudo apt install devdocs
 ```
 ```shell
@@ -23,7 +23,7 @@ $ sudo apt install devdocs-data-css devdocs-data-html
 RaspberryPi:
 
 ```shell
-$ sudo add-apt-repository -S deb https://ppa.launchpadcontent.net/ppa-verse/dev/ubuntu jammy main
+$ sudo add-apt-repository -S deb https://ppa.launchpadcontent.net/ppa-verse/devdocs/ubuntu jammy main
 $ sudo apt install devdocs
 ```
 ```shell
