@@ -1,0 +1,153 @@
+<h1 id="error-code-e0038">Error code E0038</h1> <p>For any given trait <code>Trait</code> there may be a related <em>type</em> called the <em>trait object type</em> which is typically written as <code>dyn Trait</code>. In earlier editions of Rust, trait object types were written as plain <code>Trait</code> (just the name of the trait, written in type positions) but this was a bit too confusing, so we now write <code>dyn Trait</code>.</p> <p>Some traits are not allowed to be used as trait object types. The traits that are allowed to be used as trait object types are called "dyn-compatible"<sup class="footnote-reference" id="fr-1-1"><a href="#footnote-1">1</a></sup> traits. Attempting to use a trait object type for a trait that is not dyn-compatible will trigger error E0038.</p> <p>Two general aspects of trait object types give rise to the restrictions:</p> <ol> <li> <p>Trait object types are dynamically sized types (DSTs), and trait objects of these types can only be accessed through pointers, such as <code>&amp;dyn Trait</code> or <code>Box&lt;dyn Trait&gt;</code>. The size of such a pointer is known, but the size of the <code>dyn Trait</code> object pointed-to by the pointer is <em>opaque</em> to code working with it, and different trait objects with the same trait object type may have different sizes.</p> </li> <li> <p>The pointer used to access a trait object is paired with an extra pointer to a "virtual method table" or "vtable", which is used to implement dynamic dispatch to the object's implementations of the trait's methods. There is a single such vtable for each trait implementation, but different trait objects with the same trait object type may point to vtables from different implementations.</p> </li> </ol> <p>The specific conditions that violate dyn-compatibility follow, most of which relate to missing size information and vtable polymorphism arising from these aspects.</p> <h3 id="the-trait-requires-self-sized">The trait requires <code id="">Self: Sized</code>
+</h3> <p>Traits that are declared as <code>Trait: Sized</code> or which otherwise inherit a constraint of <code>Self:Sized</code> are not dyn-compatible.</p> <p>The reasoning behind this is somewhat subtle. It derives from the fact that Rust requires (and defines) that every trait object type <code>dyn Trait</code> automatically implements <code>Trait</code>. Rust does this to simplify error reporting and ease interoperation between static and dynamic polymorphism. For example, this code works:</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Trait {
+}
+
+fn static_foo&lt;T:Trait + ?Sized&gt;(b: &amp;T) {
+}
+
+fn dynamic_bar(a: &amp;dyn Trait) {
+    static_foo(a)
+}
+}</pre> <p>This code works because <code>dyn Trait</code>, if it exists, always implements <code>Trait</code>.</p> <p>However as we know, any <code>dyn Trait</code> is also unsized, and so it can never implement a sized trait like <code>Trait:Sized</code>. So, rather than allow an exception to the rule that <code>dyn Trait</code> always implements <code>Trait</code>, Rust chooses to prohibit such a <code>dyn Trait</code> from existing at all.</p> <p>Only unsized traits are considered dyn-compatible.</p> <p>Generally, <code>Self: Sized</code> is used to indicate that the trait should not be used as a trait object. If the trait comes from your own crate, consider removing this restriction.</p> <h3 id="method-references-the-self-type-in-its-parameters-or-return-type">Method references the <code id="">Self</code> type in its parameters or return type</h3> <p>This happens when a trait has a method like the following:</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Trait {
+    fn foo(&amp;self) -&gt; Self;
+}
+
+impl Trait for String {
+    fn foo(&amp;self) -&gt; Self {
+        "hi".to_owned()
+    }
+}
+
+impl Trait for u8 {
+    fn foo(&amp;self) -&gt; Self {
+        1
+    }
+}
+}</pre> <p>(Note that <code>&amp;self</code> and <code>&amp;mut self</code> are okay, it's additional <code>Self</code> types which cause this problem.)</p> <p>In such a case, the compiler cannot predict the return type of <code>foo()</code> in a situation like the following:</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Trait {
+    fn foo(&amp;self) -&gt; Self;
+}
+
+fn call_foo(x: Box&lt;dyn Trait&gt;) {
+    let y = x.foo(); // What type is y?
+    // ...
+}
+}</pre> <p>If only some methods aren't dyn-compatible, you can add a <code>where Self: Sized</code> bound on them to mark them as explicitly unavailable to trait objects. The functionality will still be available to all other implementers, including <code>Box&lt;dyn Trait&gt;</code> which is itself sized (assuming you <code>impl Trait for Box&lt;dyn Trait&gt;</code>).</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Trait {
+    fn foo(&amp;self) -&gt; Self where Self: Sized;
+    // more functions
+}
+}</pre> <p>Now, <code>foo()</code> can no longer be called on a trait object, but you will now be allowed to make a trait object, and that will be able to call any dyn-compatible methods. With such a bound, one can still call <code>foo()</code> on types implementing that trait that aren't behind trait objects.</p> <h3 id="method-has-generic-type-parameters">Method has generic type parameters</h3> <p>As mentioned before, trait objects contain pointers to method tables. So, if we have:</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Trait {
+    fn foo(&amp;self);
+}
+
+impl Trait for String {
+    fn foo(&amp;self) {
+        // implementation 1
+    }
+}
+
+impl Trait for u8 {
+    fn foo(&amp;self) {
+        // implementation 2
+    }
+}
+// ...
+}</pre> <p>At compile time each implementation of <code>Trait</code> will produce a table containing the various methods (and other items) related to the implementation, which will be used as the virtual method table for a <code>dyn Trait</code> object derived from that implementation.</p> <p>This works fine, but when the method gains generic parameters, we can have a problem.</p> <p>Usually, generic parameters get <em>monomorphized</em>. For example, if I have</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+fn foo&lt;T&gt;(x: T) {
+    // ...
+}
+}</pre> <p>The machine code for <code>foo::&lt;u8&gt;()</code>, <code>foo::&lt;bool&gt;()</code>, <code>foo::&lt;String&gt;()</code>, or any other instantiation is different. Hence the compiler generates the implementation on-demand. If you call <code>foo()</code> with a <code>bool</code> parameter, the compiler will only generate code for <code>foo::&lt;bool&gt;()</code>. When we have additional type parameters, the number of monomorphized implementations the compiler generates does not grow drastically, since the compiler will only generate an implementation if the function is called with fully concrete arguments (i.e., arguments which do not contain any generic parameters).</p> <p>However, with trait objects we have to make a table containing <em>every</em> object that implements the trait. Now, if it has type parameters, we need to add implementations for every type that implements the trait, and there could theoretically be an infinite number of types.</p> <p>For example, with:</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Trait {
+    fn foo&lt;T&gt;(&amp;self, on: T);
+    // more methods
+}
+
+impl Trait for String {
+    fn foo&lt;T&gt;(&amp;self, on: T) {
+        // implementation 1
+    }
+}
+
+impl Trait for u8 {
+    fn foo&lt;T&gt;(&amp;self, on: T) {
+        // implementation 2
+    }
+}
+
+// 8 more implementations
+}</pre> <p>Now, if we have the following code:</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Trait { fn foo&lt;T&gt;(&amp;self, on: T); }
+impl Trait for String { fn foo&lt;T&gt;(&amp;self, on: T) {} }
+impl Trait for u8 { fn foo&lt;T&gt;(&amp;self, on: T) {} }
+impl Trait for bool { fn foo&lt;T&gt;(&amp;self, on: T) {} }
+// etc.
+fn call_foo(thing: Box&lt;dyn Trait&gt;) {
+    thing.foo(true); // this could be any one of the 8 types above
+    thing.foo(1);
+    thing.foo("hello");
+}
+}</pre> <p>We don't just need to create a table of all implementations of all methods of <code>Trait</code>, we need to create such a table, for each different type fed to <code>foo()</code>. In this case this turns out to be (10 types implementing <code>Trait</code>)*(3 types being fed to <code>foo()</code>) = 30 implementations!</p> <p>With real world traits these numbers can grow drastically.</p> <p>To fix this, it is suggested to use a <code>where Self: Sized</code> bound similar to the fix for the sub-error above if you do not intend to call the method with type parameters:</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Trait {
+    fn foo&lt;T&gt;(&amp;self, on: T) where Self: Sized;
+    // more methods
+}
+}</pre> <p>If this is not an option, consider replacing the type parameter with another trait object (e.g., if <code>T: OtherTrait</code>, use <code>on: Box&lt;dyn OtherTrait&gt;</code>). If the number of types you intend to feed to this method is limited, consider manually listing out the methods of different types.</p> <h3 id="method-has-no-receiver">Method has no receiver</h3> <p>Methods that do not take a <code>self</code> parameter can't be called since there won't be a way to get a pointer to the method table for them.</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Foo {
+    fn foo() -&gt; u8;
+}
+}</pre> <p>This could be called as <code>&lt;Foo as Foo&gt;::foo()</code>, which would not be able to pick an implementation.</p> <p>Adding a <code>Self: Sized</code> bound to these methods will generally make this compile.</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Foo {
+    fn foo() -&gt; u8 where Self: Sized;
+}
+}</pre> <h3 id="trait-contains-associated-constants">Trait contains associated constants</h3> <p>Just like static functions, associated constants aren't stored on the method table. If the trait or any subtrait contain an associated constant, they are not dyn compatible.</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Foo {
+    const X: i32;
+}
+
+impl dyn Foo {}
+}</pre> <p>A simple workaround is to use a helper method instead:</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Foo {
+    fn x(&amp;self) -&gt; i32;
+}
+}</pre> <h3 id="trait-uses-self-as-a-type-parameter-in-the-supertrait-listing">Trait uses <code id="">Self</code> as a type parameter in the supertrait listing</h3> <p>This is similar to the second sub-error, but subtler. It happens in situations like the following:</p> <pre data-language="rust">trait Super&lt;A: ?Sized&gt; {}
+
+trait Trait: Super&lt;Self&gt; {
+}
+
+struct Foo;
+
+impl Super&lt;Foo&gt; for Foo{}
+
+impl Trait for Foo {}
+
+fn main() {
+    let x: Box&lt;dyn Trait&gt;;
+}</pre> <p>Here, the supertrait might have methods as follows:</p> <pre data-language="rust">#![allow(unused)]
+fn main() {
+trait Super&lt;A: ?Sized&gt; {
+    fn get_a(&amp;self) -&gt; &amp;A; // note that this is dyn-compatible!
+}
+}</pre> <p>If the trait <code>Trait</code> was deriving from something like <code>Super&lt;String&gt;</code> or <code>Super&lt;T&gt;</code> (where <code>Foo</code> itself is <code>Foo&lt;T&gt;</code>), this is okay, because given a type <code>get_a()</code> will definitely return an object of that type.</p> <p>However, if it derives from <code>Super&lt;Self&gt;</code>, even though <code>Super</code> is dyn-compatible, the method <code>get_a()</code> would return an object of unknown type when called on the function. <code>Self</code> type parameters let us make dyn-compatible traits no longer compatible, so they are forbidden when specifying supertraits.</p> <p>There's no easy fix for this. Generally, code will need to be refactored so that you no longer need to derive from <code>Super&lt;Self&gt;</code>.</p>  <ol class="footnote-definition">
+<li id="footnote-1"> <p>Formerly known as "object-safe". <a href="#fr-1-1">↩</a></p> </li> </ol><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010 The Rust Project Developers<br>Licensed under the Apache License, Version 2.0 or the MIT license, at your option.<br>
+    <a href="https://doc.rust-lang.org/error_codes/E0038.html" class="_attribution-link">https://doc.rust-lang.org/error_codes/E0038.html</a>
+  </p>
+</div>

@@ -17,12 +17,13 @@ SELECT 10000000
 =# EXPLAIN ANALYZE SELECT * FROM tbloom WHERE i2 = 898732 AND i5 = 123451;
                                               QUERY PLAN
 -------------------------------------------------------------------​-----------------------------------
- Seq Scan on tbloom  (cost=0.00..213744.00 rows=250 width=24) (actual time=357.059..357.059 rows=0 loops=1)
+ Seq Scan on tbloom  (cost=0.00..213744.00 rows=250 width=24) (actual time=357.059..357.059 rows=0.00 loops=1)
    Filter: ((i2 = 898732) AND (i5 = 123451))
    Rows Removed by Filter: 10000000
+   Buffers: shared hit=63744
  Planning Time: 0.346 ms
  Execution Time: 357.076 ms
-(5 rows)
+(6 rows)
 </pre> <p>Even with the btree index defined the result will still be a sequential scan:</p> <pre data-language="sql">
 =# CREATE INDEX btreeidx ON tbloom (i1, i2, i3, i4, i5, i6);
 CREATE INDEX
@@ -34,12 +35,13 @@ CREATE INDEX
 =# EXPLAIN ANALYZE SELECT * FROM tbloom WHERE i2 = 898732 AND i5 = 123451;
                                               QUERY PLAN
 -------------------------------------------------------------------​-----------------------------------
- Seq Scan on tbloom  (cost=0.00..213744.00 rows=2 width=24) (actual time=351.016..351.017 rows=0 loops=1)
+ Seq Scan on tbloom  (cost=0.00..213744.00 rows=2 width=24) (actual time=351.016..351.017 rows=0.00 loops=1)
    Filter: ((i2 = 898732) AND (i5 = 123451))
    Rows Removed by Filter: 10000000
+   Buffers: shared hit=63744
  Planning Time: 0.138 ms
  Execution Time: 351.035 ms
-(5 rows)
+(6 rows)
 </pre> <p>Having the bloom index defined on the table is better than btree in handling this type of search:</p> <pre data-language="sql">
 =# CREATE INDEX bloomidx ON tbloom USING bloom (i1, i2, i3, i4, i5, i6);
 CREATE INDEX
@@ -51,15 +53,18 @@ CREATE INDEX
 =# EXPLAIN ANALYZE SELECT * FROM tbloom WHERE i2 = 898732 AND i5 = 123451;
                                                      QUERY PLAN
 -------------------------------------------------------------------​--------------------------------------------------
- Bitmap Heap Scan on tbloom  (cost=1792.00..1799.69 rows=2 width=24) (actual time=22.605..22.606 rows=0 loops=1)
+ Bitmap Heap Scan on tbloom  (cost=1792.00..1799.69 rows=2 width=24) (actual time=22.605..22.606 rows=0.00 loops=1)
    Recheck Cond: ((i2 = 898732) AND (i5 = 123451))
    Rows Removed by Index Recheck: 2300
    Heap Blocks: exact=2256
-   -&gt;  Bitmap Index Scan on bloomidx  (cost=0.00..178436.00 rows=1 width=0) (actual time=20.005..20.005 rows=2300 loops=1)
+   Buffers: shared hit=21864
+   -&gt;  Bitmap Index Scan on bloomidx  (cost=0.00..178436.00 rows=1 width=0) (actual time=20.005..20.005 rows=2300.00 loops=1)
          Index Cond: ((i2 = 898732) AND (i5 = 123451))
+         Index Searches: 1
+         Buffers: shared hit=19608
  Planning Time: 0.099 ms
  Execution Time: 22.632 ms
-(8 rows)
+(11 rows)
 </pre> <p>Now, the main problem with the btree search is that btree is inefficient when the search conditions do not constrain the leading index column(s). A better strategy for btree is to create a separate index on each column. Then the planner will choose something like this:</p> <pre data-language="sql">
 =# CREATE INDEX btreeidx1 ON tbloom (i1);
 CREATE INDEX
@@ -76,16 +81,22 @@ CREATE INDEX
 =# EXPLAIN ANALYZE SELECT * FROM tbloom WHERE i2 = 898732 AND i5 = 123451;
                                                         QUERY PLAN
 -------------------------------------------------------------------​--------------------------------------------------------
- Bitmap Heap Scan on tbloom  (cost=9.29..13.30 rows=1 width=24) (actual time=0.032..0.033 rows=0 loops=1)
+ Bitmap Heap Scan on tbloom  (cost=9.29..13.30 rows=1 width=24) (actual time=0.032..0.033 rows=0.00 loops=1)
    Recheck Cond: ((i5 = 123451) AND (i2 = 898732))
-   -&gt;  BitmapAnd  (cost=9.29..9.29 rows=1 width=0) (actual time=0.047..0.047 rows=0 loops=1)
-         -&gt;  Bitmap Index Scan on btreeidx5  (cost=0.00..4.52 rows=11 width=0) (actual time=0.026..0.026 rows=7 loops=1)
+   Buffers: shared read=6
+   -&gt;  BitmapAnd  (cost=9.29..9.29 rows=1 width=0) (actual time=0.047..0.047 rows=0.00 loops=1)
+         Buffers: shared hit=6
+         -&gt;  Bitmap Index Scan on btreeidx5  (cost=0.00..4.52 rows=11 width=0) (actual time=0.026..0.026 rows=7.00 loops=1)
                Index Cond: (i5 = 123451)
-         -&gt;  Bitmap Index Scan on btreeidx2  (cost=0.00..4.52 rows=11 width=0) (actual time=0.007..0.007 rows=8 loops=1)
+               Index Searches: 1
+               Buffers: shared hit=3
+         -&gt;  Bitmap Index Scan on btreeidx2  (cost=0.00..4.52 rows=11 width=0) (actual time=0.007..0.007 rows=8.00 loops=1)
                Index Cond: (i2 = 898732)
+               Index Searches: 1
+               Buffers: shared hit=3
  Planning Time: 0.264 ms
  Execution Time: 0.047 ms
-(9 rows)
+(15 rows)
 </pre> <p>Although this query runs much faster than with either of the single indexes, we pay a penalty in index size. Each of the single-column btree indexes occupies 88.5 MB, so the total space needed is 531 MB, over three times the space used by the bloom index.</p> </div> <div class="sect2" id="BLOOM-OPERATOR-CLASS-INTERFACE">    <h2 class="title">F.6.3. Operator Class Interface </h2>    <p>An operator class for bloom indexes requires only a hash function for the indexed data type and an equality operator for searching. This example shows the operator class definition for the <code class="type">text</code> data type:</p> <pre data-language="sql">
 CREATE OPERATOR CLASS text_ops
 DEFAULT FOR TYPE text USING bloom AS
@@ -94,6 +105,6 @@ DEFAULT FOR TYPE text USING bloom AS
 </pre> </div> <div class="sect2" id="BLOOM-LIMITATIONS">    <h2 class="title">F.6.4. Limitations </h2>     <ul> <li> <p>Only operator classes for <code class="type">int4</code> and <code class="type">text</code> are included with the module.</p> </li> <li> <p>Only the <code class="literal">=</code> operator is supported for search. But it is possible to add support for arrays with union and intersection operations in the future.</p> </li> <li> <p><code class="literal">bloom</code> access method doesn't support <code class="literal">UNIQUE</code> indexes.</p> </li> <li> <p><code class="literal">bloom</code> access method doesn't support searching for <code class="literal">NULL</code> values.</p> </li> </ul>  </div> <div class="sect2" id="BLOOM-AUTHORS">    <h2 class="title">F.6.5. Authors </h2>    <p>Teodor Sigaev <code class="email">&lt;<a class="email" href="mailto:teodor@postgrespro.ru.html">teodor@postgrespro.ru</a>&gt;</code>, Postgres Professional, Moscow, Russia</p> <p>Alexander Korotkov <code class="email">&lt;<a class="email" href="mailto:a.korotkov@postgrespro.ru.html">a.korotkov@postgrespro.ru</a>&gt;</code>, Postgres Professional, Moscow, Russia</p> <p>Oleg Bartunov <code class="email">&lt;<a class="email" href="mailto:obartunov@postgrespro.ru.html">obartunov@postgrespro.ru</a>&gt;</code>, Postgres Professional, Moscow, Russia</p> </div><div class="_attribution">
   <p class="_attribution-p">
     &copy; 1996&ndash;2025 The PostgreSQL Global Development Group<br>Licensed under the PostgreSQL License.<br>
-    <a href="https://www.postgresql.org/docs/17/bloom.html" class="_attribution-link">https://www.postgresql.org/docs/17/bloom.html</a>
+    <a href="https://www.postgresql.org/docs/18/bloom.html" class="_attribution-link">https://www.postgresql.org/docs/18/bloom.html</a>
   </p>
 </div>
