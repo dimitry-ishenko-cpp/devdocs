@@ -5,7 +5,7 @@ from pygments import highlight
 from pygments.lexers import get_lexer_by_name
 from pygments.formatters import HtmlFormatter
 
-formatter = HtmlFormatter(full=False, noclasses=True, nobackground=True)
+formatter = HtmlFormatter(full=False, noclasses=True, nobackground=True, style="monokai")
 
 def pre_format_html_hook(url, html):
     tree = lh.parse(StringIO(html))
