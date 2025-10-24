@@ -1,0 +1,1285 @@
+<h1>HTTP server</h1>
+<div>
+
+<article><p>The page primarily documents the Bun-native <code>Bun.serve</code> API. Bun also implements <a href="https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API"><code>fetch</code></a> and the Node.js <a href="https://nodejs.org/api/http.html"><code>http</code></a> and <a href="https://nodejs.org/api/https.html"><code>https</code></a> modules.</p>
+<div><p>These modules have been re-implemented to use Bun's fast internal HTTP infrastructure. Feel free to use these modules directly; frameworks like <a href="https://expressjs.com/">Express</a> that depend on these modules should work out of the box. For granular compatibility information, see <a href="../runtime/nodejs-apis.html">Runtime &gt; Node.js APIs</a>.</p></div>
+<p>To start a high-performance HTTP server with a clean API, the recommended approach is <a href="#start-a-server-bun-serve"><code>Bun.serve</code></a>.</p>
+<h2 level="2" anchor-id="bun-serve" id="bun-serve">
+<a href="#bun-serve"><code>Bun.serve()</code></a>
+</h2>
+<p>Use <code>Bun.serve</code> to start an HTTP server in Bun.</p>
+<div><div><div id="QQugJbUCXOwo:0"><pre data-language="typescript">Bun.serve({
+  // `routes` requires Bun v1.2.3+
+  routes: {
+    // Static routes
+    "/api/status": new Response("OK"),
+
+    // Dynamic routes
+    "/users/:id": req =&gt; {
+      return new Response(`Hello User ${req.params.id}!`);
+    },
+
+    // Per-HTTP method handlers
+    "/api/posts": {
+      GET: () =&gt; new Response("List posts"),
+      POST: async req =&gt; {
+        const body = await req.json();
+        return Response.json({ created: true, ...body });
+      },
+    },
+
+    // Wildcard route for all routes that start with "/api/" and aren't otherwise matched
+    "/api/*": Response.json({ message: "Not found" }, { status: 404 }),
+
+    // Redirect from /blog/hello to /blog/hello/world
+    "/blog/hello": Response.redirect("/blog/hello/world"),
+
+    // Serve a file by buffering it in memory
+    "/favicon.ico": new Response(await Bun.file("./favicon.ico").bytes(), {
+      headers: {
+        "Content-Type": "image/x-icon",
+      },
+    }),
+  },
+
+  // (optional) fallback for unmatched routes:
+  // Required if Bun's version &lt; 1.2.3
+  fetch(req) {
+    return new Response("Not Found", { status: 404 });
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="routing" id="routing">
+<a href="#routing">Routing</a>
+</h3>
+<p>Routes in <code>Bun.serve()</code> receive a <code>BunRequest</code> (which extends <a href="https://developer.mozilla.org/en-US/docs/Web/API/Request"><code>Request</code></a>) and return a <a href="https://developer.mozilla.org/en-US/docs/Web/API/Response"><code>Response</code></a> or <code>Promise&lt;Response&gt;</code>. This makes it easier to use the same code for both sending &amp; receiving HTTP requests.</p>
+<div><div><div id="QmxSkNkFnUjS:0"><pre data-language="typescript">// Simplified for brevity
+interface BunRequest&lt;T extends string&gt; extends Request {
+  params: Record&lt;T, string&gt;;
+  readonly cookies: CookieMap;
+}
+</pre></div></div></div>
+<h4 level="4" id="async-await-in-routes">Async/await in routes</h4>
+<p>You can use async/await in route handlers to return a <code>Promise&lt;Response&gt;</code>.</p>
+<div><div><div id="NMzyiqkXbOoS:0"><pre data-language="typescript">import { sql, serve } from "bun";
+
+serve({
+  port: 3001,
+  routes: {
+    "/api/version": async () =&gt; {
+      const [version] = await sql`SELECT version()`;
+      return Response.json(version);
+    },
+  },
+});
+</pre></div></div></div>
+<h4 level="4" id="promise-in-routes">Promise in routes</h4>
+<p>You can also return a <code>Promise&lt;Response&gt;</code> from a route handler.</p>
+<div><div><div id="yIUbucOrmOTK:0"><pre data-language="typescript">import { sql, serve } from "bun";
+
+serve({
+  routes: {
+    "/api/version": () =&gt; {
+      return new Promise(resolve =&gt; {
+        setTimeout(async () =&gt; {
+          const [version] = await sql`SELECT version()`;
+          resolve(Response.json(version));
+        }, 100);
+      });
+    },
+  },
+});
+</pre></div></div></div>
+<h4 level="4" id="type-safe-route-parameters">Type-safe route parameters</h4>
+<p>TypeScript parses route parameters when passed as a string literal, so that your editor will show autocomplete when accessing <code>request.params</code>.</p>
+<div><div><div id="FmzzASMzMWMY:0"><pre data-language="typescript">import type { BunRequest } from "bun";
+
+Bun.serve({
+  routes: {
+    // TypeScript knows the shape of params when passed as a string literal
+    "/orgs/:orgId/repos/:repoId": req =&gt; {
+      const { orgId, repoId } = req.params;
+      return Response.json({ orgId, repoId });
+    },
+
+    "/orgs/:orgId/repos/:repoId/settings": (
+      // optional: you can explicitly pass a type to BunRequest:
+      req: BunRequest&lt;"/orgs/:orgId/repos/:repoId/settings"&gt;,
+    ) =&gt; {
+      const { orgId, repoId } = req.params;
+      return Response.json({ orgId, repoId });
+    },
+  },
+});
+</pre></div></div></div>
+<p>Percent-encoded route parameter values are automatically decoded. Unicode characters are supported. Invalid unicode is replaced with the unicode replacement character <code>&amp;0xFFFD;</code>.</p>
+<h3 level="3" anchor-id="static-responses" id="static-responses">
+<a href="#static-responses">Static responses</a>
+</h3>
+<p>Routes can also be <code>Response</code> objects (without the handler function). Bun.serve() optimizes it for zero-allocation dispatch - perfect for health checks, redirects, and fixed content:</p>
+<div><div><div id="bseGKYhRzjLz:0"><pre data-language="typescript">Bun.serve({
+  routes: {
+    // Health checks
+    "/health": new Response("OK"),
+    "/ready": new Response("Ready", {
+      headers: {
+        // Pass custom headers
+        "X-Ready": "1",
+      },
+    }),
+
+    // Redirects
+    "/blog": Response.redirect("https://bun.com/blog"),
+
+    // API responses
+    "/api/config": Response.json({
+      version: "1.0.0",
+      env: "production",
+    }),
+  },
+});
+</pre></div></div></div>
+<p>Static responses do not allocate additional memory after initialization. You can generally expect at least a 15% performance improvement over manually returning a <code>Response</code> object.</p>
+<p>Static route responses are cached for the lifetime of the server object. To reload static routes, call <code>server.reload(options)</code>.</p>
+<h3 level="3" anchor-id="file-responses-vs-static-responses" id="file-responses-vs-static-responses">
+<a href="#file-responses-vs-static-responses">File Responses vs Static Responses</a>
+</h3>
+<p>When serving files in routes, there are two distinct behaviors depending on whether you buffer the file content or serve it directly:</p>
+<div><div><div id="LIHeyAiKbfaV:0"><pre data-language="typescript">Bun.serve({
+  routes: {
+    // Static route - content is buffered in memory at startup
+    "/logo.png": new Response(await Bun.file("./logo.png").bytes()),
+
+    // File route - content is read from filesystem on each request
+    "/download.zip": new Response(Bun.file("./download.zip")),
+  },
+});
+</pre></div></div></div>
+<p><strong>Static routes</strong> (<code>new Response(await file.bytes())</code>) buffer content in memory at startup:</p>
+<ul>
+<li>
+<strong>Zero filesystem I/O</strong> during requests - content served entirely from memory</li>
+<li>
+<strong>ETag support</strong> - Automatically generates and validates ETags for caching</li>
+<li>
+<strong>If-None-Match</strong> - Returns <code>304 Not Modified</code> when client ETag matches</li>
+<li>
+<strong>No 404 handling</strong> - Missing files cause startup errors, not runtime 404s</li>
+<li>
+<strong>Memory usage</strong> - Full file content stored in RAM</li>
+<li>
+<strong>Best for</strong>: Small static assets, API responses, frequently accessed files</li>
+</ul>
+<p><strong>File routes</strong> (<code>new Response(Bun.file(path))</code>) read from filesystem per request:</p>
+<ul>
+<li>
+<strong>Filesystem reads</strong> on each request - checks file existence and reads content</li>
+<li>
+<strong>Built-in 404 handling</strong> - Returns <code>404 Not Found</code> if file doesn't exist or becomes inaccessible</li>
+<li>
+<strong>Last-Modified support</strong> - Uses file modification time for <code>If-Modified-Since</code> headers</li>
+<li>
+<strong>If-Modified-Since</strong> - Returns <code>304 Not Modified</code> when file hasn't changed since client's cached version</li>
+<li>
+<strong>Range request support</strong> - Automatically handles partial content requests with <code>Content-Range</code> headers</li>
+<li>
+<strong>Streaming transfers</strong> - Uses buffered reader with backpressure handling for efficient memory usage</li>
+<li>
+<strong>Memory efficient</strong> - Only buffers small chunks during transfer, not entire file</li>
+<li>
+<strong>Best for</strong>: Large files, dynamic content, user uploads, files that change frequently</li>
+</ul>
+<h3 level="3" anchor-id="http-caching-behavior" id="http-caching-behavior">
+<a href="#http-caching-behavior">HTTP Caching Behavior</a>
+</h3>
+<p>Both route types implement HTTP caching standards but with different strategies:</p>
+<h4 level="4" id="static-routes-caching">Static Routes Caching</h4>
+<ul>
+<li>
+<strong>ETag generation</strong>: Automatically computes ETag hash from content at startup</li>
+<li>
+<strong>If-None-Match</strong>: Validates client ETag against server ETag</li>
+<li>
+<strong>304 responses</strong>: Returns <code>304 Not Modified</code> with empty body when ETags match</li>
+<li>
+<strong>Cache headers</strong>: Inherits any <code>Cache-Control</code> headers you provide in the Response</li>
+<li>
+<strong>Consistency</strong>: ETag remains constant until server restart or route reload</li>
+</ul>
+<h4 level="4" id="file-routes-caching">File Routes Caching</h4>
+<ul>
+<li>
+<strong>Last-Modified</strong>: Uses file's <code>mtime</code> for <code>Last-Modified</code> header</li>
+<li>
+<strong>If-Modified-Since</strong>: Compares client date with file modification time</li>
+<li>
+<strong>304 responses</strong>: Returns <code>304 Not Modified</code> when file unchanged since client's cached version</li>
+<li>
+<strong>Content-Length</strong>: Automatically set based on current file size</li>
+<li>
+<strong>Dynamic validation</strong>: Checks file modification time on each request</li>
+</ul>
+<h4 level="4" id="status-code-handling">Status Code Handling</h4>
+<p>Both route types automatically adjust status codes:</p>
+<ul>
+<li>
+<strong>200 → 204</strong>: Empty files (0 bytes) return <code>204 No Content</code> instead of <code>200 OK</code>
+</li>
+<li>
+<strong>200 → 304</strong>: Successful cache validation returns <code>304 Not Modified</code>
+</li>
+<li>
+<strong>File routes only</strong>: Missing or inaccessible files return <code>404 Not Found</code>
+</li>
+</ul>
+<div><div><div id="eQONvGqSRoaQ:0"><pre data-language="typescript">const server = Bun.serve({
+  static: {
+    "/api/time": new Response(new Date().toISOString()),
+  },
+
+  fetch(req) {
+    return new Response("404!");
+  },
+});
+
+// Update the time every second.
+setInterval(() =&gt; {
+  server.reload({
+    static: {
+      "/api/time": new Response(new Date().toISOString()),
+    },
+
+    fetch(req) {
+      return new Response("404!");
+    },
+  });
+}, 1000);
+</pre></div></div></div>
+<p>Reloading routes only impact the next request. In-flight requests continue to use the old routes. After in-flight requests to old routes are finished, the old routes are freed from memory.</p>
+<p>To simplify error handling, static routes do not support streaming response bodies from <code>ReadableStream</code> or an <code>AsyncIterator</code>. Fortunately, you can still buffer the response in memory first:</p>
+<div><div><div id="JfdAFDIORDUu:0"><pre data-language="typescript">const time = await fetch("https://api.example.com/v1/data");
+// Buffer the response in memory first.
+const blob = await time.blob();
+
+const server = Bun.serve({
+  static: {
+    "/api/data": new Response(blob),
+  },
+
+  fetch(req) {
+    return new Response("404!");
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="route-precedence" id="route-precedence">
+<a href="#route-precedence">Route precedence</a>
+</h3>
+<p>Routes are matched in order of specificity:</p>
+<ol>
+<li>Exact routes (<code>/users/all</code>)</li>
+<li>Parameter routes (<code>/users/:id</code>)</li>
+<li>Wildcard routes (<code>/users/*</code>)</li>
+<li>Global catch-all (<code>/*</code>)</li>
+</ol>
+<div><div><div id="wZsgpNxhiLJc:0"><pre data-language="typescript">Bun.serve({
+  routes: {
+    // Most specific first
+    "/api/users/me": () =&gt; new Response("Current user"),
+    "/api/users/:id": req =&gt; new Response(`User ${req.params.id}`),
+    "/api/*": () =&gt; new Response("API catch-all"),
+    "/*": () =&gt; new Response("Global catch-all"),
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="per-http-method-routes" id="per-http-method-routes">
+<a href="#per-http-method-routes">Per-HTTP Method Routes</a>
+</h3>
+<p>Route handlers can be specialized by HTTP method:</p>
+<div><div><div id="mhbKYAuCXoFj:0"><pre data-language="typescript">Bun.serve({
+  routes: {
+    "/api/posts": {
+      // Different handlers per method
+      GET: () =&gt; new Response("List posts"),
+      POST: async req =&gt; {
+        const post = await req.json();
+        return Response.json({ id: crypto.randomUUID(), ...post });
+      },
+      PUT: async req =&gt; {
+        const updates = await req.json();
+        return Response.json({ updated: true, ...updates });
+      },
+      DELETE: () =&gt; new Response(null, { status: 204 }),
+    },
+  },
+});
+</pre></div></div></div>
+<p>You can pass any of the following methods:</p>
+<div><table>
+<thead><tr>
+<th>Method</th>
+<th>Usecase example</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td>Fetch a resource</td>
+</tr>
+<tr>
+<td><code>HEAD</code></td>
+<td>Check if a resource exists</td>
+</tr>
+<tr>
+<td><code>OPTIONS</code></td>
+<td>Get allowed HTTP methods (CORS)</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td>Delete a resource</td>
+</tr>
+<tr>
+<td><code>PATCH</code></td>
+<td>Update a resource</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td>Create a resource</td>
+</tr>
+<tr>
+<td><code>PUT</code></td>
+<td>Update a resource</td>
+</tr>
+</tbody>
+</table></div>
+<p>When passing a function instead of an object, all methods will be handled by that function:</p>
+<div><div><div id="FuUtQCAQLgAA:0"><pre data-language="typescript">const server = Bun.serve({
+  routes: {
+    "/api/version": () =&gt; Response.json({ version: "1.0.0" }),
+  },
+});
+
+await fetch(new URL("/api/version", server.url));
+await fetch(new URL("/api/version", server.url), { method: "PUT" });
+// ... etc
+</pre></div></div></div>
+<h3 level="3" anchor-id="hot-route-reloading" id="hot-route-reloading">
+<a href="#hot-route-reloading">Hot Route Reloading</a>
+</h3>
+<p>Update routes without server restarts using <code>server.reload()</code>:</p>
+<div><div><div id="VddmBHvAqNdy:0"><pre data-language="typescript">const server = Bun.serve({
+  routes: {
+    "/api/version": () =&gt; Response.json({ version: "1.0.0" }),
+  },
+});
+
+// Deploy new routes without downtime
+server.reload({
+  routes: {
+    "/api/version": () =&gt; Response.json({ version: "2.0.0" }),
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="error-handling" id="error-handling">
+<a href="#error-handling">Error Handling</a>
+</h3>
+<p>Bun provides structured error handling for routes:</p>
+<div><div><div id="LbRrSBWLTgVU:0"><pre data-language="typescript">Bun.serve({
+  routes: {
+    // Errors are caught automatically
+    "/api/risky": () =&gt; {
+      throw new Error("Something went wrong");
+    },
+  },
+  // Global error handler
+  error(error) {
+    console.error(error);
+    return new Response(`Internal Error: ${error.message}`, {
+      status: 500,
+      headers: {
+        "Content-Type": "text/plain",
+      },
+    });
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="html-imports" id="html-imports">
+<a href="#html-imports">HTML imports</a>
+</h3>
+<p>Bun supports importing HTML files directly into your server code, enabling full-stack applications with both server-side and client-side code. HTML imports work in two modes:</p>
+<p><strong>Development (<code>bun --hot</code>):</strong> Assets are bundled on-demand at runtime, enabling hot module replacement (HMR) for a fast, iterative development experience. When you change your frontend code, the browser automatically updates without a full page reload.</p>
+<p><strong>Production (<code>bun build</code>):</strong> When building with <code>bun build --target=bun</code>, the <code>import index from "./index.html"</code> statement resolves to a pre-built manifest object containing all bundled client assets. <code>Bun.serve</code> consumes this manifest to serve optimized assets with zero runtime bundling overhead. This is ideal for deploying to production.</p>
+<div><div><div id="GBBPBXEPcVRg:0"><pre data-language="typescript">import myReactSinglePageApp from "./index.html";
+
+Bun.serve({
+  routes: {
+    "/": myReactSinglePageApp,
+  },
+});
+</pre></div></div></div>
+<p>HTML imports don't just serve HTML — it's a full-featured frontend bundler, transpiler, and toolkit built using Bun's <a href="../bundler.html">bundler</a>, JavaScript transpiler and CSS parser. You can use this to build full-featured frontends with React, TypeScript, Tailwind CSS, and more.</p>
+<p>For a complete guide on building full-stack applications with HTML imports, including detailed examples and best practices, see <a href="../bundler/fullstack.html">/docs/bundler/fullstack</a>.</p>
+<h3 level="3" anchor-id="practical-example-rest-api" id="practical-example-rest-api">
+<a href="#practical-example-rest-api">Practical example: REST API</a>
+</h3>
+<p>Here's a basic database-backed REST API using Bun's router with zero dependencies:</p>
+<div id="yuGmSHPOIu">
+<div>
+<div>server.ts</div>
+<div>types.ts</div>
+</div>
+<div><div><div><div id="EMWjqQbCNwsa:0"><pre data-language="typescript">import type { Post } from "./types.ts";
+import { Database } from "bun:sqlite";
+
+const db = new Database("posts.db");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS posts (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )
+`);
+
+Bun.serve({
+  routes: {
+    // List posts
+    "/api/posts": {
+      GET: () =&gt; {
+        const posts = db.query("SELECT * FROM posts").all();
+        return Response.json(posts);
+      },
+
+      // Create post
+      POST: async req =&gt; {
+        const post: Omit&lt;Post, "id" | "created_at"&gt; = await req.json();
+        const id = crypto.randomUUID();
+
+        db.query(
+          `INSERT INTO posts (id, title, content, created_at)
+           VALUES (?, ?, ?, ?)`,
+        ).run(id, post.title, post.content, new Date().toISOString());
+
+        return Response.json({ id, ...post }, { status: 201 });
+      },
+    },
+
+    // Get post by ID
+    "/api/posts/:id": req =&gt; {
+      const post = db
+        .query("SELECT * FROM posts WHERE id = ?")
+        .get(req.params.id);
+
+      if (!post) {
+        return new Response("Not Found", { status: 404 });
+      }
+
+      return Response.json(post);
+    },
+  },
+
+  error(error) {
+    console.error(error);
+    return new Response("Internal Server Error", { status: 500 });
+  },
+});
+</pre></div></div></div></div>
+<div><div><div><div id="CvWoVcoOQlUi:0"><pre data-language="typescript">export interface Post {
+  id: string;
+  title: string;
+  content: string;
+  created_at: string;
+}
+</pre></div></div></div></div>
+</div>
+<h3 level="3" anchor-id="routing-performance" id="routing-performance">
+<a href="#routing-performance">Routing performance</a>
+</h3>
+<p><code>Bun.serve()</code>'s router builds on top uWebSocket's <a href="https://github.com/oven-sh/bun/blob/0d1a00fa0f7830f8ecd99c027fce8096c9d459b6/packages/bun-uws/src/HttpRouter.h#L57-L64">tree-based approach</a> to add <a href="https://github.com/oven-sh/bun/blob/main/src/bun.js/bindings/decodeURIComponentSIMD.cpp#L21-L271">SIMD-accelerated route parameter decoding</a> and <a href="https://github.com/oven-sh/bun/blob/main/src/bun.js/bindings/ServerRouteList.cpp#L100-L101">JavaScriptCore structure caching</a> to push the performance limits of what modern hardware allows.</p>
+<h3 level="3" anchor-id="fetch-request-handler" id="fetch-request-handler">
+<a href="#fetch-request-handler"><code>fetch</code> request handler</a>
+</h3>
+<p>The <code>fetch</code> handler handles incoming requests that weren't matched by any route. It receives a <a href="https://developer.mozilla.org/en-US/docs/Web/API/Request"><code>Request</code></a> object and returns a <a href="https://developer.mozilla.org/en-US/docs/Web/API/Response"><code>Response</code></a> or <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>Promise&lt;Response&gt;</code></a>.</p>
+<div><div><div id="RIFkEKmMZpXG:0"><pre data-language="typescript">Bun.serve({
+  fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname === "/") return new Response("Home page!");
+    if (url.pathname === "/blog") return new Response("Blog!");
+    return new Response("404!");
+  },
+});
+</pre></div></div></div>
+<p>The <code>fetch</code> handler supports async/await:</p>
+<div><div><div id="uMWJeiTuUOdF:0"><pre data-language="typescript">import { sleep, serve } from "bun";
+serve({
+  async fetch(req) {
+    const start = performance.now();
+    await sleep(10);
+    const end = performance.now();
+    return new Response(`Slept for ${end - start}ms`);
+  },
+});
+</pre></div></div></div>
+<p>Promise-based responses are also supported:</p>
+<div><div><div id="misFzafoIPjj:0"><pre data-language="typescript">Bun.serve({
+  fetch(req) {
+    // Forward the request to another server.
+    return fetch("https://example.com");
+  },
+});
+</pre></div></div></div>
+<p>You can also access the <code>Server</code> object from the <code>fetch</code> handler. It's the second argument passed to the <code>fetch</code> function.</p>
+<div><div><div id="odbydBcHMjrU:0"><pre data-language="typescript">// `server` is passed in as the second argument to `fetch`.
+const server = Bun.serve({
+  fetch(req, server) {
+    const ip = server.requestIP(req);
+    return new Response(`Your IP is ${ip}`);
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="changing-the-port-and-hostname" id="changing-the-port-and-hostname">
+<a href="#changing-the-port-and-hostname">Changing the <code>port</code> and <code>hostname</code></a>
+</h3>
+<p>To configure which port and hostname the server will listen on, set <code>port</code> and <code>hostname</code> in the options object.</p>
+<div><div><div id="EUoRXWQSaYQW:0"><pre data-language="typescript">Bun.serve({
+  port: 8080, // defaults to $BUN_PORT, $PORT, $NODE_PORT otherwise 3000
+  hostname: "mydomain.com", // defaults to "0.0.0.0"
+  fetch(req) {
+    return new Response("404!");
+  },
+});
+</pre></div></div></div>
+<p>To randomly select an available port, set <code>port</code> to <code>0</code>.</p>
+<div><div><div id="xbqRPHIPJXXG:0"><pre data-language="typescript">const server = Bun.serve({
+  port: 0, // random port
+  fetch(req) {
+    return new Response("404!");
+  },
+});
+
+// server.port is the randomly selected port
+console.log(server.port);
+</pre></div></div></div>
+<p>You can view the chosen port by accessing the <code>port</code> property on the server object, or by accessing the <code>url</code> property.</p>
+<div><div><div id="RokKHQwvwoBu:0"><pre data-language="typescript">console.log(server.port); // 3000
+console.log(server.url); // http://localhost:3000
+</pre></div></div></div>
+<h4 level="4" id="configuring-a-default-port">Configuring a default port</h4>
+<p>Bun supports several options and environment variables to configure the default port. The default port is used when the <code>port</code> option is not set.</p>
+<ul><li>
+<code>--port</code> CLI flag</li></ul>
+<div><div><div id="AtkSnSVzbgox:0"><pre data-language="typescript">bun --port=4002 server.ts</pre></div></div></div>
+<ul><li>
+<code>BUN_PORT</code> environment variable</li></ul>
+<div><div><div id="GGouRDTAVNrN:0"><pre data-language="typescript">BUN_PORT=4002 bun server.ts</pre></div></div></div>
+<ul><li>
+<code>PORT</code> environment variable</li></ul>
+<div><div><div id="hnircXbCoCHn:0"><pre data-language="typescript">PORT=4002 bun server.ts</pre></div></div></div>
+<ul><li>
+<code>NODE_PORT</code> environment variable</li></ul>
+<div><div><div id="gfLDSszfyDuv:0"><pre data-language="typescript">NODE_PORT=4002 bun server.ts</pre></div></div></div>
+<h3 level="3" anchor-id="unix-domain-sockets" id="unix-domain-sockets">
+<a href="#unix-domain-sockets">Unix domain sockets</a>
+</h3>
+<p>To listen on a <a href="https://en.wikipedia.org/wiki/Unix_domain_socket">unix domain socket</a>, pass the <code>unix</code> option with the path to the socket.</p>
+<div><div><div id="xdBrpGmSPDot:0"><pre data-language="typescript">Bun.serve({
+  unix: "/tmp/my-socket.sock", // path to socket
+  fetch(req) {
+    return new Response(`404!`);
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="abstract-namespace-sockets" id="abstract-namespace-sockets">
+<a href="#abstract-namespace-sockets">Abstract namespace sockets</a>
+</h3>
+<p>Bun supports Linux abstract namespace sockets. To use an abstract namespace socket, prefix the <code>unix</code> path with a null byte.</p>
+<div><div><div id="RxiOLsOBImgF:0"><pre data-language="typescript">Bun.serve({
+  unix: "\0my-abstract-socket", // abstract namespace socket
+  fetch(req) {
+    return new Response(`404!`);
+  },
+});
+</pre></div></div></div>
+<p>Unlike unix domain sockets, abstract namespace sockets are not bound to the filesystem and are automatically removed when the last reference to the socket is closed.</p>
+<h2 level="2" anchor-id="error-handling" id="error-handling">
+<a href="#error-handling">Error handling</a>
+</h2>
+<p>To activate development mode, set <code>development: true</code>.</p>
+<div><div><div id="vjQBrrPLbMQw:0"><pre data-language="typescript">Bun.serve({
+  development: true,
+  fetch(req) {
+    throw new Error("woops!");
+  },
+});
+</pre></div></div></div>
+<p>In development mode, Bun will surface errors in-browser with a built-in error page.</p>
+<figure><a target="_blank" href="https://bun.com/images/exception_page.png"><img src="https://bun.com/images/exception_page.png" caption="Bun's built-in 500 page"></a><figcaption>Bun's built-in 500 page</figcaption></figure><h3 level="3" anchor-id="error-callback" id="error-callback">
+<a href="#error-callback"><code>error</code> callback</a>
+</h3>
+<p>To handle server-side errors, implement an <code>error</code> handler. This function should return a <code>Response</code> to serve to the client when an error occurs. This response will supersede Bun's default error page in <code>development</code> mode.</p>
+<div><div><div id="fqxFgpwoXpNe:0"><pre data-language="typescript">Bun.serve({
+  fetch(req) {
+    throw new Error("woops!");
+  },
+  error(error) {
+    return new Response(`&lt;pre&gt;${error}\n${error.stack}&lt;/pre&gt;`, {
+      headers: {
+        "Content-Type": "text/html",
+      },
+    });
+  },
+});
+</pre></div></div></div>
+<div><p><a href="../runtime/debugger.html">Learn more about debugging in Bun</a></p></div>
+<p>The call to <code>Bun.serve</code> returns a <code>Server</code> object. To stop the server, call the <code>.stop()</code> method.</p>
+<div><div><div id="mCFPSPfgRpvy:0"><pre data-language="typescript">const server = Bun.serve({
+  fetch() {
+    return new Response("Bun!");
+  },
+});
+
+server.stop();
+</pre></div></div></div>
+<h2 level="2" anchor-id="tls" id="tls">
+<a href="#tls">TLS</a>
+</h2>
+<p>Bun supports TLS out of the box, powered by <a href="https://boringssl.googlesource.com/boringssl">BoringSSL</a>. Enable TLS by passing in a value for <code>key</code> and <code>cert</code>; both are required to enable TLS.</p>
+<div><div>
+
+
+
+
+<div id="vRZorUnNZnlk:0"><pre data-language="typescript">Bun.serve({
+  fetch(req) {
+    return new Response("Hello!!!");
+  },
+
+  tls: {
+    key: Bun.file("./key.pem"),
+    cert: Bun.file("./cert.pem"),
+  }
+});</pre></div>
+</div></div>
+<p>The <code>key</code> and <code>cert</code> fields expect the <em>contents</em> of your TLS key and certificate, <em>not a path to it</em>. This can be a string, <code>BunFile</code>, <code>TypedArray</code>, or <code>Buffer</code>.</p>
+<div><div><div id="KdnFdaRSOGcy:0"><pre data-language="typescript">Bun.serve({
+  fetch() {},
+
+  tls: {
+    // BunFile
+    key: Bun.file("./key.pem"),
+    // Buffer
+    key: fs.readFileSync("./key.pem"),
+    // string
+    key: fs.readFileSync("./key.pem", "utf8"),
+    // array of above
+    key: [Bun.file("./key1.pem"), Bun.file("./key2.pem")],
+  },
+});
+</pre></div></div></div>
+<p>If your private key is encrypted with a passphrase, provide a value for <code>passphrase</code> to decrypt it.</p>
+<div><div>
+
+<div id="lACnyWoVsJIo:0"><pre data-language="typescript">Bun.serve({
+  fetch(req) {
+    return new Response("Hello!!!");
+  },
+
+  tls: {
+    key: Bun.file("./key.pem"),
+    cert: Bun.file("./cert.pem"),
+    passphrase: "my-secret-passphrase",
+  }
+});</pre></div>
+</div></div>
+<p>Optionally, you can override the trusted CA certificates by passing a value for <code>ca</code>. By default, the server will trust the list of well-known CAs curated by Mozilla. When <code>ca</code> is specified, the Mozilla list is overwritten.</p>
+<div><div>
+
+<div id="brllyylaKHkb:0"><pre data-language="typescript">Bun.serve({
+  fetch(req) {
+    return new Response("Hello!!!");
+  },
+  tls: {
+    key: Bun.file("./key.pem"), // path to TLS key
+    cert: Bun.file("./cert.pem"), // path to TLS cert
+    ca: Bun.file("./ca.pem"), // path to root CA certificate
+  }
+});</pre></div>
+</div></div>
+<p>To override Diffie-Hellman parameters:</p>
+<div><div><div id="rkiHpqsDgbEj:0"><pre data-language="typescript">Bun.serve({
+  // ...
+  tls: {
+    // other config
+    dhParamsFile: "/path/to/dhparams.pem", // path to Diffie Hellman parameters
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="server-name-indication-sni" id="server-name-indication-sni">
+<a href="#server-name-indication-sni">Server name indication (SNI)</a>
+</h3>
+<p>To configure the server name indication (SNI) for the server, set the <code>serverName</code> field in the <code>tls</code> object.</p>
+<div><div><div id="hULlowCtPpaZ:0"><pre data-language="typescript">Bun.serve({
+  // ...
+  tls: {
+    // ... other config
+    serverName: "my-server.com", // SNI
+  },
+});
+</pre></div></div></div>
+<p>To allow multiple server names, pass an array of objects to <code>tls</code>, each with a <code>serverName</code> field.</p>
+<div><div><div id="YGiZntLLyWeI:0"><pre data-language="typescript">Bun.serve({
+  // ...
+  tls: [
+    {
+      key: Bun.file("./key1.pem"),
+      cert: Bun.file("./cert1.pem"),
+      serverName: "my-server1.com",
+    },
+    {
+      key: Bun.file("./key2.pem"),
+      cert: Bun.file("./cert2.pem"),
+      serverName: "my-server2.com",
+    },
+  ],
+});
+</pre></div></div></div>
+<h2 level="2" anchor-id="idletimeout" id="idletimeout">
+<a href="#idletimeout">idleTimeout</a>
+</h2>
+<p>To configure the idle timeout, set the <code>idleTimeout</code> field in Bun.serve.</p>
+<div><div><div id="QYKwUsRKDrCi:0"><pre data-language="typescript">Bun.serve({
+  // 10 seconds:
+  idleTimeout: 10,
+
+  fetch(req) {
+    return new Response("Bun!");
+  },
+});
+</pre></div></div></div>
+<p>This is the maximum amount of time a connection is allowed to be idle before the server closes it. A connection is idling if there is no data sent or received.</p>
+<h2 level="2" anchor-id="export-default-syntax" id="export-default-syntax">
+<a href="#export-default-syntax">export default syntax</a>
+</h2>
+<p>Thus far, the examples on this page have used the explicit <code>Bun.serve</code> API. Bun also supports an alternate syntax.</p>
+<div><div><div id="axheFrHaESQm:0"><pre data-language="typescript">import {type Serve} from "bun";
+
+export default {
+  fetch(req) {
+    return new Response("Bun!");
+  },
+} satisfies Serve;
+</pre></div></div></div>
+<p>Instead of passing the server options into <code>Bun.serve</code>, <code>export default</code> it. This file can be executed as-is; when Bun sees a file with a <code>default</code> export containing a <code>fetch</code> handler, it passes it into <code>Bun.serve</code> under the hood.</p>
+<h2 level="2" anchor-id="streaming-files" id="streaming-files">
+<a href="#streaming-files">Streaming files</a>
+</h2>
+<p>To stream a file, return a <code>Response</code> object with a <code>BunFile</code> object as the body.</p>
+<div><div><div id="KtlkMSdgMfoi:0"><pre data-language="typescript">Bun.serve({
+  fetch(req) {
+    return new Response(Bun.file("./hello.txt"));
+  },
+});
+</pre></div></div></div>
+<div><p>⚡️ <strong>Speed</strong> — Bun automatically uses the <a href="https://man7.org/linux/man-pages/man2/sendfile.2.html"><code>sendfile(2)</code></a> system call when possible, enabling zero-copy file transfers in the kernel—the fastest way to send files.</p></div>
+<p>You can send part of a file using the <a href="https://developer.mozilla.org/en-US/docs/Web/API/Blob/slice"><code>slice(start, end)</code></a> method on the <code>Bun.file</code> object. This automatically sets the <code>Content-Range</code> and <code>Content-Length</code> headers on the <code>Response</code> object.</p>
+<div><div><div id="jKQZbOUFoJio:0"><pre data-language="typescript">Bun.serve({
+  fetch(req) {
+    // parse `Range` header
+    const [start = 0, end = Infinity] = req.headers
+      .get("Range") // Range: bytes=0-100
+      .split("=") // ["Range: bytes", "0-100"]
+      .at(-1) // "0-100"
+      .split("-") // ["0", "100"]
+      .map(Number); // [0, 100]
+
+    // return a slice of the file
+    const bigFile = Bun.file("./big-video.mp4");
+    return new Response(bigFile.slice(start, end));
+  },
+});
+</pre></div></div></div>
+<h2 level="2" anchor-id="server-lifecycle-methods" id="server-lifecycle-methods">
+<a href="#server-lifecycle-methods">Server Lifecycle Methods</a>
+</h2>
+<h3 level="3" anchor-id="server-stop-stop-the-server" id="server-stop-stop-the-server">
+<a href="#server-stop-stop-the-server">server.stop() - Stop the server</a>
+</h3>
+<p>To stop the server from accepting new connections:</p>
+<div><div><div id="heFviokakLmo:0"><pre data-language="typescript">const server = Bun.serve({
+  fetch(req) {
+    return new Response("Hello!");
+  },
+});
+
+// Gracefully stop the server (waits for in-flight requests)
+await server.stop();
+
+// Force stop and close all active connections
+await server.stop(true);
+</pre></div></div></div>
+<p>By default, <code>stop()</code> allows in-flight requests and WebSocket connections to complete. Pass <code>true</code> to immediately terminate all connections.</p>
+<h3 level="3" anchor-id="server-ref-and-server-unref-process-lifecycle-control" id="server-ref-and-server-unref-process-lifecycle-control">
+<a href="#server-ref-and-server-unref-process-lifecycle-control">server.ref() and server.unref() - Process lifecycle control</a>
+</h3>
+<p>Control whether the server keeps the Bun process alive:</p>
+<div><div><div id="RcbTMIeVXduu:0"><pre data-language="typescript">// Don't keep process alive if server is the only thing running
+server.unref();
+
+// Restore default behavior - keep process alive
+server.ref();
+</pre></div></div></div>
+<h3 level="3" anchor-id="server-reload-hot-reload-handlers" id="server-reload-hot-reload-handlers">
+<a href="#server-reload-hot-reload-handlers">server.reload() - Hot reload handlers</a>
+</h3>
+<p>Update the server's handlers without restarting:</p>
+<div><div><div id="bmgefMTMkLDx:0"><pre data-language="typescript">const server = Bun.serve({
+  routes: {
+    "/api/version": Response.json({ version: "v1" }),
+  },
+  fetch(req) {
+    return new Response("v1");
+  },
+});
+
+// Update to new handler
+server.reload({
+  routes: {
+    "/api/version": Response.json({ version: "v2" }),
+  },
+  fetch(req) {
+    return new Response("v2");
+  },
+});
+</pre></div></div></div>
+<p>This is useful for development and hot reloading. Only <code>fetch</code>, <code>error</code>, and <code>routes</code> can be updated.</p>
+<h2 level="2" anchor-id="per-request-controls" id="per-request-controls">
+<a href="#per-request-controls">Per-Request Controls</a>
+</h2>
+<h3 level="3" anchor-id="server-timeout-request-seconds-custom-request-timeouts" id="server-timeout-request-seconds-custom-request-timeouts">
+<a href="#server-timeout-request-seconds-custom-request-timeouts">server.timeout(Request, seconds) - Custom request timeouts</a>
+</h3>
+<p>Set a custom idle timeout for individual requests:</p>
+<div><div><div id="JDoRWgRizrke:0"><pre data-language="typescript">const server = Bun.serve({
+  fetch(req, server) {
+    // Set 60 second timeout for this request
+    server.timeout(req, 60);
+
+    // If they take longer than 60 seconds to send the body, the request will be aborted
+    await req.text();
+
+    return new Response("Done!");
+  },
+});
+</pre></div></div></div>
+<p>Pass <code>0</code> to disable the timeout for a request.</p>
+<h3 level="3" anchor-id="server-requestip-request-get-client-information" id="server-requestip-request-get-client-information">
+<a href="#server-requestip-request-get-client-information">server.requestIP(Request) - Get client information</a>
+</h3>
+<p>Get client IP and port information:</p>
+<div><div><div id="oZXERYHAGfsb:0"><pre data-language="typescript">const server = Bun.serve({
+  fetch(req, server) {
+    const address = server.requestIP(req);
+    if (address) {
+      return new Response(
+        `Client IP: ${address.address}, Port: ${address.port}`,
+      );
+    }
+    return new Response("Unknown client");
+  },
+});
+</pre></div></div></div>
+<p>Returns <code>null</code> for closed requests or Unix domain sockets.</p>
+<h2 level="2" anchor-id="working-with-cookies" id="working-with-cookies">
+<a href="#working-with-cookies">Working with Cookies</a>
+</h2>
+<p>Bun provides a built-in API for working with cookies in HTTP requests and responses. The <code>BunRequest</code> object includes a <code>cookies</code> property that provides a <code>CookieMap</code> for easily accessing and manipulating cookies. When using <code>routes</code>, <code>Bun.serve()</code> automatically tracks <code>request.cookies.set</code> and applies them to the response.</p>
+<h3 level="3" anchor-id="reading-cookies" id="reading-cookies">
+<a href="#reading-cookies">Reading cookies</a>
+</h3>
+<p>Read cookies from incoming requests using the <code>cookies</code> property on the <code>BunRequest</code> object:</p>
+<div><div><div id="nbTllDYXFMmQ:0"><pre data-language="typescript">Bun.serve({
+  routes: {
+    "/profile": req =&gt; {
+      // Access cookies from the request
+      const userId = req.cookies.get("user_id");
+      const theme = req.cookies.get("theme") || "light";
+
+      return Response.json({
+        userId,
+        theme,
+        message: "Profile page",
+      });
+    },
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="setting-cookies" id="setting-cookies">
+<a href="#setting-cookies">Setting cookies</a>
+</h3>
+<p>To set cookies, use the <code>set</code> method on the <code>CookieMap</code> from the <code>BunRequest</code> object.</p>
+<div><div><div id="CIwDAVphbNRE:0"><pre data-language="typescript">Bun.serve({
+  routes: {
+    "/login": req =&gt; {
+      const cookies = req.cookies;
+
+      // Set a cookie with various options
+      cookies.set("user_id", "12345", {
+        maxAge: 60 * 60 * 24 * 7, // 1 week
+        httpOnly: true,
+        secure: true,
+        path: "/",
+      });
+
+      // Add a theme preference cookie
+      cookies.set("theme", "dark");
+
+      // Modified cookies from the request are automatically applied to the response
+      return new Response("Login successful");
+    },
+  },
+});
+</pre></div></div></div>
+<p><code>Bun.serve()</code> automatically tracks modified cookies from the request and applies them to the response.</p>
+<h3 level="3" anchor-id="deleting-cookies" id="deleting-cookies">
+<a href="#deleting-cookies">Deleting cookies</a>
+</h3>
+<p>To delete a cookie, use the <code>delete</code> method on the <code>request.cookies</code> (<code>CookieMap</code>) object:</p>
+<div><div><div id="ZvOsEwvAtNXd:0"><pre data-language="typescript">Bun.serve({
+  routes: {
+    "/logout": req =&gt; {
+      // Delete the user_id cookie
+      req.cookies.delete("user_id", {
+        path: "/",
+      });
+
+      return new Response("Logged out successfully");
+    },
+  },
+});
+</pre></div></div></div>
+<p>Deleted cookies become a <code>Set-Cookie</code> header on the response with the <code>maxAge</code> set to <code>0</code> and an empty <code>value</code>.</p>
+<h2 level="2" anchor-id="server-metrics" id="server-metrics">
+<a href="#server-metrics">Server Metrics</a>
+</h2>
+<h3 level="3" anchor-id="server-pendingrequests-and-server-pendingwebsockets" id="server-pendingrequests-and-server-pendingwebsockets">
+<a href="#server-pendingrequests-and-server-pendingwebsockets">server.pendingRequests and server.pendingWebSockets</a>
+</h3>
+<p>Monitor server activity with built-in counters:</p>
+<div><div><div id="CvtaxXAEgSKk:0"><pre data-language="typescript">const server = Bun.serve({
+  fetch(req, server) {
+    return new Response(
+      `Active requests: ${server.pendingRequests}\n` +
+        `Active WebSockets: ${server.pendingWebSockets}`,
+    );
+  },
+});
+</pre></div></div></div>
+<h3 level="3" anchor-id="server-subscribercount-topic-websocket-subscribers" id="server-subscribercount-topic-websocket-subscribers">
+<a href="#server-subscribercount-topic-websocket-subscribers">server.subscriberCount(topic) - WebSocket subscribers</a>
+</h3>
+<p>Get count of subscribers for a WebSocket topic:</p>
+<div><div><div id="eIgDWvYGjENs:0"><pre data-language="typescript">const server = Bun.serve({
+  fetch(req, server) {
+    const chatUsers = server.subscriberCount("chat");
+    return new Response(`${chatUsers} users in chat`);
+  },
+  websocket: {
+    message(ws) {
+      ws.subscribe("chat");
+    },
+  },
+});
+</pre></div></div></div>
+<h2 level="2" anchor-id="websocket-configuration" id="websocket-configuration">
+<a href="#websocket-configuration">WebSocket Configuration</a>
+</h2>
+<h3 level="3" anchor-id="server-publish-topic-data-compress-websocket-message-publishing" id="server-publish-topic-data-compress-websocket-message-publishing">
+<a href="#server-publish-topic-data-compress-websocket-message-publishing">server.publish(topic, data, compress) - WebSocket Message Publishing</a>
+</h3>
+<p>The server can publish messages to all WebSocket clients subscribed to a topic:</p>
+<div><div><div id="ynPobxUxvfVZ:0"><pre data-language="typescript">const server = Bun.serve({
+  websocket: {
+    message(ws) {
+      // Publish to all "chat" subscribers
+      server.publish("chat", "Hello everyone!");
+    },
+  },
+
+  fetch(req) {
+    // ...
+  },
+});
+</pre></div></div></div>
+<p>The <code>publish()</code> method returns:</p>
+<ul>
+<li>Number of bytes sent if successful</li>
+<li>
+<code>0</code> if the message was dropped</li>
+<li>
+<code>-1</code> if backpressure was applied</li>
+</ul>
+<h3 level="3" anchor-id="websocket-handler-options" id="websocket-handler-options">
+<a href="#websocket-handler-options">WebSocket Handler Options</a>
+</h3>
+<p>When configuring WebSockets, several advanced options are available through the <code>websocket</code> handler:</p>
+<div><div><div id="RyzxkwjalGJV:0"><pre data-language="typescript">Bun.serve({
+  websocket: {
+    // Maximum message size (in bytes)
+    maxPayloadLength: 64 * 1024,
+
+    // Backpressure limit before messages are dropped
+    backpressureLimit: 1024 * 1024,
+
+    // Close connection if backpressure limit is hit
+    closeOnBackpressureLimit: true,
+
+    // Handler called when backpressure is relieved
+    drain(ws) {
+      console.log("Backpressure relieved");
+    },
+
+    // Enable per-message deflate compression
+    perMessageDeflate: {
+      compress: true,
+      decompress: true,
+    },
+
+    // Send ping frames to keep connection alive
+    sendPings: true,
+
+    // Handlers for ping/pong frames
+    ping(ws, data) {
+      console.log("Received ping");
+    },
+    pong(ws, data) {
+      console.log("Received pong");
+    },
+
+    // Whether server receives its own published messages
+    publishToSelf: false,
+  },
+});
+</pre></div></div></div>
+<h2 level="2" anchor-id="benchmarks" id="benchmarks">
+<a href="#benchmarks">Benchmarks</a>
+</h2>
+<p>Below are Bun and Node.js implementations of a simple HTTP server that responds <code>Bun!</code> to each incoming <code>Request</code>.</p>
+<div id="kGCQUZnTYj">
+<div>
+<div>Bun</div>
+<div>Node</div>
+</div>
+<div><div><div><div id="RiciYgGhsKtt:0"><pre data-language="typescript">Bun.serve({
+  fetch(req: Request) {
+    return new Response("Bun!");
+  },
+  port: 3000,
+});
+</pre></div></div></div></div>
+<div><div><div><div id="keLvhXZPcrCg:0"><pre data-language="typescript">require("http")
+  .createServer((req, res) =&gt; res.end("Bun!"))
+  .listen(8080);
+</pre></div></div></div></div>
+</div>
+<p>The <code>Bun.serve</code> server can handle roughly 2.5x more requests per second than Node.js on Linux.</p>
+<div><table>
+<thead><tr>
+<th>Runtime</th>
+<th>Requests per second</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>Node 16</td>
+<td>~64,000</td>
+</tr>
+<tr>
+<td>Bun</td>
+<td>~160,000</td>
+</tr>
+</tbody>
+</table></div>
+<figure><a target="_blank" href="https://user-images.githubusercontent.com/709451/162389032-fc302444-9d03-46be-ba87-c12bd8ce89a0.png"><img src="data:image/png;base64,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" alt="image" width="499"></a></figure><h2 level="2" anchor-id="reference" id="reference">
+<a href="#reference">Reference</a>
+</h2>
+<div>
+<div id="GPdjMUVxoa-summary"><p>See TypeScript definitions</p></div>
+<div id="GPdjMUVxoa-details">
+
+<div><div><div id="GWVKnJEivmTt:0"><pre data-language="typescript">interface Server extends Disposable {
+  /**
+   * Stop the server from accepting new connections.
+   * @param closeActiveConnections If true, immediately terminates all connections
+   * @returns Promise that resolves when the server has stopped
+   */
+  stop(closeActiveConnections?: boolean): Promise&lt;void&gt;;
+
+  /**
+   * Update handlers without restarting the server.
+   * Only fetch and error handlers can be updated.
+   */
+  reload(options: Serve): void;
+
+  /**
+   * Make a request to the running server.
+   * Useful for testing or internal routing.
+   */
+  fetch(request: Request | string): Response | Promise&lt;Response&gt;;
+
+  /**
+   * Upgrade an HTTP request to a WebSocket connection.
+   * @returns true if upgrade successful, false if failed
+   */
+  upgrade&lt;T = undefined&gt;(
+    request: Request,
+    options?: {
+      headers?: Bun.HeadersInit;
+      data?: T;
+    },
+  ): boolean;
+
+  /**
+   * Publish a message to all WebSocket clients subscribed to a topic.
+   * @returns Bytes sent, 0 if dropped, -1 if backpressure applied
+   */
+  publish(
+    topic: string,
+    data: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer,
+    compress?: boolean,
+  ): ServerWebSocketSendStatus;
+
+  /**
+   * Get count of WebSocket clients subscribed to a topic.
+   */
+  subscriberCount(topic: string): number;
+
+  /**
+   * Get client IP address and port.
+   * @returns null for closed requests or Unix sockets
+   */
+  requestIP(request: Request): SocketAddress | null;
+
+  /**
+   * Set custom idle timeout for a request.
+   * @param seconds Timeout in seconds, 0 to disable
+   */
+  timeout(request: Request, seconds: number): void;
+
+  /**
+   * Keep process alive while server is running.
+   */
+  ref(): void;
+
+  /**
+   * Allow process to exit if server is only thing running.
+   */
+  unref(): void;
+
+  /** Number of in-flight HTTP requests */
+  readonly pendingRequests: number;
+
+  /** Number of active WebSocket connections */
+  readonly pendingWebSockets: number;
+
+  /** Server URL including protocol, hostname and port */
+  readonly url: URL;
+
+  /** Port server is listening on */
+  readonly port: number;
+
+  /** Hostname server is bound to */
+  readonly hostname: string;
+
+  /** Whether server is in development mode */
+  readonly development: boolean;
+
+  /** Server instance identifier */
+  readonly id: string;
+}
+
+interface WebSocketHandler&lt;T = undefined&gt; {
+  /** Maximum WebSocket message size in bytes */
+  maxPayloadLength?: number;
+
+  /** Bytes of queued messages before applying backpressure */
+  backpressureLimit?: number;
+
+  /** Whether to close connection when backpressure limit hit */
+  closeOnBackpressureLimit?: boolean;
+
+  /** Called when backpressure is relieved */
+  drain?(ws: ServerWebSocket&lt;T&gt;): void | Promise&lt;void&gt;;
+
+  /** Seconds before idle timeout */
+  idleTimeout?: number;
+
+  /** Enable per-message deflate compression */
+  perMessageDeflate?:
+    | boolean
+    | {
+        compress?: WebSocketCompressor | boolean;
+        decompress?: WebSocketCompressor | boolean;
+      };
+
+  /** Send ping frames to keep connection alive */
+  sendPings?: boolean;
+
+  /** Whether server receives its own published messages */
+  publishToSelf?: boolean;
+
+  /** Called when connection opened */
+  open?(ws: ServerWebSocket&lt;T&gt;): void | Promise&lt;void&gt;;
+
+  /** Called when message received */
+  message(
+    ws: ServerWebSocket&lt;T&gt;,
+    message: string | Buffer,
+  ): void | Promise&lt;void&gt;;
+
+  /** Called when connection closed */
+  close?(
+    ws: ServerWebSocket&lt;T&gt;,
+    code: number,
+    reason: string,
+  ): void | Promise&lt;void&gt;;
+
+  /** Called when ping frame received */
+  ping?(ws: ServerWebSocket&lt;T&gt;, data: Buffer): void | Promise&lt;void&gt;;
+
+  /** Called when pong frame received */
+  pong?(ws: ServerWebSocket&lt;T&gt;, data: Buffer): void | Promise&lt;void&gt;;
+}
+
+interface TLSOptions {
+  /** Certificate authority chain */
+  ca?: string | Buffer | BunFile | Array&lt;string | Buffer | BunFile&gt;;
+
+  /** Server certificate */
+  cert?: string | Buffer | BunFile | Array&lt;string | Buffer | BunFile&gt;;
+
+  /** Path to DH parameters file */
+  dhParamsFile?: string;
+
+  /** Private key */
+  key?: string | Buffer | BunFile | Array&lt;string | Buffer | BunFile&gt;;
+
+  /** Reduce TLS memory usage */
+  lowMemoryMode?: boolean;
+
+  /** Private key passphrase */
+  passphrase?: string;
+
+  /** OpenSSL options flags */
+  secureOptions?: number;
+
+  /** Server name for SNI */
+  serverName?: string;
+}
+</pre></div></div></div>
+
+</div>
+</div></article>
+</div>
+<div class="_attribution">
+  <p class="_attribution-p">
+    &copy; bun.com, oven-sh, Jarred Sumner<br>Licensed under the MIT License.<br>
+    <a href="https://bun.com/docs/api/http" class="_attribution-link">https://bun.com/docs/api/http</a>
+  </p>
+</div>

@@ -1,0 +1,792 @@
+<h1 title="Package java.lang.classfile" class="title">Package java.lang.classfile</h1>  <div class="horizontal-scroll"> <div class="package-signature">package <span class="element-name">java.lang.classfile</span>
+</div> <section class="package-description" id="package-description"> <div class="block">
+<h2 id="provides-classfile-parsing-generation-and-transformation-library--heading">Provides classfile parsing, generation, and transformation library.</h2> The <code>java.lang.classfile</code> package contains API models for reading, writing, and modifying Java class files, as specified in Chapter <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4">4</a> of the <cite>Java Virtual Machine Specification</cite>. This package, <a href="attribute/package-summary.html"><code>java.lang.classfile.attribute</code></a>, <a href="constantpool/package-summary.html"><code>java.lang.classfile.constantpool</code></a>, and <a href="instruction/package-summary.html"><code>java.lang.classfile.instruction</code></a> form the Class-File API. <h2 id="reading-classfiles-heading">Reading classfiles</h2> The main class for reading classfiles is <a href="classmodel.html" title="interface in java.lang.classfile"><code>ClassModel</code></a>; we convert bytes into a <a href="classmodel.html" title="interface in java.lang.classfile"><code>ClassModel</code></a> with <a href="classfile.html#parse(byte%5B%5D)"><code>ClassFile.parse(byte[])</code></a>: <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile1" data-language="java"><code class="language-java">ClassModel cm = ClassFile.of().parse(bytes);
+</code></pre> </div> There are several additional overloads of <code>parse</code> that let you specify various processing options. <p> A <a href="classmodel.html" title="interface in java.lang.classfile"><code>ClassModel</code></a> is an immutable description of a class file. It provides accessor methods to get at class metadata (e.g., <a href="classmodel.html#thisClass()"><code>ClassModel.thisClass()</code></a>, <a href="classmodel.html#flags()"><code>ClassModel.flags()</code></a>), as well as subordinate classfile entities (<a href="classmodel.html#fields()"><code>ClassModel.fields()</code></a>, <a href="attributedelement.html#attributes()"><code>AttributedElement.attributes()</code></a>). A <a href="classmodel.html" title="interface in java.lang.classfile"><code>ClassModel</code></a> is inflated lazily; most parts of the classfile are not parsed until they are actually needed. Due to the laziness, these models may not be thread safe. Additionally, invocations to accessor methods on models may lead to <a href="../illegalargumentexception.html" title="class in java.lang"><code>IllegalArgumentException</code></a> due to malformed <code>
+class</code> file format, as parsing happens lazily. </p>
+<p> We can enumerate the names of the fields and methods in a class by: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile2" data-language="java"><code class="language-java">ClassModel cm = ClassFile.of().parse(bytes);
+for (FieldModel fm : cm.fields())
+    System.out.printf("Field %s%n", fm.fieldName().stringValue());
+for (MethodModel mm : cm.methods())
+    System.out.printf("Method %s%n", mm.methodName().stringValue());
+</code></pre> </div> <p> When we enumerate the methods, we get a <a href="methodmodel.html" title="interface in java.lang.classfile"><code>MethodModel</code></a> for each method; like a <code>ClassModel</code>, it gives us access to method metadata and the ability to descend into subordinate entities such as the bytecodes of the method body. In this way, a <code>ClassModel</code> is the root of a tree, with children for fields, methods, and attributes, and <code>MethodModel</code> in turn has its own children (attributes, <code>CodeModel</code>, etc.) </p>
+<p> Methods like <a href="classmodel.html#methods()"><code>ClassModel.methods()</code></a> allows us to traverse the class structure explicitly, going straight to the parts we are interested in. This is useful for certain kinds of analysis, but if we wanted to process the whole classfile, we may want something more organized. A <a href="classmodel.html" title="interface in java.lang.classfile"><code>ClassModel</code></a> also provides us with a view of the classfile as a series of class <em>elements</em>, which may include methods, fields, attributes, and more, and which can be distinguished with pattern matching. We could rewrite the above example as: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile3" data-language="java"><code class="language-java">ClassModel cm = ClassFile.of().parse(bytes);
+for (ClassElement ce : cm) {
+    switch (ce) {
+        case MethodModel mm -&gt; System.out.printf("Method %s%n", mm.methodName().stringValue());
+        case FieldModel fm -&gt; System.out.printf("Field %s%n", fm.fieldName().stringValue());
+        default -&gt; { }
+    }
+}
+</code></pre> </div> <p> The models returned as elements from traversing <code>ClassModel</code> can in turn be sources of elements. If we wanted to traverse a classfile and enumerate all the classes for which we access fields and methods, we can pick out the class elements that describe methods, then in turn pick out the method elements that describe the code attribute, and finally pick out the code elements that describe field access and invocation instructions: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile4" data-language="java"><code class="language-java">ClassModel cm = ClassFile.of().parse(bytes);
+Set&lt;ClassDesc&gt; dependencies = new HashSet&lt;&gt;();
+
+for (ClassElement ce : cm) {
+    if (ce instanceof MethodModel mm) {
+        for (MethodElement me : mm) {
+            if (me instanceof CodeModel xm) {
+                for (CodeElement e : xm) {
+                    switch (e) {
+                        case InvokeInstruction i -&gt; dependencies.add(i.owner().asSymbol());
+                        case FieldInstruction i -&gt; dependencies.add(i.owner().asSymbol());
+                        default -&gt; { }
+                    }
+                }
+            }
+        }
+    }
+}
+</code></pre> </div> <p> This same query could alternately be processed as a stream pipeline over class elements: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile5" data-language="java"><code class="language-java">ClassModel cm = ClassFile.of().parse(bytes);
+Set&lt;ClassDesc&gt; dependencies =
+      cm.elementStream()
+        .flatMap(ce -&gt; ce instanceof MethodModel mm ? mm.elementStream() : Stream.empty())
+        .flatMap(me -&gt; me instanceof CodeModel com ? com.elementStream() : Stream.empty())
+        .&lt;ClassDesc&gt;mapMulti((xe, c) -&gt; {
+            switch (xe) {
+                case InvokeInstruction i -&gt; c.accept(i.owner().asSymbol());
+                case FieldInstruction i -&gt; c.accept(i.owner().asSymbol());
+                default -&gt; { }
+            }
+        })
+        .collect(toSet());
+</code></pre> </div> <h3 id="models-and-elements-heading">Models and elements</h3> The view of classfiles presented by this API is framed in terms of <em>models</em> and <em>elements</em>. Models represent complex structures, such as classes, methods, fields, record elements, or the code body of a method. Models can be explored either via random-access navigation (such as the <a href="classmodel.html#methods()"><code>ClassModel.methods()</code></a> accessor) or as a linear sequence of <em>elements</em>. (Elements can in turn also be models; a <a href="fieldmodel.html" title="interface in java.lang.classfile"><code>FieldModel</code></a> is also an element of a class.) For each model type (e.g., <a href="methodmodel.html" title="interface in java.lang.classfile"><code>MethodModel</code></a>), there is a corresponding element type (<a href="methodelement.html" title="interface in java.lang.classfile"><code>MethodElement</code></a>). Models and elements are immutable and are inflated lazily so creating a model does not necessarily require processing its entire content. <h3 id="the-constant-pool-heading">The constant pool</h3> Much of the interesting content in a classfile lives in the <em>constant pool</em>. <a href="classmodel.html" title="interface in java.lang.classfile"><code>ClassModel</code></a> provides a lazily-inflated, read-only view of the constant pool via <a href="classmodel.html#constantPool()"><code>ClassModel.constantPool()</code></a>. Descriptions of classfile content is often exposed in the form of various subtypes of <a href="constantpool/poolentry.html" title="interface in java.lang.classfile.constantpool"><code>PoolEntry</code></a>, such as <a href="constantpool/classentry.html" title="interface in java.lang.classfile.constantpool"><code>ClassEntry</code></a> or <a href="constantpool/utf8entry.html" title="interface in java.lang.classfile.constantpool"><code>Utf8Entry</code></a>. <p> Constant pool entries are also exposed through models and elements; in the above traversal example, the <a href="instruction/invokeinstruction.html" title="interface in java.lang.classfile.instruction"><code>InvokeInstruction</code></a> element exposed a method for <code>owner</code> that corresponds to a <code>
+Constant_Class_info</code> entry in the constant pool. </p>
+<h3 id="attributes-heading">Attributes</h3> Much of the contents of a classfile is stored in attributes; attributes are found on classes, methods, fields, record components, and on the <code>Code</code> attribute. Most attributes are surfaced as elements; for example, <a href="attribute/signatureattribute.html" title="interface in java.lang.classfile.attribute"><code>SignatureAttribute</code></a> is a <a href="classelement.html" title="interface in java.lang.classfile"><code>ClassElement</code></a>, <a href="methodelement.html" title="interface in java.lang.classfile"><code>MethodElement</code></a>, and <a href="fieldelement.html" title="interface in java.lang.classfile"><code>FieldElement</code></a> since it can appear in all of those places, and is included when iterating the elements of the corresponding model. <p> Some attributes are not surfaced as elements; these are attributes that are tightly coupled to -- and logically part of -- other parts of the class file. These include the <code>BootstrapMethods</code>, <code>LineNumberTable</code>, <code>
+StackMapTable</code>, <code>LocalVariableTable</code>, and <code>
+LocalVariableTypeTable</code> attributes. These are processed by the library and treated as part of the structure they are coupled to (the entries of the <code>BootstrapMethods</code> attribute are treated as part of the constant pool; line numbers and local variable metadata are modeled as elements of <a href="codemodel.html" title="interface in java.lang.classfile"><code>CodeModel</code></a>.) </p>
+<p> The <code>Code</code> attribute, in addition to being modeled as a <a href="methodelement.html" title="interface in java.lang.classfile"><code>MethodElement</code></a>, is also a model in its own right (<a href="codemodel.html" title="interface in java.lang.classfile"><code>CodeModel</code></a>) due to its complex structure. </p>
+<p> Each standard attribute has an interface (in <code>java.lang.classfile.attribute</code>) which exposes the contents of the attribute and provides factories to construct the attribute. For example, the <code>Signature</code> attribute is defined by the <a href="attribute/signatureattribute.html" title="interface in java.lang.classfile.attribute"><code>SignatureAttribute</code></a> class, and provides accessors for <a href="attribute/signatureattribute.html#signature()"><code>SignatureAttribute.signature()</code></a> as well as factories taking <a href="constantpool/utf8entry.html" title="interface in java.lang.classfile.constantpool"><code>Utf8Entry</code></a> or <a href="../string.html" title="class in java.lang"><code>String</code></a>. </p>
+<h3 id="custom-attributes-heading">Custom attributes</h3> Attributes are converted between their classfile form and their corresponding object form via an <a href="attributemapper.html" title="interface in java.lang.classfile"><code>AttributeMapper</code></a>. An <code>
+AttributeMapper</code> provides the <a href="attributemapper.html#readAttribute(java.lang.classfile.AttributedElement,java.lang.classfile.ClassReader,int)"><code>AttributeMapper.readAttribute(AttributedElement, ClassReader, int)</code></a> method for mapping from the classfile format to an attribute instance, and the <a href="attributemapper.html#writeAttribute(java.lang.classfile.BufWriter,A)"><code>AttributeMapper.writeAttribute(BufWriter, Attribute)</code></a> method for mapping back to the classfile format. It also contains metadata including the attribute name, the set of classfile entities where the attribute is applicable, and whether multiple attributes of the same kind are allowed on a single entity. <p> There are built-in attribute mappers (in <a href="attributes.html" title="class in java.lang.classfile"><code>Attributes</code></a>) for each of the attribute types defined in section <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7">4.7</a> of <cite>The Java Virtual Machine Specification</cite>, as well as several common nonstandard attributes used by the JDK such as <code>CharacterRangeTable</code>. </p>
+<p> Unrecognized attributes are delivered as elements of type <a href="attribute/unknownattribute.html" title="interface in java.lang.classfile.attribute"><code>UnknownAttribute</code></a>, which provide access only to the <code>byte[]</code> contents of the attribute. </p>
+<p> For nonstandard attributes, user-provided attribute mappers can be specified through the use of the <a href="classfile.attributemapperoption.html#of(java.util.function.Function)"><code>ClassFile.AttributeMapperOption.of(Function)</code></a> classfile option. Implementations of custom attributes should extend <a href="customattribute.html" title="class in java.lang.classfile"><code>CustomAttribute</code></a>. </p>
+<h3 id="options">Options</h3> <p> <a href="classfile.html#of(java.lang.classfile.ClassFile.Option...)"><code>ClassFile.of(ClassFile.Option[])</code></a> accepts a list of options. <a href="classfile.option.html" title="interface in java.lang.classfile"><code>ClassFile.Option</code></a> is a base interface for some statically enumerated options, as well as factories for more complex options, including: </p>
+<ul> <li>
+<a href="classfile.attributemapperoption.html#of(java.util.function.Function)"><code>ClassFile.AttributeMapperOption.of(Function)</code></a> -- specify format of custom attributes</li> <li>
+<a href="classfile.attributesprocessingoption.html" title="enum class in java.lang.classfile"><code>ClassFile.AttributesProcessingOption</code></a> -- unrecognized or problematic original attributes (default is <code>PASS_ALL_ATTRIBUTES</code>)</li> <li>
+<a href="classfile.classhierarchyresolveroption.html#of(java.lang.classfile.ClassHierarchyResolver)"><code>ClassFile.ClassHierarchyResolverOption.of(ClassHierarchyResolver)</code></a> -- specify a custom class hierarchy resolver used by stack map generation</li> <li>
+<a href="classfile.constantpoolsharingoption.html" title="enum class in java.lang.classfile"><code>ClassFile.ConstantPoolSharingOption</code></a> -- share constant pool when transforming (default is <code>SHARED_POOL</code>)</li> <li>
+<a href="classfile.deadcodeoption.html" title="enum class in java.lang.classfile"><code>ClassFile.DeadCodeOption</code></a> -- patch out unreachable code (default is <code>PATCH_DEAD_CODE</code>)</li> <li>
+<a href="classfile.deadlabelsoption.html" title="enum class in java.lang.classfile"><code>ClassFile.DeadLabelsOption</code></a> -- filter unresolved labels (default is <code>FAIL_ON_DEAD_LABELS</code>)</li> <li>
+<a href="classfile.debugelementsoption.html" title="enum class in java.lang.classfile"><code>ClassFile.DebugElementsOption</code></a> -- processing of debug information, such as local variable metadata (default is <code>PASS_DEBUG</code>) </li> <li>
+<a href="classfile.linenumbersoption.html" title="enum class in java.lang.classfile"><code>ClassFile.LineNumbersOption</code></a> -- processing of line numbers (default is <code>PASS_LINE_NUMBERS</code>) </li> <li>
+<a href="classfile.shortjumpsoption.html" title="enum class in java.lang.classfile"><code>ClassFile.ShortJumpsOption</code></a> -- automatically rewrite short jumps to long when necessary (default is <code>FIX_SHORT_JUMPS</code>)</li> <li>
+<a href="classfile.stackmapsoption.html" title="enum class in java.lang.classfile"><code>ClassFile.StackMapsOption</code></a> -- generate stackmaps (default is <code>STACK_MAPS_WHEN_REQUIRED</code>)</li> </ul> <p> <a href="classfile.attributemapperoption.html" title="interface in java.lang.classfile"><code>ClassFile.AttributeMapperOption</code></a> and <a href="classfile.classhierarchyresolveroption.html" title="interface in java.lang.classfile"><code>ClassFile.ClassHierarchyResolverOption</code></a> are critical to the correctness of <code>class</code> file parsing and generation. The attribute mapper is required to parse custom attributes. A correct resolver is required to generate <code>class</code> files that refer to classes not available to the system class loader in its bytecode, or in corner cases, when generation wishes to avoid loading system classes, such as in agents. </p>
+<p> Most options allow you to request that certain parts of the classfile be skipped during traversal, such as debug information or unrecognized attributes. Some options allow you to suppress generation of portions of the classfile, such as stack maps. Many of these options are to access performance tradeoffs; processing debug information and line numbers has a cost (both in writing and reading.) If you don't need this information, you can suppress it with options to gain some performance. </p>
+<h2 id="writing-classfiles-heading">Writing classfiles</h2> ClassFile generation is accomplished through <em>builders</em>. For each entity type that has a model, there is also a corresponding builder type; classes are built through <a href="classbuilder.html" title="interface in java.lang.classfile"><code>ClassBuilder</code></a>, methods through <a href="methodbuilder.html" title="interface in java.lang.classfile"><code>MethodBuilder</code></a>, etc. <p> Rather than creating builders directly, builders are provided as an argument to a user-provided lambda. To generate the familiar "hello world" program, we ask for a class builder, and use that class builder to create method builders for the constructor and <code>main</code> method, and in turn use the method builders to create a <code>Code</code> attribute and use the code builders to generate the instructions: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile6" data-language="java"><code class="language-java">byte[] bytes = ClassFile.of().build(CD_Hello,
+        clb -&gt; clb.withFlags(ClassFile.ACC_PUBLIC)
+                  .withMethod(ConstantDescs.INIT_NAME, ConstantDescs.MTD_void,
+                              ClassFile.ACC_PUBLIC,
+                              mb -&gt; mb.withCode(
+                                      cob -&gt; cob.aload(0)
+                                                .invokespecial(ConstantDescs.CD_Object,
+                                                               ConstantDescs.INIT_NAME, ConstantDescs.MTD_void)
+                                                .return_()))
+                  .withMethod("main", MTD_void_StringArray, ClassFile.ACC_PUBLIC + ClassFile.ACC_STATIC,
+                              mb -&gt; mb.withCode(
+                                      cob -&gt; cob.getstatic(CD_System, "out", CD_PrintStream)
+                                                .ldc("Hello World")
+                                                .invokevirtual(CD_PrintStream, "println", MTD_void_String)
+                                                .return_())));
+</code></pre> </div> <p> The convenience methods <code>ClassBuilder.buildMethodBody</code> allows us to ask <a href="classbuilder.html" title="interface in java.lang.classfile"><code>ClassBuilder</code></a> to create code builders to build method bodies directly, skipping the method builder custom lambda: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile7" data-language="java"><code class="language-java">byte[] bytes = ClassFile.of().build(CD_Hello,
+        clb -&gt; clb.withFlags(ClassFile.ACC_PUBLIC)
+                  .withMethodBody(ConstantDescs.INIT_NAME, ConstantDescs.MTD_void,
+                                  ClassFile.ACC_PUBLIC,
+                                  cob -&gt; cob.aload(0)
+                                            .invokespecial(ConstantDescs.CD_Object,
+                                                           ConstantDescs.INIT_NAME, ConstantDescs.MTD_void)
+                                            .return_())
+                  .withMethodBody("main", MTD_void_StringArray, ClassFile.ACC_PUBLIC + ClassFile.ACC_STATIC,
+                                  cob -&gt; cob.getstatic(CD_System, "out", CD_PrintStream)
+                                            .ldc("Hello World")
+                                            .invokevirtual(CD_PrintStream, "println", MTD_void_String)
+                                            .return_()));
+</code></pre> </div> <p> Builders often support multiple ways of expressing the same entity at different levels of abstraction. For example, the <code>invokevirtual</code> instruction invoking <code>println</code> could have been generated with <a href="codebuilder.html#invokevirtual(java.lang.constant.ClassDesc,java.lang.String,java.lang.constant.MethodTypeDesc)"><code>CodeBuilder.invokevirtual</code></a>, <a href="codebuilder.html#invoke(java.lang.classfile.Opcode,java.lang.constant.ClassDesc,java.lang.String,java.lang.constant.MethodTypeDesc,boolean)"><code>CodeBuilder.invoke</code></a>, or <a href="classfilebuilder.html#with(E)"><code>CodeBuilder.with</code></a>. </p>
+<p> The convenience method <code>CodeBuilder.invokevirtual</code> behaves as if it calls the convenience method <code>CodeBuilder.invoke</code>, which in turn behaves as if it calls method <code>CodeBuilder.with</code>. This composing of method calls on the builder enables the composing of transforms (as described later). </p>
+<p> Unless otherwise noted, passing a <code>null</code> argument to a constructor or method of any Class-File API class or interface will cause a <a href="../nullpointerexception.html" title="class in java.lang"><code>NullPointerException</code></a> to be thrown. Additionally, invoking a method with an array or collection containing a <code>null</code> element will cause a <code>NullPointerException</code>, unless otherwise specified. </p> <h3 id="symbolic-information-heading">Symbolic information</h3> To describe symbolic information for classes and types, the API uses the nominal descriptor abstractions from <a href="../constant/package-summary.html"><code>java.lang.constant</code></a> such as <a href="../constant/classdesc.html" title="interface in java.lang.constant"><code>ClassDesc</code></a> and <a href="../constant/methodtypedesc.html" title="interface in java.lang.constant"><code>MethodTypeDesc</code></a>, which is less error-prone than using raw strings. <p> If a constant pool entry has a nominal representation then it provides a method returning the corresponding nominal descriptor type e.g. method <a href="constantpool/classentry.html#asSymbol()"><code>ClassEntry.asSymbol()</code></a> returns <code>ClassDesc</code>. </p>
+<p> Where appropriate builders provide two methods for building an element with symbolic information, one accepting nominal descriptors, and the other accepting constant pool entries. </p>
+<h3 id="consistency-checks-syntax-checks-and-verification-heading">Consistency checks, syntax checks and verification</h3> No consistency checks are performed while building or transforming classfiles (except for null arguments checks). All builders and classfile elements factory methods accepts the provided information without implicit validation. However, fatal inconsistencies (like for example invalid code sequence or unresolved labels) affects internal tools and may cause exceptions later in the classfile building process. These fatal exceptions are thrown as <a href="../illegalargumentexception.html" title="class in java.lang"><code>IllegalArgumentException</code></a>. <p> Using nominal descriptors assures the right serial form is applied by the ClassFile API library based on the actual context. Also these nominal descriptors are validated during their construction, so it is not possible to create them with invalid content by mistake. Following example pass class name to the <a href="../constant/classdesc.html#of(java.lang.String)"><code>ClassDesc.of(String)</code></a> method for validation and the library performs automatic conversion to the right internal form of the class name when serialized in the constant pool as a class entry. </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile8" data-language="java"><code class="language-java">var validClassEntry = constantPoolBuilder.classEntry(ClassDesc.of("mypackage.MyClass"));
+</code></pre> </div> <p> On the other hand it is possible to use builders methods and factories accepting constant pool entries directly. Constant pool entries can be constructed also directly from raw values, with no additional conversions or validations. Following example uses intentionally wrong class name form and it is applied without any validation or conversion. </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile9" data-language="java"><code class="language-java">var invalidClassEntry = constantPoolBuilder.classEntry(
+                            constantPoolBuilder.utf8Entry("mypackage.MyClass"));
+</code></pre> </div> <p> More complex verification of a classfile can be achieved by invocation of <a href="classfile.html#verify(java.lang.classfile.ClassModel)"><code>ClassFile.verify(ClassModel)</code></a>. </p>
+<h2 id="transforming-classfiles-heading">Transforming classfiles</h2> ClassFile Processing APIs are most frequently used to combine reading and writing into transformation, where a classfile is read, localized changes are made, but much of the classfile is passed through unchanged. For each kind of builder, <code>XxxBuilder</code> has a method <code>with(XxxElement)</code> so that elements that we wish to pass through unchanged can be handed directly back to the builder. <p> If we wanted to strip out methods whose names starts with "debug", we could get an existing <a href="classmodel.html" title="interface in java.lang.classfile"><code>ClassModel</code></a>, build a new classfile that provides a <a href="classbuilder.html" title="interface in java.lang.classfile"><code>ClassBuilder</code></a>, iterate the elements of the original <a href="classmodel.html" title="interface in java.lang.classfile"><code>ClassModel</code></a>, and pass through all of them to the builder except the methods we want to drop: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile10" data-language="java"><code class="language-java">ClassModel classModel = ClassFile.of().parse(bytes);
+byte[] newBytes = ClassFile.of().build(classModel.thisClass().asSymbol(),
+        classBuilder -&gt; {
+            for (ClassElement ce : classModel) {
+                if (!(ce instanceof MethodModel mm
+                        &amp;&amp; mm.methodName().stringValue().startsWith("debug"))) {
+                    classBuilder.with(ce);
+                }
+            }
+        });
+</code></pre> </div> <p> This hands every class element, except for those corresponding to methods whose names start with <code>debug</code>, back to the builder. Transformations can of course be more complicated, diving into method bodies and instructions and transforming those as well, but the same structure is repeated at every level, since every entity has corresponding model, builder, and element abstractions. </p>
+<p> Transformation can be viewed as a "flatMap" operation on the sequence of elements; for every element, we could pass it through unchanged, drop it, or replace it with one or more elements. Because transformation is such a common operation on classfiles, each model type has a corresponding <code>
+XxxTransform</code> type (which describes a transform on a sequence of <code>
+XxxElement</code>) and each builder type has <code>transformYyy</code> methods for transforming its child models. A transform is simply a functional interface that takes a builder and an element, and an implementation "flatMap"s elements into the builder. We could express the above as: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile11" data-language="java"><code class="language-java">ClassTransform ct = (builder, element) -&gt; {
+    if (!(element instanceof MethodModel mm &amp;&amp; mm.methodName().stringValue().startsWith("debug")))
+        builder.with(element);
+};
+var cc = ClassFile.of();
+byte[] newBytes = cc.transformClass(cc.parse(bytes), ct);
+</code></pre> </div> <p> <code>ClassTransform.dropping</code> convenience method allow us to simplify the same transformation construction and express the above as: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile12" data-language="java"><code class="language-java">ClassTransform ct = ClassTransform.dropping(
+                            element -&gt; element instanceof MethodModel mm
+                                    &amp;&amp; mm.methodName().stringValue().startsWith("debug"));
+</code></pre> </div> <h3 id="lifting-transforms-heading">Lifting transforms</h3> While the example using transformations are only slightly shorter, the advantage of expressing transformation in this way is that the transform operations can be more easily combined. Suppose we want to redirect invocations of static methods on <code>Foo</code> to the corresponding method on <code>Bar</code> instead. We could express this as a transformation on <a href="codeelement.html" title="interface in java.lang.classfile"><code>CodeElement</code></a>: <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile13" data-language="java"><code class="language-java">CodeTransform fooToBar = (b, e) -&gt; {
+    if (e instanceof InvokeInstruction i
+            &amp;&amp; i.owner().name().equalsString("Foo")
+            &amp;&amp; i.opcode() == Opcode.INVOKESTATIC) {
+        // remove the old element i by doing nothing to the builder
+        // add a new invokestatic instruction to the builder
+        b.invokestatic(CD_Bar, i.name().stringValue(), i.typeSymbol(), i.isInterface());
+    } else {
+        b.with(e);  // leaves the element in place
+    }
+};
+</code></pre> </div> <p> We can then <em>lift</em> this transformation on code elements into a transformation on method elements. This intercepts method elements that correspond to a <code>Code</code> attribute, dives into its code elements, and applies the code transform to them, and passes other method elements through unchanged: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile14" data-language="java"><code class="language-java">MethodTransform mt = MethodTransform.transformingCode(fooToBar);
+</code></pre> </div> <p> and further lift the transform on method elements into one on class elements: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile15" data-language="java"><code class="language-java">ClassTransform ct = ClassTransform.transformingMethods(mt);
+</code></pre> </div> <p> or lift the code transform into the class transform directly: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile16" data-language="java"><code class="language-java">ClassTransform ct = ClassTransform.transformingMethodBodies(fooToBar);
+</code></pre> </div> <p> and then transform the classfile: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile17" data-language="java"><code class="language-java">var cc = ClassFile.of();
+byte[] newBytes = cc.transformClass(cc.parse(bytes), ct);
+</code></pre> </div> <p> This is much more concise (and less error-prone) than the equivalent expressed by traversing the classfile structure directly: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile18" data-language="java"><code class="language-java">byte[] newBytes = ClassFile.of().build(classModel.thisClass().asSymbol(),
+    classBuilder -&gt; {
+      for (ClassElement ce : classModel) {
+          if (ce instanceof MethodModel mm) {
+              classBuilder.withMethod(mm.methodName().stringValue(), mm.methodTypeSymbol(),
+                                      mm.flags().flagsMask(),
+                                      methodBuilder -&gt; {
+                          for (MethodElement me : mm) {
+                              if (me instanceof CodeModel xm) {
+                                  methodBuilder.withCode(codeBuilder -&gt; {
+                                      for (CodeElement e : xm) {
+                                          if (e instanceof InvokeInstruction i &amp;&amp; i.owner().asInternalName().equals("Foo")
+                                                                       &amp;&amp; i.opcode() == Opcode.INVOKESTATIC)
+                                                      codeBuilder.invoke(i.opcode(), CD_Bar,
+                                                                                    i.name().stringValue(), i.typeSymbol(), i.isInterface());
+                                          else codeBuilder.with(e);
+                                      }});
+                                  }
+                                  else
+                                  methodBuilder.with(me);
+                              }
+                          });
+                      }
+              else
+              classBuilder.with(ce);
+          }
+      });
+</code></pre> </div> <h3 id="composing-transforms-heading">Composing transforms</h3> Transforms on the same type of element can be composed in sequence, where the output of the first is fed to the input of the second. Suppose we want to instrument all method calls, where we print the name of a method before calling it: <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile19" data-language="java"><code class="language-java">CodeTransform instrumentCalls = (b, e) -&gt; {
+    if (e instanceof InvokeInstruction i) {
+        b.getstatic(CD_System, "out", CD_PrintStream)
+         .ldc(i.name().stringValue())
+         .invokevirtual(CD_PrintStream, "println", MTD_void_String);
+    }
+    b.with(e);
+};
+</code></pre> </div> <p> Then we can compose <code>fooToBar</code> and <code>instrumentCalls</code> with <a href="codetransform.html#andThen(java.lang.classfile.CodeTransform)"><code>CodeTransform.andThen(CodeTransform)</code></a>: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile20" data-language="java"><code class="language-java">var cc = ClassFile.of();
+byte[] newBytes = cc.transformClass(cc.parse(bytes),
+                               ClassTransform.transformingMethods(
+                                   MethodTransform.transformingCode(
+                                       fooToBar.andThen(instrumentCalls))));
+</code></pre> </div> Transform <code>instrumentCalls</code> will receive all code elements produced by transform <code>forToBar</code>, either those code elements from the original classfile or replacements (replacing static invocations to <code>Foo</code> with those to <code>Bar</code>). <h3 id="constant-pool-sharing-heading">Constant pool sharing</h3> Transformation doesn't merely handle the logistics of reading, transforming elements, and writing. Most of the time when we are transforming a classfile, we are making relatively minor changes. To optimize such cases, transformation seeds the new classfile with a copy of the constant pool from the original classfile; this enables significant optimizations (methods and attributes that are not transformed can be processed by bulk-copying their bytes, rather than parsing them and regenerating their contents.) If constant pool sharing is not desired it can be suppressed with the <a href="classfile.constantpoolsharingoption.html" title="enum class in java.lang.classfile"><code>ClassFile.ConstantPoolSharingOption</code></a> option. Such suppression may be beneficial when transformation removes many elements, resulting in many unreferenced constant pool entries. <h3 id="transformation-handling-of-unknown-classfile-elements-heading">Transformation handling of unknown classfile elements</h3> Custom classfile transformations might be unaware of classfile elements introduced by future JDK releases. To achieve deterministic stability, classfile transforms interested in consuming all classfile elements should be implemented strictly to throw exceptions if running on a newer JDK, if the transformed class file is a newer version, or if a new and unknown classfile element appears. As for example in the following strict compatibility-checking transformation snippets: <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile21" data-language="java"><code class="language-java">CodeTransform fooToBar = (b, e) -&gt; {
+    if (ClassFile.latestMajorVersion() &gt; ClassFile.JAVA_22_VERSION) {
+        throw new IllegalArgumentException("Cannot run on JDK &gt; 22");
+    }
+    switch (e) {
+        case ArrayLoadInstruction i -&gt; doSomething(b, i);
+        case ArrayStoreInstruction i -&gt; doSomething(b, i);
+        default -&gt;  b.with(e);
+    }
+};
+</code></pre> </div> <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile22" data-language="java"><code class="language-java">ClassTransform fooToBar = (b, e) -&gt; {
+    switch (e) {
+        case ClassFileVersion v when v.majorVersion() &gt; ClassFile.JAVA_22_VERSION -&gt;
+            throw new IllegalArgumentException("Cannot transform class file version " + v.majorVersion());
+        default -&gt;  doSomething(b, e);
+    }
+};
+</code></pre> </div> <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile23" data-language="java"><code class="language-java">CodeTransform fooToBar = (b, e) -&gt; {
+    switch (e) {
+        case ArrayLoadInstruction i -&gt; doSomething(b, i);
+        case ArrayStoreInstruction i -&gt; doSomething(b, i);
+        case BranchInstruction i -&gt; doSomething(b, i);
+        case ConstantInstruction i -&gt; doSomething(b, i);
+        case ConvertInstruction i -&gt; doSomething(b, i);
+        case DiscontinuedInstruction i -&gt; doSomething(b, i);
+        case FieldInstruction i -&gt; doSomething(b, i);
+        case InvokeDynamicInstruction i -&gt; doSomething(b, i);
+        case InvokeInstruction i -&gt; doSomething(b, i);
+        case LoadInstruction i -&gt; doSomething(b, i);
+        case StoreInstruction i -&gt; doSomething(b, i);
+        case IncrementInstruction i -&gt; doSomething(b, i);
+        case LookupSwitchInstruction i -&gt; doSomething(b, i);
+        case MonitorInstruction i -&gt; doSomething(b, i);
+        case NewMultiArrayInstruction i -&gt; doSomething(b, i);
+        case NewObjectInstruction i -&gt; doSomething(b, i);
+        case NewPrimitiveArrayInstruction i -&gt; doSomething(b, i);
+        case NewReferenceArrayInstruction i -&gt; doSomething(b, i);
+        case NopInstruction i -&gt; doSomething(b, i);
+        case OperatorInstruction i -&gt; doSomething(b, i);
+        case ReturnInstruction i -&gt; doSomething(b, i);
+        case StackInstruction i -&gt; doSomething(b, i);
+        case TableSwitchInstruction i -&gt; doSomething(b, i);
+        case ThrowInstruction i -&gt; doSomething(b, i);
+        case TypeCheckInstruction i -&gt; doSomething(b, i);
+        case PseudoInstruction i -&gt;  doSomething(b, i);
+        default -&gt;
+            throw new IllegalArgumentException("An unknown instruction could not be handled by this transformation");
+    }
+};
+</code></pre> </div> <p> Conversely, classfile transforms that are only interested in consuming a portion of classfile elements do not need to concern with new and unknown classfile elements and may pass them through. Following example shows such future-proof code transformation: </p>
+<div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile24" data-language="java"><code class="language-java">CodeTransform fooToBar = (b, e) -&gt; {
+    switch (e) {
+        case ArrayLoadInstruction i -&gt; doSomething(b, i);
+        case ArrayStoreInstruction i -&gt; doSomething(b, i);
+        default -&gt;  b.with(e);
+    }
+};
+</code></pre> </div> <h2 id="api-conventions-heading">API conventions</h2> <p> The API is largely derived from a <a href="#data_model"><em>data model</em></a> for the classfile format, which defines each element kind (which includes models and attributes) and its properties. For each element kind, there is a corresponding interface to describe that element, and factory methods to create that element. Some element kinds also have convenience methods on the corresponding builder (e.g., <a href="codebuilder.html#invokevirtual(java.lang.constant.ClassDesc,java.lang.String,java.lang.constant.MethodTypeDesc)"><code>CodeBuilder.invokevirtual(ClassDesc, String, MethodTypeDesc)</code></a>). </p>
+<p> Most symbolic information in elements is represented by constant pool entries (for example, the owner of a field is represented by a <a href="constantpool/classentry.html" title="interface in java.lang.classfile.constantpool"><code>ClassEntry</code></a>.) Factories and builders also accept nominal descriptors from <a href="../constant/package-summary.html"><code>java.lang.constant</code></a> (e.g., <a href="../constant/classdesc.html" title="interface in java.lang.constant"><code>ClassDesc</code></a>.) </p>
+<h2>
+Data model</h2> We define each kind of element by its name, an optional arity indicator (zero or more, zero or one, exactly one), and a list of components. The elements of a class are fields, methods, and the attributes that can appear on classes: <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile25" data-language="java"><code class="language-text">ClassElement =
+    FieldModel*(UtfEntry name, Utf8Entry descriptor)
+    | MethodModel*(UtfEntry name, Utf8Entry descriptor)
+    | ModuleAttribute?(int flags, ModuleEntry moduleName, UtfEntry moduleVersion,
+                       List&lt;ModuleRequireInfo&gt; requires, List&lt;ModuleOpenInfo&gt; opens,
+                       List&lt;ModuleExportInfo&gt; exports, List&lt;ModuleProvidesInfo&gt; provides,
+                       List&lt;ClassEntry&gt; uses)
+    | ModulePackagesAttribute?(List&lt;PackageEntry&gt; packages)
+    | ModuleTargetAttribute?(Utf8Entry targetPlatform)
+    | ModuleHashesAttribute?(Utf8Entry algorithm, List&lt;HashInfo&gt; hashes)
+    | ModuleResolutionAttribute?(int resolutionFlags)
+    | SourceFileAttribute?(Utf8Entry sourceFile)
+    | SourceDebugExtensionsAttribute?(byte[] contents)
+    | CompilationIDAttribute?(Utf8Entry compilationId)
+    | SourceIDAttribute?(Utf8Entry sourceId)
+    | NestHostAttribute?(ClassEntry nestHost)
+    | NestMembersAttribute?(List&lt;ClassEntry&gt; nestMembers)
+    | RecordAttribute?(List&lt;RecordComponent&gt; components)
+    | EnclosingMethodAttribute?(ClassEntry className, NameAndTypeEntry method)
+    | InnerClassesAttribute?(List&lt;InnerClassInfo&gt; classes)
+    | PermittedSubclassesAttribute?(List&lt;ClassEntry&gt; permittedSubclasses)
+    | DeclarationElement*
+</code></pre> </div> where <code>DeclarationElement</code> are the elements that are common to all declarations (classes, methods, fields) and so are factored out: <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile26" data-language="java"><code class="language-text">DeclarationElement =
+    SignatureAttribute?(Utf8Entry signature)
+    | SyntheticAttribute?()
+    | DeprecatedAttribute?()
+    | RuntimeInvisibleAnnotationsAttribute?(List&lt;Annotation&gt; annotations)
+    | RuntimeVisibleAnnotationsAttribute?(List&lt;Annotation&gt; annotations)
+    | CustomAttribute*
+    | UnknownAttribute*
+</code></pre> </div> Fields and methods are models with their own elements. The elements of fields and methods are fairly simple; most of the complexity of methods lives in the <a href="codemodel.html" title="interface in java.lang.classfile"><code>CodeModel</code></a> (which models the <code>Code</code> attribute along with the code-related attributes: stack map table, local variable table, line number table, etc.) <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile27" data-language="java"><code class="language-text">FieldElement =
+    DeclarationElement
+    | ConstantValueAttribute?(ConstantValueEntry constant)
+
+MethodElement =
+    DeclarationElement
+    | CodeModel?()
+    | AnnotationDefaultAttribute?(ElementValue defaultValue)
+    | MethodParametersAttribute?(List&lt;MethodParameterInfo&gt; parameters)
+    | ExceptionsAttribute?(List&lt;ClassEntry&gt; exceptions)
+</code></pre> </div> <a href="codemodel.html" title="interface in java.lang.classfile"><code>CodeModel</code></a> is unique in that its elements are <em>ordered</em>. Elements of <code>Code</code> include ordinary bytecodes, as well as a number of pseudo-instructions representing branch targets, line number metadata, local variable metadata, and catch blocks. <div class="snippet-container"> <pre class="lang-java" id="snippet-java.lang.classfile28" data-language="java"><code class="language-text">CodeElement = Instruction | PseudoInstruction
+
+Instruction =
+    LoadInstruction(TypeKind type, int slot)
+    | StoreInstruction(TypeKind type, int slot)
+    | IncrementInstruction(int slot, int constant)
+    | BranchInstruction(Opcode opcode, Label target)
+    | LookupSwitchInstruction(Label defaultTarget, List&lt;SwitchCase&gt; cases)
+    | TableSwitchInstruction(Label defaultTarget, int low, int high,
+                             List&lt;SwitchCase&gt; cases)
+    | ReturnInstruction(TypeKind kind)
+    | ThrowInstruction()
+    | FieldInstruction(Opcode opcode, FieldRefEntry field)
+    | InvokeInstruction(Opcode opcode, MemberRefEntry method, boolean isInterface)
+    | InvokeDynamicInstruction(InvokeDynamicEntry invokedynamic)
+    | NewObjectInstruction(ClassEntry className)
+    | NewReferenceArrayInstruction(ClassEntry componentType)
+    | NewPrimitiveArrayInstruction(TypeKind typeKind)
+    | NewMultiArrayInstruction(ClassEntry componentType, int dims)
+    | ArrayLoadInstruction(Opcode opcode)
+    | ArrayStoreInstruction(Opcode opcode)
+    | TypeCheckInstruction(Opcode opcode, ClassEntry className)
+    | ConvertInstruction(TypeKind from, TypeKind to)
+    | OperatorInstruction(Opcode opcode)
+    | ConstantInstruction(ConstantDesc constant)
+    | StackInstruction(Opcode opcode)
+    | MonitorInstruction(Opcode opcode)
+    | NopInstruction()
+
+PseudoInstruction =
+    | LabelTarget(Label label)
+    | LineNumber(int line)
+    | ExceptionCatch(Label tryStart, Label tryEnd, Label handler, ClassEntry exception)
+    | LocalVariable(int slot, UtfEntry name, Utf8Entry type, Label startScope, Label endScope)
+    | LocalVariableType(int slot, Utf8Entry name, Utf8Entry type, Label startScope, Label endScope)
+    | CharacterRange(int rangeStart, int rangeEnd, int flags, Label startScope, Label endScope)
+</code></pre> </div> </div> <dl class="notes"> <dt>Since:</dt> <dd>24</dd> </dl> </section> </div> <section class="summary"> <div class="summary-list"> <div> <div id="related-package-summary">  <table class="summary-table two-column-summary">           <tr>
+<th>Package</th>
+<th>Description</th>
+</tr>
+<tr>
+<td><a href="../package-summary.html">java.lang</a></td>
+<td> <div class="block">Provides classes that are fundamental to the design of the Java programming language.</div> </td>
+</tr>
+<tr>
+<td><a href="attribute/package-summary.html">java.lang.classfile.attribute</a></td>
+<td> <div class="block">Provides interfaces describing <code>class</code> file attributes for the <a href="package-summary.html"><code>java.lang.classfile</code></a> library.</div> </td>
+</tr>
+<tr>
+<td><a href="constantpool/package-summary.html">java.lang.classfile.constantpool</a></td>
+<td> <div class="block">Provides interfaces describing constant pool entries for the <a href="package-summary.html"><code>java.lang.classfile</code></a> library.</div> </td>
+</tr>
+<tr>
+<td><a href="instruction/package-summary.html">java.lang.classfile.instruction</a></td>
+<td> <div class="block">Provides interfaces describing code instructions for the <a href="package-summary.html"><code>java.lang.classfile</code></a> library.</div> </td>
+</tr>
+</table> </div> </div> <div> <div id="class-summary">  <div id="class-summary.tabpanel" role="tabpanel" aria-labelledby="class-summary-tab0"> <table class="summary-table two-column-summary">                                                                                                                                                                                                               <tr>
+<th>Class</th>
+<th>Description</th>
+</tr>
+<tr>
+<td><a href="accessflags.html" title="interface in java.lang.classfile">AccessFlags</a></td>
+<td> <div class="block">Models the access flags for a class, method, or field.</div> </td>
+</tr>
+<tr>
+<td><a href="annotation.html" title="interface in java.lang.classfile">Annotation</a></td>
+<td> <div class="block">Models an <code>annotation</code> structure (JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.16">4.7.16</a>) or part of a <code>
+type_annotation</code> structure (JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.20">4.7.20</a>).</div> </td>
+</tr>
+<tr>
+<td><a href="annotationelement.html" title="interface in java.lang.classfile">AnnotationElement</a></td>
+<td> <div class="block">Models an element-value pair in the <code>element_value_pairs</code> table in the <code>annotation</code> structure defined in JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.16">4.7.16</a> or the <code>type_annotation</code> structure defined in JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.20">4.7.20</a>.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.html" title="interface in java.lang.classfile">AnnotationValue</a></td>
+<td> <div class="block">Models an <code>element_value</code> structure, or a value of an element-value pair of an annotation, as defined in JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.16.1">4.7.16.1</a>.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofannotation.html" title="interface in java.lang.classfile">AnnotationValue.OfAnnotation</a></td>
+<td> <div class="block">Models an annotation value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofarray.html" title="interface in java.lang.classfile">AnnotationValue.OfArray</a></td>
+<td> <div class="block">Models an array value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofboolean.html" title="interface in java.lang.classfile">AnnotationValue.OfBoolean</a></td>
+<td> <div class="block">Models a boolean value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofbyte.html" title="interface in java.lang.classfile">AnnotationValue.OfByte</a></td>
+<td> <div class="block">Models a byte value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofchar.html" title="interface in java.lang.classfile">AnnotationValue.OfChar</a></td>
+<td> <div class="block">Models a char value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofclass.html" title="interface in java.lang.classfile">AnnotationValue.OfClass</a></td>
+<td> <div class="block">Models a class value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofconstant.html" title="interface in java.lang.classfile">AnnotationValue.OfConstant</a></td>
+<td> <div class="block">Models a constant value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofdouble.html" title="interface in java.lang.classfile">AnnotationValue.OfDouble</a></td>
+<td> <div class="block">Models a double value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofenum.html" title="interface in java.lang.classfile">AnnotationValue.OfEnum</a></td>
+<td> <div class="block">Models an enum value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.offloat.html" title="interface in java.lang.classfile">AnnotationValue.OfFloat</a></td>
+<td> <div class="block">Models a float value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofint.html" title="interface in java.lang.classfile">AnnotationValue.OfInt</a></td>
+<td> <div class="block">Models an int value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.oflong.html" title="interface in java.lang.classfile">AnnotationValue.OfLong</a></td>
+<td> <div class="block">Models a long value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofshort.html" title="interface in java.lang.classfile">AnnotationValue.OfShort</a></td>
+<td> <div class="block">Models a short value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td><a href="annotationvalue.ofstring.html" title="interface in java.lang.classfile">AnnotationValue.OfString</a></td>
+<td> <div class="block">Models a string value of an element-value pair.</div> </td>
+</tr>
+<tr>
+<td>
+<a href="attribute.html" title="interface in java.lang.classfile">Attribute</a>&lt;A extends <a href="attribute.html" title="interface in java.lang.classfile">Attribute</a>&lt;A&gt;&gt;</td>
+<td> <div class="block">Models an attribute (JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7">4.7</a>) in the <code>class</code> file format.</div> </td>
+</tr>
+<tr>
+<td><a href="attributedelement.html" title="interface in java.lang.classfile">AttributedElement</a></td>
+<td> <div class="block">A <a href="classfileelement.html" title="interface in java.lang.classfile"><code>ClassFileElement</code></a> describing a <code>class</code> file structure that has attributes, such as a <code>class</code> file, a field, a method, a <a href="attribute/codeattribute.html" title="interface in java.lang.classfile.attribute"><code>Code</code></a> attribute, or a record component.</div> </td>
+</tr>
+<tr>
+<td>
+<a href="attributemapper.html" title="interface in java.lang.classfile">AttributeMapper</a>&lt;A extends <a href="attribute.html" title="interface in java.lang.classfile">Attribute</a>&lt;A&gt;&gt;</td>
+<td> <div class="block">Bidirectional mapper between the <code>class</code> file representation of an attribute and its API model.</div> </td>
+</tr>
+<tr>
+<td><a href="attributemapper.attributestability.html" title="enum class in java.lang.classfile">AttributeMapper.AttributeStability</a></td>
+<td> <div class="block">Indicates the data dependency of the <code>class</code> file representation of an attribute.</div> </td>
+</tr>
+<tr>
+<td><a href="attributes.html" title="class in java.lang.classfile">Attributes</a></td>
+<td> <div class="block">Attribute mappers for predefined (JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7">4.7</a>) and JDK-specific nonstandard attributes.</div> </td>
+</tr>
+<tr>
+<td><a href="bootstrapmethodentry.html" title="interface in java.lang.classfile">BootstrapMethodEntry</a></td>
+<td> <div class="block">Models an entry in the bootstrap method table.</div> </td>
+</tr>
+<tr>
+<td><a href="bufwriter.html" title="interface in java.lang.classfile">BufWriter</a></td>
+<td> <div class="block">Advanced <code>class</code> file writing support for <a href="attributemapper.html" title="interface in java.lang.classfile"><code>AttributeMapper</code></a>s.</div> </td>
+</tr>
+<tr>
+<td><a href="classbuilder.html" title="interface in java.lang.classfile">ClassBuilder</a></td>
+<td> <div class="block">A builder for a <code>class</code> file.</div> </td>
+</tr>
+<tr>
+<td><a href="classelement.html" title="interface in java.lang.classfile">ClassElement</a></td>
+<td> <div class="block">Marker interface for a member element of a <a href="classmodel.html" title="interface in java.lang.classfile"><code>ClassModel</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.html" title="interface in java.lang.classfile">ClassFile</a></td>
+<td> <div class="block">Provides ability to parse, transform, and generate <code>class</code> files.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.attributemapperoption.html" title="interface in java.lang.classfile">ClassFile.AttributeMapperOption</a></td>
+<td> <div class="block">The option describing user-defined attributes for parsing <code>class</code> files.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.attributesprocessingoption.html" title="enum class in java.lang.classfile">ClassFile.AttributesProcessingOption</a></td>
+<td> <div class="block">The option describing whether to retain or discard attributes that cannot verify their correctness after a transformation.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.classhierarchyresolveroption.html" title="interface in java.lang.classfile">ClassFile.ClassHierarchyResolverOption</a></td>
+<td> <div class="block">The option describing the class hierarchy resolver to use when generating stack maps or verifying classes.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.constantpoolsharingoption.html" title="enum class in java.lang.classfile">ClassFile.ConstantPoolSharingOption</a></td>
+<td> <div class="block">Option describing whether to extend from the original constant pool when transforming a <code>class</code> file.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.deadcodeoption.html" title="enum class in java.lang.classfile">ClassFile.DeadCodeOption</a></td>
+<td> <div class="block">The option describing whether to patch out unreachable code for stack map generation.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.deadlabelsoption.html" title="enum class in java.lang.classfile">ClassFile.DeadLabelsOption</a></td>
+<td> <div class="block">The option describing whether to filter <a href="codebuilder.html#labelBinding(java.lang.classfile.Label)">unbound labels</a> and drop their enclosing structures if possible.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.debugelementsoption.html" title="enum class in java.lang.classfile">ClassFile.DebugElementsOption</a></td>
+<td> <div class="block">The option describing whether to process or discard debug <a href="pseudoinstruction.html" title="interface in java.lang.classfile"><code>PseudoInstruction</code></a>s in the traversal of a <a href="codemodel.html" title="interface in java.lang.classfile"><code>CodeModel</code></a> or a <a href="codebuilder.html" title="interface in java.lang.classfile"><code>CodeBuilder</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.linenumbersoption.html" title="enum class in java.lang.classfile">ClassFile.LineNumbersOption</a></td>
+<td> <div class="block">The option describing whether to process or discard <a href="instruction/linenumber.html" title="interface in java.lang.classfile.instruction"><code>LineNumber</code></a>s in the traversal of a <a href="codemodel.html" title="interface in java.lang.classfile"><code>CodeModel</code></a> or a <a href="codebuilder.html" title="interface in java.lang.classfile"><code>CodeBuilder</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.option.html" title="interface in java.lang.classfile">ClassFile.Option</a></td>
+<td> <div class="block">An option that affects the parsing or writing of <code>class</code> files.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.shortjumpsoption.html" title="enum class in java.lang.classfile">ClassFile.ShortJumpsOption</a></td>
+<td> <div class="block">The option describing whether to automatically rewrite short jumps to equivalent instructions when necessary.</div> </td>
+</tr>
+<tr>
+<td><a href="classfile.stackmapsoption.html" title="enum class in java.lang.classfile">ClassFile.StackMapsOption</a></td>
+<td> <div class="block">The option describing whether to generate stack maps.</div> </td>
+</tr>
+<tr>
+<td>
+<a href="classfilebuilder.html" title="interface in java.lang.classfile">ClassFileBuilder</a>&lt;E extends <a href="classfileelement.html" title="interface in java.lang.classfile">ClassFileElement</a>, B extends <a href="classfilebuilder.html" title="interface in java.lang.classfile">ClassFileBuilder</a>&lt;E,<wbr>B&gt;&gt;</wbr>
+</td>
+<td> <div class="block">A builder for a <a href="compoundelement.html" title="interface in java.lang.classfile"><code>CompoundElement</code></a>, which accepts the member elements to be integrated into the built structure.</div> </td>
+</tr>
+<tr>
+<td><a href="classfileelement.html" title="interface in java.lang.classfile">ClassFileElement</a></td>
+<td> <div class="block">Marker interface for structures with special capabilities in the <code>
+class</code> file format.</div> </td>
+</tr>
+<tr>
+<td>
+<a href="classfiletransform.html" title="interface in java.lang.classfile">ClassFileTransform</a>&lt;C extends <a href="classfiletransform.html" title="interface in java.lang.classfile">ClassFileTransform</a>&lt;C,<wbr>E,<wbr>B&gt;, E extends <a href="classfileelement.html" title="interface in java.lang.classfile">ClassFileElement</a>, B extends <a href="classfilebuilder.html" title="interface in java.lang.classfile">ClassFileBuilder</a>&lt;E,<wbr>B&gt;&gt;</wbr></wbr></wbr>
+</td>
+<td> <div class="block">A transformation on a <a href="compoundelement.html" title="interface in java.lang.classfile"><code>CompoundElement</code></a> by processing its individual member elements and sending the results to a <a href="classfilebuilder.html" title="interface in java.lang.classfile"><code>ClassFileBuilder</code></a>, through <a href="classfilebuilder.html#transform(java.lang.classfile.CompoundElement,java.lang.classfile.ClassFileTransform)"><code>ClassFileBuilder.transform(CompoundElement, ClassFileTransform)</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="classfileversion.html" title="interface in java.lang.classfile">ClassFileVersion</a></td>
+<td> <div class="block">Models the minor and major version numbers of a <code>class</code> file (JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.1">4.1</a>).</div> </td>
+</tr>
+<tr>
+<td><a href="classhierarchyresolver.html" title="interface in java.lang.classfile">ClassHierarchyResolver</a></td>
+<td> <div class="block">Provides class hierarchy information for <a href="classfile.stackmapsoption.html" title="enum class in java.lang.classfile">stack maps generation</a> and <a href="classfile.html#verify(byte%5B%5D)">verification</a>.</div> </td>
+</tr>
+<tr>
+<td><a href="classhierarchyresolver.classhierarchyinfo.html" title="interface in java.lang.classfile">ClassHierarchyResolver.ClassHierarchyInfo</a></td>
+<td> <div class="block">Information about a resolved class.</div> </td>
+</tr>
+<tr>
+<td><a href="classmodel.html" title="interface in java.lang.classfile">ClassModel</a></td>
+<td> <div class="block">Models a <code>class</code> file.</div> </td>
+</tr>
+<tr>
+<td><a href="classreader.html" title="interface in java.lang.classfile">ClassReader</a></td>
+<td> <div class="block">Advanced <code>class</code> file reading support for <a href="attributemapper.html" title="interface in java.lang.classfile"><code>AttributeMapper</code></a>s.</div> </td>
+</tr>
+<tr>
+<td><a href="classsignature.html" title="interface in java.lang.classfile">ClassSignature</a></td>
+<td> <div class="block">Models the generic signature of a class or interface, as defined by JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.9.1">4.7.9.1</a>.</div> </td>
+</tr>
+<tr>
+<td><a href="classtransform.html" title="interface in java.lang.classfile">ClassTransform</a></td>
+<td> <div class="block">A transformation on streams of <a href="classelement.html" title="interface in java.lang.classfile"><code>ClassElement</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="codebuilder.html" title="interface in java.lang.classfile">CodeBuilder</a></td>
+<td> <div class="block">A builder for <a href="codemodel.html" title="interface in java.lang.classfile"><code>Code</code></a> attributes (method bodies).</div> </td>
+</tr>
+<tr>
+<td><a href="codebuilder.blockcodebuilder.html" title="interface in java.lang.classfile">CodeBuilder.BlockCodeBuilder</a></td>
+<td> <div class="block">A builder for blocks of code.</div> </td>
+</tr>
+<tr>
+<td><a href="codebuilder.catchbuilder.html" title="interface in java.lang.classfile">CodeBuilder.CatchBuilder</a></td>
+<td> <div class="block">A builder to add catch blocks.</div> </td>
+</tr>
+<tr>
+<td><a href="codeelement.html" title="interface in java.lang.classfile">CodeElement</a></td>
+<td> <div class="block">Marker interface for a member element of a <a href="codemodel.html" title="interface in java.lang.classfile"><code>CodeModel</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="codemodel.html" title="interface in java.lang.classfile">CodeModel</a></td>
+<td> <div class="block">Models the body of a method (the <code>Code</code> attribute).</div> </td>
+</tr>
+<tr>
+<td><a href="codetransform.html" title="interface in java.lang.classfile">CodeTransform</a></td>
+<td> <div class="block">A transformation on streams of <a href="codeelement.html" title="interface in java.lang.classfile"><code>CodeElement</code></a>.</div> </td>
+</tr>
+<tr>
+<td>
+<a href="compoundelement.html" title="interface in java.lang.classfile">CompoundElement</a>&lt;E extends <a href="classfileelement.html" title="interface in java.lang.classfile">ClassFileElement</a>&gt;</td>
+<td> <div class="block">A <code>class</code> file structure that can be viewed as a composition of its member structures.</div> </td>
+</tr>
+<tr>
+<td>
+<a href="customattribute.html" title="class in java.lang.classfile">CustomAttribute</a>&lt;T extends <a href="customattribute.html" title="class in java.lang.classfile">CustomAttribute</a>&lt;T&gt;&gt;</td>
+<td> <div class="block">Models a user-defined attribute in a <code>class</code> file.</div> </td>
+</tr>
+<tr>
+<td><a href="fieldbuilder.html" title="interface in java.lang.classfile">FieldBuilder</a></td>
+<td> <div class="block">A builder for fields.</div> </td>
+</tr>
+<tr>
+<td><a href="fieldelement.html" title="interface in java.lang.classfile">FieldElement</a></td>
+<td> <div class="block">Marker interface for a member element of a <a href="fieldmodel.html" title="interface in java.lang.classfile"><code>FieldModel</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="fieldmodel.html" title="interface in java.lang.classfile">FieldModel</a></td>
+<td> <div class="block">Models a field.</div> </td>
+</tr>
+<tr>
+<td><a href="fieldtransform.html" title="interface in java.lang.classfile">FieldTransform</a></td>
+<td> <div class="block">A transformation on streams of <a href="fieldelement.html" title="interface in java.lang.classfile"><code>FieldElement</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="instruction.html" title="interface in java.lang.classfile">Instruction</a></td>
+<td> <div class="block">Models an executable instruction in the <code>code</code> array of the <a href="attribute/codeattribute.html" title="interface in java.lang.classfile.attribute"><code>Code</code></a> attribute of a method.</div> </td>
+</tr>
+<tr>
+<td><a href="interfaces.html" title="interface in java.lang.classfile">Interfaces</a></td>
+<td> <div class="block">Models the interfaces (JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.1">4.1</a>) of a class.</div> </td>
+</tr>
+<tr>
+<td><a href="label.html" title="interface in java.lang.classfile">Label</a></td>
+<td> <div class="block">A marker for a position within the instructions of a method body.</div> </td>
+</tr>
+<tr>
+<td><a href="methodbuilder.html" title="interface in java.lang.classfile">MethodBuilder</a></td>
+<td> <div class="block">A builder for methods.</div> </td>
+</tr>
+<tr>
+<td><a href="methodelement.html" title="interface in java.lang.classfile">MethodElement</a></td>
+<td> <div class="block">Marker interface for a member element of a <a href="methodmodel.html" title="interface in java.lang.classfile"><code>MethodModel</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="methodmodel.html" title="interface in java.lang.classfile">MethodModel</a></td>
+<td> <div class="block">Models a method.</div> </td>
+</tr>
+<tr>
+<td><a href="methodsignature.html" title="interface in java.lang.classfile">MethodSignature</a></td>
+<td> <div class="block">Models the generic signature of a method or constructor, as defined by JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.9.1">4.7.9.1</a>.</div> </td>
+</tr>
+<tr>
+<td><a href="methodtransform.html" title="interface in java.lang.classfile">MethodTransform</a></td>
+<td> <div class="block">A transformation on streams of <a href="methodelement.html" title="interface in java.lang.classfile"><code>MethodElement</code></a>.</div> </td>
+</tr>
+<tr>
+<td><a href="opcode.html" title="enum class in java.lang.classfile">Opcode</a></td>
+<td> <div class="block">Describes the opcodes of the JVM instruction set, as described in JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-6.html#jvms-6.5">6.5</a>.</div> </td>
+</tr>
+<tr>
+<td><a href="opcode.kind.html" title="enum class in java.lang.classfile">Opcode.Kind</a></td>
+<td> <div class="block">Kinds of opcodes.</div> </td>
+</tr>
+<tr>
+<td><a href="pseudoinstruction.html" title="interface in java.lang.classfile">PseudoInstruction</a></td>
+<td> <div class="block">Models metadata about a <a href="codemodel.html" title="interface in java.lang.classfile"><code>CodeModel</code></a>, derived from the <a href="attribute/codeattribute.html" title="interface in java.lang.classfile.attribute"><code>Code</code></a> attribute itself or its attributes.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.html" title="interface in java.lang.classfile">Signature</a></td>
+<td> <div class="block">Models generic Java type signatures, as defined in JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.9.1">4.7.9.1</a>.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.arraytypesig.html" title="interface in java.lang.classfile">Signature.ArrayTypeSig</a></td>
+<td> <div class="block">Models the signature of an array type.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.basetypesig.html" title="interface in java.lang.classfile">Signature.BaseTypeSig</a></td>
+<td> <div class="block">Models the signature of a primitive type (JLS <a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-4.html#jls-4.2">4.2</a>) or void.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.classtypesig.html" title="interface in java.lang.classfile">Signature.ClassTypeSig</a></td>
+<td> <div class="block">Models the signature of a possibly-parameterized class or interface type.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.reftypesig.html" title="interface in java.lang.classfile">Signature.RefTypeSig</a></td>
+<td> <div class="block">Models the signature of a reference type, which may be a class, interface, type variable, or array type.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.throwablesig.html" title="interface in java.lang.classfile">Signature.ThrowableSig</a></td>
+<td> <div class="block">Marker interface for a signature for a throwable type.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.typearg.html" title="interface in java.lang.classfile">Signature.TypeArg</a></td>
+<td> <div class="block">Models a type argument, an argument to a type parameter.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.typearg.bounded.html" title="interface in java.lang.classfile">Signature.TypeArg.Bounded</a></td>
+<td> <div class="block">Models a type argument with an explicit bound type.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.typearg.bounded.wildcardindicator.html" title="enum class in java.lang.classfile">Signature.TypeArg.Bounded.WildcardIndicator</a></td>
+<td> <div class="block">Models a type argument's wildcard indicator.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.typearg.unbounded.html" title="interface in java.lang.classfile">Signature.TypeArg.Unbounded</a></td>
+<td> <div class="block">Models an unbounded wildcard type argument <code>*</code>, or <code>
+?</code> in Java programs.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.typeparam.html" title="interface in java.lang.classfile">Signature.TypeParam</a></td>
+<td> <div class="block">Models a signature for a type parameter of a generic class, interface, method, or constructor, which introduces a <a href="signature.typevarsig.html" title="interface in java.lang.classfile">type variable</a>.</div> </td>
+</tr>
+<tr>
+<td><a href="signature.typevarsig.html" title="interface in java.lang.classfile">Signature.TypeVarSig</a></td>
+<td> <div class="block">Models the signature of a type variable.</div> </td>
+</tr>
+<tr>
+<td><a href="superclass.html" title="interface in java.lang.classfile">Superclass</a></td>
+<td> <div class="block">Models the superclass (JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.1">4.1</a>) of a class.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.html" title="interface in java.lang.classfile">TypeAnnotation</a></td>
+<td> <div class="block">Models a <code>type_annotation</code> structure (JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.20">4.7.20</a>).</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.catchtarget.html" title="interface in java.lang.classfile">TypeAnnotation.CatchTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears on the i'th type in an exception parameter declaration.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.emptytarget.html" title="interface in java.lang.classfile">TypeAnnotation.EmptyTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears on either the type in a field declaration, the return type of a method, the type of a newly constructed object, or the receiver type of a method or constructor.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.formalparametertarget.html" title="interface in java.lang.classfile">TypeAnnotation.FormalParameterTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears on the type in a formal parameter declaration of a method, constructor, or lambda expression.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.localvartarget.html" title="interface in java.lang.classfile">TypeAnnotation.LocalVarTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears on the type in a local variable declaration, including a variable declared as a resource in a try-with-resources statement.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.localvartargetinfo.html" title="interface in java.lang.classfile">TypeAnnotation.LocalVarTargetInfo</a></td>
+<td> <div class="block">Indicates a range of code array offsets within which a local variable has a value, and the index into the local variable array of the current frame at which that local variable can be found.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.offsettarget.html" title="interface in java.lang.classfile">TypeAnnotation.OffsetTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears on either the type in an instanceof expression or a new expression, or the type before the :: in a method reference expression.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.supertypetarget.html" title="interface in java.lang.classfile">TypeAnnotation.SupertypeTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears on a type in the extends or implements clause of a class or interface declaration.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.targetinfo.html" title="interface in java.lang.classfile">TypeAnnotation.TargetInfo</a></td>
+<td> <div class="block">Specifies which type in a declaration or expression is being annotated.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.targettype.html" title="enum class in java.lang.classfile">TypeAnnotation.TargetType</a></td>
+<td> <div class="block">The kind of target on which the annotation appears, as defined in JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.20.1">4.7.20.1</a>.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.throwstarget.html" title="interface in java.lang.classfile">TypeAnnotation.ThrowsTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears on the i'th type in the throws clause of a method or constructor declaration.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.typeargumenttarget.html" title="interface in java.lang.classfile">TypeAnnotation.TypeArgumentTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears either on the i'th type in a cast expression, or on the i'th type argument in the explicit type argument list for any of the following: a new expression, an explicit constructor invocation statement, a method invocation expression, or a method reference expression.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.typeparameterboundtarget.html" title="interface in java.lang.classfile">TypeAnnotation.TypeParameterBoundTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears on the i'th bound of the j'th type parameter declaration of a generic class, interface, method, or constructor.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.typeparametertarget.html" title="interface in java.lang.classfile">TypeAnnotation.TypeParameterTarget</a></td>
+<td> <div class="block">Indicates that an annotation appears on the declaration of the i'th type parameter of a generic class, generic interface, generic method, or generic constructor.</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.typepathcomponent.html" title="interface in java.lang.classfile">TypeAnnotation.TypePathComponent</a></td>
+<td> <div class="block">JVMS: Type_path structure identifies which part of the type is annotated, as defined in JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.20.2">4.7.20.2</a>
+</div> </td>
+</tr>
+<tr>
+<td><a href="typeannotation.typepathcomponent.kind.html" title="enum class in java.lang.classfile">TypeAnnotation.TypePathComponent.Kind</a></td>
+<td> <div class="block">Type path kind, as defined in JVMS <a href="https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.20.2">4.7.20.2</a>
+</div> </td>
+</tr>
+<tr>
+<td><a href="typekind.html" title="enum class in java.lang.classfile">TypeKind</a></td>
+<td> <div class="block">Describes the data types Java Virtual Machine operates on.</div> </td>
+</tr>
+</table> </div> </div> </div> </div> </section> <footer role="contentinfo">  <p class="legal-copy"><small><a href="https://bugreport.java.com/bugreport/">Report a bug or suggest an enhancement</a><br> For further API reference and developer documentation see the <a href="https://docs.oracle.com/pls/topic/lookup?ctx=javase25&amp;id=homepage" target="_blank">Java SE Documentation</a>, which contains more detailed, developer-targeted descriptions with conceptual overviews, definitions of terms, workarounds, and working code examples. <a href="https://docs.oracle.com/en/java/javase/index.html">Other versions.</a><br> Java is a trademark or registered trademark of Oracle and/or its affiliates in the US and other countries.<br> <a href="https://docs.oracle.com/en/java/javase/25/docs/legal/copyright.html">Copyright</a> © 1993, 2025, Oracle and/or its affiliates, 500 Oracle Parkway, Redwood Shores, CA 94065 USA.<br>All rights reserved. Use is subject to <a href="https://www.oracle.com/java/javase/terms/license/java25speclicense.html">license terms</a> and the <a href="https://www.oracle.com/technetwork/java/redist-137594.html">documentation redistribution policy</a>. </small></p> </footer><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 1993, 2025, Oracle and/or its affiliates. All rights reserved.<br>Documentation extracted from Debian's OpenJDK Development Kit package.<br>Licensed under the GNU General Public License, version 2, with the Classpath Exception.<br>Various third party code in OpenJDK is licensed under different licenses (see Debian package).<br>Java and OpenJDK are trademarks or registered trademarks of Oracle and/or its affiliates.<br>
+    <a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/classfile/package-summary.html" class="_attribution-link">https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/classfile/package-summary.html</a>
+  </p>
+</div>
