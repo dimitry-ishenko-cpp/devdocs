@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16) # focal
-project(devdocs VERSION 1.2 LANGUAGES C)
+project(devdocs VERSION 1.3 LANGUAGES C)
 
 option(SYSTEM_INSTALL "" OFF)
 
@@ -22,7 +22,7 @@ configure_file(bin/devopen.in devopen)
 install(PROGRAMS
     ${CMAKE_CURRENT_BINARY_DIR}/devgrep
     ${CMAKE_CURRENT_BINARY_DIR}/devmanage
-    ${CMAKE_CURRENT_BINARY_DIR}/devopen 
+    ${CMAKE_CURRENT_BINARY_DIR}/devopen
     DESTINATION ${DEVDOCS_INSTALL_BINDIR}
 )
 
