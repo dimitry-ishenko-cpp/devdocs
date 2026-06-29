@@ -68,10 +68,13 @@ You can use the _--preview_ option with both **devgrep** and **devopen**:
 
 ### Binary
 
-Debian/Ubuntu/etc:
+Binary packages for Debian, Ubuntu, RaspberryPi and other Debian-based
+distributions can be installed from the [CCCP Linux Package
+Archive](https://github.com/cccp-linux/archive). Follow their instructions to
+set up the archive and be sure to add the _dev_ component. After that:
 
 ```shell
-sudo add-apt-repository ppa:ppa-verse/devdocs
+# install the devdocs package
 sudo apt install devdocs
 ```
 
@@ -79,17 +82,6 @@ sudo apt install devdocs
 # find doc packages you are interested in and install them as well, eg:
 apt list devdocs-data-*
 sudo apt install devdocs-data-css devdocs-data-html
-```
-
-RaspberryPi:
-
-```shell
-$ sudo add-apt-repository -S deb https://ppa.launchpadcontent.net/ppa-verse/devdocs/ubuntu jammy main
-$ sudo apt install devdocs
-```
-
-```shell
-# install doc packages as above
 ```
 
 ### From source
@@ -107,12 +99,14 @@ $ make
 $ make install
 ```
 
-To install system-wide, change the last 3 commands above to:
+To install system-wide, change the last 3 commands as follows:
 ```bash
 $ cmake -DSYSTEM_INSTALL=ON ..
 $ make
 $ sudo make install
 ```
+
+Share and enjoy.
 
 ## Authors
 
@@ -125,5 +119,3 @@ This project is distributed under the GNU GPL license. See the [LICENSE.md](LICE
 ## Acknowledgments
 
 * [devdocs](https://devdocs.io)
-
-Share and enjoy.
