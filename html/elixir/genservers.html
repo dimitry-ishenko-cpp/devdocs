@@ -1,28 +1,48 @@
-<div id="top-content"> <h1> <a href="https://github.com/elixir-lang/elixir/blob/v1.18.1/lib/elixir/pages/mix-and-otp/genservers.md#L1" title="View Source" class="source" rel="help">Source</a> <span>Client-server communication with GenServer</span> </h1> <p>In the <a href="agents.html">previous chapter</a>, we used agents to represent our buckets. In the <a href="introduction-to-mix.html">introduction to mix</a>, we specified we would like to name each bucket so we can do the following:</p>
-<pre data-language="elixir">CREATE shopping
-OK
+<div id="top-content"> <div class="heading-with-actions top-heading"> <h1>Client-server with GenServer</h1>  <a href="https://github.com/elixir-lang/elixir/blob/v1.20.1/lib/elixir/pages/mix-and-otp/genservers.md#L1" title="View Source" class="source" rel="help nofollow">Source</a> </div> <p>To wrap up our distributed key-value store, we will implement a feature where a client can subscribe to a bucket and receive realtime notifications of any modification happening in the bucket, regardless of where in the cluster the bucket is located.</p>
+<p>We will do by adding a new command, called SUBSCRIBE, to be used like this:</p>
+<pre data-language="elixir">SUBSCRIBE shopping
+milk SET TO 1
+eggs SET TO 10
+milk DELETED</pre>
+<p>To make this work, we must change our <code class="inline">KV.Bucket</code> implementation to track subscriptions and emit broadcasts. However, as we will see, we cannot implement such on top of agents, and we will need to rewrite our bucket implementation to a <a href="genserver.html"><code class="inline">GenServer</code></a>.</p>
+<h2 id="links-and-monitors" class="section-heading">
+<span class="text">Links and monitors</span>
+</h2>
+<p>Processes in Elixir are isolated. When they need to communicate, they do so by sending messages. However, how do you know when a process terminates, either because it has completed or due to a crash?</p>
+<p>We have two options: links and monitors.</p>
+<p>We have used links extensively. Whenever we started a process, we typically did so by using <code class="inline">start_link</code> or similar. The idea behind links is that, if any of the processes crash, the other will crash due to the link. We talked about them in the <a href="processes.html">Process chapter of the Getting Started guide</a>. Here is a refresher:</p>
+<pre data-language="elixir">iex&gt; self()
+#PID&lt;0.115.0&gt;
+iex&gt; spawn_link(fn -&gt; :nothing_bad_will_happen end)
+#PID&lt;0.116.0&gt;
+iex&gt; self()
+#PID&lt;0.115.0&gt;</pre>
+<pre data-language="elixir">iex&gt; spawn_link(fn -&gt; raise "oops" end)
+#PID&lt;0.117.0&gt;
 
-PUT shopping milk 1
-OK
-
-GET shopping milk
-1
-OK</pre>
-<p>In the session above we interacted with the "shopping" bucket.</p>
-<p>Since agents are processes, each bucket has a process identifier (PID), but buckets do not have a name. Back <a href="processes.html">in the Process chapter</a>, we have learned that we can register processes in Elixir by giving them atom names:</p>
-<pre data-language="elixir">iex&gt; Agent.start_link(fn -&gt; %{} end, name: :shopping)
-{:ok, #PID&lt;0.43.0&gt;}
-iex&gt; KV.Bucket.put(:shopping, "milk", 1)
+12:37:33.229 [error] Process #PID&lt;0.117.0&gt; raised an exception
+Interactive Elixir (1.18.4) - press Ctrl+C to exit (type h() ENTER for help)
+iex&gt; self()
+#PID&lt;0.118.0&gt;</pre>
+<p>The reason why we links are so pervasive is because when we start a process inside a supervisor, we want our process to crash if the supervisor terminates. On the other hand, we don't want the supervisor to crash when a child terminates, and therefore supervisors trap exits from links by calling <code class="inline">Process.flag(:trap_exit, true)</code>.</p>
+<p>In other words, links create an intrinsic relationship between the processes. If we simply want to track when a process dies, without tying their exit signals to each other, a better solution is to use monitors. When a monitored process terminates, we receive a message in our inbox, regardless of the reason:</p>
+<pre data-language="elixir">iex&gt; pid = spawn(fn -&gt; Process.sleep(5000) end)
+#PID&lt;0.119.0&gt;
+iex&gt; Process.monitor(pid)
+#Reference&lt;0.1076459149.2159017989.118674&gt;
+iex&gt; flush()
 :ok
-iex&gt; KV.Bucket.get(:shopping, "milk")
-1</pre>
-<p>However, naming dynamic processes with atoms is a terrible idea! If we use atoms, we would need to convert the bucket name (often received from an external client) to atoms, and <strong>we should never convert user input to atoms</strong>. This is because atoms are not garbage collected. Once an atom is created, it is never reclaimed. Generating atoms from user input would mean the user can inject enough different names to exhaust our system memory!</p>
-<p>In practice, it is more likely you will reach the Erlang VM limit for the maximum number of atoms before you run out of memory, which will bring your system down regardless.</p>
-<p>Instead of abusing the built-in name facility, we will create our own <em>process registry</em> that associates the bucket name to the bucket process.</p>
-<p>The registry needs to guarantee that it is always up to date. For example, if one of the bucket processes crashes due to a bug, the registry must notice this change and avoid serving stale entries. In Elixir, we say the registry needs to <em>monitor</em> each bucket. Because our <em>registry</em> needs to be able to receive and handle ad-hoc messages from the system, the <a href="agent.html"><code class="inline">Agent</code></a> API is not enough.</p>
-<p>We will use a <a href="genserver.html"><code class="inline">GenServer</code></a> to create a registry process that can monitor the bucket processes. GenServer provides industrial strength functionality for building servers in both Elixir and OTP.</p>
-<p>Please read the <a href="genserver.html"><code class="inline">GenServer</code></a> module documentation for an overview if you haven't yet. Once you do so, we are ready to proceed.</p>
-<h2 id="genserver-callbacks" class="section-heading">  <span class="text">GenServer callbacks</span> </h2> <p>A GenServer is a process that invokes a limited set of functions under specific conditions. When we used an <a href="agent.html"><code class="inline">Agent</code></a>, we would keep both the client code and the server code side by side, like this:</p>
+# Wait five seconds
+iex&gt; flush()
+{:DOWN, #Reference&lt;0.1076459149.2159017989.118674&gt;, :process, #PID&lt;0.119.0&gt;, :normal}
+:ok</pre>
+<p>Once the process terminates, we receive a "DOWN message", represented in a five-element tuple. The last element is the reason why it crashed (<code class="inline">:normal</code> means it terminated successfully).</p>
+<p>Monitors will play a very important role in our subscribe feature. When a client subscribes to a bucket, the bucket will store the client PID and send messages to it on every change. However, if the client terminates (for example because it was disconnected), the bucket must remove the client from its list of subscribers (otherwise the list would keep on growing forever as clients connect and disconnect).</p>
+<p>We chose the <a href="agent.html"><code class="inline">Agent</code></a> module to implement our <code class="inline">KV.Bucket</code> and, unfortunately, agents cannot receive messages. So the first step is to rewrite our <code class="inline">KV.Bucket</code> to a <a href="genserver.html"><code class="inline">GenServer</code></a>. The <a href="genserver.html"><code class="inline">GenServer</code></a> module documentation has a good overview on what they are and how to implement them. Give it a read and then we are ready to proceed.</p>
+<h2 id="genserver-callbacks" class="section-heading">
+<span class="text">GenServer callbacks</span>
+</h2>
+<p>A GenServer is a process that invokes a limited set of functions under specific conditions. When we used an <a href="agent.html"><code class="inline">Agent</code></a>, we would keep both the client code and the server code side by side, like this:</p>
 <pre data-language="elixir">def put(bucket, key, value) do
   Agent.update(bucket, &amp;Map.put(&amp;1, key, value))
 end</pre>
@@ -47,190 +67,227 @@ end
 def handle_call({:put, key, value}, _from, state) do
   {:reply, :ok, Map.put(state, key, value)}
 end</pre>
-<p>There is quite a bit more ceremony in the GenServer code but, as we will see, it brings some benefits too.</p>
-<p>For now, we will write only the server callbacks for our bucket registering logic, without providing a proper API, which we will do later.</p>
-<p>Create a new file at <code class="inline">lib/kv/registry.ex</code> with the following contents:</p>
-<pre data-language="elixir">defmodule KV.Registry do
+<p>Let's go ahead and rewrite <code class="inline">KV.Bucket</code> at once. Open up <code class="inline">lib/kv/bucket.ex</code> and replace its contents with this new version:</p>
+<pre data-language="elixir">defmodule KV.Bucket do
   use GenServer
 
-  ## Missing Client API - will add this later
-
-  ## Defining GenServer Callbacks
-
-  @impl true
-  def init(:ok) do
-    {:ok, %{}}
-  end
-
-  @impl true
-  def handle_call({:lookup, name}, _from, names) do
-    {:reply, Map.fetch(names, name), names}
-  end
-
-  @impl true
-  def handle_cast({:create, name}, names) do
-    if Map.has_key?(names, name) do
-      {:noreply, names}
-    else
-      {:ok, bucket} = KV.Bucket.start_link([])
-      {:noreply, Map.put(names, name, bucket)}
-    end
-  end
-end</pre>
-<p>There are two types of requests you can send to a GenServer: calls and casts. Calls are synchronous and the server <strong>must</strong> send a response back to such requests. While the server computes the response, the client is <strong>waiting</strong>. Casts are asynchronous: the server won't send a response back and therefore the client won't wait for one. Both requests are messages sent to the server, and will be handled in sequence. In the above implementation, we pattern-match on the <code class="inline">:create</code> messages, to be handled as cast, and on the <code class="inline">:lookup</code> messages, to be handled as call.</p>
-<p>In order to invoke the callbacks above, we need to go through the corresponding <a href="genserver.html"><code class="inline">GenServer</code></a> functions. Let's start a registry, create a named bucket, and then look it up:</p>
-<pre data-language="elixir">iex&gt; {:ok, registry} = GenServer.start_link(KV.Registry, :ok)
-{:ok, #PID&lt;0.136.0&gt;}
-iex&gt; GenServer.cast(registry, {:create, "shopping"})
-:ok
-iex&gt; {:ok, bucket} = GenServer.call(registry, {:lookup, "shopping"})
-{:ok, #PID&lt;0.174.0&gt;}</pre>
-<p>Our <code class="inline">KV.Registry</code> process received a cast with <code class="inline">{:create, "shopping"}</code> and a call with <code class="inline">{:lookup, "shopping"}</code>, in this sequence. <code class="inline">GenServer.cast</code> will immediately return, as soon as the message is sent to the <code class="inline">registry</code>. The <code class="inline">GenServer.call</code> on the other hand, is where we would be waiting for an answer, provided by the above <code class="inline">KV.Registry.handle_call</code> callback.</p>
-<p>You may also have noticed that we have added <code class="inline">@impl true</code> before each callback. The <code class="inline">@impl true</code> informs the compiler that our intention for the subsequent function definition is to define a callback. If by any chance we make a mistake in the function name or in the number of arguments, like we define a <code class="inline">handle_call/2</code>, the compiler would warn us there isn't any <code class="inline">handle_call/2</code> to define, and would give us the complete list of known callbacks for the <a href="genserver.html"><code class="inline">GenServer</code></a> module.</p>
-<p>This is all good and well, but we still want to offer our users an API that allows us to hide our implementation details.</p>
-<h2 id="the-client-api" class="section-heading">  <span class="text">The Client API</span> </h2> <p>A GenServer is implemented in two parts: the client API and the server callbacks. You can either combine both parts into a single module or you can separate them into a client module and a server module. The client is any process that invokes the client function. The server is always the process identifier or process name that we will explicitly pass as argument to the client API. Here we'll use a single module for both the server callbacks and the client API.</p>
-<p>Edit the file at <code class="inline">lib/kv/registry.ex</code>, filling in the blanks for the client API:</p>
-<pre data-language="elixir">  ## Client API
-
   @doc """
-  Starts the registry.
+  Starts a new bucket.
   """
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, :ok, opts)
+    GenServer.start_link(__MODULE__, %{}, opts)
   end
 
   @doc """
-  Looks up the bucket pid for `name` stored in `server`.
-
-  Returns `{:ok, pid}` if the bucket exists, `:error` otherwise.
+  Gets a value from the `bucket` by `key`.
   """
-  def lookup(server, name) do
-    GenServer.call(server, {:lookup, name})
+  def get(bucket, key) do
+    GenServer.call(bucket, {:get, key})
   end
 
   @doc """
-  Ensures there is a bucket associated with the given `name` in `server`.
+  Puts the `value` for the given `key` in the `bucket`.
   """
-  def create(server, name) do
-    GenServer.cast(server, {:create, name})
-  end</pre>
-<p>The first function is <code class="inline">start_link/1</code>, which starts a new GenServer passing a list of options. <code class="inline">start_link/1</code> calls out to <a href="genserver.html#start_link/3"><code class="inline">GenServer.start_link/3</code></a>, which takes three arguments:</p>
+  def put(bucket, key, value) do
+    GenServer.call(bucket, {:put, key, value})
+  end
+
+  @doc """
+  Deletes `key` from `bucket`.
+
+  Returns the current value of `key`, if `key` exists.
+  """
+  def delete(bucket, key) do
+    GenServer.call(bucket, {:delete, key})
+  end
+
+  ### Callbacks
+
+  @impl true
+  def init(bucket) do
+    state = %{
+      bucket: bucket
+    }
+
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call({:get, key}, _from, state) do
+    value = get_in(state.bucket[key])
+    {:reply, value, state}
+  end
+
+  def handle_call({:put, key, value}, _from, state) do
+    state = put_in(state.bucket[key], value)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:delete, key}, _from, state) do
+    {value, state} = pop_in(state.bucket[key])
+    {:reply, value, state}
+  end
+end</pre>
+<p>The first function is <code class="inline">start_link/1</code>, which starts a new GenServer passing a list of options. <a href="genserver.html#start_link/3"><code class="inline">GenServer.start_link/3</code></a>, which takes three arguments:</p>
 <ol>
 <li><p>The module where the server callbacks are implemented, in this case <code class="inline">__MODULE__</code> (meaning the current module)</p></li>
-<li><p>The initialization arguments, in this case the atom <code class="inline">:ok</code></p></li>
-<li><p>A list of options which can be used to specify things like the name of the server. For now, we forward the list of options that we receive on <code class="inline">start_link/1</code> to <a href="genserver.html#start_link/3"><code class="inline">GenServer.start_link/3</code></a></p></li>
+<li><p>The initialization arguments, in this case the empty bucket <code class="inline">%{}</code></p></li>
+<li><p>A list of options which can be used to specify things like the name of the server. Once again, we forward the list of options that we receive on <code class="inline">start_link/1</code> to <a href="genserver.html#start_link/3"><code class="inline">GenServer.start_link/3</code></a>, as we did for agents</p></li>
 </ol>
-<p>The next two functions, <code class="inline">lookup/2</code> and <code class="inline">create/2</code>, are responsible for sending these requests to the server. In this case, we have used <code class="inline">{:lookup, name}</code> and <code class="inline">{:create, name}</code> respectively. Requests are often specified as tuples, like this, in order to provide more than one "argument" in that first argument slot. It's common to specify the action being requested as the first element of a tuple, and arguments for that action in the remaining elements. Note that the requests must match the first argument to <code class="inline">handle_call/3</code> or <code class="inline">handle_cast/2</code>.</p>
-<p>That's it for the client API. On the server side, we can implement a variety of callbacks to guarantee the server initialization, termination, and handling of requests. Those callbacks are optional and for now, we have only implemented the ones we care about. Let's recap.</p>
-<p>The first is the <code class="inline">init/1</code> callback, that receives the second argument given to <a href="genserver.html#start_link/3"><code class="inline">GenServer.start_link/3</code></a> and returns <code class="inline">{:ok, state}</code>, where state is a new map. We can already notice how the <a href="genserver.html"><code class="inline">GenServer</code></a> API makes the client/server segregation more apparent. <code class="inline">start_link/3</code> happens in the client, while <code class="inline">init/1</code> is the respective callback that runs on the server.</p>
-<p>For <code class="inline">call/2</code> requests, we implement a <code class="inline">handle_call/3</code> callback that receives the <code class="inline">request</code>, the process from which we received the request (<code class="inline">_from</code>), and the current server state (<code class="inline">names</code>). The <code class="inline">handle_call/3</code> callback returns a tuple in the format <code class="inline">{:reply, reply, new_state}</code>. The first element of the tuple, <code class="inline">:reply</code>, indicates that the server should send a reply back to the client. The second element, <code class="inline">reply</code>, is what will be sent to the client while the third, <code class="inline">new_state</code> is the new server state.</p>
-<p>For <code class="inline">cast/2</code> requests, we implement a <code class="inline">handle_cast/2</code> callback that receives the <code class="inline">request</code> and the current server state (<code class="inline">names</code>). The <code class="inline">handle_cast/2</code> callback returns a tuple in the format <code class="inline">{:noreply, new_state}</code>. Note that in a real application we would have probably implemented the callback for <code class="inline">:create</code> with a synchronous call instead of an asynchronous cast. We are doing it this way to illustrate how to implement a cast callback.</p>
-<p>There are other tuple formats both <code class="inline">handle_call/3</code> and <code class="inline">handle_cast/2</code> callbacks may return. There are other callbacks like <code class="inline">terminate/2</code> and <code class="inline">code_change/3</code> that we could implement. You are welcome to explore the full <a href="genserver.html"><code class="inline">GenServer</code></a> documentation to learn more about those.</p>
-<p>For now, let's write some tests to guarantee our GenServer works as expected.</p>
-<h2 id="testing-a-genserver" class="section-heading">  <span class="text">Testing a GenServer</span> </h2> <p>Testing a GenServer is not much different from testing an agent. We will spawn the server on a setup callback and use it throughout our tests. Create a file at <code class="inline">test/kv/registry_test.exs</code> with the following:</p>
-<pre data-language="elixir">defmodule KV.RegistryTest do
-  use ExUnit.Case, async: true
+<p>Once started, the GenServer will invoke the <code class="inline">init/1</code> callback, that receives the second argument given to <a href="genserver.html#start_link/3"><code class="inline">GenServer.start_link/3</code></a> and returns <code class="inline">{:ok, state}</code>, where state is a new map. We can already notice how the <a href="genserver.html"><code class="inline">GenServer</code></a> API makes the client/server segregation more apparent. <code class="inline">start_link/3</code> happens in the client, while <code class="inline">init/1</code> is the respective callback that runs on the server.</p>
+<p>There are two types of requests you can send to a GenServer: calls and casts. Calls are synchronous and the server <strong>must</strong> send a response back to such requests. While the server computes the response, the client is <strong>waiting</strong>. Casts are asynchronous: the server won't send a response back and therefore the client won't wait for one. Both requests are messages sent to the server, and will be handled in sequence. So far we have only used <a href="genserver.html#call/2"><code class="inline">GenServer.call/2</code></a>, to keep the same semantics as the Agent, but we will give <code class="inline">cast</code> a try when implementing subscriptions. Given we kept the same behaviour, all tests will still pass.</p>
+<p>Each request must be implemented as a specific callback. For <code class="inline">call/2</code> requests, we implement a <code class="inline">handle_call/3</code> callback that receives the <code class="inline">request</code>, the process from which we received the request (<code class="inline">_from</code>), and the current server state (<code class="inline">state</code>). The <code class="inline">handle_call/3</code> callback returns a tuple in the format <code class="inline">{:reply, reply, updated_state}</code>. The first element of the tuple, <code class="inline">:reply</code>, indicates that the server should send a reply back to the client. The second element, <code class="inline">reply</code>, is what will be sent to the client while the third, <code class="inline">updated_state</code> is the new server state.</p>
+<p>Another Elixir feature we used in the implementation above are the nested traversal functions: <a href="kernel.html#get_in/1"><code class="inline">get_in/1</code></a>, <a href="kernel.html#put_in/2"><code class="inline">put_in/2</code></a>, and <a href="kernel.html#pop_in/1"><code class="inline">pop_in/1</code></a>. Instead of keeping the <code class="inline">bucket</code> as our GenServer state, we defined a state map with a <code class="inline">bucket</code> key inside. This will be important as we also need to track subscribers as part of the GenServer state. These new functions make it straight-forward to manipulate data structures nested in other data structures.</p>
+<p>With our GenServer in place, let's work on subscription, starting with the tests.</p>
+<h2 id="implementing-subscriptions" class="section-heading">
+<span class="text">Implementing subscriptions</span>
+</h2>
+<p>Our new test will subscribe to a bucket and then assert that, as operations are performed against the bucket, we receive messages of said events.</p>
+<p>Open up <code class="inline">test/kv/bucket_test.exs</code> and key this in:</p>
+<pre data-language="elixir">  test "subscribes to puts and deletes" do
+    {:ok, bucket} = start_supervised(KV.Bucket)
+    KV.Bucket.subscribe(bucket)
 
-  setup do
-    registry = start_supervised!(KV.Registry)
-    %{registry: registry}
+    KV.Bucket.put(bucket, "milk", 3)
+    assert_receive {:put, "milk", 3}
+
+    # Also check it works even from another process
+    spawn(fn -&gt; KV.Bucket.delete(bucket, "milk") end)
+    assert_receive {:delete, "milk"}
+  end</pre>
+<p>In order to make the test pass, we need to implement the <code class="inline">KV.Bucket.subscribe/1</code>. So let's add these three new functions to <code class="inline">KV.Bucket</code>:</p>
+<pre data-language="elixir">  @doc """
+  Subscribes the current process to the bucket.
+  """
+  def subscribe(bucket) do
+    GenServer.cast(bucket, {:subscribe, self()})
   end
 
-  test "spawns buckets", %{registry: registry} do
-    assert KV.Registry.lookup(registry, "shopping") == :error
-
-    KV.Registry.create(registry, "shopping")
-    assert {:ok, bucket} = KV.Registry.lookup(registry, "shopping")
-
-    KV.Bucket.put(bucket, "milk", 1)
-    assert KV.Bucket.get(bucket, "milk") == 1
+  @impl true
+  def handle_cast({:subscribe, pid}, state) do
+    Process.monitor(pid)
+    state = update_in(state.subscribers, &amp;MapSet.put(&amp;1, pid))
+    {:noreply, state}
   end
-end</pre>
-<p>Our test case first asserts there are no buckets in our registry, creates a named bucket, looks it up, and asserts it behaves as a bucket.</p>
-<p>There is one important difference between the <code class="inline">setup</code> block we wrote for <code class="inline">KV.Registry</code> and the one we wrote for <code class="inline">KV.Bucket</code>. Instead of starting the registry by hand by calling <code class="inline">KV.Registry.start_link/1</code>, we instead called the <a href="https://hexdocs.pm/ex_unit/1.18.1/ExUnit.Callbacks.html#start_supervised!/2"><code class="inline">ExUnit.Callbacks.start_supervised!/2</code></a> function, passing the <code class="inline">KV.Registry</code> module.</p>
-<p>The <code class="inline">start_supervised!</code> function was injected into our test module by <code class="inline">use ExUnit.Case</code>. It does the job of starting the <code class="inline">KV.Registry</code> process, by calling its <code class="inline">start_link/1</code> function. The advantage of using <code class="inline">start_supervised!</code> is that ExUnit will guarantee that the registry process will be shutdown <strong>before</strong> the next test starts. In other words, it helps guarantee that the state of one test is not going to interfere with the next one in case they depend on shared resources.</p>
-<p>When starting processes during your tests, we should always prefer to use <code class="inline">start_supervised!</code>. We recommend you to change the <code class="inline">setup</code> block in <code class="inline">bucket_test.exs</code> to use <code class="inline">start_supervised!</code> too.</p>
-<p>Run the tests and they should all pass!</p>
-<h2 id="the-need-for-monitoring" class="section-heading">  <span class="text">The need for monitoring</span> </h2> <p>Everything we have done so far could have been implemented with a <a href="agent.html"><code class="inline">Agent</code></a>. In this section, we will see one of many things that we can achieve with a GenServer that is not possible with an Agent.</p>
-<p>Let's start with a test that describes how we want the registry to behave if a bucket stops or crashes:</p>
-<pre data-language="elixir">test "removes buckets on exit", %{registry: registry} do
-  KV.Registry.create(registry, "shopping")
-  {:ok, bucket} = KV.Registry.lookup(registry, "shopping")
-  Agent.stop(bucket)
-  assert KV.Registry.lookup(registry, "shopping") == :error
-end</pre>
-<p>The test above will fail on the last assertion as the bucket name remains in the registry even after we stop the bucket process.</p>
-<p>In order to fix this bug, we need the registry to monitor every bucket it spawns. Once we set up a monitor, the registry will receive a notification every time a bucket process exits, allowing us to clean the registry up.</p>
-<p>Let's first play with monitors by starting a new console with <code class="inline">iex -S mix</code>:</p>
-<pre data-language="elixir">iex&gt; {:ok, pid} = KV.Bucket.start_link([])
-{:ok, #PID&lt;0.66.0&gt;}
-iex&gt; Process.monitor(pid)
-#Reference&lt;0.0.0.551&gt;
-iex&gt; Agent.stop(pid)
-:ok
-iex&gt; flush()
-{:DOWN, #Reference&lt;0.0.0.551&gt;, :process, #PID&lt;0.66.0&gt;, :normal}</pre>
-<p>Note <code class="inline">Process.monitor(pid)</code> returns a unique reference that allows us to match upcoming messages to that monitoring reference. After we stop the agent, we can <code class="inline">flush/0</code> all messages and notice a <code class="inline">:DOWN</code> message arrived, with the exact reference returned by <code class="inline">monitor</code>, notifying that the bucket process exited with reason <code class="inline">:normal</code>.</p>
-<p>Let's reimplement the server callbacks to fix the bug and make the test pass. First, we will modify the GenServer state to two maps: one that contains <code class="inline">name -&gt; pid</code> and another that holds <code class="inline">ref -&gt; name</code>. Then we need to monitor the buckets on <code class="inline">handle_cast/2</code> as well as implement a <code class="inline">handle_info/2</code> callback to handle the monitoring messages. The full server callbacks implementation is shown below:</p>
-<pre data-language="elixir">## Server callbacks
 
-@impl true
-def init(:ok) do
-  names = %{}
-  refs = %{}
-  {:ok, {names, refs}}
-end
+  @impl true
+  def handle_info({:DOWN, _ref, _type, pid, _reason}, state) do
+    state = update_in(state.subscribers, &amp;MapSet.delete(&amp;1, pid))
+    {:noreply, state}
+  end</pre>
+<p>On subscription, we send a <code class="inline">cast/2</code> request with the current process identifier and implement its <code class="inline">handle_cast/2</code> callback that receives the <code class="inline">request</code> and the current server state. We then proceed to monitor the given <code class="inline">pid</code> and add it to the list of subscribers, which we are implementing using <a href="mapset.html"><code class="inline">MapSet</code></a>. The <code class="inline">handle_cast/2</code> callback returns a tuple in the format <code class="inline">{:noreply, updated_state}</code>. Note that in a real application we would have probably implemented it with a synchronous call, as it provides back pressure, instead of an asynchronous cast. We are doing it this way to illustrate how to implement a cast callback.</p>
+<p>Then, because we have monitored a process, once that process terminates, we will receive a "DOWN message". GenServers handle regular messages using the <code class="inline">handle_info/2</code> callback, which also typically return <code class="inline">{:noreply, updated_state}</code>. In this callback, we remove the PID that terminated from our list of subscribers.</p>
+<p>We are almost there. We can see both <code class="inline">handle_cast/2</code> and <code class="inline">handle_info/2</code> callbacks assume there is a subscribers key in our state with a <a href="mapset.html"><code class="inline">MapSet</code></a>. So let's add it by updating the existing <code class="inline">init/1</code> to the following:</p>
+<pre data-language="elixir">  @impl true
+  def init(bucket) do
+    state = %{
+      bucket: bucket,
+      subscribers: MapSet.new()
+    }
 
-@impl true
-def handle_call({:lookup, name}, _from, state) do
-  {names, _} = state
-  {:reply, Map.fetch(names, name), state}
-end
-
-@impl true
-def handle_cast({:create, name}, {names, refs}) do
-  if Map.has_key?(names, name) do
-    {:noreply, {names, refs}}
-  else
-    {:ok, bucket} = KV.Bucket.start_link([])
-    ref = Process.monitor(bucket)
-    refs = Map.put(refs, ref, name)
-    names = Map.put(names, name, bucket)
-    {:noreply, {names, refs}}
+    {:ok, state}
+  end</pre>
+<p>And finally let's update the callbacks for <code class="inline">put/3</code> and <code class="inline">delete/2</code> to broadcast messages whenever they are invoked, like this:</p>
+<pre data-language="elixir">  def handle_call({:put, key, value}, _from, state) do
+    state = put_in(state.bucket[key], value)
+    broadcast(state, {:put, key, value})
+    {:reply, :ok, state}
   end
-end
 
-@impl true
-def handle_info({:DOWN, ref, :process, _pid, _reason}, {names, refs}) do
-  {name, refs} = Map.pop(refs, ref)
-  names = Map.delete(names, name)
-  {:noreply, {names, refs}}
-end
+  def handle_call({:delete, key}, _from, state) do
+    {value, state} = pop_in(state.bucket[key])
+    broadcast(state, {:delete, key})
+    {:reply, value, state}
+  end
 
-@impl true
-def handle_info(msg, state) do
-  require Logger
-  Logger.debug("Unexpected message in KV.Registry: #{inspect(msg)}")
-  {:noreply, state}
-end</pre>
-<p>Observe that we were able to considerably change the server implementation without changing any of the client API. That's one of the benefits of explicitly segregating the server and the client.</p>
-<p>Finally, different from the other callbacks, we have defined a "catch-all" clause for <code class="inline">handle_info/2</code> that discards and logs any unknown message. To understand why, let's move on to the next section.</p>
-<h2 id="call-cast-or-info" class="section-heading">  <span class="text"><code class="inline">call</code>, <code class="inline">cast</code> or <code class="inline">info</code>?</span> </h2> <p>So far we have used three callbacks: <code class="inline">handle_call/3</code>, <code class="inline">handle_cast/2</code> and <code class="inline">handle_info/2</code>. Here is what we should consider when deciding when to use each:</p>
+  defp broadcast(state, message) do
+    for pid &lt;- state.subscribers do
+      send(pid, message)
+    end
+  end</pre>
+<p>There is no need to modify the callback for <code class="inline">get/2</code>. And that's it, run the tests again, and our new test should pass!</p>
+<h2 id="wiring-it-all-up" class="section-heading">
+<span class="text">Wiring it all up</span>
+</h2>
+<p>Now that our bucket deals with subscriptions, we need to expose this new functionality in our server. Let's once again start with the test.</p>
+<p>Open up <code class="inline">test/kv/server_test.exs</code> and add this new test:</p>
+<pre data-language="elixir">  test "subscribes to buckets", %{socket: socket, name: name} do
+    assert send_and_recv(socket, "CREATE #{name}\r\n") == "OK\r\n"
+    :gen_tcp.send(socket, "SUBSCRIBE #{name}\r\n")
+
+    {:ok, other} = :gen_tcp.connect(~c"localhost", 4040, @socket_options)
+
+    assert send_and_recv(other, "PUT #{name} milk 3\r\n") == "OK\r\n"
+    assert :gen_tcp.recv(socket, 0, 1000) == {:ok, "milk SET TO 3\r\n"}
+
+    assert send_and_recv(other, "DELETE #{name} milk\r\n") == "OK\r\n"
+    assert :gen_tcp.recv(socket, 0, 1000) == {:ok, "milk DELETED\r\n"}
+  end</pre>
+<p>The test creates a bucket and subscribes to it. Then it opens up another TCP connection to send commands. For each command sent, we expect the subscribed socket to receive a message.</p>
+<p>To make the test pass, we need to change <code class="inline">KV.Command</code> to parse the new <code class="inline">SUBSCRIBE</code> command and then run it. Open up <code class="inline">lib/kv/commands.ex</code> and then first change the <code class="inline">parse/1</code> definition to the following:</p>
+<pre data-language="elixir">  def parse(line) do
+    case String.split(line) do
+      ["SUBSCRIBE", bucket] -&gt; {:ok, {:subscribe, bucket}}
+      ["CREATE", bucket] -&gt; {:ok, {:create, bucket}}
+      ["GET", bucket, key] -&gt; {:ok, {:get, bucket, key}}
+      ["PUT", bucket, key, value] -&gt; {:ok, {:put, bucket, key, value}}
+      ["DELETE", bucket, key] -&gt; {:ok, {:delete, bucket, key}}
+      _ -&gt; {:error, :unknown_command}
+    end
+  end</pre>
+<p>We added a new clause that converts "SUBSCRIBE" into a tuple. Now we need to match on this tuple within <code class="inline">run/1</code>. We can do so by adding a new clause at the bottom of <code class="inline">run/1</code>, with the following code:</p>
+<pre data-language="elixir">  def run({:subscribe, bucket}, socket) do
+    lookup(bucket, fn pid -&gt;
+      KV.Bucket.subscribe(pid)
+      :inet.setopts(socket, active: true)
+      receive_messages(socket)
+    end)
+  end
+
+  defp receive_messages(socket) do
+    receive do
+      {:put, key, value} -&gt;
+        :gen_tcp.send(socket, "#{key} SET TO #{value}\r\n")
+        receive_messages(socket)
+
+      {:delete, key} -&gt;
+        :gen_tcp.send(socket, "#{key} DELETED\r\n")
+        receive_messages(socket)
+
+      {:tcp_closed, ^socket} -&gt;
+        {:error, :closed}
+
+      # If we receive any message, including socket writes, we discard them
+      _ -&gt;
+        receive_messages(socket)
+    end
+  end</pre>
+<p>Let's go over it by parts. We use the existing <code class="inline">lookup/2</code> private function to lookup for a bucket. If one is found, we subscribe the current process to the bucket. Then we call <code class="inline">:inet.setopts(socket, active: true)</code> (which we will explain soon) and <code class="inline">receive_messages/1</code>.</p>
+<p><code class="inline">receive_messages/1</code> awaits for messages from the bucket and then calls itself again, becoming a loop. We match on <code class="inline">{:put, key, value}</code> and <code class="inline">{:delete, key}</code> and write to those events to the socket. We also match on <code class="inline">{:tcp_closed, ^socket}</code>, which is a message that will be delivered if the TCP socket closes, and use it to abort the loop. We discard any other message.</p>
+<p>At this point you may be wondering: where does <code class="inline">{:tcp_closed, ^socket}</code> come from?</p>
+<p>So far, when receiving messages from the socket, we used <a href="https://www.erlang.org/doc/apps/kernel/gen_tcp.html#recv/3"><code class="inline">:gen_tcp.recv/3</code></a> to perform calls that will block the current process until content is available. This is known as "passive mode". However, we can also ask <code class="inline">:gen_tcp</code> to stream messages to the current process inbox as they arrive, which is known as "active mode", which is exactly what we configured when we called <code class="inline">:inet.setopts(socket, active: true)</code>. Those messages have the shape <code class="inline">{:tcp, socket, data}</code>. When the socket is in active mode and it is closed, it delivers a <code class="inline">{:tcp_closed, socket}</code> message. Once we receive this message, we exit the loop, which will exit the connection process. Since the bucket is monitoring the process, it will automatically remove the subscription too. You could verify this in practice by adding a <code class="inline">COUNT SUBSCRIPTIONS</code> command that returns the number of subscribers for a given bucket.</p>
+<p>In practice, many systems would prefer to call <code class="inline">:inet.setopts(socket, active: :once)</code> to specify only a single TCP message should be delivered to avoid overflowing message queues. Once the message is received, they call <a href="https://www.erlang.org/doc/apps/kernel/inet.html#setopts/2"><code class="inline">:inet.setopts/2</code></a> again. In our case, we are simply discarding anything that arrives over the socket, so setting <code class="inline">active: true</code> is equally fine. In all scenarios, the benefit of using active mode is that the process can receive TCP messages as well as messages from other processes at the same time, instead of blocking on <a href="https://www.erlang.org/doc/apps/kernel/gen_tcp.html#recv/3"><code class="inline">:gen_tcp.recv/3</code></a>.</p>
+<p>To wrap it all up, you should give our new feature a try in a distributed setting too. Start two <code class="inline">NODES=... PORT=... iex --sname ... -S mix</code> instances. In one of them, create a bucket. In the other, subscribe to the same bucket. Once you go back to the first shell, you will see that, even as you send commands to the bucket in one machine, the messages will be streamed to the other one. In other words, our subscription system is also distributed, and all we had to do is to send messages!</p>
+<h2 id="call-cast-or-info" class="section-heading">
+<span class="text"><code class="inline">call</code>, <code class="inline">cast</code> or <code class="inline">info</code>?</span>
+</h2>
+<p>So far we have used three callbacks: <code class="inline">handle_call/3</code>, <code class="inline">handle_cast/2</code> and <code class="inline">handle_info/2</code>. Here is what we should consider when deciding when to use each:</p>
 <ol>
 <li><p><code class="inline">handle_call/3</code> must be used for synchronous requests. This should be the default choice as waiting for the server reply is a useful back-pressure mechanism.</p></li>
-<li><p><code class="inline">handle_cast/2</code> must be used for asynchronous requests, when you don't care about a reply. A cast does not guarantee the server has received the message and, for this reason, should be used sparingly. For example, the <code class="inline">create/2</code> function we have defined in this chapter should have used <code class="inline">call/2</code>. We have used <code class="inline">cast/2</code> for didactic purposes.</p></li>
+<li><p><code class="inline">handle_cast/2</code> must be used for asynchronous requests, when you don't care about a reply. A cast does not guarantee the server has received the message and, for this reason, should be used sparingly. For example, the <code class="inline">subscribe/1</code> function we have defined in this chapter should have used <code class="inline">call/2</code>. We have used <code class="inline">cast/2</code> for educational purposes.</p></li>
 <li><p><code class="inline">handle_info/2</code> must be used for all other messages a server may receive that are not sent via <a href="genserver.html#call/2"><code class="inline">GenServer.call/2</code></a> or <a href="genserver.html#cast/2"><code class="inline">GenServer.cast/2</code></a>, including regular messages sent with <a href="kernel.html#send/2"><code class="inline">send/2</code></a>. The monitoring <code class="inline">:DOWN</code> messages are an example of this.</p></li>
 </ol>
-<p>Since any message, including the ones sent via <a href="kernel.html#send/2"><code class="inline">send/2</code></a>, go to <code class="inline">handle_info/2</code>, there is a chance that unexpected messages will arrive to the server. Therefore, if we don't define the catch-all clause, those messages could cause our registry to crash, because no clause would match. We don't need to worry about such cases for <code class="inline">handle_call/3</code> and <code class="inline">handle_cast/2</code> though. Calls and casts are only done via the <a href="genserver.html"><code class="inline">GenServer</code></a> API, so an unknown message is quite likely a developer mistake.</p>
 <p>To help developers remember the differences between call, cast and info, the supported return values and more, we have a tiny <a href="https://elixir-lang.org/downloads/cheatsheets/gen-server.pdf">GenServer cheat sheet</a>.</p>
-<h2 id="monitors-or-links" class="section-heading">  <span class="text">Monitors or links?</span> </h2> <p>We have previously learned about links in the <a href="processes.html">Process chapter</a>. Now, with the registry complete, you may be wondering: when should we use monitors and when should we use links?</p>
-<p>Links are bi-directional. If you link two processes and one of them crashes, the other side will crash too (unless it is trapping exits). A monitor is uni-directional: only the monitoring process will receive notifications about the monitored one. In other words: use links when you want linked crashes, and monitors when you just want to be informed of crashes, exits, and so on.</p>
-<p>Returning to our <code class="inline">handle_cast/2</code> implementation, you can see the registry is both linking and monitoring the buckets:</p>
-<pre data-language="elixir">{:ok, bucket} = KV.Bucket.start_link([])
-ref = Process.monitor(bucket)</pre>
-<p>This is a bad idea, as we don't want the registry to crash when a bucket crashes. The proper fix is to actually not link the bucket to the registry. Instead, we will link each bucket to a special type of process called Supervisors, which are explicitly designed to handle failures and crashes. We will learn more about them in the next chapter.</p> </div> <div class="bottom-actions" id="bottom-actions"> <div class="bottom-actions-item"> <a href="agents.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Simple state management with agents </span> </a> </div> <div class="bottom-actions-item"> <a href="supervisor-and-application.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Supervision trees and applications </span> </a> </div> </div> <footer class="footer"> <p> <span class="line"> <button class="a-main footer-button display-quick-switch" title="Search HexDocs packages"> Search HexDocs </button> <a href="elixir.epub.html" title="ePub version"> Download ePub version </a> </span> </p> <p class="built-using"> Built using <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener" translate="no">ExDoc</a> (v0.36.1) for the <a href="https://elixir-lang.org" title="Elixir" target="_blank" translate="no">Elixir programming language</a> </p> </footer><div class="_attribution">
+<h2 id="agents-or-genservers" class="section-heading">
+<span class="text">Agents or GenServers?</span>
+</h2>
+<p>Before moving forward to the last chapter, you may be wondering: in the future, should you use an <a href="agent.html"><code class="inline">Agent</code></a> or a <a href="genserver.html"><code class="inline">GenServer</code></a>?</p>
+<p>As we saw throughout this guide, agents are straight-forward to get started but they are limited in what they can do. Agents are effectively a subset of GenServers. In fact, agents are implemented on top of GenServers. As well as supervisors, the <a href="registry.html"><code class="inline">Registry</code></a> module, and many other features you will find in both Erlang and Elixir.</p>
+<p>In other words, GenServers are the most essential component for building concurrent and fault-tolerant systems in Elixir. They provide a robust and flexible framework for managing state and coordinating interactions between processes.</p>
+<p>For those reasons, many adopt a rule of thumb to never use Agents and jump straight into GenServers instead. On the other hand, others are more than fine with using agents to store a bit of state here and there. Either way, you will be fine!</p>
+<p>This is the last feature we have implemented for our distributed key-value store. In the next chapter, we will learn how to package our application before shipping it to production.</p> </div> <div class="bottom-actions" id="bottom-actions"> <div class="bottom-actions-item"> <a href="config-and-distribution.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Configuration and distribution </span> </a> </div> <div class="bottom-actions-item"> <a href="releases.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Releases </span> </a> </div> </div> <footer class="footer"> <p> <span class="line"> <button class="a-main footer-button display-quick-switch" title="Go to package docs"> Go to package docs </button> <a href="llms.txt.html" target="_blank"> View llms.txt </a> <a href="elixir.epub.html"> Download ePub version </a> </span> </p> <p class="built-using"> Built using <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener nofollow" translate="no">ExDoc</a> (v0.40.3) for the <a href="https://elixir-lang.org" title="Elixir" target="_blank" translate="no">Elixir programming language</a> </p> </footer><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2012-2024 The Elixir Team<br>Licensed under the Apache License, Version 2.0.<br>
-    <a href="https://hexdocs.pm/elixir/1.18.1/genservers.html" class="_attribution-link">https://hexdocs.pm/elixir/1.18.1/genservers.html</a>
+    &copy; 2012-2026 The Elixir Team<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://elixir.hexdocs.pm/1.20.1/genservers.html" class="_attribution-link">https://elixir.hexdocs.pm/1.20.1/genservers.html</a>
   </p>
 </div>

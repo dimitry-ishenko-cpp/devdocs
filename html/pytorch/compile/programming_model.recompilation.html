@@ -1,0 +1,228 @@
+<div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList"> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Reference API"> <meta itemprop="position" content="1"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compiler"> <meta itemprop="position" content="2"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compile Programming Model"> <meta itemprop="position" content="3"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem"> <meta itemprop="name" content="Dealing with Recompilations"> <meta itemprop="position" content="4"> </div> </div>  <article class="bd-article">  <h1 id="dealing-with-recompilations">Dealing with Recompilations</h1> <p class="date-info-last-verified" style="color: #6c6c6d; font-size: small;">Created On: Jul 29, 2025 | Last Updated On: Jul 29, 2025</p> <p>Recompilations are necessary for <code>torch.compile</code> soundness, but can result in significantly increased compile time. Thus, minimizing recompilations while preserving soundness is essential for reducing compile time.</p> <p>You can view recompilations and their reasons using tlparse or <code>TORCH_LOGS=recompiles</code>.</p>  <h2 id="is-dynamic-shapes-enabled">Is Dynamic Shapes Enabled?</h2> <p>In the below example, we recompile due to mismatched shapes:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">@torch.compile
+def fn(x):
+    return x + 1
+fn(torch.ones(3))
+fn(torch.ones(4))
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">Recompiling function fn in /tmp/ipykernel_507/2479206322.py:1
+    triggered by the following guard failure(s):
+    - 0/0: tensor 'x' size mismatch at index 0. expected 3, actual 4
+</pre> <pre data-language="myst">tensor([2., 2., 2., 2.])
+</pre> </div> </div> <p>Make sure that the dynamic option of <code>torch.compile</code> is not set to <code>False</code>. The default option, <code>dynamic=None</code>, will only attempt dynamic shapes after the first compilation. You can set <code>dynamic=True</code> to upfront compile as dynamic as possible:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">@torch.compile(dynamic=True)
+def gn(x):
+    return x + 1
+gn(torch.ones(3))
+gn(torch.ones(4))
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">tensor([2., 2., 2., 2.])
+</pre> </div> </div> <p>For more information on dynamic shapes, including dealing with errors/recompilations due to dynamic shapes, see <a class="reference external" href="https://docs.google.com/document/d/1GgvOe7C8_NVOMLOCwDaYV1mXXyHMXY7ExoewHqooxrs/edit?tab=t.0#heading=h.fh8zzonyw8ng">the dynamic shapes manual</a>.</p>   <h2 id="wrapping-constants-with-tensors">Wrapping Constants with Tensors</h2> <p>By default, <code>int</code> / <code>float</code> variables are treated as constants and are guarded on their exact value. In the below example, we have a recompilation for each function call.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">@torch.compile
+def fn(x, c):
+    return x + c
+for i in range(5):
+    fn(torch.ones(i), 0.5 + i)
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">Recompiling function fn in /tmp/ipykernel_507/3647755280.py:1
+    triggered by the following guard failure(s):
+    - 2/0: c == 0.5                                                 # return x + c  # mp/ipykernel_507/3647755280.py:3 in fn
+Recompiling function fn in /tmp/ipykernel_507/3647755280.py:1
+    triggered by the following guard failure(s):
+    - 2/1: tensor 'x' size mismatch at index 0. expected 1, actual 2
+    - 2/0: c == 0.5                                                 # return x + c  # mp/ipykernel_507/3647755280.py:3 in fn
+</pre> </div> </div> <p>In particular, for LR schedulers, initializing with a constant can lead to recompilations:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">mod = torch.nn.Linear(3, 3)
+opt = torch.optim.Adam(mod.parameters(), lr=0.01)
+sched = torch.optim.lr_scheduler.ExponentialLR(opt, 0.9)
+@torch.compile
+def gn(inp):
+    opt.zero_grad(True)
+    out = mod(inp).sum()
+    out.backward()
+    opt.step()
+    sched.step()
+for i in range(5):
+    gn(torch.ones(3, 3))
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">Profiler function &lt;class 'torch.autograd.profiler.record_function'&gt; will be ignored
+Recompiling function step in /opt/conda/envs/py_3.10/lib/python3.10/site-packages/torch/optim/adam.py:213
+    triggered by the following guard failure(s):
+    - 7/0: self.param_groups[0]['lr'] == 0.01                       # for group in self.param_groups:  # optim/adam.py:228 in step
+</pre> </div> </div> <p>In both examples, we can wrap <code>float</code> variables in tensors in order to prevent recompilations.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python"># first example
+for i in range(5):
+    fn(torch.ones(i), torch.tensor(0.5 + i))
+# second example
+opt = torch.optim.Adam(mod.parameters(), lr=torch.tensor(0.01))
+sched = torch.optim.lr_scheduler.ExponentialLR(opt, torch.tensor(0.9))
+for i in range(5):
+    gn(torch.ones(3, 3))
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">Recompiling function fn in /tmp/ipykernel_507/3647755280.py:1
+    triggered by the following guard failure(s):
+    - 0/0: tensor 'x' size mismatch at index 0. expected 0, actual 1
+Recompiling function fn in /tmp/ipykernel_507/3647755280.py:1
+    triggered by the following guard failure(s):
+    - 0/1: tensor 'x' size mismatch at index 0. expected 1, actual 2
+    - 0/0: tensor 'x' size mismatch at index 0. expected 0, actual 2
+</pre> </div> </div>   <h2 id="programming-model-recompilation-changing-cache-size-limit">Changing the Cache Size Limit</h2> <p id="changing-the-cache-size-limit">There is a limit to how many times a function can be recompiled, determined by <code>torch._dynamo.config.cache_size_limit</code> and <code>torch._dynamo.config.accumulated_cache_size_limit</code> (The exact difference between these 2 values is detailed in <a class="reference external" href="https://github.com/pytorch/pytorch/blob/4ce6e6ec8890a3f6ee604c9efb3ff153825ce575/torch/_dynamo/cache_size.py#L14"><code>torch/_dynamo/cache_size.py</code></a>). If the Dynamo cache limit is hit, then all future compilation attempts <strong>will result in the function being skipped (run eagerly)</strong>. Dynamo will still attempt to use previously compiled bytecode for future function calls, if the guards pass. Note that in the case of a recompilation limit hit, <strong>all nested function calls WILL be skipped</strong> (Dynamo will try to use previously compiled bytecode for the nested functions). Dynamo will also issue a warning containing the affected function and which limit was hit. In the example below, each function call results in a recompile attempt. When we hit the cache size limit (by default, 8), we stop attempting to recompile. (Note that we set <code>dynamic=False</code> for demonstration purposes to force recompilation every time).</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">@torch.compile(dynamic=False)
+def fn(x):
+    return x + 1
+for i in range(1, 10):
+    # recompile every time due to dynamic=False
+    fn(torch.ones(i))
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">Recompiling function fn in /tmp/ipykernel_507/3054308037.py:1
+    triggered by the following guard failure(s):
+    - 8/0: tensor 'x' size mismatch at index 0. expected 1, actual 2
+Recompiling function fn in /tmp/ipykernel_507/3054308037.py:1
+    triggered by the following guard failure(s):
+    - 8/1: tensor 'x' size mismatch at index 0. expected 2, actual 3
+    - 8/0: tensor 'x' size mismatch at index 0. expected 1, actual 3
+Recompiling function fn in /tmp/ipykernel_507/3054308037.py:1
+    triggered by the following guard failure(s):
+    - 8/2: tensor 'x' size mismatch at index 0. expected 3, actual 4
+    - 8/1: tensor 'x' size mismatch at index 0. expected 2, actual 4
+    - 8/0: tensor 'x' size mismatch at index 0. expected 1, actual 4
+Recompiling function fn in /tmp/ipykernel_507/3054308037.py:1
+    triggered by the following guard failure(s):
+    - 8/3: tensor 'x' size mismatch at index 0. expected 4, actual 5
+    - 8/2: tensor 'x' size mismatch at index 0. expected 3, actual 5
+    - 8/1: tensor 'x' size mismatch at index 0. expected 2, actual 5
+    - 8/0: tensor 'x' size mismatch at index 0. expected 1, actual 5
+Recompiling function fn in /tmp/ipykernel_507/3054308037.py:1
+    triggered by the following guard failure(s):
+    - 8/4: tensor 'x' size mismatch at index 0. expected 5, actual 6
+    - 8/3: tensor 'x' size mismatch at index 0. expected 4, actual 6
+    - 8/2: tensor 'x' size mismatch at index 0. expected 3, actual 6
+    - 8/1: tensor 'x' size mismatch at index 0. expected 2, actual 6
+    - 8/0: tensor 'x' size mismatch at index 0. expected 1, actual 6
+Recompiling function fn in /tmp/ipykernel_507/3054308037.py:1
+    triggered by the following guard failure(s):
+    - 8/5: tensor 'x' size mismatch at index 0. expected 6, actual 7
+    - 8/4: tensor 'x' size mismatch at index 0. expected 5, actual 7
+    - 8/3: tensor 'x' size mismatch at index 0. expected 4, actual 7
+    - 8/2: tensor 'x' size mismatch at index 0. expected 3, actual 7
+    - 8/1: tensor 'x' size mismatch at index 0. expected 2, actual 7
+    - 8/0: tensor 'x' size mismatch at index 0. expected 1, actual 7
+Recompiling function fn in /tmp/ipykernel_507/3054308037.py:1
+    triggered by the following guard failure(s):
+    - 8/6: tensor 'x' size mismatch at index 0. expected 7, actual 8
+    - 8/5: tensor 'x' size mismatch at index 0. expected 6, actual 8
+    - 8/4: tensor 'x' size mismatch at index 0. expected 5, actual 8
+    - 8/3: tensor 'x' size mismatch at index 0. expected 4, actual 8
+    - 8/2: tensor 'x' size mismatch at index 0. expected 3, actual 8
+    - 8/1: tensor 'x' size mismatch at index 0. expected 2, actual 8
+    - 8/0: tensor 'x' size mismatch at index 0. expected 1, actual 8
+Recompiling function fn in /tmp/ipykernel_507/3054308037.py:1
+    triggered by the following guard failure(s):
+    - 8/7: tensor 'x' size mismatch at index 0. expected 8, actual 9
+    - 8/6: tensor 'x' size mismatch at index 0. expected 7, actual 9
+    - 8/5: tensor 'x' size mismatch at index 0. expected 6, actual 9
+    - 8/4: tensor 'x' size mismatch at index 0. expected 5, actual 9
+    - 8/3: tensor 'x' size mismatch at index 0. expected 4, actual 9
+    - 8/2: tensor 'x' size mismatch at index 0. expected 3, actual 9
+    - 8/1: tensor 'x' size mismatch at index 0. expected 2, actual 9
+    - 8/0: tensor 'x' size mismatch at index 0. expected 1, actual 9
+torch._dynamo hit config.recompile_limit (8)
+   function: 'fn' (/tmp/ipykernel_507/3054308037.py:1)
+   last reason: 8/7: tensor 'x' size mismatch at index 0. expected 8, actual 9
+To log all recompilation reasons, use TORCH_LOGS="recompiles".
+To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+</pre> </div> </div> <p>If you know that the number of recompilations has a reasonable constant upper bound, you can raise the cache size limit. If the cost of recompilation outweighs the benefit of compilation, then you can consider lowering the cache size limit.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">torch._dynamo.config.cache_size_limit = 16
+@torch.compile(dynamic=False)
+def gn(x):
+    return x + 1
+for i in range(1, 10):
+    gn(torch.ones(i))
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">Recompiling function gn in /tmp/ipykernel_507/887097224.py:2
+    triggered by the following guard failure(s):
+    - 9/0: tensor 'x' size mismatch at index 0. expected 1, actual 2
+Recompiling function gn in /tmp/ipykernel_507/887097224.py:2
+    triggered by the following guard failure(s):
+    - 9/1: tensor 'x' size mismatch at index 0. expected 2, actual 3
+    - 9/0: tensor 'x' size mismatch at index 0. expected 1, actual 3
+Recompiling function gn in /tmp/ipykernel_507/887097224.py:2
+    triggered by the following guard failure(s):
+    - 9/2: tensor 'x' size mismatch at index 0. expected 3, actual 4
+    - 9/1: tensor 'x' size mismatch at index 0. expected 2, actual 4
+    - 9/0: tensor 'x' size mismatch at index 0. expected 1, actual 4
+Recompiling function gn in /tmp/ipykernel_507/887097224.py:2
+    triggered by the following guard failure(s):
+    - 9/3: tensor 'x' size mismatch at index 0. expected 4, actual 5
+    - 9/2: tensor 'x' size mismatch at index 0. expected 3, actual 5
+    - 9/1: tensor 'x' size mismatch at index 0. expected 2, actual 5
+    - 9/0: tensor 'x' size mismatch at index 0. expected 1, actual 5
+Recompiling function gn in /tmp/ipykernel_507/887097224.py:2
+    triggered by the following guard failure(s):
+    - 9/4: tensor 'x' size mismatch at index 0. expected 5, actual 6
+    - 9/3: tensor 'x' size mismatch at index 0. expected 4, actual 6
+    - 9/2: tensor 'x' size mismatch at index 0. expected 3, actual 6
+    - 9/1: tensor 'x' size mismatch at index 0. expected 2, actual 6
+    - 9/0: tensor 'x' size mismatch at index 0. expected 1, actual 6
+Recompiling function gn in /tmp/ipykernel_507/887097224.py:2
+    triggered by the following guard failure(s):
+    - 9/5: tensor 'x' size mismatch at index 0. expected 6, actual 7
+    - 9/4: tensor 'x' size mismatch at index 0. expected 5, actual 7
+    - 9/3: tensor 'x' size mismatch at index 0. expected 4, actual 7
+    - 9/2: tensor 'x' size mismatch at index 0. expected 3, actual 7
+    - 9/1: tensor 'x' size mismatch at index 0. expected 2, actual 7
+    - 9/0: tensor 'x' size mismatch at index 0. expected 1, actual 7
+Recompiling function gn in /tmp/ipykernel_507/887097224.py:2
+    triggered by the following guard failure(s):
+    - 9/6: tensor 'x' size mismatch at index 0. expected 7, actual 8
+    - 9/5: tensor 'x' size mismatch at index 0. expected 6, actual 8
+    - 9/4: tensor 'x' size mismatch at index 0. expected 5, actual 8
+    - 9/3: tensor 'x' size mismatch at index 0. expected 4, actual 8
+    - 9/2: tensor 'x' size mismatch at index 0. expected 3, actual 8
+    - 9/1: tensor 'x' size mismatch at index 0. expected 2, actual 8
+    - 9/0: tensor 'x' size mismatch at index 0. expected 1, actual 8
+Recompiling function gn in /tmp/ipykernel_507/887097224.py:2
+    triggered by the following guard failure(s):
+    - 9/7: tensor 'x' size mismatch at index 0. expected 8, actual 9
+    - 9/6: tensor 'x' size mismatch at index 0. expected 7, actual 9
+    - 9/5: tensor 'x' size mismatch at index 0. expected 6, actual 9
+    - 9/4: tensor 'x' size mismatch at index 0. expected 5, actual 9
+    - 9/3: tensor 'x' size mismatch at index 0. expected 4, actual 9
+    - 9/2: tensor 'x' size mismatch at index 0. expected 3, actual 9
+    - 9/1: tensor 'x' size mismatch at index 0. expected 2, actual 9
+    - 9/0: tensor 'x' size mismatch at index 0. expected 1, actual 9
+</pre> </div> </div>   <h2 id="graph-breaking-to-reduce-recompilation-costs">Graph Breaking to Reduce Recompilation Costs</h2> <p>If a large graph is recompiling and causing high compile time, you can intentionally introduce a graph break in order to reduce recompilation costs, at the expense of introducing a performance hit.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">def very_large_function(x):
+    return x + 1
+
+@torch.compile(dynamic=False)
+def fn(x, c):
+    y = very_large_function(x)  # recompiled every time
+    return y + c
+
+for i in range(1, 5):
+    fn(torch.ones(3), i)
+
+@torch.compile(dynamic=False)
+def gn(x, c):
+    y = very_large_function(x)  # compiled only once
+    torch._dynamo.graph_break()
+    return y + c  # recompiled every time
+
+for i in range(1, 5):
+    gn(torch.ones(3), i)
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">Recompiling function fn in /tmp/ipykernel_507/2876112129.py:4
+    triggered by the following guard failure(s):
+    - 10/0: c == 1                                                   # return y + c  # mp/ipykernel_507/2876112129.py:7 in fn
+Recompiling function fn in /tmp/ipykernel_507/2876112129.py:4
+    triggered by the following guard failure(s):
+    - 10/1: c == 2                                                   # return y + c  # mp/ipykernel_507/2876112129.py:7 in fn
+    - 10/0: c == 1                                                   # return y + c  # mp/ipykernel_507/2876112129.py:7 in fn
+Recompiling function fn in /tmp/ipykernel_507/2876112129.py:4
+    triggered by the following guard failure(s):
+    - 10/2: c == 3                                                   # return y + c  # mp/ipykernel_507/2876112129.py:7 in fn
+    - 10/1: c == 2                                                   # return y + c  # mp/ipykernel_507/2876112129.py:7 in fn
+    - 10/0: c == 1                                                   # return y + c  # mp/ipykernel_507/2876112129.py:7 in fn
+Recompiling function torch_dynamo_resume_in_gn_at_15 in /tmp/ipykernel_507/2876112129.py:15
+    triggered by the following guard failure(s):
+    - 12/0: c == 1                                                   # return y + c  # recompiled every time  # mp/ipykernel_507/2876112129.py:16 in torch_dynamo_resume_in_gn_at_15
+Recompiling function torch_dynamo_resume_in_gn_at_15 in /tmp/ipykernel_507/2876112129.py:15
+    triggered by the following guard failure(s):
+    - 12/1: c == 2                                                   # return y + c  # recompiled every time  # mp/ipykernel_507/2876112129.py:16 in torch_dynamo_resume_in_gn_at_15
+    - 12/0: c == 1                                                   # return y + c  # recompiled every time  # mp/ipykernel_507/2876112129.py:16 in torch_dynamo_resume_in_gn_at_15
+Recompiling function torch_dynamo_resume_in_gn_at_15 in /tmp/ipykernel_507/2876112129.py:15
+    triggered by the following guard failure(s):
+    - 12/2: c == 3                                                   # return y + c  # recompiled every time  # mp/ipykernel_507/2876112129.py:16 in torch_dynamo_resume_in_gn_at_15
+    - 12/1: c == 2                                                   # return y + c  # recompiled every time  # mp/ipykernel_507/2876112129.py:16 in torch_dynamo_resume_in_gn_at_15
+    - 12/0: c == 1                                                   # return y + c  # recompiled every time  # mp/ipykernel_507/2876112129.py:16 in torch_dynamo_resume_in_gn_at_15
+</pre> </div> </div>   </article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2025, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.9/compile/programming_model.recompilation.html" class="_attribution-link">https://docs.pytorch.org/docs/2.9/compile/programming_model.recompilation.html</a>
+  </p>
+</div>

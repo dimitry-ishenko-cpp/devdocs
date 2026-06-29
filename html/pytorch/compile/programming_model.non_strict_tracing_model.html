@@ -1,0 +1,155 @@
+<div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList"> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Reference API"> <meta itemprop="position" content="1"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compiler"> <meta itemprop="position" content="2"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compile Programming Model"> <meta itemprop="position" content="3"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem"> <meta itemprop="name" content="Non-strict Tracing Programming Model"> <meta itemprop="position" content="4"> </div> </div>  <article class="bd-article">  <h1 id="non-strict-tracing-programming-model">Non-strict Tracing Programming Model</h1> <p class="date-info-last-verified" style="color: #6c6c6d; font-size: small;">Created On: Jul 28, 2025 | Last Updated On: Jul 28, 2025</p> <p><strong>Summary:</strong></p> <ul class="simple"> <li>
+<strong>Non-strict tracing</strong> is a way to trace Python code that is less strict than Dynamo, but may result in silent incorrectness.</li> <li>Non-strict tracing runs a Python function and uses Python and PyTorch’s operator overloading capabilities to record what Tensor operations occurred during execution into a trace.</li> <li>A function is <strong>non-strict traceable</strong> if it complies with some constraints, namely, that the function is <strong>pure</strong> and does not directly manipulate Tensor.data_ptr().</li> <li>Non-strict tracing may <strong>specialize</strong> on certain variables and treat them as <strong>constants</strong>, baking the values of the variables into the trace.</li> </ul> <p><code>torch.compile</code> internals (<code>make_fx</code>, AOTDispatcher) use <strong>non-strict tracing</strong>. <a class="reference internal" href="programming_model.dynamo_nonstrict_trace.html"><span class="doc std std-doc"><code>torch._dynamo.nonstrict_trace</code></span></a> can also be used in <code>torch.compile</code>d code to mark sections of code to be traced with non-strict tracing. Non-strict tracing runs a Python function and uses Python and PyTorch’s operator overloading capabilities to record what Tensor operations occurred during execution into a trace.</p> <p><strong><code>make_fx</code></strong> is the main entrypoint for non-strict tracing. For the following function, only the top branch is taken during execution of the inputs, so it captures a graph with only that branch.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">from torch.fx.experimental.proxy_tensor import make_fx
+def f(x):
+    if x.shape[0] &gt; 2:
+        return x ** 2 / 6
+    else:
+        return x * 3
+x = torch.randn(3)
+gm = make_fx(f, tracing_mode="fake")(x)
+gm.print_readable()
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">class f(torch.nn.Module):
+    def forward(self, x_1: "f32[3]"):
+        # No stacktrace found for following nodes
+        pow_1: "f32[3]" = torch.ops.aten.pow.Tensor_Scalar(x_1, 2);  x_1 = None
+        div: "f32[3]" = torch.ops.aten.div.Tensor(pow_1, 6);  pow_1 = None
+        return div
+        
+</pre> <pre data-language="myst">'class f(torch.nn.Module):\n    def forward(self, x_1: "f32[3]"):\n        # No stacktrace found for following nodes\n        pow_1: "f32[3]" = torch.ops.aten.pow.Tensor_Scalar(x_1, 2);  x_1 = None\n        div: "f32[3]" = torch.ops.aten.div.Tensor(pow_1, 6);  pow_1 = None\n        return div\n        '
+</pre> </div> </div> <p>Non-strict tracing differs from Dynamo (strict) tracing in that <strong>it is unsafe</strong>, that is, given a function, it captures a graph of Tensor operations that may have different semantics than the original function. Given a Python function, Dynamo Tracing captures a graph of Tensor operations and residual bytecode that when combined give the same semantics as the Python function.</p>  <h2 id="programming-model-non-strict-tracing-model-pure-functions">Pure Functions</h2> <p id="pure-functions">Non-strict tracing is sound only on <strong>pure functions</strong>, and thus only pure functions should be non-strict traced.</p> <p>A pure function is a function with the following properties:</p> <ul class="simple"> <li>
+<strong>Determinism.</strong> Given the same inputs, the pure function will always return the same output.</li> <li>
+<strong>No side effects.</strong> A pure function does not have any side effects such as modifying external state or performing I/O operations.</li> <li>
+<strong>Explicit input/output.</strong> All the input data must be passed through the function parameters and all of the outputs are returned from the function.</li> </ul> <p>Here are some examples of impure functions for which the captured graph behaves differently from the original function.</p>  <h3 id="example-1-no-explicit-input-e-g-accesses-global-tensor">Example 1: No explicit input (e.g. accesses global tensor)</h3> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">var = torch.tensor(1)
+def function_with_global_access(y):
+    return y + var
+x = torch.tensor([0, 1, 2])
+# _allow_non_fake_inputs=True is needed to capture the global variable
+# for demonstration purposes.
+gm = make_fx(
+    function_with_global_access, tracing_mode="fake", _allow_non_fake_inputs=True
+)(x)
+# Non-strict Tracing captures the value of the global (1.)
+print("1. call function", function_with_global_access(x))
+print("1. call graph", gm(x))
+# However, after changing the global, the captured graph
+# produces a different result from the original function
+var = torch.tensor(2)
+print("2. call function", function_with_global_access(x))
+print("2. call graph", gm(x))
+# To capture a graph that can have a varying `var` tensor,
+# it must be an explicit input:
+def function_fixed(y, var):
+    return y + var
+var = torch.tensor(3)
+gm = make_fx(function_fixed, tracing_mode="fake")(x, var)
+print("3. call function", function_fixed(x, var))
+print("3. call graph", gm(x, var))
+var = torch.tensor(4)
+print("4. call function", function_fixed(x, var))
+print("4. call graph", gm(x, var))
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">1. call function tensor([1, 2, 3])
+1. call graph tensor([1, 2, 3])
+2. call function tensor([2, 3, 4])
+2. call graph tensor([1, 2, 3])
+3. call function tensor([3, 4, 5])
+3. call graph tensor([3, 4, 5])
+4. call function tensor([4, 5, 6])
+4. call graph tensor([4, 5, 6])
+</pre> </div> </div> <p>See <a class="reference internal" href="#specialization-and-constants"><span class="std std-ref">Specialization and Constants</span></a> for an explanation of why.</p>   <h3 id="example-2-side-effect-printing">Example 2: Side effect (printing)</h3> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">def function_with_side_effect(y):
+    print(y)
+x = torch.tensor([0, 1, 2])
+_ = function_with_side_effect(x)
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">tensor([0, 1, 2])
+</pre> </div> </div> <p>Running <code>f</code> in Python prints a Tensor as a side effect.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">gm = make_fx(function_with_side_effect, tracing_mode="fake")(x)
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">FakeTensor(..., size=(3,), dtype=torch.int64)
+</pre> </div> </div> <p>During non-strict tracing, this print occurs during the graph capture.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">_ = gm(x)
+</pre> </div> </div> <p>The graph does not store a call to the <code>print</code> statement, so executing the graph doesn’t print anything.</p>   <h3 id="example-3-side-effect-input-list-mutation">Example 3: Side effect (input list mutation)</h3> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">lst = []
+def function_with_input_list_mutation(lst):
+    val = lst.pop()
+    return val
+x = torch.tensor([0, 1, 2])
+y = torch.tensor([0, 1, 2])
+# Each time the function is executed, the list shrinks in size
+lst = [x, y]
+function_with_input_list_mutation(lst)
+print("len(lst) after one call", len(lst))
+function_with_input_list_mutation(lst)
+print("len(lst) after two calls", len(lst))
+# With Non-strict Tracing, the length of the list shrinks during
+# the graph capture but not in invocations of the graph.
+lst = [x, y]
+gm = make_fx(function_with_input_list_mutation, tracing_mode="fake")(lst)
+print("len(lst) after graph capture", len(lst))
+gm(lst)
+print("len(lst) after one call to graph", len(lst))
+gm(lst)
+print("len(lst) after two calls to graph", len(lst))
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">len(lst) after one call 1
+len(lst) after two calls 0
+len(lst) after graph capture 2
+len(lst) after one call to graph 2
+len(lst) after two calls to graph 2
+</pre> </div> </div>   <h3 id="no-direct-data-ptr-manipulation">No direct data_ptr manipulation</h3> <p>Directly manipulating <code>Tensor.data_ptr</code> is not non-strict traceable. The intuition behind this is that PyTorch is unable to tell <em>how</em> you manipulated the <code>data_ptr</code>.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">import ctypes
+# Create a tensor with a single element
+tensor = torch.tensor([42], dtype=torch.int32)  # Using int32 for simplicity
+def function_with_data_ptr(tensor):
+    # Get the data pointer
+    ptr = tensor.data_ptr()
+    # Cast the pointer to a ctypes pointer
+    ctypes_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_int32))
+    # Increment the value at the pointer
+    ctypes_ptr.contents.value += 1
+    return tensor
+try:
+    make_fx(function_with_data_ptr, tracing_mode="fake")(tensor)
+except Exception as e:
+    print(e)
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">Cannot access data pointer of Tensor (e.g. FakeTensor, FunctionalTensor). If you're using torch.compile/export/fx, it is likely that we are erroneously tracing into a custom kernel. To fix this, please wrap the custom kernel into an opaque custom op. Please see the following for details: https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html
+</pre> </div> </div>    <h2 id="id1">Specialization and Constants</h2> <p id="specialization-and-constants">Non-strict tracing captures a graph that may be specialized on some values. What this means is the captured graph is only valid for these values. We say the graph treats those values as <strong>constant</strong>.</p> <p>All non-Tensor variables are treated as constant during Non-strict Tracing:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">def f(x, y):
+    return x + y
+x = torch.tensor([0, 1, 2])
+y = 3.14
+gm = make_fx(f, tracing_mode="fake")(x, y)
+gm.print_readable()
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">class f(torch.nn.Module):
+    def forward(self, x_1: "i64[3]", y_1):
+        # No stacktrace found for following nodes
+        add: "f32[3]" = torch.ops.aten.add.Tensor(x_1, 3.14);  x_1 = None
+        return add
+        
+</pre> <pre data-language="myst">'class f(torch.nn.Module):\n    def forward(self, x_1: "i64[3]", y_1):\n        # No stacktrace found for following nodes\n        add: "f32[3]" = torch.ops.aten.add.Tensor(x_1, 3.14);  x_1 = None\n        return add\n        '
+</pre> </div> </div> <p>3.14 is a constant in the graph.</p> <p>Non-strict tracing will also specialize on properties of the input Tensors.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">def f(x):
+    if x.shape[0] &gt; 2:
+        return x ** 2 / 6
+    else:
+        return x * 3
+x = torch.randn(3)
+gm = make_fx(f, tracing_mode="fake")(x)
+gm.print_readable()
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">class f(torch.nn.Module):
+    def forward(self, x_1: "f32[3]"):
+        # No stacktrace found for following nodes
+        pow_1: "f32[3]" = torch.ops.aten.pow.Tensor_Scalar(x_1, 2);  x_1 = None
+        div: "f32[3]" = torch.ops.aten.div.Tensor(pow_1, 6);  pow_1 = None
+        return div
+        
+</pre> <pre data-language="myst">'class f(torch.nn.Module):\n    def forward(self, x_1: "f32[3]"):\n        # No stacktrace found for following nodes\n        pow_1: "f32[3]" = torch.ops.aten.pow.Tensor_Scalar(x_1, 2);  x_1 = None\n        div: "f32[3]" = torch.ops.aten.div.Tensor(pow_1, 6);  pow_1 = None\n        return div\n        '
+</pre> </div> </div> <p>And it will also specialize on any variables not directly passed into the function:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">var = torch.tensor(1)
+def f(x):
+    return x + y
+x = torch.randn(3)
+gm = make_fx(f, tracing_mode="fake")(x)
+gm.print_readable()
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">class f(torch.nn.Module):
+    def forward(self, x_1: "f32[3]"):
+        # No stacktrace found for following nodes
+        add: "f32[3]" = torch.ops.aten.add.Tensor(x_1, 3.14);  x_1 = None
+        return add
+        
+</pre> <pre data-language="myst">'class f(torch.nn.Module):\n    def forward(self, x_1: "f32[3]"):\n        # No stacktrace found for following nodes\n        add: "f32[3]" = torch.ops.aten.add.Tensor(x_1, 3.14);  x_1 = None\n        return add\n        '
+</pre> </div> </div>   </article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2025, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.9/compile/programming_model.non_strict_tracing_model.html" class="_attribution-link">https://docs.pytorch.org/docs/2.9/compile/programming_model.non_strict_tracing_model.html</a>
+  </p>
+</div>

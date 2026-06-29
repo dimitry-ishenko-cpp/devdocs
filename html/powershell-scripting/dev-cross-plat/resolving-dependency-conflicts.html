@@ -1,0 +1,306 @@
+<h1 id="resolving-powershell-module-assembly-dependency-conflicts">Resolving PowerShell module assembly dependency conflicts</h1> <p>When writing a binary PowerShell module in C#, it's natural to take dependencies on other packages or libraries to provide functionality. Taking dependencies on other libraries is desirable for code reuse. PowerShell always loads assemblies into the same context. This presents issues when a module's dependencies conflict with already-loaded DLLs and may prevent using two otherwise unrelated modules in the same PowerShell session.</p> <p>If you've had this problem, you've seen an error message like this:</p>  <p>This article looks at some ways dependency conflicts occur in PowerShell and ways to mitigate dependency conflict issues. Even if you're not a module author, there are some tricks in here that might help you with dependency conflicts occurring in modules that you use.</p> <h2 id="why-do-dependency-conflicts-occur">Why do dependency conflicts occur?</h2> <p>In .NET, dependency conflicts occur when two versions of the same assembly are loaded into the same <em>Assembly Load Context</em>. This term means slightly different things on different .NET platforms, which is covered <a href="#powershell-and-net">later</a> in this article. This conflict is a common problem that occurs in any software where versioned dependencies are used.</p> <p>Conflict issues are compounded by the fact that a project almost never deliberately or directly depends on two versions of the same dependency. Instead, the project has two or more dependencies that each require a different version of the same dependency.</p> <p>For example, say your .NET application, <code>DuckBuilder</code>, brings in two dependencies, to perform parts of its functionality and looks like this:</p>  <p>Because <code>Contoso.ZipTools</code> and <code>Fabrikam.FileHelpers</code> both depend on different versions of <strong>Newtonsoft.Json</strong>, there may be a dependency conflict depending on how each dependency is loaded.</p> <h3 id="conflicting-with-powershells-dependencies">Conflicting with PowerShell's dependencies</h3> <p>In PowerShell, the dependency conflict issue is magnified because PowerShell's own dependencies are loaded into the same shared context. This means the PowerShell engine and all loaded PowerShell modules must not have conflicting dependencies. A classic example of this is <strong>Newtonsoft.Json</strong>:</p>  <p>In this example, the module <code>FictionalTools</code> depends on <strong>Newtonsoft.Json</strong> version <code>12.0.3</code>, which is a newer version of <strong>Newtonsoft.Json</strong> than <code>11.0.2</code> that ships in the example PowerShell.</p> <blockquote> <p>[!NOTE] This is an example. PowerShell 7.0 currently ships with <strong>Newtonsoft.Json 12.0.3</strong>. Newer versions of PowerShell have newer versions of <strong>Newtonsoft.Json</strong>.</p> </blockquote> <p>Because the module depends on a newer version of the assembly, it won't accept the version that PowerShell already has loaded. But because PowerShell has already loaded a version of the assembly, the module can't load its own version using the conventional load mechanism.</p> <h3 id="conflicting-with-another-modules-dependencies">Conflicting with another module's dependencies</h3> <p>Another common scenario in PowerShell is that a module is loaded that depends on one version of an assembly, and then another module is loaded later that depends on a different version of that assembly.</p> <p>This often looks like the following:</p>  <p>In this case, the <code>FictionalTools</code> module requires a newer version of <code>Microsoft.Extensions.Logging</code> than the <code>FilesystemManager</code> module.</p> <p>Imagine these modules load their dependencies by placing the dependency assemblies in the same directory as the root module assembly. This allows .NET to implicitly load them by name. If we're running PowerShell 7.0 (on top of .NET Core 3.1), we can load and run <code>FictionalTools</code>, then load and run <code>FilesystemManager</code> without issue. However, in a new session, if we load and run <code>FilesystemManager</code>, then load <code>FictionalTools</code>, we get a <code>FileLoadException</code> from the <code>FictionalTools</code> command because it requires a newer version of <code>Microsoft.Extensions.Logging</code> than the one loaded. <code>FictionalTools</code> can't load the version needed because an assembly of the same name has already been loaded.</p> <h2 id="powershell-and-net">PowerShell and .NET</h2> <p>PowerShell runs on the .NET platform, which is responsible for resolving and loading assembly dependencies. We must understand how .NET operates here to understand dependency conflicts.</p> <p>We must also confront the fact that different versions of PowerShell run on different .NET implementations. In general, PowerShell 5.1 and below run on .NET Framework, while PowerShell 6 and above run on .NET Core. These two implementations of .NET load and handle assemblies differently. This means that resolving dependency conflicts can vary depending on the underlying .NET platform.</p> <h3 id="assembly-load-contexts">Assembly Load Contexts</h3> <p>In .NET, an <em>Assembly Load Context</em> (ALC) is a runtime namespace into which assemblies are loaded. The assemblies' names must be unique. This concept allows assemblies to be uniquely resolved by name in each ALC.</p> <h3 id="assembly-reference-loading-in-net">Assembly reference loading in .NET</h3> <p>The semantics of assembly loading depend on both the .NET implementation (.NET Core vs .NET Framework) and the .NET API used to load a particular assembly. Rather than go into detail here, there are links in the <a href="#further-reading">Further reading</a> section that go into great detail on how .NET assembly loading works in each .NET implementation.</p> <p>In this article we'll refer to the following mechanisms:</p> <ul> <li>Implicit assembly loading (effectively <code>Assembly.Load(AssemblyName)</code>), when .NET implicitly tries to load an assembly by name from a static assembly reference in .NET code.</li> <li>
+<code>Assembly.LoadFrom()</code>, a plugin-oriented loading API that adds handlers to resolve dependencies of the loaded DLL. This method may not resolve dependencies the way we want.</li> <li>
+<code>Assembly.LoadFile()</code>, a basic loading API intended to load only the assembly asked for and does not handle any dependencies.</li> </ul> <h3 id="differences-in-net-framework-vs-net-core">Differences in .NET Framework vs .NET Core</h3> <p>The way these APIs work has changed in subtle ways between .NET Core and .NET Framework, so it's worth reading through the included <a href="#further-reading">links</a>. Importantly, Assembly Load Contexts and other assembly resolution mechanisms have changed between .NET Framework and .NET Core.</p> <p>In particular, .NET Framework has the following features:</p> <ul> <li>The Global Assembly Cache, for machine-wide assembly resolution</li> <li>Application Domains, which work like in-process sandboxes for assembly isolation, but also present a serialization layer to contend with</li> <li>A limited assembly load context model that has a fixed set of assembly load contexts, each with their own behavior: <ul> <li>The default load context, where assemblies are loaded by default</li> <li>The load-from context, for loading assemblies manually at runtime</li> <li>The reflection-only context, for safely loading assemblies to read their metadata without running them</li> <li>The mysterious void that assemblies loaded with <code>Assembly.LoadFile(string path)</code> and <code>Assembly.Load(byte[] asmBytes)</code> live in</li> </ul>
+</li> </ul> <p>For more information, see <a href="../dotnet/framework/deployment/best-practices-for-assembly-loading.html">Best Practices for Assembly Loading</a>.</p> <p>.NET Core (and .NET 5+) has replaced this complexity with a simpler model:</p> <ul> <li>No Global Assembly Cache. Applications bring all their own dependencies. This removes an external factor for dependency resolution in applications, making dependency resolution more reproducible. PowerShell, as the plugin host, complicates this slightly for modules. Its dependencies in <code>$PSHOME</code> are shared with all modules.</li> <li>Only one Application Domain, and no ability to create new ones. The Application Domain concept is maintained in .NET to be the global state of the .NET process.</li> <li>A new, extensible Assembly Load Context (ALC) model. Assembly resolution can be namespaced by putting it in a new ALC. .NET processes begin with a single default ALC into which all assemblies are loaded (except for those loaded with <code>Assembly.LoadFile(string)</code> and <code>Assembly.Load(byte[])</code>). But the process can create and define its own custom ALCs with its own loading logic. When an assembly is loaded, the first ALC it's loaded into is responsible for resolving its dependencies. This creates opportunities to implement powerful .NET plugin loading mechanisms.</li> </ul> <p>In both implementations, assemblies are loaded lazily. This means that they're loaded when a method requiring their type is run for the first time.</p> <p>For example, here are two versions of the same code that load a dependency at different times.</p> <p>The first always loads its dependency when <code>Program.GetRange()</code> is called, because the dependency reference is lexically present within the method:</p> <pre><code class="csharp">using Dependency.Library;
+
+public static class Program
+{
+    public static List&lt;int&gt; GetRange(int limit)
+    {
+        var list = new List&lt;int&gt;();
+        for (int i = 0; i &lt; limit; i++)
+        {
+            if (i &gt;= 20)
+            {
+                // Dependency.Library will be loaded when GetRange is run
+                // because the dependency call occurs directly within the method
+                DependencyApi.Use();
+            }
+
+            list.Add(i);
+        }
+        return list;
+    }
+}
+</code></pre> <p>The second loads its dependency only if the <code>limit</code> parameter is 20 or more, because of the internal indirection through a method:</p> <pre><code class="csharp">using Dependency.Library;
+
+public static class Program
+{
+    public static List&lt;int&gt; GetNumbers(int limit)
+    {
+        var list = new List&lt;int&gt;();
+        for (int i = 0; i &lt; limit; i++)
+        {
+            if (i &gt;= 20)
+            {
+                // Dependency.Library is only referenced within
+                // the UseDependencyApi() method,
+                // so will only be loaded when limit &gt;= 20
+                UseDependencyApi();
+            }
+
+            list.Add(i);
+        }
+        return list;
+    }
+
+    private static void UseDependencyApi()
+    {
+        // Once UseDependencyApi() is called, Dependency.Library is loaded
+        DependencyApi.Use();
+    }
+}
+</code></pre> <p>This is a good practice since it minimizes the memory and filesystem I/O and uses the resources more efficiently. The unfortunate a side effect of this is that we won't know that the assembly fails to load until we reach the code path that tries to load the assembly.</p> <p>It can also create a timing condition for assembly load conflicts. If two parts of the same program try to load different versions of the same assembly, the version loaded depends on which code path is run first.</p> <p>For PowerShell, this means that the following factors can affect an assembly load conflict:</p> <ul> <li>Which module was loaded first?</li> <li>Was the code path that uses the dependency library run?</li> <li>Does PowerShell load a conflicting dependency at startup or only under certain code paths?</li> </ul> <h2 id="quick-fixes-and-their-limitations">Quick fixes and their limitations</h2> <p>In some cases, it's possible to make small adjustments to your module and fix things with minimal effort. But these solutions tend to come with caveats. While they may apply to your module, they won't work for every module.</p> <h3 id="change-your-dependency-version">Change your dependency version</h3> <p>The simplest way to avoid dependency conflicts is to agree on a dependency. This may be possible when:</p> <ul> <li>Your conflict is with a direct dependency of your module and you control the version.</li> <li>Your conflict is with an indirect dependency, but you can configure your direct dependencies to use a workable indirect dependency version.</li> <li>You know the conflicting version and can rely on it not changing.</li> </ul> <p>The <strong>Newtonsoft.Json</strong> package is a good example of this last scenario. This is a dependency of PowerShell 6 and above, and isn't used in Windows PowerShell. Meaning a simple way to resolve versioning conflicts is to target the lowest version of <strong>Newtonsoft.Json</strong> across the PowerShell versions you wish to target.</p> <p>For example, PowerShell 6.2.6 and PowerShell 7.0.2 both currently use <strong>Newtonsoft.Json</strong> version 12.0.3. To create a module targeting Windows PowerShell, PowerShell 6, and PowerShell 7, you would target <strong>Newtonsoft.Json 12.0.3</strong> as a dependency and include it in your built module. When the module is loaded in PowerShell 6 or 7, PowerShell's own <strong>Newtonsoft.Json</strong> assembly is already loaded. Since it's the version required for your module, resolution succeeds. In Windows PowerShell, the assembly isn't already present in PowerShell, so it's loaded from your module folder instead.</p> <p>Generally, when targeting a concrete PowerShell package, like <strong>Microsoft.PowerShell.Sdk</strong> or <strong>System.Management.Automation</strong>, NuGet should be able to resolve the right dependency versions required. Targeting both Windows PowerShell and PowerShell 6+ becomes more difficult because you must choose between targeting multiple frameworks or <strong>PowerShellStandard.Library</strong>.</p> <p>Circumstances where pinning to a common dependency version won't work include:</p> <ul> <li>The conflict is with an indirect dependency, and none of your dependencies can be configured to use a common version.</li> <li>The other dependency version is likely to change often, so settling on a common version is only a short-term fix.</li> </ul> <h3 id="use-the-dependency-out-of-process">Use the dependency out of process</h3> <p>This solution is more for module users than module authors. This is a solution to use when confronted with a module that won't work due to an existing dependency conflict.</p> <p>Dependency conflicts occur because two versions of the same assembly are loaded into the same .NET process. A simple solution is to load them into different processes, as long as you can still use the functionality from both together.</p> <p>In PowerShell, there are several ways to achieve this:</p> <ul> <li>Invoke PowerShell as a subprocess</li> </ul> <p>To run a PowerShell command out of the current process, start a new PowerShell process directly with the command call:</p> <pre><code class="powershell">  pwsh -c 'Invoke-ConflictingCommand'
+</code></pre> <p>The main limitation here is that restructuring the result can be trickier or more error prone than other options.</p> <ul> <li>The PowerShell job system</li> </ul> <p>The PowerShell job system also runs commands out of process, by sending commands to a new PowerShell process and returning the results:</p> <pre><code class="powershell">  $result = Start-Job { Invoke-ConflictingCommand } | Receive-Job -Wait
+</code></pre> <p>In this case, you just need to be sure that any variables and state are passed in correctly.</p> <p>The job system can also be slightly cumbersome when running small commands.</p> <ul> <li>PowerShell remoting</li> </ul> <p>When it's available, PowerShell remoting can be a useful way to run commands out of process. With remoting, you can create a fresh <strong>PSSession</strong> in a new process, call its commands over PowerShell remoting, then use the results locally with the other modules containing the conflicting dependencies.</p> <p>An example might look like this:</p> <pre><code class="powershell">  # Create a local PowerShell session
+  # where the module with conflicting assemblies will be loaded
+  $s = New-PSSession
+
+  # Import the module with the conflicting dependency via remoting,
+  # exposing the commands locally
+  Import-Module -PSSession $s -Name ConflictingModule
+
+  # Run a command from the module with the conflicting dependencies
+  Invoke-ConflictingCommand
+</code></pre> <ul> <li>Implicit remoting to Windows PowerShell</li> </ul> <p>Another option in PowerShell 7 is to use the <code>-UseWindowsPowerShell</code> flag on <code>Import-Module</code>. This imports the module through a local remoting session into Windows PowerShell:</p> <pre><code class="powershell">  Import-Module -Name ConflictingModule -UseWindowsPowerShell
+</code></pre> <p>Be aware that modules may not be compatible with or may work differently with Windows PowerShell.</p> <h4 id="when-out-of-process-invocation-shouldnt-be-used">When out-of-process invocation shouldn't be used</h4> <p>As a module author, out-of-process command invocation is difficult to bake into a module and may have edge cases that cause issues. In particular, remoting and jobs may not be available in all environments where your module needs to work. However, the general principle of moving the implementation out of process and allowing the PowerShell module to be a thinner client, may still be applicable.</p> <p>As a module user, there are cases where out-of-process invocation won't work:</p> <ul> <li>When PowerShell remoting is unavailable because you don't have privileges to use it or it isn't enabled.</li> <li>When a particular .NET type is needed from output as input to a method or another command. Commands running over PowerShell remoting emit deserialized objects rather than strongly-typed .NET objects. This means that method calls and strongly typed APIs don't work with the output of commands imported over remoting.</li> </ul> <h2 id="more-robust-solutions">More robust solutions</h2> <p>The previous solutions all had scenarios and modules that don't work. However, they also have the virtue of being relatively simple to implement correctly. The following solutions are more robust, but require more effort to implement correctly and can introduce subtle bugs if not written carefully.</p> <h3 id="loading-through-net-core-assembly-load-contexts">Loading through .NET Core Assembly Load Contexts</h3> <p><a href="xref:System.Runtime.Loader.AssemblyLoadContext.html">Assembly Load Contexts</a> (ALCs) were introduced in .NET Core 1.0 to specifically address the need to load multiple versions of the same assembly into the same runtime.</p> <p>Within .NET, they offer the most robust solution to the problem of loading conflicting versions of an assembly. However, custom ALCs aren't available in .NET Framework. This means that this solution only works in PowerShell 6 and above.</p> <p>Currently, the best example of using an ALC for dependency isolation in PowerShell is in PowerShell Editor Services, the language server for the PowerShell extension for Visual Studio Code. An <a href="https://github.com/PowerShell/PowerShellEditorServices/blob/master/src/PowerShellEditorServices.Hosting/Internal/PsesLoadContext.cs">ALC is used</a> to prevent PowerShell Editor Services' own dependencies from clashing with those in PowerShell modules.</p> <p>Implementing module dependency isolation with an ALC is conceptually difficult, but we will work through a minimal example. Imagine we've a simple module that's only intended to work in PowerShell 7. The source code is organized as follows:</p> <pre><code>+ AlcModule.psd1
++ src/
+    + TestAlcModuleCommand.cs
+    + AlcModule.csproj
+</code></pre> <p>The cmdlet implementation looks like this:</p> <pre><code class="csharp">using Shared.Dependency;
+
+namespace AlcModule
+{
+    [Cmdlet(VerbsDiagnostic.Test, "AlcModule")]
+    public class TestAlcModuleCommand : Cmdlet
+    {
+        protected override void EndProcessing()
+        {
+            // Here's where our dependency gets used
+            Dependency.Use();
+            // Something trivial to make our cmdlet do *something*
+            WriteObject("done!");
+        }
+    }
+}
+</code></pre> <p>The (heavily simplified) manifest, looks like this:</p> <pre><code class="powershell">@{
+    Author = 'Me'
+    ModuleVersion = '0.0.1'
+    RootModule = 'AlcModule.dll'
+    CmdletsToExport = @('Test-AlcModule')
+    PowerShellVersion = '7.0'
+}
+</code></pre> <p>And the <code>csproj</code> looks like this:</p> <pre><code class="xml">&lt;Project Sdk="Microsoft.NET.Sdk"&gt;
+  &lt;PropertyGroup&gt;
+    &lt;TargetFramework&gt;netcoreapp3.1&lt;/TargetFramework&gt;
+  &lt;/PropertyGroup&gt;
+  &lt;ItemGroup&gt;
+    &lt;PackageReference Include="Shared.Dependency" Version="1.0.0" /&gt;
+    &lt;PackageReference Include="Microsoft.PowerShell.Sdk" Version="7.0.1" PrivateAssets="all" /&gt;
+  &lt;/ItemGroup&gt;
+&lt;/Project&gt;
+</code></pre> <p>When we build this module, the generated output has the following layout:</p> <pre><code>AlcModule/
+  + AlcModule.psd1
+  + AlcModule.dll
+  + Shared.Dependency.dll
+</code></pre> <p>In this example, our problem is in the <code>Shared.Dependency.dll</code> assembly, which is our imaginary conflicting dependency. This is the dependency that we need to put behind an ALC so that we can use the module-specific version.</p> <p>We need to re-engineer the module so that:</p> <ul> <li>Module dependencies are only loaded into our custom ALC, and not into PowerShell's ALC, so there can be no conflict. Moreover, as we add more dependencies to our project, we don't want to continuously add more code to keep loading working. Instead, we want reusable, generic dependency resolution logic.</li> <li>Loading the module still works as normal in PowerShell. Cmdlets and other types that the PowerShell module system needs are defined within PowerShell's own ALC.</li> </ul> <p>To mediate these two requirements, we must break up our module into two assemblies:</p> <ul> <li>A cmdlets assembly, <code>AlcModule.Cmdlets.dll</code>, that contains definitions of all the types that PowerShell's module system needs to load our module correctly. Namely, any implementations of the <code>Cmdlet</code> base class and the class that implements <code>IModuleAssemblyInitializer</code>, which sets up the event handler for <code>AssemblyLoadContext.Default.Resolving</code> to properly load <code>AlcModule.Engine.dll</code> through our custom ALC. Since PowerShell 7 deliberately hides types defined in assemblies loaded in other ALCs, any types that are meant to be publicly exposed to PowerShell must also be defined here. Finally, our custom ALC definition needs to be defined in this assembly. Beyond that, as little code as possible should live in this assembly.</li> <li>An engine assembly, <code>AlcModule.Engine.dll</code>, that handles the actual implementation of the module. Types from this are available in the PowerShell ALC, but it's initially loaded through our custom ALC. Its dependencies are only loaded into the custom ALC. Effectively, this becomes a <em>bridge</em> between the two ALCs.</li> </ul> <p>Using this bridge concept, our new assembly situation looks like this:</p>  <p>To make sure the default ALC's dependency probing logic doesn't resolve the dependencies to be loaded into the custom ALC, we need to separate these two parts of the module in different directories. The new module layout has the following structure:</p> <pre><code>AlcModule/
+  AlcModule.Cmdlets.dll
+  AlcModule.psd1
+  Dependencies/
+  | + AlcModule.Engine.dll
+  | + Shared.Dependency.dll
+</code></pre> <p>To see how the implementation changes, we'll start with the implementation of <code>AlcModule.Engine.dll</code>:</p> <pre><code class="csharp">using Shared.Dependency;
+
+namespace AlcModule.Engine
+{
+    public class AlcEngine
+    {
+        public static void Use()
+        {
+            Dependency.Use();
+        }
+    }
+}
+</code></pre> <p>This is a simple container for the dependency, <code>Shared.Dependency.dll</code>, but you should think of it as the .NET API for your functionality that the cmdlets in the other assembly wrap for PowerShell.</p> <p>The cmdlet in <code>AlcModule.Cmdlets.dll</code> looks like this:</p> <pre><code class="csharp">// Reference our module's Engine implementation here
+using AlcModule.Engine;
+
+namespace AlcModule.Cmdlets
+{
+    [Cmdlet(VerbsDiagnostic.Test, "AlcModule")]
+    public class TestAlcModuleCommand : Cmdlet
+    {
+        protected override void EndProcessing()
+        {
+            AlcEngine.Use();
+            WriteObject("done!");
+        }
+    }
+}
+</code></pre> <p>At this point, if we were to load <strong>AlcModule</strong> and run <code>Test-AlcModule</code>, we get a <strong>FileNotFoundException</strong> when the default ALC tries to load <code>Alc.Engine.dll</code> to run <code>EndProcessing()</code>. This is good, since it means the default ALC can't find the dependencies we want to hide.</p> <p>Now we need to add code to <code>AlcModule.Cmdlets.dll</code> so that it knows how to resolve <code>AlcModule.Engine.dll</code>. First we must define our custom ALC to resolve assemblies from our module's <code>Dependencies</code> directory:</p> <pre><code class="csharp">namespace AlcModule.Cmdlets
+{
+    internal class AlcModuleAssemblyLoadContext : AssemblyLoadContext
+    {
+        private readonly string _dependencyDirPath;
+
+        public AlcModuleAssemblyLoadContext(string dependencyDirPath)
+        {
+            _dependencyDirPath = dependencyDirPath;
+        }
+
+        protected override Assembly Load(AssemblyName assemblyName)
+        {
+            // We do the simple logic here of looking for an assembly of the given name
+            // in the configured dependency directory.
+            string assemblyPath = Path.Combine(
+                _dependencyDirPath,
+                $"{assemblyName.Name}.dll");
+
+            if (File.Exists(assemblyPath))
+            {
+                // The ALC must use inherited methods to load assemblies.
+                // Assembly.Load*() won't work here.
+                return LoadFromAssemblyPath(assemblyPath);
+            }
+
+            // For other assemblies, return null to allow other resolutions to continue.
+            return null;
+        }
+    }
+}
+</code></pre> <p>Then we need to hook up our custom ALC to the default ALC's <code>Resolving</code> event, which is the ALC version of the <code>AssemblyResolve</code> event on Application Domains. This event is fired to find <code>AlcModule.Engine.dll</code> when <code>EndProcessing()</code> is called.</p> <pre><code class="csharp">namespace AlcModule.Cmdlets
+{
+    public class AlcModuleResolveEventHandler : IModuleAssemblyInitializer, IModuleAssemblyCleanup
+    {
+        // Get the path of the dependency directory.
+        // In this case we find it relative to the AlcModule.Cmdlets.dll location
+        private static readonly string s_dependencyDirPath = Path.GetFullPath(
+            Path.Combine(
+                Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location),
+                "Dependencies"));
+
+        private static readonly AlcModuleAssemblyLoadContext s_dependencyAlc =
+            new AlcModuleAssemblyLoadContext(s_dependencyDirPath);
+
+        public void OnImport()
+        {
+            // Add the Resolving event handler here
+            AssemblyLoadContext.Default.Resolving += ResolveAlcEngine;
+        }
+
+        public void OnRemove(PSModuleInfo psModuleInfo)
+        {
+            // Remove the Resolving event handler here
+            AssemblyLoadContext.Default.Resolving -= ResolveAlcEngine;
+        }
+
+        private static Assembly ResolveAlcEngine(AssemblyLoadContext defaultAlc, AssemblyName assemblyToResolve)
+        {
+            // We only want to resolve the Alc.Engine.dll assembly here.
+            // Because this will be loaded into the custom ALC,
+            // all of *its* dependencies will be resolved
+            // by the logic we defined for that ALC's implementation.
+            //
+            // Note that we're safe in our assumption that the name is enough
+            // to distinguish our assembly here,
+            // since it's unique to our module.
+            // There should be no other AlcModule.Engine.dll on the system.
+            if (!assemblyToResolve.Name.Equals("AlcModule.Engine"))
+            {
+                return null;
+            }
+
+            // Allow our ALC to handle the directory discovery concept
+            //
+            // This is where Alc.Engine.dll is loaded into our custom ALC
+            // and then passed through into PowerShell's ALC,
+            // becoming the bridge between both
+            return s_dependencyAlc.LoadFromAssemblyName(assemblyToResolve);
+        }
+    }
+}
+</code></pre> <p>With the new implementation, take a look at the sequence of calls that occurs when the module is loaded and <code>Test-AlcModule</code> is run:</p>  <p>Some points of interest are:</p> <ul> <li>The <code>IModuleAssemblyInitializer</code> is run first when the module loads and sets the <code>Resolving</code> event.</li> <li>We don't load the dependencies until <code>Test-AlcModule</code> is run and its <code>EndProcessing()</code> method is called.</li> <li>When <code>EndProcessing()</code> is called, the default ALC fails to find <code>AlcModule.Engine.dll</code> and fires the <code>Resolving</code> event.</li> <li>Our event handler hooks up the custom ALC to the default ALC and loads <code>AlcModule.Engine.dll</code> only.</li> <li>When <code>AlcEngine.Use()</code> is called within <code>AlcModule.Engine.dll</code>, the custom ALC again kicks in to resolve <code>Shared.Dependency.dll</code>. Specifically, it always loads <em>our</em> <code>Shared.Dependency.dll</code> since it never conflicts with anything in the default ALC and only looks in our <code>Dependencies</code> directory.</li> </ul> <p>Assembling the implementation, our new source code layout looks like this:</p> <pre><code>+ AlcModule.psd1
++ src/
+  + AlcModule.Cmdlets/
+  | + AlcModule.Cmdlets.csproj
+  | + TestAlcModuleCommand.cs
+  | + AlcModuleAssemblyLoadContext.cs
+  | + AlcModuleInitializer.cs
+  |
+  + AlcModule.Engine/
+  | + AlcModule.Engine.csproj
+  | + AlcEngine.cs
+</code></pre> <p>AlcModule.Cmdlets.csproj looks like:</p> <pre><code class="xml">&lt;Project Sdk="Microsoft.NET.Sdk"&gt;
+  &lt;PropertyGroup&gt;
+    &lt;TargetFramework&gt;netcoreapp3.1&lt;/TargetFramework&gt;
+  &lt;/PropertyGroup&gt;
+  &lt;ItemGroup&gt;
+    &lt;ProjectReference Include="..\AlcModule.Engine\AlcModule.Engine.csproj" /&gt;
+    &lt;PackageReference Include="Microsoft.PowerShell.Sdk" Version="7.0.1" PrivateAssets="all" /&gt;
+  &lt;/ItemGroup&gt;
+&lt;/Project&gt;
+</code></pre> <p>AlcModule.Engine.csproj looks like this:</p> <pre><code class="xml">&lt;Project Sdk="Microsoft.NET.Sdk"&gt;
+  &lt;PropertyGroup&gt;
+    &lt;TargetFramework&gt;netcoreapp3.1&lt;/TargetFramework&gt;
+  &lt;/PropertyGroup&gt;
+  &lt;ItemGroup&gt;
+    &lt;PackageReference Include="Shared.Dependency" Version="1.0.0" /&gt;
+  &lt;/ItemGroup&gt;
+&lt;/Project&gt;
+</code></pre> <p>So, when we build the module, our strategy is:</p> <ul> <li>Build <code>AlcModule.Engine</code>
+</li> <li>Build <code>AlcModule.Cmdlets</code>
+</li> <li>Copy everything from <code>AlcModule.Engine</code> into the <code>Dependencies</code> directory, and remember what we copied</li> <li>Copy everything from <code>AlcModule.Cmdlets</code> that wasn't in <code>AlcModule.Engine</code> into the base module directory</li> </ul> <p>Since the module layout here is so crucial to dependency separation, here's a build script to use from the source root:</p> <pre><code class="powershell">param(
+    # The .NET build configuration
+    [ValidateSet('Debug', 'Release')]
+    [string]
+    $Configuration = 'Debug'
+)
+
+# Convenient reusable constants
+$mod = "AlcModule"
+$netcore = "netcoreapp3.1"
+$copyExtensions = @('.dll', '.pdb')
+
+# Source code locations
+$src = "$PSScriptRoot/src"
+$engineSrc = "$src/$mod.Engine"
+$cmdletsSrc = "$src/$mod.Cmdlets"
+
+# Generated output locations
+$outDir = "$PSScriptRoot/out/$mod"
+$outDeps = "$outDir/Dependencies"
+
+# Build AlcModule.Engine
+Push-Location $engineSrc
+dotnet publish -c $Configuration
+Pop-Location
+
+# Build AlcModule.Cmdlets
+Push-Location $cmdletsSrc
+dotnet publish -c $Configuration
+Pop-Location
+
+# Ensure out directory exists and is clean
+Remove-Item -Path $outDir -Recurse -ErrorAction Ignore
+New-Item -Path $outDir -ItemType Directory
+New-Item -Path $outDeps -ItemType Directory
+
+# Copy manifest
+Copy-Item -Path "$PSScriptRoot/$mod.psd1"
+
+# Copy each Engine asset and remember it
+$deps = [System.Collections.Generic.Hashtable[string]]::new()
+Get-ChildItem -Path "$engineSrc/bin/$Configuration/$netcore/publish/" |
+    Where-Object { $_.Extension -in $copyExtensions } |
+    ForEach-Object { [void]$deps.Add($_.Name); Copy-Item -Path $_.FullName -Destination $outDeps }
+
+# Now copy each Cmdlets asset, not taking any found in Engine
+Get-ChildItem -Path "$cmdletsSrc/bin/$Configuration/$netcore/publish/" |
+    Where-Object { -not $deps.Contains($_.Name) -and $_.Extension -in $copyExtensions } |
+    ForEach-Object { Copy-Item -Path $_.FullName -Destination $outDir }
+</code></pre> <p>Finally, we've a general way to isolate our module's dependencies in an Assembly Load Context that remains robust over time as more dependencies are added.</p> <p>For a more detailed example, go to this <a href="https://github.com/rjmholt/ModuleDependencyIsolationExample">GitHub repository</a>. This example demonstrates how to migrate a module to use an ALC, while keeping that module working in .NET Framework. It also shows how to use .NET Standard and PowerShell Standard to simplify the core implementation.</p> <p>This solution is also used by the <a href="https://github.com/PSBicep/PSBicep">Bicep PowerShell module</a>, and the blog post <a href="https://pipe.how/get-assemblyloadcontext/">Resolving PowerShell Module Conflicts</a> is another good read about this solution.</p> <h3 id="assembly-resolving-handler-for-side-by-side-loading">Assembly resolving handler for side-by-side loading</h3> <p>Although being robust, the solution described above requires the module assembly to not directly reference the dependency assemblies, but instead, reference a wrapper assembly that references the dependency assemblies. The wrapper assembly acts like a bridge, forwarding the calls from the module assembly to the dependency assemblies. This makes it usually a non-trivial amount of work to adopt this solution:</p> <ul> <li>For a new module, this would add additional complexity to the design and implementation</li> <li>For an existing module, this would require significant refactoring</li> </ul> <p>There is a simplified solution to achieve side-by-side assembly loading, by hooking up a <code>Resolving</code> event with a custom <code>AssemblyLoadContext</code> instance. Using this method is easier for the module author but has two limitations. Check out the <a href="https://github.com/daxian-dbw/PowerShell-ALC-Samples">PowerShell-ALC-Samples</a> repository for sample code and documentation that describes these limitations and detailed scenarios for this solution.</p> <blockquote> <p>[!IMPORTANT] Don't use <code>Assembly.LoadFile</code> for the dependency isolation purpose. Using <code>Assembly.LoadFile</code> creates a <em>Type Identity</em> issue when another module loads a different version of the same assembly into the default <code>AssemblyLoadContext</code>. While this API loads an assembly to a separate <code>AssemblyLoadContext</code> instance, the assemblies loaded are discoverable by PowerShell's <a href="https://github.com/PowerShell/PowerShell/blob/918bb8c952af1d461abfc98bc709a1d359168a1c/src/System.Management.Automation/utils/ClrFacade.cs#L56-L61">type resolution code</a>. Therefore, there could be duplicate types with the same fully qualifed type name available from two different ALCs.</p> </blockquote> <h3 id="custom-application-domains">Custom Application Domains</h3> <p>The final and most extreme option for assembly isolation is to use custom <strong>Application Domains</strong>. <strong>Application Domains</strong> are only available in .NET Framework. They're used to provide in-process isolation between parts of a .NET application. One of the uses is to isolate assembly loads from each other within the same process.</p> <p>However, <strong>Application Domains</strong>are serialization boundaries. Objects in one application domain can't be referenced and used directly by objects in another application domain. You can work around this by implementing <code>MarshalByRefObject</code>. But when you don't control the types, as is often the case with dependencies, it's not possible to force an implementation here. The only solution is to make large architectural changes. The serialization boundary also has serious performance implications.</p> <p>Because <strong>Application Domains</strong> have this serious limitation, are complicated to implement, and only work in .NET Framework, we won't give an example of how you might use them here. While they're worth mentioning as a possibility, they're not recommended.</p> <p>If you're interested in trying to use a custom application domain, the following links might help:</p> <ul> <li><a href="../dotnet/framework/app-domains/application-domains.html">Conceptual documentation on Application Domains</a></li> <li><a href="../dotnet/framework/app-domains/use.html">Examples for using Application Domains</a></li> </ul> <h2 id="solutions-for-dependency-conflicts-that-dont-work-for-powershell">Solutions for dependency conflicts that don't work for PowerShell</h2> <p>Finally, we'll address some possibilities that come up when researching .NET dependency conflicts in .NET that can look promising, but generally won't work for PowerShell.</p> <p>These solutions have the common theme that they're changes to deployment configurations for an environment where you control the application and possibly the entire machine. These solutions are oriented toward scenarios like web servers and other applications deployed to server environments, where the environment is intended to host the application and is free to be configured by the deploying user. They also tend to be very much .NET Framework oriented, meaning they don't work with PowerShell 6 or higher.</p> <p>If you know that your module is only used in Windows PowerShell 5.1 environments that you have total control over, some of these may be options. In general however, <strong>modules shouldn't modify global machine state like this</strong>. It can break configurations that cause problems in <code>powershell.exe</code>, other modules, or other dependent applications that cause your module to fail in unexpected ways.</p> <h3 id="static-binding-redirect-with-app-config-to-force-using-the-same-dependency-version">Static binding redirect with app.config to force using the same dependency version</h3> <p>.NET Framework applications can take advantage of an <code>app.config</code> file to configure some application behaviors declaratively. It's possible to write an <code>app.config</code> entry that configures assembly binding to redirect assembly loading to a particular version.</p> <p>Two issues with this for PowerShell are:</p> <ul> <li>.NET Core doesn't support <code>app.config</code>, so this solution only applies to <code>powershell.exe</code>.</li> <li>
+<code>powershell.exe</code> is a shared application that lives in the <code>System32</code> directory. It's likely that your module won't be able to modify its contents on many systems. Even if it can, modifying the <code>app.config</code> could break an existing configuration or affect the loading of other modules.</li> </ul> <h3 id="setting-codebase-with-app-config">Setting <code>codebase</code> with app.config</h3> <p>For the same reasons, trying to configure the <code>codebase</code> setting in <code>app.config</code> isn't going to work in PowerShell modules.</p> <h3 id="installing-dependencies-to-the-global-assembly-cache-gac">Installing dependencies to the Global Assembly Cache (GAC)</h3> <p>Another way to resolve dependency version conflicts in .NET Framework is to install dependencies to the GAC, so that different versions can be loaded side-by-side from the GAC.</p> <p>Again, for PowerShell modules, the chief issues here are:</p> <ul> <li>The GAC only applies to .NET Framework, so this doesn't help in PowerShell 6 and above.</li> <li>Installing assemblies to the GAC is a modification of global machine state and may cause side-effects in other applications or to other modules. It may also be difficult to do correctly, even when your module has the required access privileges. Getting it wrong could cause serious, machine-wide issues in other .NET applications.</li> </ul> <h2 id="further-reading">Further reading</h2> <p>There's plenty more to read on .NET assembly version dependency conflicts. Here are some nice jumping off points:</p> <ul> <li><a href="../dotnet/standard/assembly/index.html">.NET: Assemblies in .NET</a></li> <li><a href="../dotnet/core/dependency-loading/loading-managed.html">.NET Core: The managed assembly loading algorithm</a></li> <li><a href="../dotnet/core/dependency-loading/understanding-assemblyloadcontext.html">.NET Core: Understanding System.Runtime.Loader.AssemblyLoadContext</a></li> <li><a href="https://github.com/dotnet/runtime/issues/13471">.NET Core: Discussion about side-by-side assembly loading solutions</a></li> <li><a href="../dotnet/framework/configure-apps/redirect-assembly-versions.html">.NET Framework: Redirecting assembly versions</a></li> <li><a href="../dotnet/framework/deployment/best-practices-for-assembly-loading.html">.NET Framework: Best practices for assembly loading</a></li> <li><a href="../dotnet/framework/deployment/how-the-runtime-locates-assemblies.html">.NET Framework: How the runtime locates assemblies</a></li> <li><a href="../dotnet/standard/assembly/resolve-loads.html">.NET Framework: Resolve assembly loads</a></li> <li><a href="https://stackoverflow.com/questions/43365736/assembly-binding-redirect-how-and-why">Stack Overflow: Assembly binding redirect, how and why?</a></li> <li><a href="https://github.com/PowerShell/PowerShell/issues/11571">PowerShell: Discussion about implementing AssemblyLoadContexts</a></li> <li><a href="https://github.com/PowerShell/PowerShell/issues/12052">PowerShell: <code>Assembly.LoadFile()</code> doesn't load into default AssemblyLoadContext</a></li> <li><a href="https://weblog.west-wind.com/posts/2012/Nov/03/Back-to-Basics-When-does-a-NET-Assembly-Dependency-get-loaded">Rick Strahl: When does a .NET assembly dependency get loaded?</a></li> <li><a href="https://codeblog.jonskeet.uk/2019/06/30/versioning-limitations-in-net/">Jon Skeet: Summary of versioning in .NET</a></li> <li><a href="https://natemcmaster.com/blog/2017/12/21/netcore-primitives/">Nate McMaster: Deep dive into .NET Core primitives</a></li> </ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Microsoft CorporationCode licensed under an MIT-style License. Documentation licensed under CC BY 4.0.<br>
+    <a href="https://learn.microsoft.com/en-us/powershell/scripting/dev-cross-plat/resolving-dependency-conflicts?view=powershell-Scripting" class="_attribution-link">https://learn.microsoft.com/en-us/powershell/scripting/dev-cross-plat/resolving-dependency-conflicts?view=powershell-Scripting</a>
+  </p>
+</div>

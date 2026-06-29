@@ -1,0 +1,56 @@
+<h1 id="auditing-and-reporting-on-jea">Auditing and Reporting on JEA</h1> <p>After you've deployed JEA, you need to regularly audit the JEA configuration. Auditing helps you assess that the correct people have access to the JEA endpoint and their assigned roles are still appropriate.</p> <h2 id="find-registered-jea-sessions-on-a-machine">Find registered JEA sessions on a machine</h2> <p>To check which JEA sessions are registered on a machine, use the <a href="../../../powershell/module/microsoft.powershell.core/get-pssessionconfiguration.html">Get-PSSessionConfiguration</a> cmdlet.</p> <pre><code class="powershell"># Filter for sessions that are configured as 'RestrictedRemoteServer' to
+# find JEA-like session configurations
+Get-PSSessionConfiguration | Where-Object { $_.SessionType -eq 'RestrictedRemoteServer' }
+</code></pre> <pre><code class="Output">Name          : JEAMaintenance
+PSVersion     : 5.1
+StartupScript :
+RunAsUser     :
+Permission    : CONTOSO\JEA_DNS_ADMINS AccessAllowed, CONTOSO\JEA_DNS_OPERATORS AccessAllowed,
+                CONTOSO\JEA_DNS_AUDITORS AccessAllowed
+</code></pre> <p>The effective rights for the endpoint are listed in the <strong>Permission</strong> property. These users have the right to connect to the JEA endpoint. However, the roles and commands they have access to is determined by the <strong>RoleDefinitions</strong> property in the <a href="session-configurations.html">session configuration file</a> that was used to register the endpoint. Expand the <strong>RoleDefinitions</strong> property to evaluate the role mappings in a registered JEA endpoint.</p> <pre><code class="powershell"># Get the desired session configuration
+$jea = Get-PSSessionConfiguration -Name 'JEAMaintenance'
+
+# Enumerate users/groups and which roles they have access to
+$jea.RoleDefinitions.GetEnumerator() | Select-Object Name, @{
+  Name = 'Role Capabilities'
+  Expression = { $_.Value.RoleCapabilities }
+}
+</code></pre> <h2 id="find-available-role-capabilities-on-the-machine">Find available role capabilities on the machine</h2> <p>JEA gets role capabilities from the <code>.psrc</code> files stored in the <strong>RoleCapabilities</strong> folder inside a PowerShell module. The following function finds all role capabilities available on a computer.</p> <pre><code class="powershell">function Find-LocalRoleCapability {
+    $results = @()
+
+    # Find modules with a "RoleCapabilities" subfolder and add any PSRC files to the result set
+    Get-Module -ListAvailable | ForEach-Object {
+        $psrcpath = Join-Path -Path $_.ModuleBase -ChildPath 'RoleCapabilities'
+        if (Test-Path $psrcpath) {
+            $results += Get-ChildItem -Path $psrcpath -Filter *.psrc
+        }
+    }
+
+    # Format the results nicely to make it easier to read
+    $results | Select-Object @{ Name = 'Name'; Expression = { $_.Name.TrimEnd('.psrc') }}, @{
+        Name = 'Path'; Expression = { $_.FullName }
+    } | Sort-Object Name
+}
+</code></pre> <blockquote> <p>[!NOTE] The order of results from this function isn't necessarily the order in which the role capabilities will be selected if multiple role capabilities share the same name.</p> </blockquote> <h2 id="check-effective-rights-for-a-specific-user">Check effective rights for a specific user</h2> <p>The <a href="../../../powershell/module/microsoft.powershell.core/get-pssessioncapability.html">Get-PSSessionCapability</a> cmdlet enumerates all the commands available on a JEA endpoint based on a user's group memberships. The output of <code>Get-PSSessionCapability</code> is identical to that of the specified user running <code>Get-Command -CommandType All</code> in a JEA session.</p> <pre><code class="powershell">Get-PSSessionCapability -ConfigurationName 'JEAMaintenance' -Username 'CONTOSO\Alice'
+</code></pre> <p>If your users aren't permanent members of groups that would grant them additional JEA rights, this cmdlet may not reflect those extra permissions. This happens when using just-in-time privileged access management systems to allow users to temporarily belong to a security group. Carefully evaluate the mapping of users to roles and capabilities to ensure that users only get the level of access needed to do their jobs successfully.</p> <h2 id="powershell-event-logs">PowerShell event logs</h2> <p>If you enabled module or script block logging on the system, you can see events in the Windows event logs for each command a user runs in a JEA session. To find these events, open <strong>Microsoft-Windows-PowerShell/Operational</strong> event log and look for events with event ID <strong>4104</strong>.</p> <p>Each event log entry includes information about the session in which the command was run. For JEA sessions, the event includes information about the <strong>ConnectedUser</strong> and the <strong>RunAsUser</strong>. The <strong>ConnectedUser</strong> is the actual user who created the JEA session. The <strong>RunAsUser</strong> is the account JEA used to execute the command.</p> <p>Application event logs show changes being made by the <strong>RunAsUser</strong>. So having module and script logging enabled is required to trace a specific command invocation back to the <strong>ConnectedUser</strong>.</p> <h2 id="application-event-logs">Application event logs</h2> <p>Commands run in a JEA session that interact with external applications or services may log events to their own event logs. Unlike PowerShell logs and transcripts, other logging mechanisms don't capture the connected user of the JEA session. Instead, those applications only log the virtual run-as user. To determine who ran the command, you need to consult a <a href="#session-transcripts">session transcript</a> or correlate PowerShell event logs with the time and user shown in the application event log.</p> <p>The WinRM log can also help you correlate run-as users to the connecting user in an application event log. Event ID <strong>193</strong> in the <strong>Microsoft-Windows-Windows Remote Management/Operational</strong> log records the security identifier (SID) and account name for both the connecting user and run as user for every new JEA session.</p> <h2 id="session-transcripts">Session transcripts</h2> <p>If you configured JEA to create a transcript for each user session, a text copy of every user's actions are stored in the specified folder.</p> <p>The following command (as an administrator) finds all transcript directories.</p> <pre><code class="powershell">Get-PSSessionConfiguration |
+  Where-Object { $_.TranscriptDirectory -ne $null } |
+    Format-Table Name, TranscriptDirectory
+</code></pre> <p>Each transcript starts with information about the time the session started, which user connected to the session, and which JEA identity was assigned to them.</p> <pre><code>**********************
+Windows PowerShell transcript start
+Start time: 20160710144736
+Username: CONTOSO\Alice
+RunAs User: WinRM Virtual Users\WinRM VA_1_CONTOSO_Alice
+Machine: SERVER01 (Microsoft Windows NT 10.0.14393.0)
+[...]
+</code></pre> <p>The body of the transcript contains information about each command the user invoked. The exact syntax of the command used is unavailable in JEA sessions because of the way commands are transformed for PowerShell remoting. However, you can still determine the effective command that was executed. Below is an example transcript snippet from a user running <code>Get-Service Dns</code> in a JEA session:</p> <pre><code>PS&gt;CommandInvocation(Get-Service): "Get-Service"
+&gt;&gt; ParameterBinding(Get-Service): name="Name"; value="Dns"
+&gt;&gt; CommandInvocation(Out-Default): "Out-Default"
+&gt;&gt; ParameterBinding(Out-Default): name="InputObject"; value="Dns"
+
+Running  Dns                DNS Server
+</code></pre> <p>A <strong>CommandInvocation</strong> line is written for each command a user runs. <strong>ParameterBindings</strong> record each parameter and value supplied with the command. In the previous example, you can see that the parameter <strong>Name</strong> was supplied the with value <strong>Dns</strong> for the <code>Get-Service</code> cmdlet.</p> <p>The output of each command also triggers a <strong>CommandInvocation</strong>, usually to <code>Out-Default</code>. The <strong>InputObject</strong> of <code>Out-Default</code> is the PowerShell object returned from the command. The details of that object are printed a few lines below, closely mimicking what the user would have seen.</p> <h2 id="see-also">See also</h2> <p><a href="https://devblogs.microsoft.com/powershell/powershell-the-blue-team/"><em>PowerShell ♥ the Blue Team</em> blog post on security</a></p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Microsoft CorporationCode licensed under an MIT-style License. Documentation licensed under CC BY 4.0.<br>
+    <a href="https://learn.microsoft.com/en-us/powershell/scripting/security/remoting/jea/audit-and-report?view=powershell-Scripting" class="_attribution-link">https://learn.microsoft.com/en-us/powershell/scripting/security/remoting/jea/audit-and-report?view=powershell-Scripting</a>
+  </p>
+</div>

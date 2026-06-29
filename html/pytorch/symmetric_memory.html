@@ -1,0 +1,174 @@
+<div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList"> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Reference API"> <meta itemprop="position" content="1"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem"> <meta itemprop="name" content="PyTorch Symmetric Memory"> <meta itemprop="position" content="2"> </div> </div>  <article class="bd-article">  <h1 id="pytorch-symmetric-memory">PyTorch Symmetric Memory</h1> <p class="date-info-last-verified" style="color: #6c6c6d; font-size: small;">Created On: Nov 10, 2025 | Last Updated On: Nov 10, 2025</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p><code>torch.distributed._symmetric_memory</code> is currently in alpha state and under development. API changes may be possible.</p> </div>  <h2 id="why-symmetric-memory">Why Symmetric Memory?</h2> <p>With rapidly evolving parallelization techniques, existing frameworks and libraries often struggle to keep up, and developers increasingly rely on custom implementations directly scheduling communications and computations. In recent years we’ve witnessed a shift from primarily relying on one-dimensional data-parallelism techniques to multi-dimensional parallelism ones. The latter have different latency requirements for different types of communications and thus require fine-grained overlapping of compute and communications.</p> <p>To minimize compute interference, they also require the use of copy engines and network interface cards (NICs) to drive communication. Network transport protocols such as remote direct memory access (RDMA) enhance the performance by enabling direct, high-speed, and low-latency communication between processors and memory. This increase in variety indicates the need for finer-grained communication primitives than are offered today by high-level collective APIs, ones that would enable developers to implement specific algorithms tailored for their use cases, such as low-latency collectives, fine-grained compute-communications overlap, or custom fusions.</p> <p>Furthermore, today’s advanced AI systems connect GPUs with high-bandwidth links (such as NVLinks, InfiniBand or RoCE), making GPU global memory directly accessible to peers. Such connections present a great opportunity for programmers to program the system as a single, gigantic GPU with vast accessible memory, instead of programming singular “GPU islands.”</p> <p>In this document, we will show how you can use PyTorch Symmetric Memory to program modern GPU systems as a “single GPU” and achieve fine-grained remote access.</p>   <h2 id="what-pytorch-symmetric-memory-unlocks">What PyTorch Symmetric Memory unlocks?</h2> <p>PyTorch Symmetric Memory unlocks three new capabilities:</p> <ul class="simple"> <li>
+<strong>Customized communication patterns</strong>: Increased flexibility in kernel writing allows developers to write custom kernels that implement their custom computations and communications, directly tailored to the need of the application. It will also be straightforward to add support for new data types along with the special compute that those data types might require, even if it’s not present yet in the standard libraries.</li> <li>
+<strong>In-kernel compute-comm fusion</strong>: Device-initiated communication capability allows developers to write kernels with both computation and communication instructions, allowing for the fusion of computation and data movement in the smallest possible granularity.</li> <li>
+<strong>Low-latency remote access</strong>: Network transport protocols like RDMA enhance the performance of symmetric memory in networked environments by enabling direct, high-speed, and low-latency communication between processors and memory. RDMA eliminates the overhead associated with the traditional network stack and CPU involvement. It also offloads data transfer from the compute to the NICs, freeing up compute resources for computational tasks.</li> </ul> <p>Next, we will show you how PyTorch Symmetric Memory (SymmMem) enables new applications with the above capabilities.</p>   <h2 id="a-hello-world-example">A “Hello World” example</h2> <p>The PyTorch SymmMem programming model involves two key elements:</p> <ul class="simple"> <li>creating symmetric tensors</li> <li>creating SymmMem kernels</li> </ul> <p>To create symmetric tensors, one can use the <code>torch.distributed._symmetric_memory</code> package:</p> <pre data-language="python">import torch.distributed._symmetric_memory as symm_mem
+
+t = symm_mem.empty(128, device=torch.device("cuda", rank))
+hdl = symm_mem.rendezvous(t, group)
+</pre> <p>The <code>symm_mem.empty</code> function creates a tensor that is backed by a symmetric memory allocation. The <code>rendezvous</code> function establishes a rendezvous with peers in the group, and returns a handle to the symmetric memory allocation. The handle provides method to access information related to the symmetric memory allocation, such as pointers to symmetric buffer on peer ranks, multicast pointer (if supported), and signal pads.</p> <p>The <code>empty</code> and <code>rendezvous</code> functions must be called in the same order on all ranks in the group.</p> <p>Then, collectives can be called on these tensors. For example, to perform a one-shot all-reduce:</p> <pre data-language="python"># Most SymmMem ops are under the torch.ops.symm_mem namespace
+torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group)
+</pre> <p>Please note that <code>torch.ops.symm_mem</code> is an “op namespace” instead of a python module. Therefore, you can’t import it by <code>import torch.ops.symm_mem</code>, neither can you import an op by <code>from torch.ops.symm_mem import one_shot_all_reduce</code>. You can call the op directly as in the example above.</p>   <h2 id="write-your-own-kernel">Write your own kernel</h2> <p>To write your own kernel doing communications with symmetric memory, you’ll need access to the addresses of mapped peer buffers and access to signal pads that are required for synchronization. In the kernel you’ll also need to perform correct synchronizations to make sure that peers are ready for communication, and signal to them that this GPU is ready.</p> <p>PyTorch Symmetric Memory provides CUDA Graph-compatible synchronization primitives that operate on the signal pad accompanying each symmetric memory allocation. Kernels using symmetric memory can be written both in CUDA and in Triton. Here’s an example allocating symmetric tensor and exchanging handles:</p> <pre data-language="python">import torch.distributed._symmetric_memory as symm_mem
+
+dist.init_process_group()
+rank = dist.get_rank()
+
+# Allocate a tensor
+t = symm_mem.empty(4096, device=f"cuda:{rank}")
+# Establish symmetric memory and obtain the handle
+hdl = symm_mem.rendezvous(t, dist.group.WORLD)
+</pre> <p>Access to buffer pointers, multimem pointer, and signal pads is provided via:</p> <pre data-language="python">hdl.buffer_ptrs
+hdl.multicast_ptr
+hdl.signal_pad_ptrs
+</pre> <p>Data pointed to by <code>buffer_ptrs</code> can be accessed just like regular local data, and any necessary compute can also be performed in the usual ways. As with local data, you can and should use vectorized accesses to improve efficiency.</p> <p>Symmetric memory is especially convenient for writing kernels in Triton. While previously Triton removed the barriers to writing efficient CUDA code, now communications can be added easily to Triton kernels. The kernel below demonstrates a low-latency, all-reduce kernel written in Triton.</p> <pre data-language="python">@triton.jit
+def one_shot_all_reduce_kernel(
+    buf_tuple,
+    signal_pad_ptrs,
+    output_ptr,
+    numel: tl.constexpr,
+    rank: tl.constexpr,
+    world_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    ptx_utils.symm_mem_sync(
+        signal_pad_ptrs, None, rank, world_size, hasSubsequenceMemAccess=True
+    )
+
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+
+    while block_start &lt; numel:
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets &lt; numel
+        acc = tl.zeros((BLOCK_SIZE,), dtype=tl.bfloat16)
+
+        for i in tl.static_range(world_size):
+            buffer_rank = buf_tuple[i]
+            x = tl.load(buffer_rank + offsets, mask=mask)
+            acc += x
+
+        tl.store(output_ptr + offsets, acc, mask=mask)
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
+    ptx_utils.symm_mem_sync(
+        signal_pad_ptrs, None, rank, world_size, hasPreviousMemAccess=True
+    )
+</pre> <p>Synchronizations at the beginning and the end of the kernel above guarantee that all the processes see consistent data. The bulk of the kernel is recognizable Triton code, and Triton will optimize it behind the scene, making sure memory accesses are performed in an efficient way with vectorization and unrolling. As with all Triton kernels, it is easily modifiable to add extra computations or change the communication algorithm. Visit https://github.com/meta-pytorch/kraken/blob/main/kraken to see additional utilities and examples of using symmetric memory to implement common patterns in Triton.</p>   <h2 id="scale-out">Scale out</h2> <p>Large language models distribute experts onto more than 8 GPUs, hence requiring multi-node access capability. NICs capable of RDMA come to help. In addition, software libraries such as NVSHMEM or rocSHMEM abstract away the programming difference between intra-node access and inter-node access with primitives that are slightly higher level than pointer access, such as put and get.</p> <p>PyTorch provides NVSHMEM plugins to augment Triton kernels’ cross-node capabilities. As shown in the code snippet below, one can initiate a cross-node put command within the kernel.</p> <pre data-language="python">import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem
+from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem
+
+@requires_nvshmem
+@triton.jit
+def my_put_kernel(
+    dest,
+    src,
+    nelems,
+    pe,
+):
+    nvshmem.put(dest, src, nelems, pe)
+</pre> <p>The <code>requires_nvshmem</code> decorator is used to indicate that the kernel requires the NVSHMEM device library as an external dependency. When Triton compiles the kernel, the decorator will search your system paths for the NVSHMEM device library. If it is available, Triton will include the necessary device assembly to use the NVSHMEM functions.</p>   <h2 id="api-reference">API Reference</h2> <dl class="py function"> <dt class="sig sig-object py" id="torch.distributed._symmetric_memory.empty">
+<code>torch.distributed._symmetric_memory.empty(*size: _int, dtype: _dtype | None = None, device: _device | None = None) → Tensor</code> <a class="reference external" href="https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/_symmetric_memory/__init__.py#L1671"><span class="viewcode-link">[source]</span></a>
+</dt> <dt class="sig sig-object py"> <span class="sig-prename descclassname">torch.distributed._symmetric_memory.</span><span class="sig-name descname">empty</span><span class="sig-paren">(</span><em class="sig-param"><span class="n">size</span><span class="p">:</span><span class="n">Sequence<span class="p">[</span>_int<span class="p">]</span></span></em>, <em class="sig-param"><span class="o">*</span></em>, <em class="sig-param"><span class="n">dtype</span><span class="p">:</span><span class="n">_dtype<span class="p">|</span><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)">None</a></span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">device</span><span class="p">:</span><span class="n">_device<span class="p">|</span><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)">None</a></span><span class="o">=</span><span class="default_value">None</span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">→</span> <span class="sig-return-typehint"><a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a></span></span>
+</dt> <dd>
+<p>Similar to <a class="reference internal" href="generated/torch.empty.html#torch.empty" title="torch.empty"><code>torch.empty()</code></a>. The returned tensor can be used by <code>torch._distributed._symmetric_memory.rendezvous()</code> to establish a symmetric memory tensor among participating processes.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<p><strong>size</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)">int</a><em>...</em>) – a sequence of integers defining the shape of the output tensor. Can be a variable number of arguments or a collection like a list or tuple.</p> </dd> <dt class="field-even">Keyword Arguments</dt> <dd class="field-even">
+<ul class="simple"> <li>
+<strong>dtype</strong> (<a class="reference internal" href="tensor_attributes.html#torch.dtype" title="torch.dtype"><code>torch.dtype</code></a>, optional) – the desired data type of returned tensor. Default: if <code>None</code>, uses a global default (see <a class="reference internal" href="generated/torch.set_default_dtype.html#torch.set_default_dtype" title="torch.set_default_dtype"><code>torch.set_default_dtype()</code></a>).</li> <li>
+<strong>device</strong> (<a class="reference internal" href="tensor_attributes.html#torch.device" title="torch.device"><code>torch.device</code></a>, optional) – the desired device of returned tensor. Default: if <code>None</code>, uses the current device for the default tensor type (see <a class="reference internal" href="generated/torch.set_default_device.html#torch.set_default_device" title="torch.set_default_device"><code>torch.set_default_device()</code></a>). <code>device</code> will be the CPU for CPU tensor types and the current CUDA device for CUDA tensor types.</li> </ul> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.distributed._symmetric_memory.rendezvous">
+<code>torch.distributed._symmetric_memory.rendezvous(tensor, group) → _SymmetricMemory</code> <a class="reference external" href="https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/_symmetric_memory/__init__.py#L1712"><span class="viewcode-link">[source]</span></a>
+</dt> <dd>
+<p>Establish a symmetric memory tensor among participating processes. This is a collective operation.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>tensor</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor"><code>torch.Tensor</code></a>) – the local tensor used to establish the symmetric memory tensor. It must be allocated via <code>torch._distributed._symmetric_memory.empty()</code>. The shape, dtype, and device type must be identical across all participating processes.</li> <li>
+<strong>group</strong> (Union[str, <code>torch.distributed.ProcessGroup</code>]) – The group identifying the participating processes. This can be either a group name or a process group object.</li> </ul> </dd> <dt class="field-even">Return type</dt> <dd class="field-even">
+<p>_SymmetricMemory</p> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.distributed._symmetric_memory.is_nvshmem_available">
+<code>torch.distributed._symmetric_memory.is_nvshmem_available() → bool</code> <a class="reference external" href="https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/_symmetric_memory/__init__.py#L1741"><span class="viewcode-link">[source]</span></a>
+</dt> <dd>
+<p>Check if NVSHMEM is available in current build and on current system.</p> <dl class="field-list simple"> <dt class="field-odd">Return type</dt> <dd class="field-odd">
+<p><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)">bool</a></p> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.distributed._symmetric_memory.set_backend">
+<code>torch.distributed._symmetric_memory.set_backend(name)</code> <a class="reference external" href="https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/_symmetric_memory/__init__.py#L1757"><span class="viewcode-link">[source]</span></a>
+</dt> <dd>
+<p>Set the backend for symmetric memory allocation. This is a global setting and affects all subsequent calls to <code>torch._distributed._symmetric_memory.empty()</code>. Note that the backend cannot be changed once a symmetric memory tensor has been allocated.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<p><strong>backend</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – the backend for symmetric memory allocation. Currently, only <code>“NVSHMEM”</code>, <code>“CUDA”</code>, <code>“NCCL”</code> are supported.</p> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.distributed._symmetric_memory.get_backend">
+<code>torch.distributed._symmetric_memory.get_backend(device)</code> <a class="reference external" href="https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/_symmetric_memory/__init__.py#L1771"><span class="viewcode-link">[source]</span></a>
+</dt> <dd>
+<p>Get the backend for symmetric memory allocation for a given device. If not found, return None.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<p><strong>device</strong> (<code>torch.device</code> or str) – the device for which to get the backend.</p> </dd> <dt class="field-even">Return type</dt> <dd class="field-even">
+<p><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a> | None</p> </dd> </dl> </dd>
+</dl>   <h2 id="op-reference">Op Reference</h2> <div class="admonition note"> <p class="admonition-title">Note</p> <p>The following ops are hosted in the <code>torch.ops.symm_mem</code> namespace. You can call them directly via <code>torch.ops.symm_mem.&lt;op_name&gt;</code>.</p> </div> <dl class="py function"> <dt class="sig sig-object py" id="torch.ops.symm_mem.multimem_all_reduce_">
+<code>torch.ops.symm_mem.multimem_all_reduce_(input: Tensor, reduce_op: str, group_name: str) → Tensor</code> </dt> <dd>
+<p>Performs a multimem all-reduce operation on the input tensor. This operation requires hardware support for multimem operations. On NVIDIA GPUs, NVLink SHARP is required.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>input</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Input tensor to perform all-reduce on. Must be symmetric.</li> <li>
+<strong>reduce_op</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Reduction operation to perform. Currently only “sum” is supported.</li> <li>
+<strong>group_name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Name of the group to perform all-reduce on.</li> </ul> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.ops.symm_mem.multimem_all_gather_out">
+<code>torch.ops.symm_mem.multimem_all_gather_out(input: Tensor, group_name: str, out: Tensor) → Tensor</code> </dt> <dd>
+<p>Performs a multimem all-gather operation on the input tensor. This operation requires hardware support for multimem operations. On NVIDIA GPUs, NVLink SHARP is required.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>input</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Input tensor to perform all-gather on.</li> <li>
+<strong>group_name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Name of the group to perform all-gather on.</li> <li>
+<strong>out</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Output tensor to store the result of the all-gather operation. Must be symmetric.</li> </ul> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.ops.symm_mem.one_shot_all_reduce">
+<code>torch.ops.symm_mem.one_shot_all_reduce(input: Tensor, reduce_op: str, group_name: str) → Tensor</code> </dt> <dd>
+<p>Performs a one-shot all-reduce operation on the input tensor.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>input</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Input tensor to perform all-reduce on. Must be symmetric.</li> <li>
+<strong>reduce_op</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Reduction operation to perform. Currently only “sum” is supported.</li> <li>
+<strong>group_name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Name of the group to perform all-reduce on.</li> </ul> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.ops.symm_mem.one_shot_all_reduce_out">
+<code>torch.ops.symm_mem.one_shot_all_reduce_out(input: Tensor, reduce_op: str, group_name: str, out: Tensor) → Tensor</code> </dt> <dd>
+<p>Performs a one-shot all-reduce operation based on the input tensor and writes the result to the output tensor.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>input</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Input tensor to perform all-reduce on. Must be symmetric.</li> <li>
+<strong>reduce_op</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Reduction operation to perform. Currently only “sum” is supported.</li> <li>
+<strong>group_name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Name of the group to perform all-reduce on.</li> <li>
+<strong>out</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Output tensor to store the result of the all-reduce operation. Can be a regular tensor.</li> </ul> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.ops.symm_mem.two_shot_all_reduce_">
+<code>torch.ops.symm_mem.two_shot_all_reduce_(input: Tensor, reduce_op: str, group_name: str) → Tensor</code> </dt> <dd>
+<p>Performs a two-shot all-reduce operation on the input tensor.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>input</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Input tensor to perform all-reduce on. Must be symmetric.</li> <li>
+<strong>reduce_op</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Reduction operation to perform. Currently only “sum” is supported.</li> <li>
+<strong>group_name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Name of the group to perform all-reduce on.</li> </ul> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.ops.symm_mem.all_to_all_vdev">
+<code>torch.ops.symm_mem.all_to_all_vdev(input: Tensor, out: Tensor, in_splits: Tensor, out_splits_offsets: Tensor, group_name: str) → None</code> </dt> <dd>
+<p>Performs an all-to-all-v operation using NVSHMEM, with split information provided on device.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>input</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Input tensor to perform all-to-all on. Must be symmetric.</li> <li>
+<strong>out</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Output tensor to store the result of the all-to-all operation. Must be symmetric.</li> <li>
+<strong>in_splits</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Tensor containing splits of data to send to each peer. Must be symmetric. Must be of size (group_size,). The splits are in the unit of elements in the 1st dimension.</li> <li>
+<strong>out_splits_offsets</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Tensor containing the splits and offsets of data received from each peer. Must be symmetric. Must be of size (2, group_size). The rows are (in order): output splits and output offsets.</li> <li>
+<strong>group_name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Name of the group to perform all-to-all on.</li> </ul> </dd> </dl> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.ops.symm_mem.all_to_all_vdev_2d">
+<code>torch.ops.symm_mem.all_to_all_vdev_2d(input: Tensor, out: Tensor, in_splits: Tensor, out_splits_offsets: Tensor, group_name: str[, major_align: int = None]) → None</code> </dt> <dd>
+<p>Perform a 2D all-to-all-v operation using NVSHMEM, with split information provided on device. In Mixture of Experts models, this operation can be used to dispatch tokens.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>input</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Input tensor to perform all-to-all on. Must be symmetric.</li> <li>
+<strong>out</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Output tensor to store the result of the all-to-all operation. Must be symmetric.</li> <li>
+<strong>in_splits</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Tensor containing the splits of data to send to each expert. Must be symmetric. Must be of size (group_size * ne,), where ne is the number of experts per rank. The splits are in the unit of elements in the 1st dimension.</li> <li>
+<strong>out_splits_offsets</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Tensor containing the splits and offsets of data received from each peer. Must be symmetric. Must be of size (2, group_size * ne). The rows are (in order): output splits and output offsets.</li> <li>
+<strong>group_name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Name of the group to perform all-to-all on.</li> <li>
+<strong>major_align</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)">int</a>) – Optional alignment for the major dimension of the output chunk for each expert. If not provided, the alignment is assumed to be 1. Any alignment adjustment will be reflected in the output offsets.</li> </ul> </dd> </dl> <p>A 2D AllToAllv shuffle is illustrated below: (world_size = 2, ne = 2, total number of experts = 4):</p> <pre data-language="python">Source: |       Rank 0      |       Rank 1      |
+        | c0 | c1 | c2 | c3 | d0 | d1 | d2 | d3 |
+
+Dest  : |       Rank 0      |       Rank 1      |
+        | c0 | d0 | c1 | d1 | c2 | d2 | c3 | d3 |
+</pre> <p>where each <code>c_i</code> / <code>d_i</code> are slices of the <code>input</code> tensor, targeting expert <code>i</code>, with length indicated by input splits. That is, the 2D AllToAllv shuffle achieves a transpose from rank-major order at input to expert-major order at output.</p> <p>If <code>major_align</code> is not 1, the output offsets of c1, c2, c3 will be up-aligned to this value. For example, if c0 has length 5 and d0 has length 7 (making a total of 12), and if the <code>major_align</code> is set to 16, the output offset of c1 will be 16. Similar for c2 and c3. This value has no effect on the offset of the minor dimension, i.e. d0, d1, d2 and d3. Note: since cutlass does not support empty bins, we set the aligned length to <code>major_align</code> if it is 0. See <a class="github reference external" href="https://github.com/pytorch/pytorch/issues/152668">pytorch/pytorch#152668</a>.</p> </dd>
+</dl> <dl class="py function"> <dt class="sig sig-object py" id="torch.ops.symm_mem.all_to_all_vdev_2d_offset">
+<code>torch.ops.symm_mem.all_to_all_vdev_2d_offset(Tensor input, Tensor out, Tensor in_splits_offsets, Tensor out_splits_offsets, str group_name) → None</code> </dt> <dd>
+<p>Perform a 2D AllToAllv shuffle operation, with input split and offset information provided on device. The input offsets are not required to be exact prefix sum of the input splits, i.e. paddings are allowed between the split chunks. The paddings, however, will not be transferred to peer ranks.</p> <p>In Mixture of Experts models, this operation can be used to combine tokens processed by experts on parallel ranks. This operation can be viewed as an “reverse” operation to the <code>all_to_all_vdev_2d</code> operation (which shuffles tokens to experts).</p> <dl class="field-list simple"> <dt class="field-odd">Parameters</dt> <dd class="field-odd">
+<ul class="simple"> <li>
+<strong>input</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Input tensor to perform all-to-all on. Must be symmetric.</li> <li>
+<strong>out</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Output tensor to store the result of the all-to-all operation. Must be symmetric.</li> <li>
+<strong>in_splits_offsets</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Tensor containing the splits and offsets of data to send to each expert. Must be symmetric. Must be of size (2, group_size * ne), where <code>ne</code> is the number of experts. The rows are (in order): input splits and input offsets. The splits are in the unit of elements in the 1st dimension.</li> <li>
+<strong>out_splits_offsets</strong> (<a class="reference internal" href="tensors.html#torch.Tensor" title="torch.Tensor">Tensor</a>) – Tensor containing the splits and offsets of data received from each peer. Must be symmetric. Must be of size (2, group_size * ne). The rows are (in order): output splits and output offsets.</li> <li>
+<strong>group_name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)">str</a>) – Name of the group to perform all-to-all on.</li> </ul> </dd> </dl> </dd>
+</dl>   </article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2025, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.9/symmetric_memory.html" class="_attribution-link">https://docs.pytorch.org/docs/2.9/symmetric_memory.html</a>
+  </p>
+</div>

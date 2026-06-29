@@ -166,6 +166,188 @@ end</pre>
 Profile.init(n = 10^7, delay = 0.01)</pre>
 <p><code>n</code> is the total number of instruction pointers you can store, with a default value of <code>10^6</code>. If your typical backtrace is 20 instruction pointers, then you can collect 50000 backtraces, which suggests a statistical uncertainty of less than 1%. This may be good enough for most applications.</p>
 <p>Consequently, you are more likely to need to modify <code>delay</code>, expressed in seconds, which sets the amount of time that Julia gets between snapshots to perform the requested computations. A very long-running job might not need frequent backtraces. The default setting is <code>delay = 0.001</code>. Of course, you can decrease the delay as well as increase it; however, the overhead of profiling grows once the delay becomes similar to the amount of time needed to take a backtrace (~30 microseconds on the author's laptop).</p>
+<h2 id="Wall-time-Profiler">
+<a class="docs-heading-anchor" href="#Wall-time-Profiler">Wall-time Profiler</a>
+</h2>
+<h3 id="Introduction-and-Problem-Motivation">
+<a class="docs-heading-anchor" href="#Introduction-and-Problem-Motivation">Introduction &amp; Problem Motivation</a>
+</h3>
+<p>The profiler described in the previous section is a sampling CPU profiler. At a high level, the profiler periodically stops all Julia compute threads to collect their backtraces and estimates the time spent in each function based on the number of backtrace samples that include a frame from that function. However, note that only tasks currently running on system threads just before the profiler stops them will have their backtraces collected.</p>
+<p>While this profiler is typically well-suited for workloads where the majority of tasks are compute-bound, it is less helpful for systems where most tasks are IO-heavy or for diagnosing contention on synchronization primitives in your code.</p>
+<p>Let's consider this simple workload:</p>
+<pre data-language="julia">using Base.Threads
+using Profile
+using PProf
+
+ch = Channel(1)
+
+const N_SPAWNED_TASKS = (1 &lt;&lt; 10)
+const WAIT_TIME_NS = 10_000_000
+
+function spawn_a_bunch_of_tasks_waiting_on_channel()
+    for i in 1:N_SPAWNED_TASKS
+        Threads.@spawn begin
+            take!(ch)
+        end
+    end
+end
+
+function busywait()
+    t0 = time_ns()
+    while true
+        if time_ns() - t0 &gt; WAIT_TIME_NS
+            break
+        end
+    end
+end
+
+function main()
+    spawn_a_bunch_of_tasks_waiting_on_channel()
+    for i in 1:N_SPAWNED_TASKS
+        put!(ch, i)
+        busywait()
+    end
+end
+
+Profile.@profile main()</pre>
+<p>Our goal is to detect whether there is contention on the <code>ch</code> channel—i.e., whether the number of waiters is excessive given the rate at which work items are being produced in the channel.</p>
+<p>If we run this, we obtain the following <a href="https://github.com/JuliaPerf/PProf.jl">PProf</a> flame graph:</p>
+<p><img src="https://docs.julialang.org/en/v1.12/manual/img/cpu-profile.png" alt="CPU Profile"></p>
+<p>This profile provides no information to help determine where contention occurs in the system’s synchronization primitives. Waiters on a channel will be blocked and descheduled, meaning no system thread will be running the tasks assigned to those waiters, and as a result, they won't be sampled by the profiler.</p>
+<h3 id="Wall-time-Profiler-2">
+<a class="docs-heading-anchor" href="#Wall-time-Profiler-2">Wall-time Profiler</a>
+</h3>
+<p>Instead of sampling threads—and thus only sampling tasks that are running—a wall-time task profiler samples tasks independently of their scheduling state. For example, tasks that are sleeping on a synchronization primitive at the time the profiler is running will be sampled with the same probability as tasks that were actively running when the profiler attempted to capture backtraces.</p>
+<p>This approach allows us to construct a profile where backtraces from tasks blocked on the <code>ch</code> channel, as in the example above, are actually represented.</p>
+<p>Let's run the same example, but now with a wall-time profiler:</p>
+<pre data-language="julia">using Base.Threads
+using Profile
+using PProf
+
+ch = Channel(1)
+
+const N_SPAWNED_TASKS = (1 &lt;&lt; 10)
+const WAIT_TIME_NS = 10_000_000
+
+function spawn_a_bunch_of_tasks_waiting_on_channel()
+    for i in 1:N_SPAWNED_TASKS
+        Threads.@spawn begin
+            take!(ch)
+        end
+    end
+end
+
+function busywait()
+    t0 = time_ns()
+    while true
+        if time_ns() - t0 &gt; WAIT_TIME_NS
+            break
+        end
+    end
+end
+
+function main()
+    spawn_a_bunch_of_tasks_waiting_on_channel()
+    for i in 1:N_SPAWNED_TASKS
+        put!(ch, i)
+        busywait()
+    end
+end
+
+Profile.@profile_walltime main()</pre>
+<p>We obtain the following flame graph:</p>
+<p><img src="https://docs.julialang.org/en/v1.12/manual/img/wall-time-profiler-channel-example.png" alt="Wall-time Profile Channel"></p>
+<p>We see that a large number of samples come from channel-related <code>take!</code> functions, which allows us to determine that there is indeed an excessive number of waiters in <code>ch</code>.</p>
+<h3 id="A-Compute-Bound-Workload">
+<a class="docs-heading-anchor" href="#A-Compute-Bound-Workload">A Compute-Bound Workload</a>
+</h3>
+<p>Despite the wall-time profiler sampling all live tasks in the system and not just the currently running ones, it can still be helpful for identifying performance hotspots, even if your code is compute-bound. Let’s consider a simple example:</p>
+<pre data-language="julia">using Base.Threads
+using Profile
+using PProf
+
+ch = Channel(1)
+
+const MAX_ITERS = (1 &lt;&lt; 22)
+const N_TASKS = (1 &lt;&lt; 12)
+
+function spawn_a_task_waiting_on_channel()
+    Threads.@spawn begin
+        take!(ch)
+    end
+end
+
+function sum_of_sqrt()
+    sum_of_sqrt = 0.0
+    for i in 1:MAX_ITERS
+        sum_of_sqrt += sqrt(i)
+    end
+    return sum_of_sqrt
+end
+
+function spawn_a_bunch_of_compute_heavy_tasks()
+    Threads.@sync begin
+        for i in 1:N_TASKS
+            Threads.@spawn begin
+                sum_of_sqrt()
+            end
+        end
+    end
+end
+
+function main()
+    spawn_a_task_waiting_on_channel()
+    spawn_a_bunch_of_compute_heavy_tasks()
+end
+
+Profile.@profile_walltime main()</pre>
+<p>After collecting a wall-time profile, we get the following flame graph:</p>
+<p><img src="https://docs.julialang.org/en/v1.12/manual/img/wall-time-profiler-compute-bound-example.png" alt="Wall-time Profile Compute-Bound"></p>
+<p>Notice how many of the samples contain <code>sum_of_sqrt</code>, which is the expensive compute function in our example.</p>
+<h3 id="Identifying-Task-Sampling-Failures-in-your-Profile">
+<a class="docs-heading-anchor" href="#Identifying-Task-Sampling-Failures-in-your-Profile">Identifying Task Sampling Failures in your Profile</a>
+</h3>
+<p>In the current implementation, the wall-time profiler attempts to sample from tasks that have been alive since the last garbage collection, along with those created afterward. However, if most tasks are extremely short-lived, you may end up sampling tasks that have already completed, resulting in missed backtrace captures.</p>
+<p>If you encounter samples containing <code>failed_to_sample_task_fun</code> or <code>failed_to_stop_thread_fun</code>, this likely indicates a high volume of short-lived tasks, which prevented their backtraces from being collected.</p>
+<p>Let's consider this simple example:</p>
+<pre data-language="julia">using Base.Threads
+using Profile
+using PProf
+
+const N_SPAWNED_TASKS = (1 &lt;&lt; 16)
+const WAIT_TIME_NS = 100_000
+
+function spawn_a_bunch_of_short_lived_tasks()
+    for i in 1:N_SPAWNED_TASKS
+        Threads.@spawn begin
+            # Do nothing
+        end
+    end
+end
+
+function busywait()
+    t0 = time_ns()
+    while true
+        if time_ns() - t0 &gt; WAIT_TIME_NS
+            break
+        end
+    end
+end
+
+function main()
+    GC.enable(false)
+    spawn_a_bunch_of_short_lived_tasks()
+    for i in 1:N_SPAWNED_TASKS
+        busywait()
+    end
+    GC.enable(true)
+end
+
+Profile.@profile_walltime main()</pre>
+<p>Notice that the tasks spawned in <code>spawn_a_bunch_of_short_lived_tasks</code> are extremely short-lived. Since these tasks constitute the majority in the system, we will likely miss capturing a backtrace for most sampled tasks.</p>
+<p>After collecting a wall-time profile, we obtain the following flame graph:</p>
+<p><img src="https://docs.julialang.org/en/v1.12/manual/img/task-sampling-failure.png" alt="Task Sampling Failure"></p>
+<p>The large number of samples from <code>failed_to_stop_thread_fun</code> confirms that we have a significant number of short-lived tasks in the system.</p>
 <h2 id="Memory-allocation-analysis">
 <a class="docs-heading-anchor" href="#Memory-allocation-analysis">Memory allocation analysis</a>
 </h2>
@@ -181,14 +363,14 @@ Profile.init(n = 10^7, delay = 0.01)</pre>
 <h3 id="allocation-profiler">
 <a class="docs-heading-anchor" href="#allocation-profiler">Allocation Profiler</a>
 </h3>
-<div class="admonition is-compat">
+<div class="admonition is-compat" id="Julia-1.8-9e816c1268df60c9">
 
 <div class="admonition-body"><p>This functionality requires at least Julia 1.8.</p></div>
 </div>
 <p>The allocation profiler records the stack trace, type, and size of each allocation while it is running. It can be invoked with <a href="../../stdlib/profile/index.html#Profile.Allocs.@profile"><code>Profile.Allocs.@profile</code></a>.</p>
 <p>This information about the allocations is returned as an array of <code>Alloc</code> objects, wrapped in an <code>AllocResults</code> object. The best way to visualize these is currently with the <a href="https://github.com/JuliaPerf/PProf.jl">PProf.jl</a> and <a href="https://github.com/pfitzseb/ProfileCanvas.jl">ProfileCanvas.jl</a> packages, which can visualize the call stacks which are making the most allocations.</p>
 <p>The allocation profiler does have significant overhead, so a <code>sample_rate</code> argument can be passed to speed it up by making it skip some allocations. Passing <code>sample_rate=1.0</code> will make it record everything (which is slow); <code>sample_rate=0.1</code> will record only 10% of the allocations (faster), etc.</p>
-<div class="admonition is-compat">
+<div class="admonition is-compat" id="Julia-1.11-9b66f5b825954f3a">
 
 <div class="admonition-body">
 <p>Older versions of Julia could not capture types in all cases. In older versions of Julia, if you see an allocation of type <code>Profile.Allocs.UnknownType</code>, it means that the profiler doesn't know what type of object was allocated. This mainly happened when the allocation was coming from generated code produced by the compiler. See <a href="https://github.com/JuliaLang/julia/issues/43688">issue #43688</a> for more info.</p>
@@ -253,7 +435,7 @@ Serving web UI on http://localhost:62261
 </h4>
 <p>An alternative way to measure allocations is to start Julia with the <code>--track-allocation=&lt;setting&gt;</code> command-line option, for which you can choose <code>none</code> (the default, do not measure allocation), <code>user</code> (measure memory allocation everywhere except Julia's core code), or <code>all</code> (measure memory allocation at each line of Julia code). Allocation gets measured for each line of compiled code. When you quit Julia, the cumulative results are written to text files with <code>.mem</code> appended after the file name, residing in the same directory as the source file. Each line lists the total number of bytes allocated. The <a href="https://github.com/JuliaCI/Coverage.jl"><code>Coverage</code> package</a> contains some elementary analysis tools, for example to sort the lines in order of number of bytes allocated.</p>
 <p>In interpreting the results, there are a few important details. Under the <code>user</code> setting, the first line of any function directly called from the REPL will exhibit allocation due to events that happen in the REPL code itself. More significantly, JIT-compilation also adds to allocation counts, because much of Julia's compiler is written in Julia (and compilation usually requires memory allocation). The recommended procedure is to force compilation by executing all the commands you want to analyze, then call <a href="../../stdlib/profile/index.html#Profile.clear_malloc_data"><code>Profile.clear_malloc_data()</code></a> to reset all allocation counters. Finally, execute the desired commands and quit Julia to trigger the generation of the <code>.mem</code> files.</p>
-<div class="admonition is-info">
+<div class="admonition is-info" id="Note-2728c0099792b27b">
 
 <div class="admonition-body"><p><code>--track-allocation</code> changes code generation to log the allocations, and so the allocations may be different than what happens without the option. We recommend using the <a href="#allocation-profiler">allocation profiler</a> instead.</p></div>
 </div>
@@ -273,7 +455,7 @@ $ perf report --call-graph -G -i /tmp/perf-jit.data</pre>
 <p>There are many more interesting things that you can measure about your program, to get a comprehensive list please read the <a href="https://www.brendangregg.com/perf.html">Linux perf examples page</a>.</p>
 <p>Remember that perf saves for each execution a <code>perf.data</code> file that, even for small programs, can get quite large. Also the perf LLVM module saves temporarily debug objects in <code>~/.debug/jit</code>, remember to clean that folder frequently.</p><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2009&ndash;2024 Jeff Bezanson, Stefan Karpinski, Viral B. Shah, and other contributors<br>Licensed under the MIT License.<br>
-    <a href="https://docs.julialang.org/en/v1.11/manual/profile/" class="_attribution-link">https://docs.julialang.org/en/v1.11/manual/profile/</a>
+    &copy; 2009&ndash;2026 Jeff Bezanson, Stefan Karpinski, Viral B. Shah, and other contributors<br>Licensed under the MIT License.<br>
+    <a href="https://docs.julialang.org/en/v1.12/manual/profile/" class="_attribution-link">https://docs.julialang.org/en/v1.12/manual/profile/</a>
   </p>
 </div>

@@ -1,0 +1,424 @@
+<div id="top-content"> <div class="heading-with-actions top-heading"> <h1>Scopes</h1> <a href="https://github.com/phoenixframework/phoenix/blob/v1.8.8/guides/authn_authz/scopes.md#L1" title="View Source" class="source" rel="help nofollow">Source</a> </div> <p>A scope is a data structure used to keep information about the current request or session, such as the current user, the user's organization/company, permissions, and so on. Think of a scope as a container with information required by the majority of pages in your application. A scope can also hold request metadata, such as IP addresses.</p>
+<p>Scopes play an important role in security. <a rel="nofollow" href="https://owasp.org/">OWASP</a> lists "Broken access control" as a <a rel="nofollow" href="https://owasp.org/Top10/">top-10 security risk</a>. Most application data is private for a user, a team, or an organization. Your database CRUD operations must be properly scoped to the current user/team/organization. Phoenix generators such as <a href="mix.tasks.phx.gen.html.html"><code class="inline">mix phx.gen.html</code></a>, <a href="mix.tasks.phx.gen.json.html"><code class="inline">mix phx.gen.json</code></a>, and <a href="mix.tasks.phx.gen.live.html"><code class="inline">mix phx.gen.live</code></a> automatically use your custom scopes.</p>
+<p>Scopes are flexible. You can have more than one scope in your application and choose the specific scope when invoking a generator. When you run <a href="mix.tasks.phx.gen.auth.html"><code class="inline">mix phx.gen.auth</code></a>, it will automatically generate a scope for you, but you may also add your own.</p>
+<p>This guide will:</p>
+<ul>
+<li>Show how <a href="mix.tasks.phx.gen.auth.html"><code class="inline">mix phx.gen.auth</code></a> generates a scope for you</li>
+<li>Discuss how generators, such as <a href="mix.tasks.phx.gen.context.html"><code class="inline">mix phx.gen.context</code></a>, rely on scopes for security</li>
+<li>How to define your own scope from scratch and all valid options</li>
+<li>Augment the built-in scope with additional scopes</li>
+</ul>
+<h2 id="phx-gen-auth" class="section-heading">
+<span class="text">phx.gen.auth</span>
+</h2>
+<p>The task <a href="mix.tasks.phx.gen.auth.html"><code class="inline">mix phx.gen.auth</code></a> will generate a default scope. This scope ties the generated resources to the currently authenticated user. Let's see it in action:</p>
+<pre data-language="elixir">$ mix phx.gen.auth Accounts User users
+</pre>
+<p>The scope code is the same for the <code class="inline">--live</code> and <code class="inline">--no-live</code> variants of the generator.</p>
+<p>Looking at the generated scope file <code class="inline">lib/my_app/accounts/scope.ex</code>, we can see that it defines a struct with a single <code class="inline">user</code> field, and a function <code class="inline">for_user/1</code> that, if given a <code class="inline">User</code> struct, returns a new <code class="inline">%Scope{}</code> for that user.</p>
+<pre data-language="elixir">defmodule MyApp.Accounts.Scope do
+  alias MyApp.Accounts.User
+
+  defstruct user: nil
+
+  def for_user(%User{} = user) do
+    %__MODULE__{user: user}
+  end
+
+  def for_user(nil), do: nil
+end</pre>
+<p>The scope is automatically fetched by the <code class="inline">fetch_current_scope_for_user</code> plug that is injected into the <code class="inline">:browser</code> pipeline:</p>
+<pre data-language="elixir"># router.ex
+...
+pipeline :browser do
+  ...
+  plug :fetch_current_scope_for_user
+end</pre>
+<pre data-language="elixir"># user_auth.ex
+def fetch_current_scope_for_user(conn, _opts) do
+  {user_token, conn} = ensure_user_token(conn)
+  user = user_token &amp;&amp; Accounts.get_user_by_session_token(user_token)
+  assign(conn, :current_scope, Scope.for_user(user))
+end</pre>
+<p>Similarly, for LiveViews, there is a pre-defined <code class="inline">mount_current_scope</code> hook that ensures the scope is available:</p>
+<pre data-language="elixir"># user_auth.ex
+def on_mount(:mount_current_scope, _params, session, socket) do
+  {:cont, mount_current_scope(socket, session)}
+end
+
+defp mount_current_scope(socket, session) do
+  Phoenix.Component.assign_new(socket, :current_scope, fn -&gt;
+    user =
+      if user_token = session["user_token"] do
+        Accounts.get_user_by_session_token(user_token)
+      end
+
+    Scope.for_user(user)
+  end)
+end</pre>
+<h2 id="integration-of-scopes-in-the-phoenix-generators" class="section-heading">
+<span class="text">Integration of scopes in the Phoenix generators</span>
+</h2>
+<p>If a default scope is defined in your application's config, the generators will build scoped resources by default. The generated LiveViews / Controllers will automatically pass the scope to the context functions. <a href="mix.tasks.phx.gen.auth.html"><code class="inline">mix phx.gen.auth</code></a> automatically sets its scope as default, if there is not already a default scope defined:</p>
+<pre data-language="elixir"># config/config.exs
+config :my_app, :scopes,
+  user: [
+    default: true,
+    ...
+  ]</pre>
+<p>We will look at the individual options in the next section.</p>
+<p>Now let's look at the code generated once a default scope is set. We will use <a href="mix.tasks.phx.gen.live.html"><code class="inline">mix phx.gen.live</code></a> as an example, but the ideas and the overall code will be similar to <a href="mix.tasks.phx.gen.html.html"><code class="inline">mix phx.gen.html</code></a> and <a href="mix.tasks.phx.gen.json.html"><code class="inline">mix phx.gen.json</code></a> too:</p>
+<pre data-language="elixir">$ mix phx.gen.live Blog Post posts title:string body:text
+</pre>
+<p>This creates a new <code class="inline">Blog</code> context, with a <code class="inline">Post</code> resource. To ensure the scope is available, for LiveViews the routes in your <code class="inline">router.ex</code> must be added to a <code class="inline">live_session</code> that ensures the user is authenticated. In this case, within the aptly named <code class="inline">required_authenticated_user</code> section:</p>
+<pre data-language="elixir">   scope "/", MyAppWeb do
+     pipe_through [:browser, :require_authenticated_user]
+
+     live_session :require_authenticated_user,
+       on_mount: [{MyAppWeb.UserAuth, :ensure_authenticated}] do
+       live "/users/settings", UserLive.Settings, :edit
+       live "/users/settings/confirm-email/:token", UserLive.Settings, :confirm_email
+
++      live "/posts", PostLive.Index, :index
++      live "/posts/new", PostLive.Form, :new
++      live "/posts/:id", PostLive.Show, :show
++      live "/posts/:id/edit", PostLive.Form, :edit
+     end
+
+     post "/users/update-password", UserSessionController, :update_password
+   end</pre>
+<blockquote><p>Although the router has a <code class="inline">scope</code> macro, the router <code class="inline">scope</code> and <code class="inline">current_scope</code> are ultimately distinct features which have similar purposes: to narrow down access to parts of our application, each acting at distinct layers (one at the router, the other at the data layer).</p></blockquote>
+<p>Now, let's look at the generated LiveView (<code class="inline">lib/my_app_web/live/post_live/index.ex</code>):</p>
+<pre data-language="elixir">defmodule MyAppWeb.PostLive.Index do
+  use MyAppWeb, :live_view
+
+  alias MyApp.Blog
+
+  ...
+
+  @impl true
+  def mount(_params, _session, socket) do
+    Blog.subscribe_posts(socket.assigns.current_scope)
+
+    {:ok,
+     socket
+     |&gt; assign(:page_title, "Listing Posts")
+     |&gt; stream(:posts, Blog.list_posts(socket.assigns.current_scope))}
+  end
+
+  @impl true
+  def handle_event("delete", %{"id" =&gt; id}, socket) do
+    post = Blog.get_post!(socket.assigns.current_scope, id)
+    {:ok, _} = Blog.delete_post(socket.assigns.current_scope, post)
+
+    {:noreply, stream_delete(socket, :posts, post)}
+  end
+
+  @impl true
+  def handle_info({type, %MyApp.Blog.Post{}}, socket)
+      when type in [:created, :updated, :deleted] do
+    {:noreply, stream(socket, :posts, Blog.list_posts(socket.assigns.current_scope), reset: true)}
+  end
+end</pre>
+<p>Note that every function from the <code class="inline">Blog</code> context that we call gets the <code class="inline">current_scope</code> assign passed in as the first argument. The <code class="inline">list_posts/1</code> function then uses that information to properly filter posts:</p>
+<pre data-language="elixir"># lib/my_app/blog.ex
+def list_posts(%Scope{} = scope) do
+  Repo.all(from post in Post, where: post.user_id == ^scope.user.id)
+end</pre>
+<p>The LiveView even subscribes to scoped PubSub messages and automatically updates the rendered list whenever a new post is created or an existing post is updated or deleted, while ensuring that only messages for the current scope are processed.</p>
+<h2 id="defining-scopes" class="section-heading">
+<span class="text">Defining scopes</span>
+</h2>
+<p>The Phoenix generators use your application's config to discover the available scopes. A scope is defined by the following options:</p>
+<pre data-language="elixir">config :my_app, :scopes,
+  user: [
+    default: true,
+    module: MyApp.Accounts.Scope,
+    assign_key: :current_scope,
+    access_path: [:user, :id],
+    schema_key: :user_id,
+    schema_type: :id,
+    schema_table: :users,
+    test_data_fixture: MyApp.AccountsFixtures,
+    test_setup_helper: :register_and_log_in_user
+  ]</pre>
+<p>In this example, the scope is called <code class="inline">user</code> and it is the <code class="inline">default</code> scope that is automatically used when running <a href="mix.tasks.phx.gen.schema.html"><code class="inline">mix phx.gen.schema</code></a>, <a href="mix.tasks.phx.gen.context.html"><code class="inline">mix phx.gen.context</code></a>, <a href="mix.tasks.phx.gen.live.html"><code class="inline">mix phx.gen.live</code></a>, <a href="mix.tasks.phx.gen.html.html"><code class="inline">mix phx.gen.html</code></a> and <a href="mix.tasks.phx.gen.json.html"><code class="inline">mix phx.gen.json</code></a>. A scope needs a module that defines a struct, in this case <code class="inline">MyApp.Accounts.Scope</code>. Those structs are used as first argument to the generated context functions, like <code class="inline">list_posts/1</code>.</p>
+<ul>
+<li><p><code class="inline">default</code> - a boolean that indicates if this scope is the default scope. There can only be one default scope defined.</p></li>
+<li><p><code class="inline">module</code> - the module that defines the struct for this scope.</p></li>
+<li><p><code class="inline">assign_key</code> - the key where the scope struct is assigned to the <a href="https://phoenix-live-view.hexdocs.pm/Phoenix.LiveView.Socket.html#t:t/0">socket</a> or <a href="https://plug.hexdocs.pm/Plug.Conn.html">conn</a>.</p></li>
+<li><p><code class="inline">access_path</code> - a list of keys that define the path to the identifying field in the scope struct. The generators generate code like <code class="inline">where: schema_key == ^scope.user.id</code>.</p></li>
+<li><p><code class="inline">route_prefix</code> - (optional) a path template string for how resources should be nested. For example, <code class="inline">/organizations/:org</code> would generate routes like <code class="inline">/organizations/:org/posts</code>. The parameter segment (<code class="inline">:org</code>) will be replaced with the appropriate scope access value in templates and LiveViews.</p></li>
+<li><p><code class="inline">route_access_path</code> - (optional) list of keys that define the path to the field used in route generation (if <code class="inline">route_prefix</code> is set). This is particularly useful for user-friendly URLs where you might want to use a slug instead of an ID. If not specified, it defaults to <code class="inline">Enum.drop(scope.access_path, -1)</code> or <code class="inline">access_path</code> if the former is empty. For example, if the <code class="inline">access_path</code> is <code class="inline">[:organization, :id]</code>, it defaults to <code class="inline">[:organization]</code>, assuming that the value at <code class="inline">scope.organization</code> implements the <a href="phoenix.param.html"><code class="inline">Phoenix.Param</code></a> protocol.</p></li>
+<li><p><code class="inline">schema_key</code> - the foreign key that ties the resource to the scope. New scoped schemas are created with a foreign key field named <code class="inline">schema_key</code> of type <code class="inline">schema_type</code> to the <code class="inline">schema_table</code> table.</p></li>
+<li><p><code class="inline">schema_type</code> - the type of the foreign key field in the schema. Typically <code class="inline">:id</code> or <code class="inline">:binary_id</code>.</p></li>
+<li><p><code class="inline">schema_migration_type</code> (optional) - the type of the foreign key column in the database. Used for the generated migration. It defaults to the default migration foreign keytype.</p></li>
+<li><p><code class="inline">schema_table</code> - the name of the table where the foreign key points to.</p></li>
+<li><p><code class="inline">test_data_fixture</code> - a module that is automatically imported into the context test file. It must have a <code class="inline">NAME_scope_fixture/0</code> function that returns a unique scope struct for context tests, in this case <code class="inline">user_scope_fixture/0</code>.</p></li>
+<li><p><code class="inline">test_setup_helper</code> - the name of a function that is registered as <a href="https://ex-unit.hexdocs.pm/ExUnit.Callbacks.html#setup/1"><code class="inline">setup</code> callback</a> in LiveView / Controller tests. The function is expected to be imported in the test file. Usually, this is ensured by putting it into the <code class="inline">MyAppWeb.ConnCase</code> module.</p></li>
+</ul>
+<p>While the <a href="mix.tasks.phx.gen.auth.html"><code class="inline">mix phx.gen.auth</code></a> automatically generates a scope, scopes can also be defined manually. This can be useful, for example, to retrofit an existing application with scopes or to define scopes that are not tied to a user.</p>
+<p>For this example, we will implement a custom scope that gives each session its own scope. While this might not be useful in most real-world applications as created resources would be inaccessible as soon as the session ends, it is a good example to understand how scopes work. See the following section for an example on how to augment an existing scope with organizations (teams, companies, or similar).</p>
+<p>First, let's define our scope module <code class="inline">lib/my_app/scope.ex</code>:</p>
+<pre data-language="elixir">defmodule MyApp.Scope do
+  defstruct id: nil
+
+  def for_id(id) do
+    %MyApp.Scope{id: id}
+  end
+end</pre>
+<p>Next, we define a plug in our router that assigns a scope to each request:</p>
+<pre data-language="elixir">   pipeline :browser do
+     plug :accepts, ["html"]
+     plug :fetch_session
+     plug :fetch_live_flash
+     plug :put_root_layout, html: {MyAppWeb.Layouts, :root}
+     plug :protect_from_forgery
+     plug :put_secure_browser_headers
++    plug :assign_scope
+   end
++
++  defp assign_scope(conn, _opts) do
++    if id = get_session(conn, :scope_id) do
++      assign(conn, :current_scope, MyApp.Scope.for_id(id))
++    else
++      id = System.unique_integer()
++
++      conn
++      |&gt; put_session(:scope_id, id)
++      |&gt; assign(:current_scope, MyApp.Scope.for_id(id))
++    end
++  end</pre>
+<p>For tests, we'll also define a fixture module <code class="inline">test/support/fixtures/scope_fixtures.ex</code>:</p>
+<pre data-language="elixir">defmodule MyApp.ScopeFixtures do
+  alias MyApp.Scope
+
+  def session_scope_fixture(id \\ System.unique_integer()) do
+    %Scope{id: id}
+  end
+end</pre>
+<p>And then add a <code class="inline">setup</code> helper to our <code class="inline">test/support/conn_case.ex</code>:</p>
+<pre data-language="elixir">defmodule MyAppWeb.ConnCase do
+  ...
+
+  def put_scope_in_session(%{conn: conn}) do
+    id = System.unique_integer()
+    scope = MyApp.ScopeFixtures.session_scope_fixture(id)
+
+    conn =
+      conn
+      |&gt; Phoenix.ConnTest.init_test_session(%{})
+      |&gt; Plug.Conn.put_session(:scope_id, id)
+
+    %{conn: conn, scope: scope}
+  end
+end</pre>
+<p>Finally, we configure the scope in our application's <code class="inline">config/config.exs</code>:</p>
+<pre data-language="elixir">config :my_app, :scopes,
+  session: [
+    default: true,
+    module: MyApp.Scope,
+    assign_key: :current_scope,
+    access_path: [:id],
+    schema_key: :session_id,
+    schema_type: :id,
+    schema_migration_type: :bigint,
+    schema_table: nil,
+    test_data_fixture: MyApp.ScopeFixtures,
+    test_setup_helper: :put_scope_in_session
+  ]</pre>
+<p>Setting <code class="inline">schema_table</code> to <code class="inline">nil</code> means that the generated resources don't have a foreign key to the scope, but instead a normal <code class="inline">bigint</code> column that directly stores the scope's id.</p>
+<p>We can now generate a new resource, for example with <code class="inline">phx.gen.html</code>:</p>
+<pre data-language="elixir">$ mix phx.gen.html Post posts title:string
+</pre>
+<p>When you now visit <a rel="nofollow" href="http://localhost:4000/posts">http://localhost:4000/posts</a>, and create a new post, you will see that it is only visible to the current session. If you open a private browser window and visit the same URL, the previously created post is not visible. Similarly, if you create a new post in the private window, it is not visible in the other window. If you try to copy the URL of a post created in one session and access it in another, you will get an <a href="https://hexdocs.pm/ecto/3.13.2/Ecto.NoResultsError.html"><code class="inline">Ecto.NoResultsError</code></a> error, which is automatically converted to 404 when the <code class="inline">debug_errors</code> setting is disabled.</p>
+<h2 id="augmenting-scopes" class="section-heading">
+<span class="text">Augmenting scopes</span>
+</h2>
+<p>Let's assume that you used <a href="mix.tasks.phx.gen.auth.html"><code class="inline">mix phx.gen.auth</code></a> to generate a scope tied to users. But now you also create a new <code class="inline">organization</code> entity, where users can be members of:</p>
+<pre data-language="elixir">defmodule MyApp.Accounts.Organization do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @derive {Phoenix.Param, key: :slug}
+  schema "organizations" do
+    field :name, :string
+    field :slug, :string
+    ...
+
+    many_to_many :users, MyApp.Accounts.User, join_through: "organizations_users"
+
+    timestamps(type: :utc_datetime)
+  end
+end</pre>
+<p>First, we'd adjust our scope struct to also include the organization:</p>
+<pre data-language="elixir"> defmodule MyApp.Accounts.Scope do
+   alias MyApp.Accounts.User
+   alias MyApp.Accounts.Organization
+
+-  defstruct user: nil
++  defstruct user: nil, organization: nil
+
+   def for_user(%User{} = user) do
+     %__MODULE__{user: user}
+   end
+
+   def for_user(nil), do: nil
++
++  def put_organization(%__MODULE__{} = scope, %Organization{} = organization) do
++    %{scope | organization: organization}
++  end
+ end</pre>
+<p>Let's also assume that the current organization is part of the URL path, like <code class="inline">http://localhost:4000/organizations/foo/posts</code>. Then, we'd adjust our router to fetch the organization from the path and assign it to the scope:</p>
+<pre data-language="elixir">  # router.ex
+  pipeline :browser do
+    ...
+    plug :fetch_current_scope_for_user
++   plug :assign_org_to_scope
+  end</pre>
+<pre data-language="elixir"># user_auth.ex
+def assign_org_to_scope(conn, _opts) do
+  current_scope = conn.assigns.current_scope
+  if slug = conn.params["org"] do
+    org = MyApp.Accounts.get_organization_by_slug!(current_scope, slug)
+    assign(conn, :current_scope, MyApp.Accounts.Scope.put_organization(current_scope, org))
+  else
+    conn
+  end
+end</pre>
+<p>For LiveViews, we'll also need to add a new <code class="inline">:on_mount</code> hook and add it to <code class="inline">live_session</code>'s <code class="inline">on_mount</code> option in the router:</p>
+<pre data-language="elixir">  # router.ex
+  scope "/", MyAppWeb do
+    pipe_through [:browser]
+
+    live_session :current_user,
+      on_mount: [
+        {MyAppWeb.UserAuth, :mount_current_scope},
++       {MyAppWeb.UserAuth, :assign_org_to_scope}
+      ] do
+      ...
+    end
+  end</pre>
+<pre data-language="elixir"># user_auth.ex
+def on_mount(:assign_org_to_scope, %{"org" =&gt; slug}, _session, socket) do
+  socket =
+    case socket.assigns.current_scope do
+      %{organization: nil} = scope -&gt;
+        org = MyApp.Accounts.get_organization_by_slug!(socket.assigns.current_scope, slug)
+        Phoenix.Component.assign(socket, :current_scope, Scope.put_organization(scope, org))
+
+      _ -&gt;
+        socket
+    end
+
+  {:cont, socket}
+end
+
+def on_mount(:assign_org_to_scope, _params, _session, socket), do: {:cont, socket}</pre>
+<p>This way, if a route is defined like <code class="inline">live /organizations/:org/posts</code>, the <code class="inline">assign_org_to_scope</code> plug would fetch the organization from the path and assign it to the scope. This code assumes that <code class="inline">get_organization_by_slug!/2</code> raises an <a href="https://hexdocs.pm/ecto/3.13.2/Ecto.NoResultsError.html"><code class="inline">Ecto.NoResultsError</code></a> which would be automatically converted to <code class="inline">404</code>, but you could also handle the error explicitly and, for example, set an error flash and redirect to another page, like a dashboard. The <code class="inline">get_organization_by_slug!/2</code> function should also rely on the current scope to filter the organizations to those the user has access to.</p>
+<p>Then, we are ready to define a new scope in our application's <code class="inline">config/config.exs</code> to generate resources scoped to the organization:</p>
+<pre data-language="elixir">config :my_app, :scopes,
+  user: [
+    ...
+  ],
+  organization: [
+    module: MyApp.Accounts.Scope,
+    assign_key: :current_scope,
+    access_path: [:organization, :id],
+    route_prefix: "/organizations/:org",
+    route_access_path: [:organization, :slug],
+    schema_key: :org_id,
+    schema_type: :id,
+    schema_table: :organizations,
+    test_data_fixture: MyApp.AccountsFixtures,
+    test_setup_helper: :register_and_log_in_user_with_org
+  ]</pre>
+<p>For the generated tests, we'll also need to define a fixture in <code class="inline">test/support/fixtures/accounts_fixtures.ex</code> and extend our <code class="inline">test/support/conn_case.ex</code>:</p>
+<pre data-language="elixir">defmodule MyApp.AccountsFixtures do
+  ...
+
+  def organization_scope_fixture(scope \\ user_scope_fixture()) do
+    org = organization_fixture(scope)
+    Scope.put_organization(scope, org)
+  end
+end</pre>
+<pre data-language="elixir">defmodule MyAppWeb.ConnCase do
+  ...
+
+  def register_and_log_in_user_with_org(context) do
+    %{conn: conn, user: _user, scope: scope} = register_and_log_in_user(context)
+    %{conn: conn, scope: MyApp.AccountsFixtures.organization_scope_fixture(scope)}
+  end
+end</pre>
+<p>Now that our scope configuration includes the <code class="inline">route_prefix</code>, we can generate resources scoped to the organization, and all paths will be automatically generated with the correct organization slug:</p>
+<pre data-language="elixir">$ mix phx.gen.live Blog Post posts title:string body:text --scope organization
+</pre>
+<p>This shows that scopes are quite flexible, allowing you to keep a well-defined data structure, even when your application grows.</p>
+<p>Most of the time, your application will have a single scope module, like in this example. But sometimes, you might want to create a new scope module, for example to completely separate a user-facing scope from an admin scope, where also the context functions are supposed to only be called by one of the two.</p>
+<h2 id="scope-helpers" class="section-heading">
+<span class="text">Scope helpers</span>
+</h2>
+<p>When working with more complex scopes, it is often useful to create some helper functions, which can conveniently be added to the scope module:</p>
+<pre data-language="elixir">defmodule MyApp.Accounts.Scope do
+  alias MyApp.Accounts
+  alias MyApp.Accounts.{User, Organization}
+
+  defstruct user: nil, organization: nil
+
+  def for_user(%User{} = user) do
+    %__MODULE__{user: user}
+  end
+
+  def for_user(nil), do: nil
+
+  def put_organization(%__MODULE__{} = scope, %Organization{} = organization) do
+    %{scope | organization: organization}
+  end
+
+  def for(opts) when is_list(opts) do
+    cond do
+      opts[:user] &amp;&amp; opts[:org] -&gt;
+        user = user(opts[:user])
+        org = org(opts[:org])
+
+        user
+        |&gt; for_user()
+        |&gt; put_organization(org)
+
+      opts[:user] -&gt;
+        user = user(opts[:user])
+        for_user(user)
+
+      opts[:org] -&gt;
+        %__MODULE__{organization: org(opts[:org])}
+    end
+  end
+
+  defp user(id) when is_integer(id) do
+    Accounts.get_user!(id)
+  end
+
+  defp user(email) when is_binary(email) do
+    Accounts.get_user_by_email(email)
+  end
+
+  defp org(id) when is_integer(id) do
+    Accounts.get_organization!(id)
+  end
+
+  defp org(slug) when is_binary(slug) do
+    Accounts.get_organization_by_slug!(slug)
+  end
+end</pre>
+<p>Then, you can alias the Scope module in your project's <code class="inline">.iex.exs</code>:</p>
+<pre data-language="elixir">alias MyApp.Accounts.Scope</pre>
+<p>And when working with scoped context functions, you can just do:</p>
+<pre data-language="elixir">iex&gt; MyApp.Blog.list_posts(Scope.for(user: 1, org: "foo"))
+...
+iex&gt; MyApp.Accounts.list_api_tokens(Scope.for(user: "john@doe.com"))
+...</pre> </div> <div class="bottom-actions" id="bottom-actions"> <div class="bottom-actions-item"> <a href="mix_phx_gen_auth.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> mix phx.gen.auth </span> </a> </div> <div class="bottom-actions-item"> <a href="api_authentication.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> API Authentication </span> </a> </div> </div> <footer class="footer"> <p> <span class="line"> <a href="https://hex.pm/packages/phoenix/1.8.8">Hex Package</a> <a href="https://preview.hex.pm/preview/phoenix/1.8.8">Hex Preview</a> (<a href="https://preview.hex.pm/preview/phoenix/1.8.8/show/guides/authn_authz/scopes.md">current file</a>) </span> <span class="line"> <button class="a-main footer-button display-quick-switch" title="Go to package docs"> Go to package docs </button> <a href="phoenix.epub.html"> Download ePub version </a> </span> </p> <p class="built-using"> Built using <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener nofollow" translate="no">ExDoc</a> (v0.40.3) for the <a href="https://elixir-lang.org" title="Elixir" target="_blank" translate="no">Elixir programming language</a> </p> </footer><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2014 Chris McCord<br>Licensed under the MIT License.<br>
+    <a href="https://phoenix.hexdocs.pm/scopes.html" class="_attribution-link">https://phoenix.hexdocs.pm/scopes.html</a>
+  </p>
+</div>

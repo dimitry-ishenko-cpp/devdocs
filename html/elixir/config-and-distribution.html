@@ -1,0 +1,187 @@
+<div id="top-content"> <div class="heading-with-actions top-heading"> <h1>Configuration and distribution</h1>  <a href="https://github.com/elixir-lang/elixir/blob/v1.20.1/lib/elixir/pages/mix-and-otp/config-and-distribution.md#L1" title="View Source" class="source" rel="help nofollow">Source</a> </div> <p>So far we have hardcoded our applications to run a web server on port 4040. This has been somewhat problematic since we can't, for example, run our development server and tests at the same time. In this chapter, we will learn how to use the application environment for configuration, paving the way for us to enable distribution by running multiple development servers on the same machine (on different ports).</p>
+<p>In this last guide, we will make the routing table for our distributed key-value store configurable, and then finally package the software for production.</p>
+<p>Let's do this.</p>
+<h2 id="application-environment" class="section-heading">
+<span class="text">Application environment</span>
+</h2>
+<p>In the chapter <a href="supervisor-and-application.html">Registries, applications, and supervisors</a>, we have learned that our project is backed by an application, which bundles our modules and specifies how your supervision tree starts and shuts down. Each application can also have its own configuration, which in Erlang/OTP (and therefore Elixir) is called "application environment".</p>
+<p>We can use the application environment to configure our own application, as well as others. Let's see the application environment in practice. Create a file <code class="inline">config/runtime.exs</code> with the following:</p>
+<pre data-language="elixir">import Config
+
+port =
+  cond do
+    port_env = System.get_env("PORT") -&gt;
+      String.to_integer(port_env)
+
+    config_env() == :test -&gt;
+      4040
+
+    true -&gt;
+      4050
+  end
+
+config :kv, :port, port</pre>
+<p>The above is attempting to read the "PORT" environment variable and use it as the port if defined. Otherwise, we default to port <code class="inline">4040</code> for tests and port <code class="inline">4050</code> for other environments, eliminating the conflict between environments we have seen in the past. Then we store its value under the <code class="inline">:port</code> key of our <code class="inline">:kv</code> application.</p>
+<p>Now we just need to read this configuration. Open up <code class="inline">lib/kv.ex</code> and the <code class="inline">start/2</code> function to the following:</p>
+<pre data-language="elixir">  def start(_type, _args) do
+    port = Application.fetch_env!(:kv, :port)
+
+    children = [
+      {Registry, name: KV, keys: :unique},
+      {DynamicSupervisor, name: KV.BucketSupervisor, strategy: :one_for_one},
+      {Task.Supervisor, name: KV.ServerSupervisor},
+      Supervisor.child_spec({Task, fn -&gt; KV.Server.accept(port) end}, restart: :permanent)
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end</pre>
+<p>Run <code class="inline">iex -S mix</code> and you will see the following message printed:</p>
+<pre data-language="elixir">[info] Accepting connections on port 4050</pre>
+<p>Run tests, without killing the development server, and you will see it running on port 4040.</p>
+<p>Our change was straight-forward. We used <a href="application.html#fetch_env!/2"><code class="inline">Application.fetch_env!/2</code></a> to read the entry for <code class="inline">port</code> in <code class="inline">:kv</code>'s environment. We explicitly used <code class="inline">fetch_env!/2</code> (instead of <code class="inline">get_env/2</code> or <code class="inline">fetch_env</code>) because it will raise if the port was not configured (preventing the app from booting).</p>
+<h2 id="compile-vs-runtime-configuration" class="section-heading">
+<span class="text">Compile vs runtime configuration</span>
+</h2>
+<p>Configuration files provide a mechanism for us to configure the environment of any application. Elixir provides two configuration entry points:</p>
+<ul>
+<li><p><code class="inline">config/config.exs</code> — this file is read at build time, before we compile our application and before we even load our dependencies. This means we can't access the code in our application nor in our dependencies. However, it means we can control how they are compiled</p></li>
+<li><p><code class="inline">config/runtime.exs</code> — this file is read after our application and dependencies are compiled and therefore it can configure how our application works at runtime. If you want to read system environment variables (via <a href="system.html#get_env/1"><code class="inline">System.get_env/1</code></a>) or access external configuration, this is the appropriate place to do so</p></li>
+</ul>
+<p>You can learn more about configuration in the <a href="config.html"><code class="inline">Config</code></a> and <a href="config.provider.html"><code class="inline">Config.Provider</code></a> modules.</p>
+<p>Generally speaking, we use <a href="application.html#fetch_env!/2"><code class="inline">Application.fetch_env!/2</code></a> (and friends) to read runtime configuration. <a href="application.html#compile_env/2"><code class="inline">Application.compile_env/2</code></a> is available for reading compile-time configuration. This allows Elixir to track which modules to recompile when the compilation environment changes.</p>
+<p>Now that we can start multiple servers, let's explore distribution.</p>
+<h2 id="our-first-distributed-code" class="section-heading">
+<span class="text">Our first distributed code</span>
+</h2>
+<p>Elixir ships with facilities to connect nodes and exchange information between them. In fact, we use the same concepts of processes, message passing and receiving messages when working in a distributed environment because Elixir processes are <em>location transparent</em>. This means that when sending a message, it doesn't matter if the recipient process is on the same node or on another node, the VM will be able to deliver the message in both cases.</p>
+<p>In order to run distributed code, we need to start the VM with a name. The name can be short (when in the same network) or long (requires the full computer address). Let's start a new IEx session:</p>
+<pre data-language="elixir">$ iex --sname foo
+</pre>
+<p>You can see now the prompt is slightly different and shows the node name followed by the computer name:</p>
+<pre data-language="elixir">Interactive Elixir - press Ctrl+C to exit (type h() ENTER for help)
+iex(foo@jv)1&gt;</pre>
+<p>My computer is named <code class="inline">jv</code>, so I see <code class="inline">foo@jv</code> in the example above, but you will get a different result. We will use <code class="inline">foo@computer-name</code> in the following examples and you should update them accordingly when trying out the code.</p>
+<p>Let's define a module named <code class="inline">Hello</code> in this shell:</p>
+<pre data-language="elixir">iex&gt; defmodule Hello do
+...&gt;   def world, do: IO.puts("hello world")
+...&gt; end</pre>
+<p>If you have another computer on the same network with both Erlang and Elixir installed, you can start another shell on it. If you don't, you can start another IEx session in another terminal. In either case, give it the short name of <code class="inline">bar</code>:</p>
+<pre data-language="elixir">$ iex --sname bar
+</pre>
+<p>Note that inside this new IEx session, we cannot access <code class="inline">Hello.world/0</code>:</p>
+<pre data-language="elixir">iex&gt; Hello.world
+** (UndefinedFunctionError) function Hello.world/0 is undefined (module Hello is not available)
+    Hello.world()</pre>
+<p>However, we can spawn a new process on <code class="inline">foo@computer-name</code> from <code class="inline">bar@computer-name</code>! Let's give it a try (where <code class="inline">@computer-name</code> is the one you see locally):</p>
+<pre data-language="elixir">iex&gt; Node.spawn_link(:"foo@computer-name", fn -&gt; Hello.world() end)
+#PID&lt;9014.59.0&gt;
+hello world</pre>
+<p>Elixir spawned a process on another node and returned its PID. You can see the PID number no longer starts with zero, showing it belongs to another node. The code then executed on the other node where the <code class="inline">Hello.world/0</code> function exists and invoked that function. Note that the result of "hello world" was printed on the current node <code class="inline">bar</code> and not on <code class="inline">foo</code>. In other words, the message to be printed was sent back from <code class="inline">foo</code> to <code class="inline">bar</code>. This happens because the process spawned on the other node (<code class="inline">foo</code>) knows all the output should be sent back to the original node!</p>
+<p>We can send and receive messages from the PID returned by <a href="node.html#spawn_link/2"><code class="inline">Node.spawn_link/2</code></a> as usual. Let's try a quick ping-pong example:</p>
+<pre data-language="elixir">iex&gt; pid = Node.spawn_link(:"foo@computer-name", fn -&gt;
+...&gt;   receive do
+...&gt;     {:ping, client} -&gt; send(client, :pong)
+...&gt;   end
+...&gt; end)
+#PID&lt;9014.59.0&gt;
+iex&gt; send(pid, {:ping, self()})
+{:ping, #PID&lt;0.73.0&gt;}
+iex&gt; flush()
+:pong
+:ok</pre>
+<p>In other words, we can spawn processes in other nodes, hold onto their PIDs, and then send messages to them as if they were running on the same machine. That's the <em>location transparency</em> principle. And because everything we have built so far was built on top of messaging passing, we should be able to adjust our key-value store to become a distributed one with little work.</p>
+<h2 id="distributed-naming-registry-with-global" class="section-heading">
+<span class="text">Distributed naming registry with <code class="inline">:global</code></span>
+</h2>
+<p>First, let's check that our code is not currently distributed. Start a new node like this:</p>
+<pre data-language="elixir">$ PORT=4100 iex --sname foo -S mix
+</pre>
+<p>And the other like this:</p>
+<pre data-language="elixir">$ PORT=4101 iex --sname bar -S mix
+</pre>
+<p>Now, within <code class="inline">foo@computer-name</code>, do this:</p>
+<pre data-language="elixir">iex&gt; :erpc.call(:"bar@computer-name", KV, :create_bucket, ["shopping"])
+{:ok, #PID&lt;22121.164.0&gt;}</pre>
+<p>Instead of using <a href="node.html#spawn_link/2"><code class="inline">Node.spawn_link/2</code></a>, we used <a href="https://www.erlang.org/doc/apps/kernel/erpc.html">Erlang's builtin RPC module</a> to call the function <code class="inline">create_bucket</code> in the <code class="inline">KV</code> module passing a one element list with the string "shopping" as the argument list. We could have used <a href="node.html#spawn_link/2"><code class="inline">Node.spawn_link/2</code></a>, but <a href="https://www.erlang.org/doc/apps/kernel/erpc.html#call/4"><code class="inline">:erpc.call/4</code></a> conveniently returns the result of the invocation.</p>
+<p>Still in <code class="inline">foo@computer-name</code>, let's try to access the bucket:</p>
+<pre data-language="elixir">iex&gt; KV.lookup_bucket("shopping")
+nil</pre>
+<p>It returns <code class="inline">nil</code>. However, if you run <code class="inline">KV.lookup_bucket("shopping")</code> in <code class="inline">bar@computer-name</code>, it will return the proper bucket. In other words, the nodes can communicate with each other, but buckets spawned in one node are not visible to the other.</p>
+<p>This is because we are using <a href="registry.html">Elixir's Registry</a> to name our buckets, which is a <strong>local</strong> process registry. In other words, it is designed for processes running on a single node and not for distribution.</p>
+<p>Luckily, Erlang ships with a distributed registry called <a href="https://www.erlang.org/doc/apps/kernel/global.html"><code class="inline">:global</code></a>, which is directly supported by the <code class="inline">:name</code> option by passing a <code class="inline">{:global, name}</code> tuple. All we need to do is update the <code class="inline">via/1</code> function in <code class="inline">lib/kv.ex</code> from this:</p>
+<pre data-language="elixir">  defp via(name), do: {:via, Registry, {KV, name}}</pre>
+<p>to this:</p>
+<pre data-language="elixir">  defp via(name), do: {:global, name}</pre>
+<p>Do the change above and restart both <code class="inline">foo@computer-name</code> and <code class="inline">bar@computer-name</code>. Now, back on <code class="inline">foo@computer-name</code>, let's give it another try:</p>
+<pre data-language="elixir">iex&gt; :erpc.call(:"bar@computer-name", KV, :create_bucket, ["shopping"])
+{:ok, #PID&lt;21821.179.0&gt;}
+iex&gt; KV.lookup_bucket("shopping")
+#PID&lt;21821.179.0&gt;</pre>
+<p>And there you go! By simply changing which naming registry we used, we now have a distributed key value store. You can even try using <code class="inline">telnet</code> to connect to the servers on different ports and validate that changes in one session are visible in the other one. Exciting!</p>
+<h2 id="node-discovery-and-dependencies" class="section-heading">
+<span class="text">Node discovery and dependencies</span>
+</h2>
+<p>There is one essential ingredient to wrap up our distributed key-value store. In order for the <code class="inline">:global</code> registry to work, we need to make sure the nodes are connected to each other. When we run <code class="inline">:erpc</code> call passing the node name:</p>
+<pre data-language="elixir">:erpc.call(:"bar@computer-name", KV, :create_bucket, ["shopping"])</pre>
+<p>Elixir automatically connected the nodes together. This is easy to do in an IEx session when both instances are running on the same machine but it requires more work in a production environment, where instances are on different machines which may be started at any time and running on different IP addresses.</p>
+<p>Luckily for us, this is also a well-solved problem. For example, if you are using <a rel="nofollow" href="https://phoenixframework.org">the Phoenix web framework</a> in production, it ships with <a rel="nofollow" href="https://github.com/phoenixframework/dns_cluster">the <code class="inline">dns_cluster</code> package</a>, which automatically runs DNS queries to find new nodes and connect them. If you are using Kubernetes or cloud providers, <a rel="nofollow" href="https://github.com/bitwalker/libcluster">packages like <code class="inline">libcluster</code></a> ship with different strategies to discover and connect nodes.</p>
+<p>Installing dependencies in Elixir is simple. Most commonly, we use the <a href="https://hex.pm">Hex Package Manager</a>, by listing the dependency inside the deps function in our <code class="inline">mix.exs</code> file:</p>
+<pre data-language="elixir">def deps do
+  [{:dns_cluster, "~&gt; 0.2"}]
+end</pre>
+<p>This dependency refers to the latest version of <code class="inline">dns_cluster</code> in the 0.x version series that has been pushed to Hex. This is indicated by the <code class="inline">~&gt;</code> preceding the version number. For more information on specifying version requirements, see the documentation for the <a href="version.html"><code class="inline">Version</code></a> module.</p>
+<p>Typically, stable releases are pushed to Hex. If you want to depend on an external dependency still in development, Mix is able to manage Git dependencies too:</p>
+<pre data-language="elixir">def deps do
+  [{:dns_cluster, git: "https://github.com/phoenixframework/dns_cluster.git"}]
+end</pre>
+<p>You will notice that when you add a dependency to your project, Mix generates a <code class="inline">mix.lock</code> file that guarantees <em>repeatable builds</em>. The lock file must be checked in to your version control system, to guarantee that everyone who uses the project will use the same dependency versions as you.</p>
+<p>Mix provides many tasks for working with dependencies, which can be seen in <a href="https://hexdocs.pm/mix/1.20.1/Mix.Tasks.Help.html"><code class="inline">mix help</code></a>:</p>
+<pre data-language="elixir">$ mix help
+mix deps              # Lists dependencies and their status
+mix deps.clean        # Deletes the given dependencies' files
+mix deps.compile      # Compiles dependencies
+mix deps.get          # Fetches unavailable and out of date dependencies
+mix deps.tree         # Prints the dependency tree
+mix deps.unlock       # Unlocks the given dependencies
+mix deps.update       # Updates the given dependencies
+</pre>
+<p>The most common tasks are <a href="https://hexdocs.pm/mix/1.20.1/Mix.Tasks.Deps.Get.html"><code class="inline">mix deps.get</code></a> and <a href="https://hexdocs.pm/mix/1.20.1/Mix.Tasks.Deps.Update.html"><code class="inline">mix deps.update</code></a>. Once fetched, dependencies are automatically compiled for you. You can read more about deps by running <a href="https://hexdocs.pm/mix/1.20.1/Mix.Tasks.Deps.html"><code class="inline">mix help deps</code></a>.</p>
+<p>To wrap up this chapter, we will build a very simple node discovery mechanism, where the name of the nodes we should connect to are given on boot, using the lessons we learned in this chapter.</p>
+<h2 id="node-connect-1" class="section-heading">
+<span class="text"><a href="node.html#connect/1"><code class="inline">Node.connect/1</code></a></span>
+</h2>
+<p>We will change our application to support a "NODES" environment variable with the name of all nodes each instance should connect to.</p>
+<p>Open up <code class="inline">config/runtime.exs</code> and add this to the bottom:</p>
+<pre data-language="elixir">nodes =
+  System.get_env("NODES", "")
+  |&gt; String.split(",", trim: true)
+  |&gt; Enum.map(&amp;String.to_atom/1)
+
+config :kv, :nodes, nodes</pre>
+<p>We fetch the environment variable, split it on "," while discarding all empty strings, and then convert each entry to an atom, as node names are atoms.</p>
+<p>Now, in your <code class="inline">start/2</code> callback, we will add this to of the <code class="inline">start/2</code> function:</p>
+<pre data-language="elixir">  def start(_type, _args) do
+    for node &lt;- Application.fetch_env!(:kv, :nodes) do
+      Node.connect(node)
+    end</pre>
+<p>Now we can start our nodes as:</p>
+<pre data-language="elixir">$ NODES="foo@computer-name,bar@computer-name" PORT=4040 iex --sname foo -S mix
+$ NODES="foo@computer-name,bar@computer-name" PORT=4041 iex --sname bar -S mix
+</pre>
+<p>And they should connect to each other. Give it a try!</p>
+<p>In an actual production system, there is some additional care we must take. For example, we often use <code class="inline">--name</code> instead of <code class="inline">--sname</code> and give fully qualified node names.</p>
+<p>Furthermore, when connecting two instances, we must guarantee they have the same cookie, which is a secret Erlang uses to authorize the connection. When they run on the same machine, they share the same cookie by default, but it must be either explicitly set or shared in other ways when deploying in a cluster.</p>
+<p>We will revisit these topics in the last chapter when we talk about releases.</p>
+<h2 id="distributed-system-trade-offs" class="section-heading">
+<span class="text">Distributed system trade-offs</span>
+</h2>
+<p>In this chapter, we made our key-value store distributed by using the <code class="inline">:global</code> naming registry. However, it is important to keep in mind that every distributed system, be it a library or a full-blown database, is designed with a series of trade-offs in mind.</p>
+<p>In particular, <code class="inline">:global</code> requires consistency across all known nodes whenever a new bucket is created. For example, if your cluster has three nodes, creating a new bucket will require all three nodes to agree on its name. This means if one node is unresponsive, perhaps due to a <a rel="nofollow" href="https://en.wikipedia.org/wiki/Network_partition">network partition</a>, the node will have to either reconnect or be kicked out before registration succeeds. This also means that, as your cluster grows in size, registration becomes more expensive, although lookups are always cheap and immediate. Within the ecosystem, there are other named registries, which explore different trade-offs, such as <a rel="nofollow" href="https://github.com/ostinelli/syn">Syn</a>.</p>
+<p>Further complications arise when we consider storage. Today, when our nodes terminate, we lose all data stored in the buckets. In our current design, since we allow each node to store their own buckets, it means we would need to backup each node. And, if we don't want data losses, we would also need to replicate the data.</p>
+<p>For those reasons, it is still very common to use a database (or any storage system) when writing production applications in Elixir, and use Elixir to implement the realtime and collaborative aspects of your applications that extend beyond storage. For example, we can use Elixir to track which clients are connected to the cluster at any given moment or implement a feed where users are notified in realtime whenever items are added or removed from a bucket.</p>
+<p>In fact, that's exactly what we will build in the next chapter. Allowing us to wrap up everything we have learned so far and also talk about one of the essential building blocks in Elixir software: GenServers.</p> </div> <div class="bottom-actions" id="bottom-actions"> <div class="bottom-actions-item"> <a href="docs-tests-and-with.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Doctests, patterns, and with </span> </a> </div> <div class="bottom-actions-item"> <a href="genservers.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Client-server with GenServer </span> </a> </div> </div> <footer class="footer"> <p> <span class="line"> <button class="a-main footer-button display-quick-switch" title="Go to package docs"> Go to package docs </button> <a href="llms.txt.html" target="_blank"> View llms.txt </a> <a href="elixir.epub.html"> Download ePub version </a> </span> </p> <p class="built-using"> Built using <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener nofollow" translate="no">ExDoc</a> (v0.40.3) for the <a href="https://elixir-lang.org" title="Elixir" target="_blank" translate="no">Elixir programming language</a> </p> </footer><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012-2026 The Elixir Team<br>Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://elixir.hexdocs.pm/1.20.1/config-and-distribution.html" class="_attribution-link">https://elixir.hexdocs.pm/1.20.1/config-and-distribution.html</a>
+  </p>
+</div>

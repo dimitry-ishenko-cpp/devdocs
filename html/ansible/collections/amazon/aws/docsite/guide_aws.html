@@ -1,0 +1,130 @@
+<section id="amazon-web-services-guide"> <h1 id="ansible-collections-amazon-aws-docsite-aws-intro">Amazon Web Services Guide</h1> <p>The <code>amazon.aws</code> collection contains a number of modules and plugins for controlling Amazon Web Services (AWS). This guide explains how to use the modules and inventory scripts to automate your AWS resources with Ansible.</p>  <ul class="simple"> <li><a class="reference internal" href="#authentication" id="id1">Authentication</a></li> <li><a class="reference internal" href="#provisioning" id="id2">Provisioning</a></li> <li><a class="reference internal" href="#security-groups" id="id3">Security Groups</a></li> <li><a class="reference internal" href="#host-inventory" id="id4">Host Inventory</a></li> <li><a class="reference internal" href="#tags-and-groups-and-variables" id="id5">Tags And Groups And Variables</a></li> <li><a class="reference internal" href="#autoscaling-with-ansible-pull" id="id6">Autoscaling with Ansible Pull</a></li> <li><a class="reference internal" href="#autoscaling-with-ansible-automation-platform" id="id7">Autoscaling with Ansible Automation Platform</a></li> <li><a class="reference internal" href="#ansible-with-and-versus-cloudformation" id="id8">Ansible With (And Versus) CloudFormation</a></li> <li><a class="reference internal" href="#aws-image-building-with-ansible" id="id9">AWS Image Building With Ansible</a></li> <li><a class="reference internal" href="#next-steps-explore-modules" id="id10">Next Steps: Explore Modules</a></li> </ul>  <p>Requirements for the AWS modules are minimal.</p> <p>All of the modules require and are tested against recent versions of botocore and boto3. Starting with the 2.0 AWS collection releases, it is generally the policy of the collections to support the versions of these libraries released 12 months prior to the most recent major collection revision. Individual modules may require a more recent library version to support specific features or may require the boto library, check the module documentation for the minimum required version for each module. You must have the boto3 Python module installed on your control machine. You can install these modules from your OS distribution or using the python package installer: <code>pip install boto3</code>.</p> <p>Starting with the 2.0 releases of both collections, Python 2.7 support will be ended in accordance with AWS’ <a class="reference external" href="https://aws.amazon.com/blogs/developer/announcing-end-of-support-for-python-2-7-in-aws-sdk-for-python-and-aws-cli-v1/">end of Python 2.7 support</a> and Python 3.6 or greater will be required.</p> <p>Whereas classically Ansible will execute tasks in its host loop against multiple remote machines, most cloud-control steps occur on your local machine with reference to the regions to control.</p> <p>In your playbook steps we’ll typically be using the following pattern for provisioning steps:</p> <pre data-language="YAML+Jinja">- hosts: localhost
+  gather_facts: False
+  tasks:
+    - ...
+</pre> <section id="authentication"> <h2 id="ansible-collections-amazon-aws-docsite-aws-authentication">Authentication</h2> <p>Authentication with the AWS-related modules is handled by either specifying your access and secret key as ENV variables or module arguments.</p> <p>For environment variables:</p> <pre data-language="YAML+Jinja">export AWS_ACCESS_KEY_ID='AK123'
+export AWS_SECRET_ACCESS_KEY='abc123'
+</pre> <p>For storing these in a vars_file, ideally encrypted with ansible-vault:</p> <pre data-language="YAML+Jinja">---
+aws_access_key: "--REMOVED--"
+aws_secret_key: "--REMOVED--"
+</pre> <p>Note that if you store your credentials in vars_file, you need to refer to them in each AWS-module. For example:</p> <pre data-language="YAML+Jinja">- amazon.aws.ec2_instance:
+    aws_access_key: "{{ aws_access_key }}"
+    aws_secret_key: "{{ aws_secret_key }}"
+    key_name: "example-ssh-key"
+    image_id: "..."
+</pre> <p>Or they can be specified using “module_defaults” at the top of a playbook.:</p> <pre data-language="YAML+Jinja"># demo_setup.yml
+
+- hosts: localhost
+  module_defaults:
+    group/aws:
+      aws_access_key: '{{ aws_access_key }}'
+      aws_secret_key: '{{ aws_secret_key }}'
+      region: '{{ region }}'
+  tasks:
+    - amazon.aws.ec2_instance:
+        key_name: "example-ssh-key"
+        image_id: "..."
+</pre> <p>Credentials can also be accessed from a <a class="reference external" href="https://docs.aws.amazon.com/cli/v1/userguide/cli-configure-files.html">Credentials Profile</a>.:</p> <pre data-language="YAML+Jinja">- amazon.aws.ec2_instance:
+    aws_profile: default
+    key_name: "example-ssh-key"
+    image_id: "..."
+</pre> </section> <section id="provisioning"> <h2 id="ansible-collections-amazon-aws-docsite-aws-provisioning">Provisioning</h2> <p>The ec2_instance module provisions and de-provisions instances within EC2.</p> <p>An example of creating an instance with a public IP assigned follows.</p> <p>The “name” parameter will create a “<a class="reference external" href="tag:Name.html">tag:Name</a>” on the instance. Additional tags can be specified with the “tags” parameter.:</p> <pre data-language="YAML+Jinja"># demo_setup.yml
+
+- hosts: localhost
+  gather_facts: False
+
+  tasks:
+
+    - name: Provision an EC2 instance with a public IP address
+      amazon.aws.ec2_instance:
+        name: Demo
+        key_name: "example-ssh-key"
+        vpc_subnet_id: subnet-5ca1ab1e
+        instance_type: c5.large
+        security_group: default
+        network:
+          assign_public_ip: true
+        image_id: ami-123456
+        tags:
+          Environment: Testing
+      register: result
+</pre> <p>The data about the instance that has been created is being saved by the “register” keyword in the variable named “result”.</p> <p>From this, we’ll use the add_host module to dynamically create a host group consisting of these new instances. This facilitates performing configuration actions on the hosts immediately in a subsequent task.:</p> <pre data-language="YAML+Jinja"># demo_setup.yml
+
+- hosts: localhost
+  gather_facts: False
+
+  tasks:
+
+    - name: Provision an EC2 instance with a public IP address
+      amazon.aws.ec2_instance:
+        name: Demo
+        key_name: "example-ssh-key"
+        vpc_subnet_id: subnet-5ca1ab1e
+        instance_type: c5.large
+        security_group: default
+        network:
+          assign_public_ip: true
+        image_id: ami-123456
+        tags:
+          Environment: Testing
+      register: result
+
+   - name: Add all instance public IPs to host group
+     add_host: hostname={{ item.public_ip }} groups=ec2hosts
+     loop: "{{ result.instances }}"
+</pre> <p>With the host group now created, a second play at the bottom of the same provisioning playbook file might now have some configuration steps:</p> <pre data-language="YAML+Jinja"># demo_setup.yml
+
+- name: Provision a set of instances
+  hosts: localhost
+  # ... AS ABOVE ...
+
+- hosts: ec2hosts
+  name: configuration play
+  user: ec2-user
+  gather_facts: true
+
+  tasks:
+
+     - name: Check NTP service
+       service: name=ntpd state=started
+</pre> </section> <section id="security-groups"> <h2 id="ansible-collections-amazon-aws-docsite-aws-security-groups">Security Groups</h2> <p>Security groups on AWS are stateful. The response of a request from your instance is allowed to flow in regardless of inbound security group rules and vice-versa. In case you only want allow traffic with AWS S3 service, you need to fetch the current IP ranges of AWS S3 for one region and apply them as an egress rule.:</p> <pre data-language="YAML+Jinja">- name: fetch raw ip ranges for aws s3
+  set_fact:
+    raw_s3_ranges: "{{ lookup('aws_service_ip_ranges', region='eu-central-1', service='S3', wantlist=True) }}"
+
+- name: prepare list structure for ec2_group module
+  set_fact:
+    s3_ranges: "{{ s3_ranges | default([]) + [{'proto': 'all', 'cidr_ip': item, 'rule_desc': 'S3 Service IP range'}] }}"
+  loop: "{{ raw_s3_ranges }}"
+
+- name: set S3 IP ranges to egress rules
+  ec2_group:
+    name: aws_s3_ip_ranges
+    description: allow outgoing traffic to aws S3 service
+    region: eu-central-1
+    state: present
+    vpc_id: vpc-123456
+    purge_rules: true
+    purge_rules_egress: true
+    rules: []
+    rules_egress: "{{ s3_ranges }}"
+    tags:
+      Name: aws_s3_ip_ranges
+</pre> </section> <section id="host-inventory"> <h2 id="ansible-collections-amazon-aws-docsite-aws-host-inventory">Host Inventory</h2> <p>Once your nodes are spun up, you’ll probably want to talk to them again. With a cloud setup, it’s best to not maintain a static list of cloud hostnames in text files. Rather, the best way to handle this is to use the aws_ec2 inventory plugin. See <a class="reference internal" href="../../../../inventory_guide/intro_dynamic_inventory.html#dynamic-inventory"><span class="std std-ref">Working with dynamic inventory</span></a>.</p> <p>The plugin will also return instances that were created outside of Ansible and allow Ansible to manage them.</p> </section> <section id="tags-and-groups-and-variables"> <h2 id="ansible-collections-amazon-aws-docsite-aws-tags-and-groups">Tags And Groups And Variables</h2> <p>When using the inventory plugin, you can configure extra inventory structure based on the metadata returned by AWS.</p> <p>For instance, you might use <code>keyed_groups</code> to create groups from instance tags:</p> <pre data-language="YAML+Jinja">plugin: amazon.aws.aws_ec2
+keyed_groups:
+  - prefix: tag
+    key: tags
+</pre> <p>You can then target all instances with a “class” tag where the value is “webserver” in a play:</p> <pre data-language="YAML+Jinja">- hosts: tag_class_webserver
+  tasks:
+    - ping
+</pre> <p>You can also use these groups with ‘group_vars’ to set variables that are automatically applied to matching instances.</p> </section> <section id="autoscaling-with-ansible-pull"> <h2 id="ansible-collections-amazon-aws-docsite-aws-pull">Autoscaling with Ansible Pull</h2> <p>Amazon Autoscaling features automatically increase or decrease capacity based on load. There are also Ansible modules shown in the cloud documentation that can configure autoscaling policy.</p> <p>When nodes come online, it may not be sufficient to wait for the next cycle of an ansible command to come along and configure that node.</p> <p>To do this, pre-bake machine images which contain the necessary ansible-pull invocation. Ansible-pull is a command line tool that fetches a playbook from a git server and runs it locally.</p> <p>One of the challenges of this approach is that there needs to be a centralized way to store data about the results of pull commands in an autoscaling context. For this reason, the autoscaling solution provided below in the next section can be a better approach.</p> <p>Read <a class="reference internal" href="../../../../cli/ansible-pull.html#ansible-pull"><span class="std std-ref">ansible-pull</span></a> for more information on pull-mode playbooks.</p> </section> <section id="autoscaling-with-ansible-automation-platform"> <h2 id="ansible-collections-amazon-aws-docsite-aws-autoscale">Autoscaling with Ansible Automation Platform</h2> <p><a class="reference external" href="https://access.redhat.com/documentation/en-us/red_hat_ansible_automation_platform/">Ansible Automation Platform (AAP)</a> also contains a very nice feature for auto-scaling use cases. In this mode, a simple curl script can call a defined URL and the server will “dial out” to the requester and configure an instance that is spinning up. This can be a great way to reconfigure ephemeral nodes. See the install and product documentation for more details.</p> <p>A benefit of using the callback in AAP over pull mode is that job results are still centrally recorded and less information has to be shared with remote hosts.</p> </section> <section id="ansible-with-and-versus-cloudformation"> <h2 id="ansible-collections-amazon-aws-docsite-aws-cloudformation-example">Ansible With (And Versus) CloudFormation</h2> <p>CloudFormation is a Amazon technology for defining a cloud stack as a JSON or YAML document.</p> <p>Ansible modules provide an easier to use interface than CloudFormation in many examples, without defining a complex JSON/YAML document. This is recommended for most users.</p> <p>However, for users that have decided to use CloudFormation, there is an Ansible module that can be used to apply a CloudFormation template to Amazon.</p> <p>When using Ansible with CloudFormation, typically Ansible will be used with a tool like Packer to build images, and CloudFormation will launch those images, or ansible will be invoked through user data once the image comes online, or a combination of the two.</p> <p>Please see the examples in the Ansible CloudFormation module for more details.</p> </section> <section id="aws-image-building-with-ansible"> <h2 id="ansible-collections-amazon-aws-docsite-aws-image-build">AWS Image Building With Ansible</h2> <p>Many users may want to have images boot to a more complete configuration rather than configuring them entirely after instantiation. To do this, one of many programs can be used with Ansible playbooks to define and upload a base image, which will then get its own AMI ID for usage with the ec2 module or other Ansible AWS modules such as ec2_asg or the cloudformation module. Possible tools include Packer, aminator, and Ansible’s ec2_ami module.</p> <p>Generally speaking, we find most users using Packer.</p> <p>See the Packer documentation of the <a class="reference external" href="https://www.packer.io/docs/provisioners/ansible/ansible-local">Ansible local Packer provisioner</a> and <a class="reference external" href="https://www.packer.io/docs/provisioners/ansible/ansible">Ansible remote Packer provisioner</a>.</p> <p>If you do not want to adopt Packer at this time, configuring a base-image with Ansible after provisioning (as shown above) is acceptable.</p> </section> <section id="next-steps-explore-modules"> <h2 id="ansible-collections-amazon-aws-docsite-aws-next-steps">Next Steps: Explore Modules</h2> <p>Ansible ships with lots of modules for configuring a wide array of EC2 services. Browse the “Cloud” category of the module documentation for a full list with examples.</p> <div class="admonition seealso"> <p class="admonition-title">See also</p> <dl class="simple"> <dt><a class="reference internal" href="../../../index.html#list-of-collections"><span class="std std-ref">Collection Index</span></a></dt>
+<dd>
+<p>Browse existing collections, modules, and plugins</p> </dd> <dt><a class="reference internal" href="../../../../playbook_guide/playbooks.html#working-with-playbooks"><span class="std std-ref">Working with playbooks</span></a></dt>
+<dd>
+<p>An introduction to playbooks</p> </dd> <dt><a class="reference internal" href="../../../../playbook_guide/playbooks_delegation.html#playbooks-delegation"><span class="std std-ref">Controlling where tasks run: delegation and local actions</span></a></dt>
+<dd>
+<p>Delegation, useful for working with loud balancers, clouds, and locally executed steps.</p> </dd> </dl> </div> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012&ndash;2018 Michael DeHaan<br>&copy; 2018&ndash;2025 Red Hat, Inc.<br>Licensed under the GNU General Public License version 3.<br>
+    <a href="https://docs.ansible.com/projects/ansible/latest/collections/amazon/aws/docsite/guide_aws.html" class="_attribution-link">https://docs.ansible.com/projects/ansible/latest/collections/amazon/aws/docsite/guide_aws.html</a>
+  </p>
+</div>

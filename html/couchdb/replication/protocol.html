@@ -1,0 +1,1066 @@
+<section id="couchdb-replication-protocol"> <h1>CouchDB Replication Protocol</h1> <dl class="field-list simple"> <dt class="field-odd">Version<span class="colon">:</span>
+</dt> <dd class="field-odd">
+<p>3</p> </dd> </dl> <p>The <cite>CouchDB Replication Protocol</cite> is a protocol for synchronising JSON documents between 2 peers over HTTP/1.1 by using the public <a class="reference internal" href="../api/index.html#api"><span class="std std-ref">CouchDB REST API</span></a> and is based on the Apache CouchDB <a class="reference external" href="http://en.wikipedia.org/wiki/Multiversion_concurrency_control">MVCC</a> Data model.</p> <section id="preface"> <h2>Preface</h2> <section id="language"> <h3>Language</h3> <p>The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL NOT”, “SHOULD”, “SHOULD NOT”, “RECOMMENDED”, “MAY”, and “OPTIONAL” in this document are to be interpreted as described in <a class="rfc reference external" href="https://datatracker.ietf.org/doc/html/rfc2119.html"><strong>RFC 2119</strong></a>.</p> </section> <section id="goals"> <h3>Goals</h3> <p>The primary goal of this specification is to describe the <cite>CouchDB Replication Protocol</cite> under the hood.</p> <p>The secondary goal is to provide enough detailed information about the protocol to make it easy to build tools on any language and platform that can synchronize data with CouchDB.</p> </section> <section id="definitions"> <h3>Definitions</h3> <dl class="simple"> <dt>JSON:</dt>
+<dd>
+<p><abbr title="JavaScript Object Notation">JSON</abbr> is a text format for the serialization of structured data. It is described in <a class="reference external" href="http://www.ecma-international.org/publications/files/ecma-st/ECMA-262.pdf">ECMA-262</a> and <a class="rfc reference external" href="https://datatracker.ietf.org/doc/html/rfc4627.html"><strong>RFC 4627</strong></a>.</p> </dd> <dt>URI:</dt>
+<dd>
+<p>A URI is defined by <a class="rfc reference external" href="https://datatracker.ietf.org/doc/html/rfc3986.html"><strong>RFC 3986</strong></a>. It can be a URL as defined in <a class="rfc reference external" href="https://datatracker.ietf.org/doc/html/rfc1738.html"><strong>RFC 1738</strong></a>.</p> </dd> <dt>ID:</dt>
+<dd>
+<p>An identifier (could be a UUID) as described in <a class="rfc reference external" href="https://datatracker.ietf.org/doc/html/rfc4122.html"><strong>RFC 4122</strong></a>.</p> </dd> <dt>Revision:</dt>
+<dd>
+<p>A <a class="reference external" href="http://en.wikipedia.org/wiki/Multiversion_concurrency_control">MVCC</a> token value of following pattern: <code class="docutils literal notranslate"><span class="pre">N-sig</span></code> where <code class="docutils literal notranslate"><span class="pre">N</span></code> is ALWAYS a positive integer and <code class="docutils literal notranslate"><span class="pre">sig</span></code> is the Document signature (custom). Don’t mix it up with the revision in version control systems!</p> </dd> <dt>Leaf Revision:</dt>
+<dd>
+<p>The last Document Revision in a series of changes. Documents may have multiple Leaf Revisions (aka Conflict Revisions) due to concurrent updates.</p> </dd> <dt>Document:</dt>
+<dd>
+<p>A document is a JSON object with an ID and Revision defined in <code class="docutils literal notranslate"><span class="pre">_id</span></code> and <code class="docutils literal notranslate"><span class="pre">_rev</span></code> fields respectively. A Document’s ID MUST be unique within the Database where it is stored.</p> </dd> <dt>Database:</dt>
+<dd>
+<p>A collection of Documents with a unique URI.</p> </dd> <dt>Changes Feed:</dt>
+<dd>
+<p>A stream of Document-changing events (create, update, delete) for the specified Database.</p> </dd> <dt>Sequence ID:</dt>
+<dd>
+<p>An ID provided by the Changes Feed. It MUST be incremental, but MAY NOT always be an integer.</p> </dd> <dt>Source:</dt>
+<dd>
+<p>Database from where the Documents are replicated.</p> </dd> <dt>Target:</dt>
+<dd>
+<p>Database where the Documents are replicated to.</p> </dd> <dt>Replication:</dt>
+<dd>
+<p>The one-way directed synchronization process of Source and Target endpoints.</p> </dd> <dt>Checkpoint:</dt>
+<dd>
+<p>Intermediate Recorded Sequence ID used for Replication recovery.</p> </dd> <dt>Replicator:</dt>
+<dd>
+<p>A service or an application which initiates and runs Replication.</p> </dd> <dt>Filter Function:</dt>
+<dd>
+<p>A special function of any programming language that is used to filter Documents during Replication (see <a class="reference internal" href="../ddocs/ddocs.html#filterfun"><span class="std std-ref">Filter Functions</span></a>)</p> </dd> <dt>Filter Function Name:</dt>
+<dd>
+<p>An ID of a Filter Function that may be used as a symbolic reference (aka callback function) to apply the related Filter Function to Replication.</p> </dd> <dt>Filtered Replication:</dt>
+<dd>
+<p>Replication of Documents from Source to Target using a Filter Function.</p> </dd> <dt>Full Replication:</dt>
+<dd>
+<p>Replication of all Documents from Source to Target.</p> </dd> <dt>Push Replication:</dt>
+<dd>
+<p>Replication process where Source is a local endpoint and Target is remote.</p> </dd> <dt>Pull Replication:</dt>
+<dd>
+<p>Replication process where Source is a remote endpoint and Target is local.</p> </dd> <dt>Continuous Replication:</dt>
+<dd>
+<p>Replication that “never stops”: after processing all events from the Changes Feed, the Replicator doesn’t close the connection, but awaits new change events from the Source. The connection is kept alive by periodic heartbeats.</p> </dd> <dt>Replication Log:</dt>
+<dd>
+<p>A special Document that holds Replication history (recorded Checkpoints and a few more statistics) between Source and Target.</p> </dd> <dt>Replication ID:</dt>
+<dd>
+<p>A unique value that unambiguously identifies the Replication Log.</p> </dd> </dl> </section> </section> <section id="replication-protocol-algorithm"> <h2>Replication Protocol Algorithm</h2> <p>The <cite>CouchDB Replication Protocol</cite> is not <em>magical</em>, but an agreement on usage of the public <a class="reference internal" href="../api/index.html#api"><span class="std std-ref">CouchDB HTTP REST API</span></a> to enable Documents to be replicated from Source to Target.</p> <p>The reference implementation, written in <a class="reference external" href="http://erlang.org">Erlang</a>, is provided by the <a class="reference external" href="https://github.com/apache/couchdb/tree/main/src/couch_replicator">couch_replicator</a> module in Apache CouchDB.</p> <p>It is RECOMMENDED that one follow this algorithm specification, use the same HTTP endpoints, and run requests with the same parameters to provide a completely compatible implementation. Custom Replicator implementations MAY use different HTTP API endpoints and request parameters depending on their local specifics and they MAY implement only part of the Replication Protocol to run only Push or Pull Replication. However, while such solutions could also run the Replication process, they loose compatibility with the CouchDB Replicator.</p> <section id="verify-peers"> <h3>Verify Peers</h3> <pre data-language="javascript">+ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+' Verify Peers:                                                             '
+'                                                                           '
+'                404 Not Found   +--------------------------------+         '
+'       +----------------------- |     Check Source Existence     |         '
+'       |                        +--------------------------------+         '
+'       |                        |          HEAD /source          |         '
+'       |                        +--------------------------------+         '
+'       |                          |                                        '
+'       |                          | 200 OK                                 '
+'       |                          v                                        '
+'       |                        +--------------------------------+         '
+'       |                        |     Check Target Existence     | ----+   '
+'       |                        +--------------------------------+     |   '
+'       |                        |         HEAD /target           |     |   '
+'       |                        +--------------------------------+     |   '
+'       |                          |                                    |   '
+'       |                          | 404 Not Found                      |   '
+'       v                          v                                    |   '
+'   +-------+    No              +--------------------------------+     |   '
+'   | Abort | &lt;----------------- |         Create Target?         |     |   '
+'   +-------+                    +--------------------------------+     |   '
+'       ^                          |                                    |   '
+'       |                          | Yes                                |   '
+'       |                          v                                    |   '
+'       |        Failure         +--------------------------------+     |   '
+'       +----------------------- |          Create Target         |     |   '
+'                                +--------------------------------+     |   '
+'                                |           PUT /target          |     |   '
+'                                +--------------------------------+     |   '
+'                                  |                                    |   '
+'                                  | 201 Created                 200 OK |   '
+'                                  |                                    |   '
++ - - - - - - - - - - - - - - - -  | - - - - - - - - - - - - - - - - -  | - +
+                                   |                                    |
++ - - - - - - - - - - - - - - - -  | - - - - - - - - - - - - - - - - -  | - +
+' Get Peers Information:           |                                    |   '
+'                                  +------------------------------------+   '
+'                                  |                                        '
+'                                  v                                        '
+'                                +--------------------------------+         '
+'                                |     Get Source Information     |         '
+'                                +--------------------------------+         '
+'                                                                           '
++ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +</pre> <p>The Replicator MUST ensure that both Source and Target exist by using <a class="reference internal" href="../api/database/common.html#head--db" title="HEAD /{db}"><code class="xref http http-head docutils literal notranslate"><span class="pre">HEAD</span> <span class="pre">/{db}</span></code></a> requests.</p> <section id="check-source-existence"> <h4>Check Source Existence</h4> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">HEAD /source HTTP/1.1
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Cache-Control: must-revalidate
+Content-Type: application/json
+Date: Sat, 05 Oct 2013 08:50:39 GMT
+Server: CouchDB (Erlang/OTP)</pre> </div>
+</blockquote> </section> <section id="check-target-existence"> <h4>Check Target Existence</h4> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">HEAD /target HTTP/1.1
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Cache-Control: must-revalidate
+Content-Type: application/json
+Date: Sat, 05 Oct 2013 08:51:11 GMT
+Server: CouchDB (Erlang/OTP)</pre> </div>
+</blockquote> </section> <section id="create-target"> <h4>Create Target?</h4> <p>In case of a non-existent Target, the Replicator MAY make a <a class="reference internal" href="../api/database/common.html#put--db" title="PUT /{db}"><code class="xref http http-put docutils literal notranslate"><span class="pre">PUT</span> <span class="pre">/{db}</span></code></a> request to create the Target:</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">PUT /target HTTP/1.1
+Accept: application/json
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 201 Created
+Content-Length: 12
+Content-Type: application/json
+Date: Sat, 05 Oct 2013 08:58:41 GMT
+Server: CouchDB (Erlang/OTP)
+
+{
+    "ok": true
+}</pre> </div>
+</blockquote> <p>However, the Replicator’s PUT request MAY NOT succeeded due to insufficient privileges (which are granted by the provided credential) and so receive a <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.2">401 Unauthorized</a> or a <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.4">403 Forbidden</a> error. Such errors SHOULD be expected and well handled:</p> <blockquote> <div>
+<pre data-language="javascript">HTTP/1.1 401 Unauthorized
+Cache-Control: must-revalidate
+Content-Length: 108
+Content-Type: application/json
+Date: Fri, 09 May 2014 13:50:32 GMT
+Server: CouchDB (Erlang OTP)
+
+{
+    "error": "unauthorized",
+    "reason": "unauthorized to access or create database http://localhost:5984/target"
+}</pre> </div>
+</blockquote> </section> <section id="abort"> <h4>Abort</h4> <p>In case of a non-existent Source or Target, Replication SHOULD be aborted with an HTTP error response:</p> <blockquote> <div>
+<pre data-language="javascript">HTTP/1.1 500 Internal Server Error
+Cache-Control: must-revalidate
+Content-Length: 56
+Content-Type: application/json
+Date: Sat, 05 Oct 2013 08:55:29 GMT
+Server: CouchDB (Erlang OTP)
+
+{
+    "error": "db_not_found",
+    "reason": "could not open source"
+}</pre> </div>
+</blockquote> </section> </section> <section id="get-peers-information"> <h3>Get Peers Information</h3> <pre data-language="javascript">+ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -+
+' Verify Peers:                                                    '
+'                         +------------------------+               '
+'                         | Check Target Existence |               '
+'                         +------------------------+               '
+'                                     |                            '
+'                                     | 200 OK                     '
+'                                     |                            '
++ - - - - - - - - - - - - - - - - - - | - - - - - - - - - - - - - -+
+                                      |
++ - - - - - - - - - - - - - - - - - - | - - - - - - - - - - - - - -+
+' Get Peers Information:              |                            '
+'                                     v                            '
+'                         +------------------------+               '
+'                         | Get Source Information |               '
+'                         +------------------------+               '
+'                         |      GET /source       |               '
+'                         +------------------------+               '
+'                                     |                            '
+'                                     | 200 OK                     '
+'                                     v                            '
+'                         +------------------------+               '
+'                         | Get Target Information |               '
+'                         +------------------------+               '
+'                         |      GET /target       |               '
+'                         +------------------------+               '
+'                                     |                            '
+'                                     | 200 OK                     '
+'                                     |                            '
++ - - - - - - - - - - - - - - - - - - | - - - - - - - - - - - - - -+
+                                      |
++ - - - - - - - - - - - - - - - - - - | - - - - - - - - - - - - - -+
+' Find Common Ancestry:               |                            '
+'                                     |                            '
+'                                     v                            '
+'                         +-------------------------+              '
+'                         | Generate Replication ID |              '
+'                         +-------------------------+              '
+'                                                                  '
++ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -+</pre> <p>The Replicator retrieves basic information both from Source and Target using <a class="reference internal" href="../api/database/common.html#get--db" title="GET /{db}"><code class="xref http http-get docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/{db}</span></code></a> requests. The GET response MUST contain JSON objects with the following mandatory fields:</p> <ul class="simple"> <li><p><strong>instance_start_time</strong> (<em>string</em>): Always <code class="docutils literal notranslate"><span class="pre">"0"</span></code>. (Returned for legacy reasons.)</p></li> <li><p><strong>update_seq</strong> (<em>number</em> / <em>string</em>): The current database Sequence ID.</p></li> </ul> <p>Any other fields are optional. The information that the Replicator needs is the <code class="docutils literal notranslate"><span class="pre">update_seq</span></code> field: this value will be used to define a <em>temporary</em> (because Database data is subject to change) upper bound for changes feed listening and statistic calculating to show proper Replication progress.</p> <section id="get-source-information"> <h4>Get Source Information</h4> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">GET /source HTTP/1.1
+Accept: application/json
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Cache-Control: must-revalidate
+Content-Length: 256
+Content-Type: application/json
+Date: Tue, 08 Oct 2013 07:53:08 GMT
+Server: CouchDB (Erlang OTP)
+
+{
+    "committed_update_seq": 61772,
+    "compact_running": false,
+    "db_name": "source",
+    "disk_format_version": 6,
+    "doc_count": 41961,
+    "doc_del_count": 3807,
+    "instance_start_time": "0",
+    "purge_seq": 0,
+    "sizes": {
+      "active": 70781613961,
+      "disk": 79132913799,
+      "external": 72345632950
+    },
+    "update_seq": 61772
+}</pre> </div>
+</blockquote> </section> <section id="get-target-information"> <h4>Get Target Information</h4> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">GET /target/ HTTP/1.1
+Accept: application/json
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Content-Length: 363
+Content-Type: application/json
+Date: Tue, 08 Oct 2013 12:37:01 GMT
+Server: CouchDB (Erlang/OTP)
+
+{
+    "compact_running": false,
+    "db_name": "target",
+    "disk_format_version": 5,
+    "doc_count": 1832,
+    "doc_del_count": 1,
+    "instance_start_time": "0",
+    "purge_seq": 0,
+    "sizes": {
+      "active": 50829452,
+      "disk": 77001455,
+      "external": 60326450
+    },
+    "update_seq": "1841-g1AAAADveJzLYWBgYMlgTmGQT0lKzi9KdUhJMtbLSs1LLUst0k"
+}</pre> </div>
+</blockquote> </section> </section> <section id="find-common-ancestry"> <h3>Find Common Ancestry</h3> <pre data-language="javascript">+ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+' Get Peers Information:                                                    '
+'                                                                           '
+'                             +-------------------------------------------+ '
+'                             |           Get Target Information          | '
+'                             +-------------------------------------------+ '
+'                               |                                           '
++ - - - - - - - - - - - - - - - | - - - - - - - - - - - - - - - - - - - - - +
+                                |
++ - - - - - - - - - - - - - - - | - - - - - - - - - - - - - - - - - - - - - +
+' Find Common Ancestry:         v                                           '
+'                             +-------------------------------------------+ '
+'                             |          Generate Replication ID          | '
+'                             +-------------------------------------------+ '
+'                               |                                           '
+'                               |                                           '
+'                               v                                           '
+'                             +-------------------------------------------+ '
+'                             |      Get Replication Log from Source      | '
+'                             +-------------------------------------------+ '
+'                             |     GET /source/_local/replication-id     | '
+'                             +-------------------------------------------+ '
+'                               |                                           '
+'                               | 200 OK                                    '
+'                               | 404 Not Found                             '
+'                               v                                           '
+'                             +-------------------------------------------+ '
+'                             |      Get Replication Log from Target      | '
+'                             +-------------------------------------------+ '
+'                             |     GET /target/_local/replication-id     | '
+'                             +-------------------------------------------+ '
+'                               |                                           '
+'                               | 200 OK                                    '
+'                               | 404 Not Found                             '
+'                               v                                           '
+'                             +-------------------------------------------+ '
+'                             |          Compare Replication Logs         | '
+'                             +-------------------------------------------+ '
+'                               |                                           '
+'                               | Use latest common sequence as start point '
+'                               |                                           '
++ - - - - - - - - - - - - - - - | - - - - - - - - - - - - - - - - - - - - - +
+                                |
+                                |
++ - - - - - - - - - - - - - - - | - - - - - - - - - - - - - - - - - - - - - +
+' Locate Changed Documents:     |                                           '
+'                               |                                           '
+'                               v                                           '
+'                             +-------------------------------------------+ '
+'                             |        Listen Source Changes Feed         | '
+'                             +-------------------------------------------+ '
+'                                                                           '
++ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +</pre> <section id="generate-replication-id"> <h4>Generate Replication ID</h4> <p>Before Replication is started, the Replicator MUST generate a Replication ID. This value is used to track Replication History, resume and continue previously interrupted Replication process.</p> <p>The Replication ID generation algorithm is implementation specific. Whatever algorithm is used it MUST uniquely identify the Replication process. CouchDB’s Replicator, for example, uses the following factors in generating a Replication ID:</p> <ul class="simple"> <li><p>Persistent Peer UUID value. For CouchDB, the local <a class="reference internal" href="https://docs.couchdb.org/en/3.5.1/config/couchdb.html#couchdb/uuid" title="uuid"><code class="xref config config-option docutils literal notranslate"><span class="pre">Server</span> <span class="pre">UUID</span></code></a> is used</p></li> <li><p>Source and Target URI and if Source or Target are local or remote Databases</p></li> <li><p>If Target needed to be created</p></li> <li><p>If Replication is Continuous</p></li> <li><p>Any custom headers</p></li> <li><p><a class="reference internal" href="../ddocs/ddocs.html#filterfun"><span class="std std-ref">Filter function</span></a> code if used</p></li> <li><p>Changes Feed query parameters, if any</p></li> </ul> <div class="admonition note"> <p class="admonition-title">Note</p> <p>See <a class="reference external" href="https://github.com/apache/couchdb/blob/main/src/couch_replicator/src/couch_replicator_ids.erl">couch_replicator_ids.erl</a> for an example of a Replication ID generation implementation.</p> </div> </section> <section id="retrieve-replication-logs-from-source-and-target"> <h4>Retrieve Replication Logs from Source and Target</h4> <p>Once the Replication ID has been generated, the Replicator SHOULD retrieve the Replication Log from both Source and Target using <a class="reference internal" href="../api/local.html#get--db-_local-docid" title="GET /{db}/_local/{docid}"><code class="xref http http-get docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/{db}/_local/{docid}</span></code></a>:</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">GET /source/_local/b3e44b920ee2951cb2e123b63044427a HTTP/1.1
+Accept: application/json
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Cache-Control: must-revalidate
+Content-Length: 1019
+Content-Type: application/json
+Date: Thu, 10 Oct 2013 06:18:56 GMT
+ETag: "0-8"
+Server: CouchDB (Erlang OTP)
+
+{
+    "_id": "_local/b3e44b920ee2951cb2e123b63044427a",
+    "_rev": "0-8",
+    "history": [
+        {
+            "doc_write_failures": 0,
+            "docs_read": 2,
+            "docs_written": 2,
+            "end_last_seq": 5,
+            "end_time": "Thu, 10 Oct 2013 05:56:38 GMT",
+            "missing_checked": 2,
+            "missing_found": 2,
+            "recorded_seq": 5,
+            "session_id": "d5a34cbbdafa70e0db5cb57d02a6b955",
+            "start_last_seq": 3,
+            "start_time": "Thu, 10 Oct 2013 05:56:38 GMT"
+        },
+        {
+            "doc_write_failures": 0,
+            "docs_read": 1,
+            "docs_written": 1,
+            "end_last_seq": 3,
+            "end_time": "Thu, 10 Oct 2013 05:56:12 GMT",
+            "missing_checked": 1,
+            "missing_found": 1,
+            "recorded_seq": 3,
+            "session_id": "11a79cdae1719c362e9857cd1ddff09d",
+            "start_last_seq": 2,
+            "start_time": "Thu, 10 Oct 2013 05:56:12 GMT"
+        },
+        {
+            "doc_write_failures": 0,
+            "docs_read": 2,
+            "docs_written": 2,
+            "end_last_seq": 2,
+            "end_time": "Thu, 10 Oct 2013 05:56:04 GMT",
+            "missing_checked": 2,
+            "missing_found": 2,
+            "recorded_seq": 2,
+            "session_id": "77cdf93cde05f15fcb710f320c37c155",
+            "start_last_seq": 0,
+            "start_time": "Thu, 10 Oct 2013 05:56:04 GMT"
+        }
+    ],
+    "replication_id_version": 3,
+    "session_id": "d5a34cbbdafa70e0db5cb57d02a6b955",
+    "source_last_seq": 5
+}</pre> </div>
+</blockquote> <p>The Replication Log SHOULD contain the following fields:</p> <ul class="simple"> <li>
+<p><strong>history</strong> (<em>array</em> of <em>object</em>): Replication history. <strong>Required</strong></p> <ul> <li><p><strong>doc_write_failures</strong> (<em>number</em>): Number of failed writes</p></li> <li><p><strong>docs_read</strong> (<em>number</em>): Number of read documents</p></li> <li><p><strong>docs_written</strong> (<em>number</em>): Number of written documents</p></li> <li><p><strong>end_last_seq</strong> (<em>number</em>): Last processed Update Sequence ID</p></li> <li><p><strong>end_time</strong> (<em>string</em>): Replication completion timestamp in <a class="rfc reference external" href="https://datatracker.ietf.org/doc/html/rfc5322.html"><strong>RFC 5322</strong></a> format</p></li> <li><p><strong>missing_checked</strong> (<em>number</em>): Number of checked revisions on Source</p></li> <li><p><strong>missing_found</strong> (<em>number</em>): Number of missing revisions found on Target</p></li> <li><p><strong>recorded_seq</strong> (<em>number</em>): Recorded intermediate Checkpoint. <strong>Required</strong></p></li> <li><p><strong>session_id</strong> (<em>string</em>): Unique session ID. Commonly, a random UUID value is used. <strong>Required</strong></p></li> <li><p><strong>start_last_seq</strong> (<em>number</em>): Start update Sequence ID</p></li> <li><p><strong>start_time</strong> (<em>string</em>): Replication start timestamp in <a class="rfc reference external" href="https://datatracker.ietf.org/doc/html/rfc5322.html"><strong>RFC 5322</strong></a> format</p></li> </ul> </li> <li><p><strong>replication_id_version</strong> (<em>number</em>): Replication protocol version. Defines Replication ID calculation algorithm, HTTP API calls and the others routines. <strong>Required</strong></p></li> <li><p><strong>session_id</strong> (<em>string</em>): Unique ID of the last session. Shortcut to the <code class="docutils literal notranslate"><span class="pre">session_id</span></code> field of the latest <code class="docutils literal notranslate"><span class="pre">history</span></code> object. <strong>Required</strong></p></li> <li><p><strong>source_last_seq</strong> (<em>number</em>): Last processed Checkpoint. Shortcut to the <code class="docutils literal notranslate"><span class="pre">recorded_seq</span></code> field of the latest <code class="docutils literal notranslate"><span class="pre">history</span></code> object. <strong>Required</strong></p></li> </ul> <p>This request MAY fail with a <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.5">404 Not Found</a> response:</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">GET /source/_local/b6cef528f67aa1a8a014dd1144b10e09 HTTP/1.1
+Accept: application/json
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 404 Object Not Found
+Cache-Control: must-revalidate
+Content-Length: 41
+Content-Type: application/json
+Date: Tue, 08 Oct 2013 13:31:10 GMT
+Server: CouchDB (Erlang OTP)
+
+{
+    "error": "not_found",
+    "reason": "missing"
+}</pre> </div>
+</blockquote> <p>That’s OK. This means that there is no information about the current Replication so it must not have been run previously and as such the Replicator MUST run a Full Replication.</p> </section> <section id="compare-replication-logs"> <h4>Compare Replication Logs</h4> <p>If the Replication Logs are successfully retrieved from both Source and Target then the Replicator MUST determine their common ancestry by following the next algorithm:</p> <ul class="simple"> <li><p>Compare <code class="docutils literal notranslate"><span class="pre">session_id</span></code> values for the chronological last session - if they match both Source and Target have a common Replication history and it seems to be valid. Use <code class="docutils literal notranslate"><span class="pre">source_last_seq</span></code> value for the startup Checkpoint</p></li> <li><p>In case of mismatch, iterate over the <code class="docutils literal notranslate"><span class="pre">history</span></code> collection to search for the latest (chronologically) common <code class="docutils literal notranslate"><span class="pre">session_id</span></code> for Source and Target. Use value of <code class="docutils literal notranslate"><span class="pre">recorded_seq</span></code> field as startup Checkpoint</p></li> </ul> <p>If Source and Target has no common ancestry, the Replicator MUST run Full Replication.</p> </section> </section> <section id="locate-changed-documents"> <h3>Locate Changed Documents</h3> <pre data-language="javascript">+ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+' Find Common Ancestry:                                                     '
+'                                                                           '
+'             +------------------------------+                              '
+'             |   Compare Replication Logs   |                              '
+'             +------------------------------+                              '
+'                                          |                                '
+'                                          |                                '
++ - - - - - - - - - - - - - - - - - - - -  |  - - - - - - - - - - - - - - - +
+                                           |
++ - - - - - - - - - - - - - - - - - - - -  |  - - - - - - - - - - - - - - - +
+' Locate Changed Documents:                |                                '
+'                                          |                                '
+'                                          |                                '
+'                                          v                                '
+'            +-------------------------------+                              '
+'   +------&gt; |     Listen to Changes Feed    | -----+                       '
+'   |        +-------------------------------+      |                       '
+'   |        |     GET  /source/_changes     |      |                       '
+'   |        |     POST /source/_changes     |      |                       '
+'   |        +-------------------------------+      |                       '
+'   |                                      |        |                       '
+'   |                                      |        |                       '
+'   |                There are new changes |        | No more changes       '
+'   |                                      |        |                       '
+'   |                                      v        v                       '
+'   |        +-------------------------------+    +-----------------------+ '
+'   |        |     Read Batch of Changes     |    | Replication Completed | '
+'   |        +-------------------------------+    +-----------------------+ '
+'   |                                      |                                '
+'   | No                                   |                                '
+'   |                                      v                                '
+'   |        +-------------------------------+                              '
+'   |        |  Compare Documents Revisions  |                              '
+'   |        +-------------------------------+                              '
+'   |        |    POST /target/_revs_diff    |                              '
+'   |        +-------------------------------+                              '
+'   |                                      |                                '
+'   |                               200 OK |                                '
+'   |                                      v                                '
+'   |        +-------------------------------+                              '
+'   +------- |     Any Differences Found?    |                              '
+'            +-------------------------------+                              '
+'                                          |                                '
+'                                      Yes |                                '
+'                                          |                                '
++ - - - - - - - - - - - - - - - - - - - -  |  - - - - - - - - - - - - - - - +
+                                           |
++ - - - - - - - - - - - - - - - - - - - -  |  - - - - - - - - - - - - - - - +
+' Replicate Changes:                       |                                '
+'                                          v                                '
+'            +-------------------------------+                              '
+'            |  Fetch Next Changed Document  |                              '
+'            +-------------------------------+                              '
+'                                                                           '
++ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +</pre> <section id="listen-to-changes-feed"> <h4>Listen to Changes Feed</h4> <p>When the start up Checkpoint has been defined, the Replicator SHOULD read the Source’s <a class="reference internal" href="../api/database/changes.html#changes"><span class="std std-ref">Changes Feed</span></a> by using a <a class="reference internal" href="../api/database/changes.html#get--db-_changes" title="GET /{db}/_changes"><code class="xref http http-get docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/{db}/_changes</span></code></a> request. This request MUST be made with the following query parameters:</p> <ul class="simple"> <li><p><code class="docutils literal notranslate"><span class="pre">feed</span></code> parameter defines the Changes Feed response style: for Continuous Replication the <code class="docutils literal notranslate"><span class="pre">continuous</span></code> value SHOULD be used, otherwise - <code class="docutils literal notranslate"><span class="pre">normal</span></code>.</p></li> <li><p><code class="docutils literal notranslate"><span class="pre">style=all_docs</span></code> query parameter tells the Source that it MUST include all Revision leaves for each document’s event in output.</p></li> <li><p>For Continuous Replication the <code class="docutils literal notranslate"><span class="pre">heartbeat</span></code> parameter defines the heartbeat period in <em>milliseconds</em>. The RECOMMENDED value by default is <code class="docutils literal notranslate"><span class="pre">10000</span></code> (10 seconds).</p></li> <li><p>If a startup Checkpoint was found during the Replication Logs comparison, the <code class="docutils literal notranslate"><span class="pre">since</span></code> query parameter MUST be passed with this value. In case of Full Replication it MAY be <code class="docutils literal notranslate"><span class="pre">0</span></code> (number zero) or be omitted.</p></li> </ul> <p>Additionally, the <code class="docutils literal notranslate"><span class="pre">filter</span></code> query parameter MAY be specified to enable a <a class="reference internal" href="../api/database/changes.html#changes-filter"><span class="std std-ref">filter function</span></a> on Source side. Other custom parameters MAY also be provided.</p> </section> <section id="read-batch-of-changes"> <h4>Read Batch of Changes</h4> <p>Reading the whole feed in a single shot may not be an optimal use of resources. It is RECOMMENDED to process the feed in small chunks. However, there is no specific recommendation on chunk size since it is heavily dependent on available resources: large chunks requires more memory while they reduce I/O operations and vice versa.</p> <p>Note, that Changes Feed output format is different for a request with <a class="reference internal" href="../api/database/changes.html#changes-normal"><span class="std std-ref">feed=normal</span></a> and with <a class="reference internal" href="../api/database/changes.html#changes-continuous"><span class="std std-ref">feed=continuous</span></a> query parameter.</p> <p>Normal Feed:</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">GET /source/_changes?feed=normal&amp;style=all_docs&amp;heartbeat=10000 HTTP/1.1
+Accept: application/json
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Cache-Control: must-revalidate
+Content-Type: application/json
+Date: Fri, 09 May 2014 16:20:41 GMT
+Server: CouchDB (Erlang OTP)
+Transfer-Encoding: chunked
+
+{"results":[
+{"seq":14,"id":"f957f41e","changes":[{"rev":"3-46a3"}],"deleted":true}
+{"seq":29,"id":"ddf339dd","changes":[{"rev":"10-304b"}]}
+{"seq":37,"id":"d3cc62f5","changes":[{"rev":"2-eec2"}],"deleted":true}
+{"seq":39,"id":"f13bd08b","changes":[{"rev":"1-b35d"}]}
+{"seq":41,"id":"e0a99867","changes":[{"rev":"2-c1c6"}]}
+{"seq":42,"id":"a75bdfc5","changes":[{"rev":"1-967a"}]}
+{"seq":43,"id":"a5f467a0","changes":[{"rev":"1-5575"}]}
+{"seq":45,"id":"470c3004","changes":[{"rev":"11-c292"}]}
+{"seq":46,"id":"b1cb8508","changes":[{"rev":"10-ABC"}]}
+{"seq":47,"id":"49ec0489","changes":[{"rev":"157-b01f"},{"rev":"123-6f7c"}]}
+{"seq":49,"id":"dad10379","changes":[{"rev":"1-9346"},{"rev":"6-5b8a"}]}
+{"seq":50,"id":"73464877","changes":[{"rev":"1-9f08"}]}
+{"seq":51,"id":"7ae19302","changes":[{"rev":"1-57bf"}]}
+{"seq":63,"id":"6a7a6c86","changes":[{"rev":"5-acf6"}],"deleted":true}
+{"seq":64,"id":"dfb9850a","changes":[{"rev":"1-102f"}]}
+{"seq":65,"id":"c532afa7","changes":[{"rev":"1-6491"}]}
+{"seq":66,"id":"af8a9508","changes":[{"rev":"1-3db2"}]}
+{"seq":67,"id":"caa3dded","changes":[{"rev":"1-6491"}]}
+{"seq":68,"id":"79f3b4e9","changes":[{"rev":"1-102f"}]}
+{"seq":69,"id":"1d89d16f","changes":[{"rev":"1-3db2"}]}
+{"seq":71,"id":"abae7348","changes":[{"rev":"2-7051"}]}
+{"seq":77,"id":"6c25534f","changes":[{"rev":"9-CDE"},{"rev":"3-00e7"},{"rev":"1-ABC"}]}
+{"seq":78,"id":"SpaghettiWithMeatballs","changes":[{"rev":"22-5f95"}]}
+],
+"last_seq":78}</pre> </div>
+</blockquote> <p>Continuous Feed:</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">GET /source/_changes?feed=continuous&amp;style=all_docs&amp;heartbeat=10000 HTTP/1.1
+Accept: application/json
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Cache-Control: must-revalidate
+Content-Type: application/json
+Date: Fri, 09 May 2014 16:22:22 GMT
+Server: CouchDB (Erlang OTP)
+Transfer-Encoding: chunked
+
+{"seq":14,"id":"f957f41e","changes":[{"rev":"3-46a3"}],"deleted":true}
+{"seq":29,"id":"ddf339dd","changes":[{"rev":"10-304b"}]}
+{"seq":37,"id":"d3cc62f5","changes":[{"rev":"2-eec2"}],"deleted":true}
+{"seq":39,"id":"f13bd08b","changes":[{"rev":"1-b35d"}]}
+{"seq":41,"id":"e0a99867","changes":[{"rev":"2-c1c6"}]}
+{"seq":42,"id":"a75bdfc5","changes":[{"rev":"1-967a"}]}
+{"seq":43,"id":"a5f467a0","changes":[{"rev":"1-5575"}]}
+{"seq":45,"id":"470c3004","changes":[{"rev":"11-c292"}]}
+{"seq":46,"id":"b1cb8508","changes":[{"rev":"10-ABC"}]}
+{"seq":47,"id":"49ec0489","changes":[{"rev":"157-b01f"},{"rev":"123-6f7c"}]}
+{"seq":49,"id":"dad10379","changes":[{"rev":"1-9346"},{"rev":"6-5b8a"}]}
+{"seq":50,"id":"73464877","changes":[{"rev":"1-9f08"}]}
+{"seq":51,"id":"7ae19302","changes":[{"rev":"1-57bf"}]}
+{"seq":63,"id":"6a7a6c86","changes":[{"rev":"5-acf6"}],"deleted":true}
+{"seq":64,"id":"dfb9850a","changes":[{"rev":"1-102f"}]}
+{"seq":65,"id":"c532afa7","changes":[{"rev":"1-6491"}]}
+{"seq":66,"id":"af8a9508","changes":[{"rev":"1-3db2"}]}
+{"seq":67,"id":"caa3dded","changes":[{"rev":"1-6491"}]}
+{"seq":68,"id":"79f3b4e9","changes":[{"rev":"1-102f"}]}
+{"seq":69,"id":"1d89d16f","changes":[{"rev":"1-3db2"}]}
+{"seq":71,"id":"abae7348","changes":[{"rev":"2-7051"}]}
+{"seq":75,"id":"SpaghettiWithMeatballs","changes":[{"rev":"21-5949"}]}
+{"seq":77,"id":"6c255","changes":[{"rev":"9-CDE"},{"rev":"3-00e7"},{"rev":"1-ABC"}]}
+{"seq":78,"id":"SpaghettiWithMeatballs","changes":[{"rev":"22-5f95"}]}</pre> </div>
+</blockquote> <p>For both Changes Feed formats record-per-line style is preserved to simplify iterative fetching and decoding JSON objects with less memory footprint.</p> </section> <section id="calculate-revision-difference"> <h4>Calculate Revision Difference</h4> <p>After reading the batch of changes from the Changes Feed, the Replicator forms a JSON mapping object for Document ID and related leaf Revisions and sends the result to Target via a <a class="reference internal" href="../api/database/misc.html#post--db-_revs_diff" title="POST /{db}/_revs_diff"><code class="xref http http-post docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/{db}/_revs_diff</span></code></a> request:</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">POST /target/_revs_diff HTTP/1.1
+Accept: application/json
+Content-Length: 287
+Content-Type: application/json
+Host: localhost:5984
+User-Agent: CouchDB
+
+{
+    "baz": [
+        "2-7051cbe5c8faecd085a3fa619e6e6337"
+    ],
+    "foo": [
+        "3-6a540f3d701ac518d3b9733d673c5484"
+    ],
+    "bar": [
+        "1-d4e501ab47de6b2000fc8a02f84a0c77",
+        "1-967a00dff5e02add41819138abb3284d"
+    ]
+}</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Cache-Control: must-revalidate
+Content-Length: 88
+Content-Type: application/json
+Date: Fri, 25 Oct 2013 14:44:41 GMT
+Server: CouchDB (Erlang/OTP)
+
+{
+    "baz": {
+        "missing": [
+            "2-7051cbe5c8faecd085a3fa619e6e6337"
+        ]
+    },
+    "bar": {
+        "missing": [
+            "1-d4e501ab47de6b2000fc8a02f84a0c77"
+        ]
+    }
+}</pre> </div>
+</blockquote> <p>In the response the Replicator receives a Document ID – Revisions mapping, but only for Revisions that do not exist in Target and are REQUIRED to be transferred from Source.</p> <p>If all Revisions in the request match the current state of the Documents then the response will contain an empty JSON object:</p> <blockquote> <div>
+<p><strong>Request</strong></p> <pre data-language="javascript">POST /target/_revs_diff HTTP/1.1
+Accept: application/json
+Content-Length: 160
+Content-Type: application/json
+Host: localhost:5984
+User-Agent: CouchDB
+
+{
+    "foo": [
+        "3-6a540f3d701ac518d3b9733d673c5484"
+    ],
+    "bar": [
+        "1-967a00dff5e02add41819138abb3284d"
+    ]
+}</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Cache-Control: must-revalidate
+Content-Length: 2
+Content-Type: application/json
+Date: Fri, 25 Oct 2013 14:45:00 GMT
+Server: CouchDB (Erlang/OTP)
+
+{}</pre> </div>
+</blockquote> </section> <section id="replication-completed"> <h4>Replication Completed</h4> <p>When there are no more changes left to process and no more Documents left to replicate, the Replicator finishes the Replication process. If Replication wasn’t Continuous, the Replicator MAY return a response to client with statistics about the process.</p> <blockquote> <div>
+<pre data-language="javascript">HTTP/1.1 200 OK
+Cache-Control: must-revalidate
+Content-Length: 414
+Content-Type: application/json
+Date: Fri, 09 May 2014 15:14:19 GMT
+Server: CouchDB (Erlang OTP)
+
+{
+    "history": [
+        {
+            "doc_write_failures": 2,
+            "docs_read": 2,
+            "docs_written": 0,
+            "end_last_seq": 2939,
+            "end_time": "Fri, 09 May 2014 15:14:19 GMT",
+            "missing_checked": 1835,
+            "missing_found": 2,
+            "recorded_seq": 2939,
+            "session_id": "05918159f64842f1fe73e9e2157b2112",
+            "start_last_seq": 0,
+            "start_time": "Fri, 09 May 2014 15:14:18 GMT"
+        }
+    ],
+    "ok": true,
+    "replication_id_version": 3,
+    "session_id": "05918159f64842f1fe73e9e2157b2112",
+    "source_last_seq": 2939
+}</pre> </div>
+</blockquote> </section> </section> <section id="replicate-changes"> <h3>Replicate Changes</h3> <pre data-language="javascript">+ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+' Locate Changed Documents:                                                       '
+'                                                                                 '
+'               +-------------------------------------+                           '
+'               |      Any Differences Found?         |                           '
+'               +-------------------------------------+                           '
+'                                                   |                             '
+'                                                   |                             '
+'                                                   |                             '
++ - - - - - - - - - - - - - - - - - - - - - - - - - | - - - - - - - - - - - - - - +
+                                                    |
++ - - - - - - - - - - - - - - - - - - - - - - - - - | - - - - - - - - - - - - - - +
+' Replicate Changes:                                |                             '
+'                                                   v                             '
+'               +-------------------------------------+                           '
+'   +---------&gt; |     Fetch Next Changed Document     | &lt;---------------------+   '
+'   |           +-------------------------------------+                       |   '
+'   |           |          GET /source/docid          |                       |   '
+'   |           +-------------------------------------+                       |   '
+'   |             |                                                           |   '
+'   |             |                                                           |   '
+'   |             |                                          201 Created      |   '
+'   |             | 200 OK                                   401 Unauthorized |   '
+'   |             |                                          403 Forbidden    |   '
+'   |             |                                                           |   '
+'   |             v                                                           |   '
+'   |           +-------------------------------------+                       |   '
+'   |   +------ |  Document Has Changed Attachments?  |                       |   '
+'   |   |       +-------------------------------------+                       |   '
+'   |   |         |                                                           |   '
+'   |   |         |                                                           |   '
+'   |   |         | Yes                                                       |   '
+'   |   |         |                                                           |   '
+'   |   |         v                                                           |   '
+'   |   |       +------------------------+   Yes    +---------------------------+ '
+'   |   | No    |  Are They Big Enough?  | -------&gt; | Update Document on Target | '
+'   |   |       +------------------------+          +---------------------------+ '
+'   |   |         |                                 |     PUT /target/docid     | '
+'   |   |         |                                 +---------------------------+ '
+'   |   |         |                                                               '
+'   |   |         | No                                                            '
+'   |   |         |                                                               '
+'   |   |         v                                                               '
+'   |   |       +-------------------------------------+                           '
+'   |   +-----&gt; |     Put Document Into the Stack     |                           '
+'   |           +-------------------------------------+                           '
+'   |             |                                                               '
+'   |             |                                                               '
+'   |             v                                                               '
+'   |     No    +-------------------------------------+                           '
+'   +---------- |           Stack is Full?            |                           '
+'   |           +-------------------------------------+                           '
+'   |             |                                                               '
+'   |             | Yes                                                           '
+'   |             |                                                               '
+'   |             v                                                               '
+'   |           +-------------------------------------+                           '
+'   |           | Upload Stack of Documents to Target |                           '
+'   |           +-------------------------------------+                           '
+'   |           |       POST /target/_bulk_docs       |                           '
+'   |           +-------------------------------------+                           '
+'   |             |                                                               '
+'   |             | 201 Created                                                   '
+'   |             v                                                               '
+'   |           +-------------------------------------+                           '
+'   |           |          Ensure in Commit           |                           '
+'   |           +-------------------------------------+                           '
+'   |           |  POST /target/_ensure_full_commit   |                           '
+'   |           +-------------------------------------+                           '
+'   |             |                                                               '
+'   |             | 201 Created                                                   '
+'   |             v                                                               '
+'   |           +-------------------------------------+                           '
+'   |           |    Record Replication Checkpoint    |                           '
+'   |           +-------------------------------------+                           '
+'   |           |  PUT /source/_local/replication-id  |                           '
+'   |           |  PUT /target/_local/replication-id  |                           '
+'   |           +-------------------------------------+                           '
+'   |             |                                                               '
+'   |             | 201 Created                                                   '
+'   |             v                                                               '
+'   |     No    +-------------------------------------+                           '
+'   +---------- | All Documents from Batch Processed? |                           '
+'               +-------------------------------------+                           '
+'                                                   |                             '
+'                                               Yes |                             '
+'                                                   |                             '
++ - - - - - - - - - - - - - - - - - - - - - - - - - | - - - - - - - - - - - - - - +
+                                                    |
++ - - - - - - - - - - - - - - - - - - - - - - - - - | - - - - - - - - - - - - - - +
+' Locate Changed Documents:                         |                             '
+'                                                   v                             '
+'               +-------------------------------------+                           '
+'               |       Listen to Changes Feed        |                           '
+'               +-------------------------------------+                           '
+'                                                                                 '
++ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +</pre> <section id="fetch-changed-documents"> <h4>Fetch Changed Documents</h4> <p>At this step the Replicator MUST fetch all Document Leaf Revisions from Source that are missed at Target. This operation is effective if Replication WILL use previously calculated Revision differences since they define missing Documents and their Revisions.</p> <p>To fetch the Document the Replicator will make a <a class="reference internal" href="../api/document/common.html#get--db-docid" title="GET /{db}/{docid}"><code class="xref http http-get docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/{db}/{docid}</span></code></a> request with the following query parameters:</p> <ul class="simple"> <li><p><code class="docutils literal notranslate"><span class="pre">revs=true</span></code>: Instructs the Source to include the list of all known revisions into the Document in the <code class="docutils literal notranslate"><span class="pre">_revisions</span></code> field. This information is needed to synchronize the Document’s ancestors history between Source and Target</p></li> <li><p>The <code class="docutils literal notranslate"><span class="pre">open_revs</span></code> query parameter contains a JSON array with a list of Leaf Revisions that are needed to be fetched. If the specified Revision exists then the Document MUST be returned for this Revision. Otherwise, Source MUST return an object with the single field <code class="docutils literal notranslate"><span class="pre">missing</span></code> with the missed Revision as the value. In case the Document contains attachments, Source MUST return information only for those ones that had been changed (added or updated) since the specified Revision values. If an attachment was deleted, the Document MUST NOT have stub information for it</p></li> <li><p><code class="docutils literal notranslate"><span class="pre">latest=true</span></code>: Ensures, that Source will return the latest Document Revision regardless of which one was specified in the <code class="docutils literal notranslate"><span class="pre">open_revs</span></code> query parameter. This parameter solves a race condition problem where the requested Document may be changed in between this step and handling related events on the Changes Feed</p></li> </ul> <p>In the response Source SHOULD return <em class="mimetype">multipart/mixed</em> or respond instead with <em class="mimetype">application/json</em> unless the <a class="reference external" href="https://www.rfc-editor.org/rfc/rfc7231#section-5.3.2">Accept</a> header specifies a different mime type. The <em class="mimetype">multipart/mixed</em> content type allows handling the response data as a stream, since there could be multiple documents (one per each Leaf Revision) plus several attachments. These attachments are mostly binary and JSON has no way to handle such data except as base64 encoded strings which are very ineffective for transfer and processing operations.</p> <p>With a <em class="mimetype">multipart/mixed</em> response the Replicator handles multiple Document Leaf Revisions and their attachments one by one as raw data without any additional encoding applied. There is also one agreement to make data processing more effective: the Document ALWAYS goes before its attachments, so the Replicator has no need to process all the data to map related Documents-Attachments and may handle it as stream with lesser memory footprint.</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">GET /source/SpaghettiWithMeatballs?revs=true&amp;open_revs=[%225-00ecbbc%22,%221-917fa23%22,%223-6bcedf1%22]&amp;latest=true HTTP/1.1
+Accept: multipart/mixed
+Host: localhost:5984
+User-Agent: CouchDB</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 200 OK
+Content-Type: multipart/mixed; boundary="7b1596fc4940bc1be725ad67f11ec1c4"
+Date: Thu, 07 Nov 2013 15:10:16 GMT
+Server: CouchDB (Erlang OTP)
+Transfer-Encoding: chunked
+
+--7b1596fc4940bc1be725ad67f11ec1c4
+Content-Type: application/json
+
+{
+    "_id": "SpaghettiWithMeatballs",
+    "_rev": "1-917fa23",
+    "_revisions": {
+        "ids": [
+            "917fa23"
+        ],
+        "start": 1
+    },
+    "description": "An Italian-American delicious dish",
+    "ingredients": [
+        "spaghetti",
+        "tomato sauce",
+        "meatballs"
+    ],
+    "name": "Spaghetti with meatballs"
+}
+--7b1596fc4940bc1be725ad67f11ec1c4
+Content-Type: multipart/related; boundary="a81a77b0ca68389dda3243a43ca946f2"
+
+--a81a77b0ca68389dda3243a43ca946f2
+Content-Type: application/json
+
+{
+    "_attachments": {
+      "recipe.txt": {
+          "content_type": "text/plain",
+          "digest": "md5-R5CrCb6fX10Y46AqtNn0oQ==",
+          "follows": true,
+          "length": 87,
+          "revpos": 7
+      }
+    },
+    "_id": "SpaghettiWithMeatballs",
+    "_rev": "7-474f12e",
+    "_revisions": {
+        "ids": [
+            "474f12e",
+            "5949cfc",
+            "00ecbbc",
+            "fc997b6",
+            "3552c87",
+            "404838b",
+            "5defd9d",
+            "dc1e4be"
+        ],
+        "start": 7
+    },
+    "description": "An Italian-American delicious dish",
+    "ingredients": [
+        "spaghetti",
+        "tomato sauce",
+        "meatballs",
+        "love"
+    ],
+    "name": "Spaghetti with meatballs"
+}
+--a81a77b0ca68389dda3243a43ca946f2
+Content-Disposition: attachment; filename="recipe.txt"
+Content-Type: text/plain
+Content-Length: 87
+
+1. Cook spaghetti
+2. Cook meetballs
+3. Mix them
+4. Add tomato sauce
+5. ...
+6. PROFIT!
+
+--a81a77b0ca68389dda3243a43ca946f2--
+--7b1596fc4940bc1be725ad67f11ec1c4
+Content-Type: application/json; error="true"
+
+{"missing":"3-6bcedf1"}
+--7b1596fc4940bc1be725ad67f11ec1c4--</pre> </div>
+</blockquote> <p>After receiving the response, the Replicator puts all the received data into a local stack for further bulk upload to utilize network bandwidth effectively. The local stack size could be limited by number of Documents or bytes of handled JSON data. When the stack is full the Replicator uploads all the handled Document in bulk mode to the Target. While bulk operations are highly RECOMMENDED to be used, in certain cases the Replicator MAY upload Documents to Target one by one.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Alternative Replicator implementations MAY use alternative ways to retrieve Documents from Source. For instance, <a class="reference external" href="https://github.com/pouchdb/pouchdb/blob/master/packages/node_modules/pouchdb-replication/src/replicate.js">PouchDB</a> doesn’t use the Multipart API and fetches only the latest Document Revision with inline attachments as a single JSON object. While this is still valid CouchDB HTTP API usage, such solutions MAY require a different API implementation for non-CouchDB Peers.</p> </div> </section> <section id="upload-batch-of-changed-documents"> <h4>Upload Batch of Changed Documents</h4> <p>To upload multiple Documents in a single shot the Replicator sends a <a class="reference internal" href="../api/database/bulk-api.html#post--db-_bulk_docs" title="POST /{db}/_bulk_docs"><code class="xref http http-post docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/{db}/_bulk_docs</span></code></a> request to Target with payload containing a JSON object with the following mandatory fields:</p> <ul class="simple"> <li><p><strong>docs</strong> (<em>array</em> of <em>objects</em>): List of Document objects to update on Target. These Documents MUST contain the <code class="docutils literal notranslate"><span class="pre">_revisions</span></code> field that holds a list of the full Revision history to let Target create Leaf Revisions that correctly preserve ancestry</p></li> <li><p><strong>new_edits</strong> (<em>boolean</em>): Special flag that instructs Target to store Documents with the specified Revision (field <code class="docutils literal notranslate"><span class="pre">_rev</span></code>) value as-is without generating a new revision. Always <code class="docutils literal notranslate"><span class="pre">false</span></code></p></li> </ul> <p>The request also MAY contain <em>X-Couch-Full-Commit</em> that used to control CouchDB &lt;3.0 behavior when delayed commits were enabled. Other Peers MAY ignore this header or use it to control similar local feature.</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">POST /target/_bulk_docs HTTP/1.1
+Accept: application/json
+Content-Length: 826
+Content-Type:application/json
+Host: localhost:5984
+User-Agent: CouchDB
+X-Couch-Full-Commit: false
+
+{
+    "docs": [
+        {
+            "_id": "SpaghettiWithMeatballs",
+            "_rev": "1-917fa2381192822767f010b95b45325b",
+            "_revisions": {
+                "ids": [
+                    "917fa2381192822767f010b95b45325b"
+                ],
+                "start": 1
+            },
+            "description": "An Italian-American delicious dish",
+            "ingredients": [
+                "spaghetti",
+                "tomato sauce",
+                "meatballs"
+            ],
+            "name": "Spaghetti with meatballs"
+        },
+        {
+            "_id": "LambStew",
+            "_rev": "1-34c318924a8f327223eed702ddfdc66d",
+            "_revisions": {
+                "ids": [
+                    "34c318924a8f327223eed702ddfdc66d"
+                ],
+                "start": 1
+            },
+            "servings": 6,
+            "subtitle": "Delicious with scone topping",
+            "title": "Lamb Stew"
+        },
+        {
+            "_id": "FishStew",
+            "_rev": "1-9c65296036141e575d32ba9c034dd3ee",
+            "_revisions": {
+                "ids": [
+                    "9c65296036141e575d32ba9c034dd3ee"
+                ],
+                "start": 1
+            },
+            "servings": 4,
+            "subtitle": "Delicious with fresh bread",
+            "title": "Fish Stew"
+        }
+    ],
+    "new_edits": false
+}</pre> </div>
+</blockquote> <p>In its response Target MUST return a JSON array with a list of Document update statuses. If the Document has been stored successfully, the list item MUST contain the field <code class="docutils literal notranslate"><span class="pre">ok</span></code> with <code class="docutils literal notranslate"><span class="pre">true</span></code> value. Otherwise it MUST contain <code class="docutils literal notranslate"><span class="pre">error</span></code> and <code class="docutils literal notranslate"><span class="pre">reason</span></code> fields with error type and a human-friendly reason description.</p> <p>Document updating failure isn’t fatal as Target MAY reject the update for its own reasons. It’s RECOMMENDED to use error type <code class="docutils literal notranslate"><span class="pre">forbidden</span></code> for rejections, but other error types can also be used (like invalid field name etc.). The Replicator SHOULD NOT retry uploading rejected documents unless there are good reasons for doing so (e.g. there is special error type for that).</p> <p>Note that while a update may fail for one Document in the response, Target can still return a <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.2.2">201 Created</a> response. Same will be true if all updates fail for all uploaded Documents.</p> <blockquote> <div>
+<p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 201 Created
+Cache-Control: must-revalidate
+Content-Length: 246
+Content-Type: application/json
+Date: Sun, 10 Nov 2013 19:02:26 GMT
+Server: CouchDB (Erlang/OTP)
+
+[
+    {
+        "ok": true,
+        "id": "SpaghettiWithMeatballs",
+        "rev":" 1-917fa2381192822767f010b95b45325b"
+    },
+    {
+        "ok": true,
+        "id": "FishStew",
+        "rev": "1-9c65296036141e575d32ba9c034dd3ee"
+    },
+    {
+        "error": "forbidden",
+        "id": "LambStew",
+        "reason": "sorry",
+        "rev": "1-34c318924a8f327223eed702ddfdc66d"
+    }
+]</pre> </div>
+</blockquote> </section> <section id="upload-document-with-attachments"> <h4>Upload Document with Attachments</h4> <p>There is a special optimization case when then Replicator WILL NOT use bulk upload of changed Documents. This case is applied when Documents contain a lot of attached files or the files are too big to be efficiently encoded with Base64.</p> <p>For this case the Replicator issues a <a class="reference internal" href="../api/document/common.html#put--db-docid" title="PUT /{db}/{docid}"><code class="xref http http-put docutils literal notranslate"><span class="pre">/{db}/{docid}?new_edits=false</span></code></a> request with <em class="mimetype">multipart/related</em> content type. Such a request allows one to easily stream the Document and all its attachments one by one without any serialization overhead.</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">PUT /target/SpaghettiWithMeatballs?new_edits=false HTTP/1.1
+Accept: application/json
+Content-Length: 1030
+Content-Type: multipart/related; boundary="864d690aeb91f25d469dec6851fb57f2"
+Host: localhost:5984
+User-Agent: CouchDB
+
+--2fa48cba80d0cdba7829931fe8acce9d
+Content-Type: application/json
+
+{
+    "_attachments": {
+        "recipe.txt": {
+            "content_type": "text/plain",
+            "digest": "md5-R5CrCb6fX10Y46AqtNn0oQ==",
+            "follows": true,
+            "length": 87,
+            "revpos": 7
+        }
+    },
+    "_id": "SpaghettiWithMeatballs",
+    "_rev": "7-474f12eb068c717243487a9505f6123b",
+    "_revisions": {
+        "ids": [
+            "474f12eb068c717243487a9505f6123b",
+            "5949cfcd437e3ee22d2d98a26d1a83bf",
+            "00ecbbc54e2a171156ec345b77dfdf59",
+            "fc997b62794a6268f2636a4a176efcd6",
+            "3552c87351aadc1e4bea2461a1e8113a",
+            "404838bc2862ce76c6ebed046f9eb542",
+            "5defd9d813628cea6e98196eb0ee8594"
+        ],
+        "start": 7
+    },
+    "description": "An Italian-American delicious dish",
+    "ingredients": [
+        "spaghetti",
+        "tomato sauce",
+        "meatballs",
+        "love"
+    ],
+    "name": "Spaghetti with meatballs"
+}
+--2fa48cba80d0cdba7829931fe8acce9d
+Content-Disposition: attachment; filename="recipe.txt"
+Content-Type: text/plain
+Content-Length: 87
+
+1. Cook spaghetti
+2. Cook meetballs
+3. Mix them
+4. Add tomato sauce
+5. ...
+6. PROFIT!
+
+--2fa48cba80d0cdba7829931fe8acce9d--</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 201 Created
+Cache-Control: must-revalidate
+Content-Length: 105
+Content-Type: application/json
+Date: Fri, 08 Nov 2013 16:35:27 GMT
+Server: CouchDB (Erlang/OTP)
+
+{
+    "ok": true,
+    "id": "SpaghettiWithMeatballs",
+    "rev": "7-474f12eb068c717243487a9505f6123b"
+}</pre> </div>
+</blockquote> <p>Unlike bulk updating via <a class="reference internal" href="../api/database/bulk-api.html#post--db-_bulk_docs" title="POST /{db}/_bulk_docs"><code class="xref http http-post docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/{db}/_bulk_docs</span></code></a> endpoint, the response MAY come with a different status code. For instance, in the case when the Document is rejected, Target SHOULD respond with a <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.4">403 Forbidden</a>:</p> <blockquote> <div>
+<p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 403 Forbidden
+Cache-Control: must-revalidate
+Content-Length: 39
+Content-Type: application/json
+Date: Fri, 08 Nov 2013 16:35:27 GMT
+Server: CouchDB (Erlang/OTP)
+
+{
+    "error": "forbidden",
+    "reason": "sorry"
+}</pre> </div>
+</blockquote> <p>Replicator SHOULD NOT retry requests in case of a <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.2">401 Unauthorized</a>, <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.4">403 Forbidden</a>, <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.10">409 Conflict</a> or <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.13">412 Precondition Failed</a> since repeating the request couldn’t solve the issue with user credentials or uploaded data.</p> </section> <section id="ensure-in-commit"> <h4>Ensure In Commit</h4> <p>Once a batch of changes has been successfully uploaded to Target, the Replicator issues a <a class="reference internal" href="../api/database/compact.html#post--db-_ensure_full_commit" title="POST /{db}/_ensure_full_commit"><code class="xref http http-post docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/{db}/_ensure_full_commit</span></code></a> request to ensure that every transferred bit is laid down on disk or other <em>persistent</em> storage place. Target MUST return <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.2.2">201 Created</a> response with a JSON object containing the following mandatory fields:</p> <ul> <li><p><strong>instance_start_time</strong> (<em>string</em>): Timestamp of when the database was opened, expressed in <em>microseconds</em> since the epoch</p></li> <li>
+<p><strong>ok</strong> (<em>boolean</em>): Operation status. Constantly <code class="docutils literal notranslate"><span class="pre">true</span></code></p> <p><strong>Request</strong>:</p> <pre data-language="javascript">POST /target/_ensure_full_commit HTTP/1.1
+Accept: application/json
+Content-Type: application/json
+Host: localhost:5984</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 201 Created
+Cache-Control: must-revalidate
+Content-Length: 53
+Content-Type: application/json
+Date: Web, 06 Nov 2013 18:20:43 GMT
+Server: CouchDB (Erlang/OTP)
+
+{
+    "instance_start_time": "0",
+    "ok": true
+}</pre> </li> </ul> </section> <section id="record-replication-checkpoint"> <h4>Record Replication Checkpoint</h4> <p>Since batches of changes were uploaded and committed successfully, the Replicator updates the Replication Log both on Source and Target recording the current Replication state. This operation is REQUIRED so that in the case of Replication failure the replication can resume from last point of success, not from the very beginning.</p> <p>Replicator updates Replication Log on Source:</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">PUT /source/_local/afa899a9e59589c3d4ce5668e3218aef HTTP/1.1
+Accept: application/json
+Content-Length: 591
+Content-Type: application/json
+Host: localhost:5984
+User-Agent: CouchDB
+
+{
+    "_id": "_local/afa899a9e59589c3d4ce5668e3218aef",
+    "_rev": "0-1",
+    "_revisions": {
+        "ids": [
+            "31f36e40158e717fbe9842e227b389df"
+        ],
+        "start": 1
+    },
+    "history": [
+        {
+            "doc_write_failures": 0,
+            "docs_read": 6,
+            "docs_written": 6,
+            "end_last_seq": 26,
+            "end_time": "Thu, 07 Nov 2013 09:42:17 GMT",
+            "missing_checked": 6,
+            "missing_found": 6,
+            "recorded_seq": 26,
+            "session_id": "04bf15bf1d9fa8ac1abc67d0c3e04f07",
+            "start_last_seq": 0,
+            "start_time": "Thu, 07 Nov 2013 09:41:43 GMT"
+        }
+    ],
+    "replication_id_version": 3,
+    "session_id": "04bf15bf1d9fa8ac1abc67d0c3e04f07",
+    "source_last_seq": 26
+}</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 201 Created
+Cache-Control: must-revalidate
+Content-Length: 75
+Content-Type: application/json
+Date: Thu, 07 Nov 2013 09:42:17 GMT
+Server: CouchDB (Erlang/OTP)
+
+{
+    "id": "_local/afa899a9e59589c3d4ce5668e3218aef",
+    "ok": true,
+    "rev": "0-2"
+}</pre> </div>
+</blockquote> <p>…and on Target too:</p> <blockquote> <div>
+<p><strong>Request</strong>:</p> <pre data-language="javascript">PUT /target/_local/afa899a9e59589c3d4ce5668e3218aef HTTP/1.1
+Accept: application/json
+Content-Length: 591
+Content-Type: application/json
+Host: localhost:5984
+User-Agent: CouchDB
+
+{
+    "_id": "_local/afa899a9e59589c3d4ce5668e3218aef",
+    "_rev": "1-31f36e40158e717fbe9842e227b389df",
+    "_revisions": {
+        "ids": [
+            "31f36e40158e717fbe9842e227b389df"
+        ],
+        "start": 1
+    },
+    "history": [
+        {
+            "doc_write_failures": 0,
+            "docs_read": 6,
+            "docs_written": 6,
+            "end_last_seq": 26,
+            "end_time": "Thu, 07 Nov 2013 09:42:17 GMT",
+            "missing_checked": 6,
+            "missing_found": 6,
+            "recorded_seq": 26,
+            "session_id": "04bf15bf1d9fa8ac1abc67d0c3e04f07",
+            "start_last_seq": 0,
+            "start_time": "Thu, 07 Nov 2013 09:41:43 GMT"
+        }
+    ],
+    "replication_id_version": 3,
+    "session_id": "04bf15bf1d9fa8ac1abc67d0c3e04f07",
+    "source_last_seq": 26
+}</pre> <p><strong>Response</strong>:</p> <pre data-language="javascript">HTTP/1.1 201 Created
+Cache-Control: must-revalidate
+Content-Length: 106
+Content-Type: application/json
+Date: Thu, 07 Nov 2013 09:42:17 GMT
+Server: CouchDB (Erlang/OTP)
+
+{
+    "id": "_local/afa899a9e59589c3d4ce5668e3218aef",
+    "ok": true,
+    "rev": "2-9b5d1e36bed6ae08611466e30af1259a"
+}</pre> </div>
+</blockquote> </section> </section> <section id="continue-reading-changes"> <h3>Continue Reading Changes</h3> <p>Once a batch of changes had been processed and transferred to Target successfully, the Replicator can continue to listen to the Changes Feed for new changes. If there are no new changes to process the Replication is considered to be done.</p> <p>For Continuous Replication, the Replicator MUST continue to wait for new changes from Source.</p> </section> </section> <section id="protocol-robustness"> <h2>Protocol Robustness</h2> <p>Since the <cite>CouchDB Replication Protocol</cite> works on top of HTTP, which is based on TCP/IP, the Replicator SHOULD expect to be working within an unstable environment with delays, losses and other bad surprises that might eventually occur. The Replicator SHOULD NOT count every HTTP request failure as a <em>fatal error</em>. It SHOULD be smart enough to detect timeouts, repeat failed requests, be ready to process incomplete or malformed data and so on. <em>Data must flow</em> - that’s the rule.</p> </section> <section id="error-responses"> <h2>Error Responses</h2> <p>In case something goes wrong the Peer MUST respond with a JSON object with the following REQUIRED fields:</p> <ul class="simple"> <li><p><strong>error</strong> (<em>string</em>): Error type for programs and developers</p></li> <li><p><strong>reason</strong> (<em>string</em>): Error description for humans</p></li> </ul> <section id="bad-request"> <h3>Bad Request</h3> <p>If a request contains malformed data (like invalid JSON) the Peer MUST respond with a HTTP <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.1">400 Bad Request</a> and <code class="docutils literal notranslate"><span class="pre">bad_request</span></code> as error type:</p> <pre data-language="javascript">{
+    "error": "bad_request",
+    "reason": "invalid json"
+}</pre> </section> <section id="unauthorized"> <h3>Unauthorized</h3> <p>If a Peer REQUIRES credentials be included with the request and the request does not contain acceptable credentials then the Peer MUST respond with the HTTP <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.2">401 Unauthorized</a> and <code class="docutils literal notranslate"><span class="pre">unauthorized</span></code> as error type:</p> <pre data-language="javascript">{
+    "error": "unauthorized",
+    "reason": "Name or password is incorrect"
+}</pre> </section> <section id="forbidden"> <h3>Forbidden</h3> <p>If a Peer receives valid user credentials, but the requester does not have sufficient permissions to perform the operation then the Peer MUST respond with a HTTP <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.4">403 Forbidden</a> and <code class="docutils literal notranslate"><span class="pre">forbidden</span></code> as error type:</p> <pre data-language="javascript">{
+    "error": "forbidden",
+    "reason": "You may only update your own user document."
+}</pre> </section> <section id="resource-not-found"> <h3>Resource Not Found</h3> <p>If the requested resource, Database or Document wasn’t found on a Peer, the Peer MUST respond with a HTTP <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.5">404 Not Found</a> and <code class="docutils literal notranslate"><span class="pre">not_found</span></code> as error type:</p> <pre data-language="javascript">{
+    "error": "not_found",
+    "reason": "database \"target\" does not exists"
+}</pre> </section> <section id="method-not-allowed"> <h3>Method Not Allowed</h3> <p>If an unsupported method was used then the Peer MUST respond with a HTTP <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.6">405 Method Not Allowed</a> and <code class="docutils literal notranslate"><span class="pre">method_not_allowed</span></code> as error type:</p> <pre data-language="javascript">{
+    "error": "method_not_allowed",
+    "reason": "Only GET, PUT, DELETE allowed"
+}</pre> </section> <section id="resource-conflict"> <h3>Resource Conflict</h3> <p>A resource conflict error occurs when there are concurrent updates of the same resource by multiple clients. In this case the Peer MUST respond with a HTTP <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.10">409 Conflict</a> and <code class="docutils literal notranslate"><span class="pre">conflict</span></code> as error type:</p> <pre data-language="javascript">{
+    "error": "conflict",
+    "reason": "document update conflict"
+}</pre> </section> <section id="precondition-failed"> <h3>Precondition Failed</h3> <p>The HTTP <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.13">412 Precondition Failed</a> response may be sent in case of an attempt to create a Database (error type <code class="docutils literal notranslate"><span class="pre">db_exists</span></code>) that already exists or some attachment information is missing (error type <code class="docutils literal notranslate"><span class="pre">missing_stub</span></code>). There is no explicit error type restrictions, but it is RECOMMEND to use error types that are previously mentioned:</p> <pre data-language="javascript">{
+    "error": "db_exists",
+    "reason": "database \"target\" exists"
+}</pre> </section> <section id="server-error"> <h3>Server Error</h3> <p>Raised in case an error is <em>fatal</em> and the Replicator cannot do anything to continue Replication. In this case the Replicator MUST return a HTTP <a class="reference external" href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.5.1">500 Internal Server Error</a> response with an error description (no restrictions on error type applied):</p> <pre data-language="javascript">{
+    "error": "worker_died",
+    "reason": "kaboom!"
+}</pre> </section> </section> <section id="optimisations"> <h2>Optimisations</h2> <p>There are RECOMMENDED approaches to optimize the Replication process:</p> <ul class="simple"> <li><p>Keep the number of HTTP requests at a reasonable minimum</p></li> <li><p>Try to work with a connection pool and make parallel/multiple requests whenever possible</p></li> <li><p>Don’t close sockets after each request: respect the keep-alive option</p></li> <li><p>Use continuous sessions (cookies, etc.) to reduce authentication overhead</p></li> <li><p>Try to use bulk requests for every operations with Documents</p></li> <li><p>Find out optimal batch size for Changes feed processing</p></li> <li><p>Preserve Replication Logs and resume Replication from the last Checkpoint whenever possible</p></li> <li><p>Optimize filter functions: let them run as fast as possible</p></li> <li><p>Get ready for surprises: networks are very unstable environments</p></li> </ul> </section> <section id="api-reference"> <h2>API Reference</h2> <section id="common-methods"> <h3>Common Methods</h3> <ul class="simple"> <li><p><a class="reference internal" href="../api/database/common.html#head--db" title="HEAD /{db}"><code class="xref http http-head docutils literal notranslate"><span class="pre">HEAD</span> <span class="pre">/{db}</span></code></a> – Check Database existence</p></li> <li><p><a class="reference internal" href="../api/database/common.html#get--db" title="GET /{db}"><code class="xref http http-get docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/{db}</span></code></a> – Retrieve Database information</p></li> <li><p><a class="reference internal" href="../api/local.html#get--db-_local-docid" title="GET /{db}/_local/{docid}"><code class="xref http http-get docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/{db}/_local/{docid}</span></code></a> – Read the last Checkpoint</p></li> <li><p><a class="reference internal" href="../api/local.html#put--db-_local-docid" title="PUT /{db}/_local/{docid}"><code class="xref http http-put docutils literal notranslate"><span class="pre">PUT</span> <span class="pre">/{db}/_local/{docid}</span></code></a> – Save a new Checkpoint</p></li> </ul> </section> <section id="for-target"> <h3>For Target</h3> <ul class="simple"> <li><p><a class="reference internal" href="../api/database/common.html#put--db" title="PUT /{db}"><code class="xref http http-put docutils literal notranslate"><span class="pre">PUT</span> <span class="pre">/{db}</span></code></a> – Create Target if it not exists and the option was provided</p></li> <li><p><a class="reference internal" href="../api/database/misc.html#post--db-_revs_diff" title="POST /{db}/_revs_diff"><code class="xref http http-post docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/{db}/_revs_diff</span></code></a> – Locate Revisions that are not known to Target</p></li> <li><p><a class="reference internal" href="../api/database/bulk-api.html#post--db-_bulk_docs" title="POST /{db}/_bulk_docs"><code class="xref http http-post docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/{db}/_bulk_docs</span></code></a> – Upload Revisions to Target</p></li> <li><p><a class="reference internal" href="../api/document/common.html#put--db-docid" title="PUT /{db}/{docid}"><code class="xref http http-put docutils literal notranslate"><span class="pre">PUT</span> <span class="pre">/{db}/{docid}</span></code></a> – Upload a single Document with attachments to Target</p></li> <li><p><a class="reference internal" href="../api/database/compact.html#post--db-_ensure_full_commit" title="POST /{db}/_ensure_full_commit"><code class="xref http http-post docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/{db}/_ensure_full_commit</span></code></a> – Ensure that all changes are stored on disk</p></li> </ul> </section> <section id="for-source"> <h3>For Source</h3> <ul class="simple"> <li><p><a class="reference internal" href="../api/database/changes.html#get--db-_changes" title="GET /{db}/_changes"><code class="xref http http-get docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/{db}/_changes</span></code></a> – Fetch changes since the last pull of Source</p></li> <li><p><a class="reference internal" href="../api/database/changes.html#post--db-_changes" title="POST /{db}/_changes"><code class="xref http http-post docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/{db}/_changes</span></code></a> – Fetch changes for specified Document IDs since the last pull of Source</p></li> <li><p><a class="reference internal" href="../api/document/common.html#get--db-docid" title="GET /{db}/{docid}"><code class="xref http http-get docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/{db}/{docid}</span></code></a> – Retrieve a single Document from Source with attachments</p></li> </ul> </section> </section> <section id="reference"> <h2>Reference</h2> <ul class="simple"> <li><p><a class="reference external" href="https://github.com/refuge/rcouch/wiki/Replication-Algorithm">Refuge RCouch wiki</a></p></li> <li><p><a class="reference external" href="https://github.com/couchbase/couchbase-lite-ios/wiki/Replication-Algorithm">CouchBase Lite IOS wiki</a></p></li> </ul> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    Copyright &copy; 2025 The Apache Software Foundation &mdash; Licensed under the Apache License 2.0<br>
+    <a href="https://docs.couchdb.org/en/3.5.1/replication/protocol.html" class="_attribution-link">https://docs.couchdb.org/en/3.5.1/replication/protocol.html</a>
+  </p>
+</div>

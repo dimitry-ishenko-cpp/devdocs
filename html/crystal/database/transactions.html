@@ -1,0 +1,262 @@
+<a href="https://github.com/crystal-lang/crystal-book/tree/master/docs/database/transactions.md" title="Edit this page" class="md-content__button md-icon"> <svg xmlns="http://www.w3.org/2000/svg" viewbox="0 0 24 24"><path d="M20.71 7.04c.39-.39.39-1.04 0-1.41l-2.34-2.34c-.37-.39-1.02-.39-1.41 0l-1.84 1.83 3.75 3.75M3 17.25V21h3.75L17.81 9.93l-3.75-3.75L3 17.25z"></path></svg> </a> <h1 id="transactions">Transactions</h1> <p>When working with databases, it is common to need to group operations in such a way that if one fails, then we can go back to the latest safe state. This solution is described in the <strong>transaction paradigm</strong>, and is implemented by most database engines as it is necessary to meet ACID properties (Atomicity, Consistency, Isolation, Durability) [^ACID]</p> <p>With this in mind, we present the following example:</p> <p>We have two accounts (each represented by a name and an amount of money).</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+</pre></div> <p>In one moment a transfer is made from one account to the other. For example, <em>John transfers $50 to Sarah</em></p> <p>We have two accounts (each represented by a name and an amount of money).</p> <div class="crystal highlight"><pre data-language="crystal">deposit db, "Sarah", 50
+withdraw db, "John", 50
+</pre></div> <p>It is important to have in mind that if one of the operations fails then the final state would be inconsistent. So we need to execute the <strong>two operations</strong> (deposit and withdraw) as <strong>one operation</strong>. And if an error occurs then we would like to go back in time as if that one operation was never executed.</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+
+db.transaction do |tx|
+  cnn = tx.connection
+
+  transfer_amount = 1000
+  deposit cnn, "Sarah", transfer_amount
+  withdraw cnn, "John", transfer_amount
+end
+</pre></div> <p>In the above example, we start a transaction simply by calling the method <code>Database#transaction</code> (how we get the <code>database</code> object is encapsulated in the method <code>get_bank_db</code> and is out of the scope of this document). The <code>block</code> is the body of the transaction. When the <code>block</code> gets executed (without any error) then an <strong>implicit commit</strong> is finally executed to persist the changes in the database. If an exception is raised by one of the operations, then an <strong>implicit rollback</strong> is executed, bringing the database to the state before the transaction started.</p> <h2 id="exception-handling-and-rolling-back">Exception handling and rolling back</h2> <p>As we mentioned early, an <strong>implicit rollback</strong> gets executed when an exception is raised, and it’s worth mentioning that the exception may be rescued by us.</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+
+begin
+  db.transaction do |tx|
+    cnn = tx.connection
+
+    transfer_amount = 1000
+    deposit(cnn, "Sarah", transfer_amount)
+    # John does not have enough money in his account!
+    withdraw(cnn, "John", transfer_amount)
+  end
+rescue ex
+  puts "Transfer has been rolled back due to: #{ex}"
+end
+</pre></div> <p>We may also raise an exception in the body of the transaction:</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+
+begin
+  db.transaction do |tx|
+    cnn = tx.connection
+
+    transfer_amount = 50
+    deposit(cnn, "Sarah", transfer_amount)
+    withdraw(cnn, "John", transfer_amount)
+    raise Exception.new "Because ..."
+  end
+rescue ex
+  puts "Transfer has been rolled back due to: #{ex}"
+end
+</pre></div> <p>As the previous example, the exception cause the transaction to rollback and then is rescued by us.</p> <p>There is one <code>exception</code> with a different behaviour. If a <code>DB::Rollback</code> is raised within the block, the implicit rollback will happen, but the exception will not be raised outside the block.</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+
+begin
+  db.transaction do |tx|
+    cnn = tx.connection
+
+    transfer_amount = 50
+    deposit(cnn, "Sarah", transfer_amount)
+    withdraw(cnn, "John", transfer_amount)
+
+    # rollback exception
+    raise DB::Rollback.new
+  end
+rescue ex
+  # ex is never a DB::Rollback
+end
+</pre></div> <h2 id="explicit-commit-and-rollback">Explicit commit and rollback</h2> <p>In all the previous examples, the rolling back is <strong>implicit</strong>, but we can also tell the transaction to rollback:</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+
+begin
+  db.transaction do |tx|
+    cnn = tx.connection
+
+    transfer_amount = 50
+    deposit(cnn, "Sarah", transfer_amount)
+    withdraw(cnn, "John", transfer_amount)
+
+    tx.rollback
+
+    puts "Rolling Back the changes!"
+  end
+rescue ex
+  # Notice that no exception is used in this case.
+end
+</pre></div> <p>And we can also use the <code>commit</code> method:</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+db.transaction do |tx|
+  cnn = tx.connection
+
+  transfer_amount = 50
+  deposit(cnn, "Sarah", transfer_amount)
+  withdraw(cnn, "John", transfer_amount)
+
+  tx.commit
+end
+</pre></div> <div class="admonition note"> <p class="admonition-title">Note</p> <p>After <code>commit</code> or <code>rollback</code> are used, the transaction is no longer usable. The connection is still open but any statement will be performed outside the context of the terminated transaction.</p> </div> <h2 id="nested-transactions">Nested transactions</h2> <p>As the name suggests, a nested transaction is a transaction created inside the scope of another transaction. Here is an example:</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+create_account db, "Jack", amount: 0
+
+begin
+  db.transaction do |outer_tx|
+    outer_cnn = outer_tx.connection
+
+    transfer_amount = 50
+    deposit(outer_cnn, "Sarah", transfer_amount)
+    withdraw(outer_cnn, "John", transfer_amount)
+
+    outer_tx.transaction do |inner_tx|
+      inner_cnn = inner_tx.connection
+
+      # John =&gt; 50 (pending commit)
+      # Sarah =&gt; 150 (pending commit)
+      # Jack =&gt; 0
+
+      another_transfer_amount = 150
+      deposit(inner_cnn, "Jack", another_transfer_amount)
+      withdraw(inner_cnn, "Sarah", another_transfer_amount)
+    end
+  end
+rescue ex
+  puts "Exception raised due to: #{ex}"
+end
+</pre></div> <p>Some observations from the above example: the <code>inner_tx</code> works with the values updated although the <code>outer_tx</code> is pending the commit. The connection used by <code>outer_tx</code> and <code>inner_tx</code> is <strong>the same connection</strong>. This is because the <code>inner_tx</code> inherits the connection from the <code>outer_tx</code> when created.</p> <h3 id="rollback-nested-transactions">Rollback nested transactions</h3> <p>As we’ve already seen, a rollback may be fired at any time (by an exception or by sending the message <code>rollback</code> explicitly)</p> <p>So let’s present an example with a <strong>rollback fired by an exception placed at the outer-transaction</strong>:</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+create_account db, "Jack", amount: 0
+
+begin
+  db.transaction do |outer_tx|
+    outer_cnn = outer_tx.connection
+
+    transfer_amount = 50
+    deposit(outer_cnn, "Sarah", transfer_amount)
+    withdraw(outer_cnn, "John", transfer_amount)
+
+    outer_tx.transaction do |inner_tx|
+      inner_cnn = inner_tx.connection
+
+      # John =&gt; 50 (pending commit)
+      # Sarah =&gt; 150 (pending commit)
+      # Jack =&gt; 0
+
+      another_transfer_amount = 150
+      deposit(inner_cnn, "Jack", another_transfer_amount)
+      withdraw(inner_cnn, "Sarah", another_transfer_amount)
+    end
+
+    raise Exception.new("Rollback all the things!")
+  end
+rescue ex
+  puts "Exception raised due to: #{ex}"
+end
+</pre></div> <p>The rollback place in the <code>outer_tx</code> block, rolled back all the changes including the ones in the <code>inner_tx</code> block (the same happens if we use an <strong>explicit</strong> rollback).</p> <p>If the <strong>rollback is fired by an exception at the inner_tx block</strong> all the changes including the ones in the <code>outer_tx</code> are rollbacked.</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+create_account db, "Jack", amount: 0
+
+begin
+  db.transaction do |outer_tx|
+    outer_cnn = outer_tx.connection
+
+    transfer_amount = 50
+    deposit(outer_cnn, "Sarah", transfer_amount)
+    withdraw(outer_cnn, "John", transfer_amount)
+
+    outer_tx.transaction do |inner_tx|
+      inner_cnn = inner_tx.connection
+
+      # John =&gt; 50 (pending commit)
+      # Sarah =&gt; 150 (pending commit)
+      # Jack =&gt; 0
+
+      another_transfer_amount = 150
+      deposit(inner_cnn, "Jack", another_transfer_amount)
+      withdraw(inner_cnn, "Sarah", another_transfer_amount)
+
+      raise Exception.new("Rollback all the things!")
+    end
+  end
+rescue ex
+  puts "Exception raised due to: #{ex}"
+end
+</pre></div> <p>There is a way to rollback the changes in the <code>inner-transaction</code> but keep the ones in the <code>outer-transaction</code>. Use <code>rollback</code> in the <code>inner_tx</code> object. This will rollback <strong>only</strong> then inner-transaction. Here is the example:</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+create_account db, "Jack", amount: 0
+
+begin
+  db.transaction do |outer_tx|
+    outer_cnn = outer_tx.connection
+
+    transfer_amount = 50
+    deposit(outer_cnn, "Sarah", transfer_amount)
+    withdraw(outer_cnn, "John", transfer_amount)
+
+    outer_tx.transaction do |inner_tx|
+      inner_cnn = inner_tx.connection
+
+      # John =&gt; 50 (pending commit)
+      # Sarah =&gt; 150 (pending commit)
+      # Jack =&gt; 0
+
+      another_transfer_amount = 150
+      deposit(inner_cnn, "Jack", another_transfer_amount)
+      withdraw(inner_cnn, "Sarah", another_transfer_amount)
+
+      inner_tx.rollback
+    end
+  end
+rescue ex
+  puts "Exception raised due to: #{ex}"
+end
+</pre></div> <p>The same happens if a <code>DB::Rollback</code> exception is raised in the <code>inner-transaction</code> block.</p> <div class="crystal highlight"><pre data-language="crystal">db = get_bank_db
+
+create_account db, "John", amount: 100
+create_account db, "Sarah", amount: 100
+create_account db, "Jack", amount: 0
+
+begin
+  db.transaction do |outer_tx|
+    outer_cnn = outer_tx.connection
+
+    transfer_amount = 50
+    deposit(outer_cnn, "Sarah", transfer_amount)
+    withdraw(outer_cnn, "John", transfer_amount)
+
+    outer_tx.transaction do |inner_tx|
+      inner_cnn = inner_tx.connection
+
+      # John =&gt; 50 (pending commit)
+      # Sarah =&gt; 150 (pending commit)
+      # Jack =&gt; 0
+
+      another_transfer_amount = 150
+      deposit(inner_cnn, "Jack", another_transfer_amount)
+      withdraw(inner_cnn, "Sarah", another_transfer_amount)
+
+      # Rollback exception
+      raise DB::Rollback.new
+    end
+  end
+rescue ex
+  puts "Exception raised due to: #{ex}"
+end
+</pre></div> <p>[^ACID]: Theo Haerder and Andreas Reuter. 1983. Principles of transaction-oriented database recovery. ACM Comput. Surv. 15, 4 (December 1983), 287-317. DOI=<a href="http://dx.doi.org/10.1145/289.291">http://dx.doi.org/10.1145/289.291</a></p><div class="_attribution">
+  <p class="_attribution-p">
+    To the extent possible under law, the persons who contributed to this workhave waived<br>all copyright and related or neighboring rights to this workby associating CC0 with it.<br>
+    <a href="https://crystal-lang.org/reference/1.2/database/transactions.html" class="_attribution-link">https://crystal-lang.org/reference/1.2/database/transactions.html</a>
+  </p>
+</div>

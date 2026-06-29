@@ -1,0 +1,64 @@
+<div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList"> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Reference API"> <meta itemprop="position" content="1"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compiler"> <meta itemprop="position" content="2"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compile Programming Model"> <meta itemprop="position" content="3"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Working with Graph Breaks"> <meta itemprop="position" content="4"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem"> <meta itemprop="name" content="Use &lt;code class=" docutils literal notranslate>torch._dynamo.nonstrict_trace"&gt; <meta itemprop="position" content="5"> </div> </div>  <article class="bd-article">  <h1 id="use-torch-dynamo-nonstrict-trace">Use torch._dynamo.nonstrict_trace</h1> <p class="date-info-last-verified" style="color: #6c6c6d; font-size: small;">Created On: Jul 28, 2025 | Last Updated On: Jul 28, 2025</p> <p><strong>Summary:</strong></p> <ul class="simple"> <li>Use <code>nonstrict_trace</code> to trace a function with non-strict tracing inside of a <code>torch.compile</code>’d region. You may wish to do this because the Dynamo graph breaks on something inside of the function and you are sure that the function is non-strict traceable.</li> </ul> <p>Consider the following scenario:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">def get_magic_num():
+    # This explicit graph break call is meant to emulate any kind of Dynamo
+    # graph break, e.g., the function is implemented in C, or uses some python
+    # language feature Dynamo doesn't yet support.
+    torch._dynamo.graph_break()
+    return torch.tensor([42])
+@torch.compile(fullgraph=True)
+def func(x):
+    n = get_magic_num()
+    return x + n
+try:
+    func(torch.rand(10))
+except Exception as e:
+    print(e)
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">Call to `torch._dynamo.graph_break()`
+  Explanation: User-inserted graph break. Message: None
+  Hint: Remove the `torch._dynamo.graph_break()` call.
+
+  Developer debug context: Called `torch._dynamo.graph_break()` with args `[]`, kwargs `{}`
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
+
+from user code:
+   File "/tmp/ipykernel_316/2253748958.py", line 9, in func
+    n = get_magic_num()
+  File "/tmp/ipykernel_316/2253748958.py", line 5, in get_magic_num
+    torch._dynamo.graph_break()
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+</pre> </div> </div> <p>If we run the code above, we’ll get an error from Dynamo, because it sees a graph break while the user specified <code>fullgraph=True</code>.</p> <p>In these situations, if a user still wants to keep <code>fullgraph=True</code>, they typically have several options:</p> <ol class="arabic simple"> <li>The graph break is due to a language feature Dynamo doesn’t yet support. In this case, the user either rewrites their code, or files an issue on GitHub.</li> <li>The graph break is due to a call to a function implemented in C. In this case, the user can try to use a custom op. The user could also try providing a polyfill (a reference implementation in Python) so that Dynamo can trace through it.</li> <li>Worst case scenario – an internal compiler error. In this case, the user likely has to file an issue on GitHub.</li> </ol> <p>In addition to all these options, PyTorch does provide an alternative <code>torch._dynamo.nonstrict_trace</code>, if the function call that induced the graph break satisfies certain requirements:</p> <ul class="simple"> <li>The requirements of <a class="reference internal" href="programming_model.non_strict_tracing_model.html"><span class="doc std std-doc">general non-strict tracing</span></a>.</li> <li>The inputs and outputs must contain either basic types (e.g., <code>int</code>, <code>float</code>, <code>list</code>, <code>dict</code>, <code>torch.Tensor</code>), or user-defined types that are registered to <code>torch.utils._pytree</code>.</li> <li>The function must be defined outside the <code>torch.compile</code>’d region.</li> <li>Any non-input values read by the function will be treated as a constant (e.g., a global tensor), and will not be guarded on.</li> </ul> <p>When tracing through a call to a <code>torch._dynamo.nonstrict_trace</code>’d function, <code>torch.compile</code> switches to <a class="reference internal" href="programming_model.non_strict_tracing_model.html"><span class="doc std std-doc">non-strict tracing</span></a>, and the FX graph will eventually contain all the relevant tensor operations which happened inside that function.</p> <p>For the example above, we can use <code>torch._dynamo.nonstrict_trace to eliminate</code> the graph break:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">@torch._dynamo.nonstrict_trace
+def get_magic_num():
+    # This explicit graph break call is meant to emulate any kind of Dynamo
+    # graph break, e.g., the function is implemented in C, or uses some python
+    # language feature Dynamo doesn't yet support.
+    torch._dynamo.graph_break()
+    return torch.tensor([42])
+@torch.compile(fullgraph=True)
+def func(x):
+    n = get_magic_num()
+    return x + n
+print(func(torch.rand(10)))
+# No graph break and no error.
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">tensor([42.6048, 42.6620, 42.3730, 42.1969, 42.7525, 42.4637, 42.1544, 42.3485,
+        42.8316, 42.8360])
+</pre> </div> </div> <p>Note that one can use it inside a <code>torch.compile</code>’d region as well:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="python">def get_magic_num():
+    # This explicit graph break call is meant to emulate any kind of Dynamo
+    # graph break, e.g., the function is implemented in C, or uses some python
+    # language feature Dynamo doesn't yet support.
+    torch._dynamo.graph_break()
+    return torch.tensor([42])
+@torch.compile(fullgraph=True)
+def func(x):
+    n = torch._dynamo.nonstrict_trace(get_magic_num)()
+    return x + n
+print(func(torch.rand(10)))
+# No graph break and no error.
+</pre> </div> <div class="cell_output docutils container"> <pre data-language="myst">tensor([42.8445, 42.3965, 42.4669, 42.6729, 42.7607, 42.7630, 42.2933, 42.7238,
+        42.9972, 42.4853])
+</pre> </div> </div>  </article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2025, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.9/compile/programming_model.dynamo_nonstrict_trace.html" class="_attribution-link">https://docs.pytorch.org/docs/2.9/compile/programming_model.dynamo_nonstrict_trace.html</a>
+  </p>
+</div>

@@ -1,0 +1,181 @@
+<h1 id="optimize-performance-using-parallel-execution">Optimize performance using parallel execution</h1> <p>PowerShell provides several options for the creation of parallel invocations.</p> <ul> <li>
+<code>Start-Job</code> runs each job in a separate process, each with a new instance of PowerShell. In many cases, a linear loop is faster. Also, serialization and deserialization can limit the usefulness of the objects returned. This command is built in to all versions of PowerShell.</li> <li>
+<code>Start-ThreadJob</code> is a cmdlet found in the <strong>ThreadJob</strong> module. This command uses PowerShell runspaces to create and manage thread-based jobs. These jobs are lighter-weight than the jobs created by <code>Start-Job</code> and avoid potential loss of type fidelity required by cross-process serialization and deserialization. The <strong>ThreadJob</strong> module comes with PowerShell 7 and higher. For Windows PowerShell 5.1, you can install this module from the PowerShell Gallery.</li> <li>Use the <strong>System.Management.Automation.Runspaces</strong> namespace from the PowerShell SDK to create your own parallel logic. Both <code>ForEach-Object -Parallel</code> and <code>Start-ThreadJob</code> use PowerShell runspaces to execute the code in parallel.</li> <li>Workflows are a feature of Windows PowerShell 5.1. Workflows aren't available in PowerShell 7.0 and higher. Workflows are a special type of PowerShell script that can run in parallel. They're designed for long-running tasks and can be paused and resumed. Workflows aren't recommended for new development. For more information, see <a href="../../powershell/module/psworkflow/about/about_workflows.html">about_Workflows</a>.</li> <li>
+<code>ForEach-Object -Parallel</code> is a feature of PowerShell 7.0 and higher. Like <code>Start-ThreadJob</code>, it uses PowerShell runspaces to create and manage thread-based jobs. This command is designed for use in a pipeline.</li> </ul> <h2 id="limit-execution-concurrency">Limit execution concurrency</h2> <p>Running scripts in parallel doesn't guarantee improved performance. For example, the following scenarios can benefit from parallel execution:</p> <ul> <li>Compute intensive scripts on multi-threaded multi-core processors</li> <li>Scripts that spend time waiting for results or doing file operations, as long as those operations don't block each other.</li> </ul> <p>It's important to balance the overhead of parallel execution with the type of work done. Also, there are limits to the number of invocations that can run in parallel.</p> <p>The <code>Start-ThreadJob</code> and <code>ForEach-Object -Parallel</code> commands have a <strong>ThrottleLimit</strong> parameter to limit the number of jobs running at one time. As more jobs are started, they're queued and wait until the current number of jobs drops below the throttle limit. As of PowerShell 7.1, <code>ForEach-Object -Parallel</code> reuses runspaces from a runspace pool by default. The <strong>ThrottleLimit</strong> parameter sets the runspace pool size. The default runspace pool size is 5. You can still create a new runspace for each iteration using the UseNewRunspace switch.</p> <p>The <code>Start-Job</code> command doesn't have a <strong>ThrottleLimit</strong> parameter. You have to manage the number of jobs running at one time.</p> <h2 id="measure-performance">Measure performance</h2> <p>The following function, <code>Measure-Parallel</code>, compares the speed of the following parallel execution approaches:</p> <ul> <li>
+<code>Start-Job</code> - creates a child PowerShell process behind the scenes</li> <li>
+<code>Start-ThreadJob</code> - runs each job in a separate thread</li> <li>
+<code>ForEach-Object -Parallel</code> - runs each job in a separate thread</li> <li>
+<code>Start-Process</code> - invokes an external program asynchronously</li> </ul> <blockquote> <p>[!NOTE] This approach only makes sense if your parallel tasks only consist of a single call to an external program, as opposed to running a block of PowerShell code. Also, the only way to capture output with this approach is by redirecting to a file.</p> </blockquote> <pre><code class="powershell">function Measure-Parallel {
+    [CmdletBinding()]
+    param(
+        [ValidateRange(2, 2147483647)]
+        [int] $BatchSize = 5,
+
+        [ValidateSet('Job', 'ThreadJob', 'Process', 'ForEachParallel', 'All')]
+        [string[]] $Approach,
+
+        # pass a higher count to run multiple batches
+        [ValidateRange(2, 2147483647)]
+        [int] $JobCount = $BatchSize
+    )
+
+    $noForEachParallel = $PSVersionTable.PSVersion.Major -lt 7
+    $noStartThreadJob = -not (Get-Command -ErrorAction Ignore Start-ThreadJob)
+
+    # Translate the approach arguments into their corresponding hashtable keys (see below).
+    if ('All' -eq $Approach) { $Approach = 'Job', 'ThreadJob', 'Process', 'ForEachParallel' }
+    $approaches = $Approach.ForEach({
+            if ($_ -eq 'ForEachParallel') { 'ForEach-Object -Parallel' }
+            else { $_ -replace '^', 'Start-' }
+        })
+
+    if ($noStartThreadJob) {
+        if ($interactive -or $approaches -contains 'Start-ThreadJob') {
+            Write-Warning "Start-ThreadJob is not installed, omitting its test."
+            $approaches = $approaches.Where({ $_ -ne 'Start-ThreadJob' })
+        }
+    }
+    if ($noForEachParallel) {
+        if ($interactive -or $approaches -contains 'ForEach-Object -Parallel') {
+            Write-Warning 'ForEach-Object -Parallel require PowerShell v7+, omitting its test.'
+            $approaches = $approaches.Where({ $_ -ne 'ForEach-Object -Parallel' })
+        }
+    }
+
+    # Simulated input: Create 'f0.zip', 'f1'.zip', ... file names.
+    $zipFiles = 0..($JobCount - 1) -replace '^', 'f' -replace '$', '.zip'
+
+    # Sample executables to run - here, the native shell is called to simply
+    # echo the argument given.
+    $exe = if ($env:OS -eq 'Windows_NT') { 'cmd.exe' } else { 'sh' }
+
+    # The list of its arguments *as a single string* - use '{0}' as the placeholder
+    # for where the input object should go.
+    $exeArgList = if ($env:OS -eq 'Windows_NT') {
+        '/c "echo {0} &gt; NUL:"'
+     } else {
+        '-c "echo {0} &gt; /dev/null"'
+    }
+
+    # A hashtable with script blocks that implement the 3 approaches to parallelism.
+    $approachImpl = [ordered] @{}
+
+    # child-process-based job
+    $approachImpl['Start-Job'] = {
+        param([array] $batch)
+        $batch |
+            ForEach-Object {
+                Start-Job {
+                    Invoke-Expression ($using:exe + ' ' + ($using:exeArgList -f $args[0]))
+                } -ArgumentList $_
+            } |
+            Receive-Job -Wait -AutoRemoveJob | Out-Null
+    }
+
+    # thread-based job - requires the ThreadJob module
+    if (-not $noStartThreadJob) {
+        # If Start-ThreadJob is available, add an approach for it.
+        $approachImpl['Start-ThreadJob'] = {
+            param([array] $batch)
+            $batch |
+                ForEach-Object {
+                    Start-ThreadJob -ThrottleLimit $BatchSize {
+                        Invoke-Expression ($using:exe + ' ' + ($using:exeArgList -f $args[0]))
+                    } -ArgumentList $_
+                } |
+                Receive-Job -Wait -AutoRemoveJob | Out-Null
+        }
+    }
+
+    # ForEach-Object -Parallel job
+    if (-not $noForEachParallel) {
+        $approachImpl['ForEach-Object -Parallel'] = {
+            param([array] $batch)
+            $batch | ForEach-Object -ThrottleLimit $BatchSize -Parallel {
+                Invoke-Expression ($using:exe + ' ' + ($using:exeArgList -f $_))
+            }
+        }
+    }
+
+    # direct execution of an external program
+    $approachImpl['Start-Process'] = {
+        param([array] $batch)
+        $batch |
+            ForEach-Object {
+                Start-Process -NoNewWindow -PassThru $exe -ArgumentList ($exeArgList -f $_)
+            } |
+            Wait-Process
+    }
+
+    # Partition the array of all indices into subarrays (batches)
+    $batches = @(
+        0..([math]::Ceiling($zipFiles.Count / $batchSize) - 1) | ForEach-Object {
+            , $zipFiles[($_ * $batchSize)..($_ * $batchSize + $batchSize - 1)]
+        }
+    )
+
+    $tsTotals = foreach ($appr in $approaches) {
+        $i = 0
+        $tsTotal = [timespan] 0
+        $batches | ForEach-Object {
+            Write-Verbose "$batchSize-element '$appr' batch"
+            $ts = Measure-Command { &amp; $approachImpl[$appr] $_ | Out-Null }
+            $tsTotal += $ts
+            if (++$i -eq $batches.Count) {
+                # last batch processed.
+                if ($batches.Count -gt 1) {
+                    Write-Verbose ("'$appr' processing $JobCount items finished in " +
+                        "$($tsTotal.TotalSeconds.ToString('N2')) secs.")
+                }
+                $tsTotal # output the overall timing for this approach
+            }
+        }
+    }
+
+    # Output a result object with the overall timings.
+    $oht = [ordered] @{}
+    $oht['JobCount'] = $JobCount
+    $oht['BatchSize'] = $BatchSize
+    $oht['BatchCount'] = $batches.Count
+    $i = 0
+    foreach ($appr in $approaches) {
+        $oht[($appr + ' (secs.)')] = $tsTotals[$i++].TotalSeconds.ToString('N2')
+    }
+    [pscustomobject] $oht
+}
+</code></pre> <p>The following example uses <code>Measure-Parallel</code> to run 20 jobs in parallel, 5 at a time, using all available approaches.</p> <pre><code class="powershell">Measure-Parallel -Approach All -BatchSize 5 -JobCount 20 -Verbose
+</code></pre> <p>The following output comes from a Windows computer running PowerShell 7.5.1. Your timing can vary based on many factors, but the ratios should provide a sense of relative performance.</p> <pre><code class="Output">VERBOSE: 5-element 'Start-Job' batch
+VERBOSE: 5-element 'Start-Job' batch
+VERBOSE: 5-element 'Start-Job' batch
+VERBOSE: 5-element 'Start-Job' batch
+VERBOSE: 'Start-Job' processing 20 items finished in 7.58 secs.
+VERBOSE: 5-element 'Start-ThreadJob' batch
+VERBOSE: 5-element 'Start-ThreadJob' batch
+VERBOSE: 5-element 'Start-ThreadJob' batch
+VERBOSE: 5-element 'Start-ThreadJob' batch
+VERBOSE: 'Start-ThreadJob' processing 20 items finished in 2.37 secs.
+VERBOSE: 5-element 'Start-Process' batch
+VERBOSE: 5-element 'Start-Process' batch
+VERBOSE: 5-element 'Start-Process' batch
+VERBOSE: 5-element 'Start-Process' batch
+VERBOSE: 'Start-Process' processing 20 items finished in 0.26 secs.
+VERBOSE: 5-element 'ForEach-Object -Parallel' batch
+VERBOSE: 5-element 'ForEach-Object -Parallel' batch
+VERBOSE: 5-element 'ForEach-Object -Parallel' batch
+VERBOSE: 5-element 'ForEach-Object -Parallel' batch
+VERBOSE: 'ForEach-Object -Parallel' processing 20 items finished in 0.79 secs.
+
+JobCount                         : 20
+BatchSize                        : 5
+BatchCount                       : 4
+Start-Job (secs.)                : 7.58
+Start-ThreadJob (secs.)          : 2.37
+Start-Process (secs.)            : 0.26
+ForEach-Object -Parallel (secs.) : 0.79
+</code></pre> <p>Conclusions</p> <ul> <li>The <code>Start-Process</code> approach performs best because it doesn't have the overhead of job management. However, as previously noted, this approach has fundamental limitations.</li> <li>The <code>ForEach-Object -Parallel</code> adds the least overhead, followed by <code>Start-ThreadJob</code>.</li> <li>
+<code>Start-Job</code> has the most overhead because of the hidden PowerShell instances it creates for each job.</li> </ul> <h2 id="acknowledgments">Acknowledgments</h2> <p>Much of the information is this article is based on the answers from <a href="https://stackoverflow.com/users/15339544/santiago-squarzon">Santiago Squarzon</a> and <a href="https://stackoverflow.com/users/45375/mklement0">mklement0</a> in this <a href="https://stackoverflow.com/questions/73997250/powershell-test-the-performance-efficiency-of-asynchronous-tasks-with-start-job/">Stack Overflow post</a>.</p> <p>You might also be interested in the <a href="https://www.powershellgallery.com/packages/PSParallelPipeline/">PSParallelPipeline</a> module created by Santiago Squarzon.</p> <h2 id="further-reading">Further reading</h2> <ul> <li><a href="xref:Microsoft.PowerShell.Core.Start-Job.html">Start-Job</a></li> <li><a href="../../powershell/module/microsoft.powershell.core/about/about_jobs.html">about_Jobs</a></li> <li><a href="xref:ThreadJob.Start-ThreadJob.html">Start-ThreadJob</a></li> <li><a href="xref:Microsoft.PowerShell.Core.ForEach-Object.html">ForEach-Object</a></li> <li><a href="xref:Microsoft.PowerShell.Management.Start-Process.html">Start-Process</a></li> </ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Microsoft CorporationCode licensed under an MIT-style License. Documentation licensed under CC BY 4.0.<br>
+    <a href="https://learn.microsoft.com/en-us/powershell/scripting/dev-cross-plat/performance/parallel-execution?view=powershell-Scripting" class="_attribution-link">https://learn.microsoft.com/en-us/powershell/scripting/dev-cross-plat/performance/parallel-execution?view=powershell-Scripting</a>
+  </p>
+</div>

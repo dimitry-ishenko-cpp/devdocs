@@ -1,0 +1,134 @@
+<div id="top-content"> <div class="heading-with-actions top-heading"> <h1>API Authentication</h1> <a href="https://github.com/phoenixframework/phoenix/blob/v1.8.8/guides/authn_authz/api_authentication.md#L1" title="View Source" class="source" rel="help nofollow">Source</a> </div> <blockquote><p><strong>Requirement</strong>: This guide expects that you have gone through the <a href="mix_phx_gen_auth.html"><code class="inline">mix phx.gen.auth</code></a> guide.</p></blockquote>
+<p>This guide shows how to add API authentication on top of <a href="mix.tasks.phx.gen.auth.html"><code class="inline">mix phx.gen.auth</code></a>. Since the authentication generator already includes a token table, we use it to store API tokens too, following the best security practices.</p>
+<p>We will break this guide in two parts: augmenting the context and the plug implementation. We will assume that the following <a href="mix.tasks.phx.gen.auth.html"><code class="inline">mix phx.gen.auth</code></a> command was executed:</p>
+<pre data-language="elixir">$ mix phx.gen.auth Accounts User users
+</pre>
+<p>If you ran something else, it should be trivial to adapt the names.</p>
+<h2 id="adding-api-functions-to-the-context" class="section-heading">
+<span class="text">Adding API functions to the context</span>
+</h2>
+<p>Our authentication system will require two functions. One to create the API token and another to verify it. Open up <code class="inline">lib/my_app/accounts.ex</code> and add these two new functions:</p>
+<pre data-language="elixir">  ## API
+
+  @doc """
+  Creates a new api token for a user.
+
+  The token returned must be saved somewhere safe.
+  This token cannot be recovered from the database.
+  """
+  def create_user_api_token(user) do
+    {encoded_token, user_token} = UserToken.build_email_token(user, "api-token")
+    Repo.insert!(user_token)
+    encoded_token
+  end
+
+  @doc """
+  Fetches the user by API token.
+  """
+  def fetch_user_by_api_token(token) do
+    with {:ok, query} &lt;- UserToken.verify_api_token_query(token),
+         %User{} = user &lt;- Repo.one(query) do
+      {:ok, user}
+    else
+      _ -&gt; :error
+    end
+  end</pre>
+<p>The new functions use the existing <code class="inline">UserToken</code> functionality to store a new type of token called "api-token". Because this is an email token, if the user changes their email, the tokens will be expired.</p>
+<p>Also notice we called the second function <code class="inline">fetch_user_by_api_token</code>, instead of <code class="inline">get_user_by_api_token</code>. Because we want to render different status codes in our API, depending if a user was found or not, we return <code class="inline">{:ok, user}</code> or <code class="inline">:error</code>. Elixir's convention is to call these functions <code class="inline">fetch_*</code>, instead of <code class="inline">get_*</code> which would usually return <code class="inline">nil</code> instead of tuples.</p>
+<p>To make sure our new functions work, let's write tests. Open up <code class="inline">test/my_app/accounts_test.exs</code> and add this new describe block:</p>
+<pre data-language="elixir">  describe "create_user_api_token/1 and fetch_user_by_api_token/1" do
+    test "creates and fetches by token" do
+      user = user_fixture()
+      token = Accounts.create_user_api_token(user)
+      assert Accounts.fetch_user_by_api_token(token) == {:ok, user}
+      assert Accounts.fetch_user_by_api_token("invalid") == :error
+    end
+  end</pre>
+<p>If you run the tests, they will actually fail. Something similar to this:</p>
+<pre data-language="elixir">1) test create_user_api_token/1 and fetch_user_by_api_token/1 creates and fetches by token (Demo.AccountsTest)
+    test/demo/accounts_test.exs:380
+    ** (UndefinedFunctionError) function Demo.Accounts.UserToken.verify_api_token_query/1 is undefined or private. Did you mean:
+
+          * verify_change_email_token_query/2
+          * verify_magic_link_token_query/1
+          * verify_session_token_query/1
+    
+    code: assert Accounts.fetch_user_by_api_token(token) == {:ok, user}
+    stacktrace:
+      (demo 0.1.0) Demo.Accounts.UserToken.verify_api_token_query("sTpJg7rt-KQ9gZ7xLMtn2keusGk9N2JpPwkXDx7LmHU")
+      (demo 0.1.0) lib/demo/accounts.ex:325: Demo.Accounts.fetch_user_by_api_token/1
+      test/demo/accounts_test.exs:383: (test)
+</pre>
+<p>If you prefer, try looking at the error and fixing it yourself. The explanation will come next.</p>
+<p>The <code class="inline">UserToken</code> module contains functions for verifying different tokens. Right now, there is no <code class="inline">verify_api_token_query/1</code>, but we can implement it similar to the existing functions. How long the API token should be valid is going to depend on your application and how sensitive it is in terms of security. For this example, let's say the token is valid for 365 days.</p>
+<p>Open up <code class="inline">lib/my_app/accounts/user_token.ex</code>, and add a new function, like this:</p>
+<pre data-language="elixir">  @doc """
+  Checks if the API token is valid and returns its underlying lookup query.
+
+  The query returns the user found by the token, if any.
+
+  The given token is valid if it matches its hashed counterpart in the
+  database and the user email has not changed. This function also checks
+  if the token is being used within 365 days.
+  """
+  def verify_api_token_query(token) do
+    case Base.url_decode64(token, padding: false) do
+      {:ok, decoded_token} -&gt;
+        hashed_token = :crypto.hash(@hash_algorithm, decoded_token)
+
+        query =
+          from token in by_token_and_context_query(hashed_token, "api-token"),
+            join: user in assoc(token, :user),
+            where:
+              token.inserted_at &gt; ago(^@api_token_validity_in_days, "day") and
+                token.sent_to == user.email,
+            select: user
+
+        {:ok, query}
+
+      :error -&gt;
+        :error
+    end
+  end</pre>
+<p>Note that we also added a <code class="inline">@api_token_validity_in_days</code> module attribute at the top of the file:</p>
+<pre data-language="elixir">   @magic_link_validity_in_minutes 15
+   @change_email_validity_in_days 7
+   @session_validity_in_days 60
++  @api_token_validity_in_days 365</pre>
+<p>Now tests should pass and we are ready to move forward!</p>
+<h2 id="api-authentication-plug" class="section-heading">
+<span class="text">API authentication plug</span>
+</h2>
+<p>The last part is to add authentication to our API.</p>
+<p>When we ran <a href="mix.tasks.phx.gen.auth.html"><code class="inline">mix phx.gen.auth</code></a>, it generated a <code class="inline">MyAppWeb.UserAuth</code> module with several plugs, which are small functions that receive the <code class="inline">conn</code> and customize our request/response life-cycle. Open up <code class="inline">lib/my_app_web/user_auth.ex</code> and add this new function:</p>
+<pre data-language="elixir">def fetch_current_scope_for_api_user(conn, _opts) do
+  with [&lt;&lt;bearer::binary-size(6), " ", token::binary&gt;&gt;] &lt;-
+         get_req_header(conn, "authorization"),
+       true &lt;- String.downcase(bearer) == "bearer",
+       {:ok, user} &lt;- Accounts.fetch_user_by_api_token(token) do
+    assign(conn, :current_scope, Scope.for_user(user))
+  else
+    _ -&gt;
+      conn
+      |&gt; send_resp(:unauthorized, "No access for you")
+      |&gt; halt()
+  end
+end</pre>
+<p>Our function receives the connection and checks if the "authorization" header has been set with "Bearer TOKEN", where "TOKEN" is the value returned by <code class="inline">Accounts.create_user_api_token/1</code>. In case the token is not valid or there is no such user, we abort the request.</p>
+<p>Finally, we need to add this <code class="inline">plug</code> to our pipeline. Open up <code class="inline">lib/my_app_web/router.ex</code> and you will find a pipeline for API. Let's add our new plug under it, like this:</p>
+<pre data-language="elixir">  pipeline :api do
+    plug :accepts, ["json"]
+    plug :fetch_current_scope_for_api_user
+  end</pre>
+<p>Now you are ready to receive and validate API requests. Feel free to open up <code class="inline">test/my_app_web/user_auth_test.exs</code> and write your own test. You can use the tests for other plugs as templates!</p>
+<h2 id="your-turn" class="section-heading">
+<span class="text">Your turn</span>
+</h2>
+<p>The overall API authentication flow will depend on your application.</p>
+<p>If you want to use this token in a JavaScript client, you will need to slightly alter the <code class="inline">UserSessionController</code> to invoke <code class="inline">Accounts.create_user_api_token/1</code> and return a JSON response including the token.</p>
+<p>If you want to provide APIs for 3rd-party users, you will need to allow them to create tokens, and show the result of <code class="inline">Accounts.create_user_api_token/1</code> to them. They must save these tokens somewhere safe and include them as part of their requests using the "authorization" header.</p> </div> <div class="bottom-actions" id="bottom-actions"> <div class="bottom-actions-item"> <a href="scopes.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Scopes </span> </a> </div> <div class="bottom-actions-item"> <a href="channels.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> Channels </span> </a> </div> </div> <footer class="footer"> <p> <span class="line"> <a href="https://hex.pm/packages/phoenix/1.8.8">Hex Package</a> <a href="https://preview.hex.pm/preview/phoenix/1.8.8">Hex Preview</a> (<a href="https://preview.hex.pm/preview/phoenix/1.8.8/show/guides/authn_authz/api_authentication.md">current file</a>) </span> <span class="line"> <button class="a-main footer-button display-quick-switch" title="Go to package docs"> Go to package docs </button> <a href="phoenix.epub.html"> Download ePub version </a> </span> </p> <p class="built-using"> Built using <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener nofollow" translate="no">ExDoc</a> (v0.40.3) for the <a href="https://elixir-lang.org" title="Elixir" target="_blank" translate="no">Elixir programming language</a> </p> </footer><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2014 Chris McCord<br>Licensed under the MIT License.<br>
+    <a href="https://phoenix.hexdocs.pm/api_authentication.html" class="_attribution-link">https://phoenix.hexdocs.pm/api_authentication.html</a>
+  </p>
+</div>

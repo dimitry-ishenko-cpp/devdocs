@@ -1,0 +1,77 @@
+<section id="windows-app-control"> <h1 id="id1">Windows App Control</h1> <p><a class="reference external" href="https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/">Windows App Control</a>, formerly known as Windows Defender Application Control (<code>WDAC</code>), is a security feature of Windows that can be used to restrict what executables and scripts can be run on a Windows host. In the past, enabling WDAC will cause Ansible to fail when running on the Windows host. Starting with Ansible 2.19 and the <code>ansible.windows</code> collection at <code>3.1.0</code>, Ansible can now run on Windows hosts with WDAC enabled.</p> <div class="admonition-experimental-functionality admonition"> <p class="admonition-title">Experimental functionality</p> <p>The App Control implementation is considered an experimental feature and can change in future releases. It is not possible to ensure all PowerShell modules will work with App Control enabled and that a module might enable arbitrary code to run in a way not typically allowed by App Control. It is recommended to test all modules with WDAC enabled before using them in production.</p> </div>  <ul class="simple"> <li><a class="reference internal" href="#requirements-for-ansible-to-work-with-app-control" id="id3">Requirements for Ansible to work with App Control</a></li> <li><a class="reference internal" href="#how-to-sign-ansible-content" id="id4">How to Sign Ansible Content</a></li> <li><a class="reference internal" href="#known-module-differences" id="id5">Known Module Differences</a></li> </ul>  <section id="requirements-for-ansible-to-work-with-app-control"> <h2>Requirements for Ansible to work with App Control</h2> <p>Ansible requires the target Windows version to be Windows Server 2019 or Windows 10 Build 1803 or later. This is because the <code>Dynamic Code Security</code> feature added in that Windows version is required to allow Ansible to run tasks on the Windows host.</p> <p>The first step towards enabling App Control is to create a code signing certificate that will be used to sign the scripts used by Ansible. While this certificate can be self signed, it is recommended that it is issued by a trusted certificate authority used in your organization. How to generate this certificate is outside the scope of this documentation. Once the certificate is setup, the policy file must be generated and applied to the Windows host.</p> <p>Setting up App Control and configuring policies is not covered under the documentation here. Please read through the Microsoft documentation for <a class="reference external" href="https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/">Application Control for Windows</a> or <a class="reference external" href="https://learn.microsoft.com/en-us/powershell/scripting/security/app-control/how-to-use-app-control?view=powershell-7.5">Application Control with PowerShell</a> to understand how to configure App Control and set up policies. The <a class="reference external" href="https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/design/appcontrol-wizard">App Control for Business Wizard</a> is a tool that can simplify policy generation through a more user friendly GUI.</p> <p>When setting up a policy it is recommended to configure Ansible as a supplemental policy so it can be easily modified and applied where Ansible will be used. Whether you use a supplemental or just a base policy for trusting the certificate used by Ansible, the base policy must have the following options set:</p> <ul class="simple"> <li>User Mode Code Integrity (<code>0 Enabled:UMCI</code>) is enabled</li> <li>Disable Script Enforcement (<code>11 Disabled:Script Enforcement</code>) is not enabled</li> <li>Dynamic Code Security (<code>19 Enabled:Dynamic Code Security</code>) is enabled</li> </ul> <p>The policy then should then add the certificate as a trusted publisher to the <code>User Mode Signing Scenario</code>, for example this is an example policy configuration that contains a trusted publisher:</p> <pre data-language="text">&lt;SiPolicy&gt;
+   ...
+   &lt;Signers&gt;
+      &lt;Signer Name="Some Signer" ID="ID_SIGNER_S_0"&gt;
+         &lt;CertRoot Type="TBS" Value="1DBF60AFC6313593EDB09B6C6239BE493FF3461D4BD6D0A8C6E1723A12C06438F471BB7F6BAA73BD142D0698CEFF9DBB" /&gt;
+         &lt;CertPublisher Value="Some Publisher" /&gt;
+      &lt;/Signer&gt;
+   &lt;/Signers&gt;
+   &lt;SigningScenarios&gt;
+      &lt;SigningScenario ID="ID_SIGNINGSCENARIO_KMCI" FriendlyName="Kernel Mode Signing Scenario" Value="131"&gt;
+         &lt;ProductSigners /&gt;
+      &lt;/SigningScenario&gt;
+      &lt;SigningScenario ID="ID_SIGNINGSCENARIO_UMCI" FriendlyName="User Mode Signing Scenario" Value="12"&gt;
+         &lt;ProductSigners&gt;
+         &lt;AllowedSigners&gt;
+            &lt;AllowedSigner SignerId="ID_SIGNER_S_0" /&gt;
+         &lt;/AllowedSigners&gt;
+         &lt;/ProductSigners&gt;
+      &lt;/SigningScenario&gt;
+   &lt;/SigningScenarios&gt;
+   ...
+&lt;/SiPolicy&gt;
+</pre> <p>Once the policy is created and the certificate that will be used to sign the Ansible content is trusted by the Windows host, the policy can be applied.</p> <div class="admonition warning"> <p class="admonition-title">Warning</p> <p>As Ansible typically runs tasks as an Administrator, it is important that the policy is signed and is applied so that Ansible cannot unset the policy through a task like <code>win_file</code> or <code>win_regedit</code>.</p> </div> </section> <section id="how-to-sign-ansible-content"> <h2>How to Sign Ansible Content</h2> <p>Once the code signing certificate has been generated and trusted by the Windows host, it can be used to sign the scripts that Ansible will run. The PowerShell script <a class="reference external" href="https://raw.githubusercontent.com/ansible/ansible-documentation/refs/heads/devel/examples/scripts/New-AnsiblePowerShellSignature.ps1">New-AnsiblePowerShellSignature.ps1</a> can be used to sign both the execution wrapper used by Ansible to invoke modules and any PowerShell modules inside an Ansible collection. It requires the following to run:</p> <ul class="simple"> <li>PowerShell 7.4 or later</li> <li>The <a class="reference external" href="https://github.com/jborean93/PowerShell-OpenAuthenticode">OpenAuthenticode</a> PowerShell module</li> <li>Python with Ansible and the required collections installed</li> <li>Access to the certificate and private key trusted by the App Control policy, typically as a PFX file</li> </ul> <div class="admonition note"> <p class="admonition-title">Note</p> <p>The <code>New-AnsiblePowerShellSignature</code> function is not officially supported and is marked as a tech preview.</p> </div> <p>To sign the Ansible PowerShell wrapper scripts, and modules in a collection, the following PowerShell script can be used with the loaded function from above:</p> <pre data-language="powershell">$certPassword = Read-Host "Enter the password for the certificate" -AsSecureString
+$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+   "wdac-cert.pfx"
+   $certPassword)
+
+$signingParams = @{
+   Certificate = $cert
+
+   Collection = @(
+      # Includes all the builtin execution wrappers and scripts needed for Ansible
+      'ansible.builtin'
+
+      # Add any remaining collections used in the playbook like microsoft.ad, community.windows, etc.
+      'ansible.windows'
+      'microsoft.ad'
+      'microsoft.iis'
+      'community.windows'
+   )
+
+   # The URL of the Authenticode timestamp server to use for timestamping
+   # the signature.
+   # https://learn.microsoft.com/en-us/windows/win32/seccrypto/time-stamping-authenticode-signatures
+   TimeStampServer = '...'
+}
+New-AnsiblePowerShellSignature @signingParams -Verbose
+</pre> <p>The <code>ansible.builtin</code> collection refers to the builtin execution scripts used in Ansible. Any other collection with PowerShell modules used in the playbook should be added to the <code>-Collection</code> parameter. The script will generate the <code>powershell_signatures.psd1</code> script signed by the certificate and contains the hashes of all the modules in the collection that should be trusted to run. It will also generate the signature for Ansible’s execution wrapper script in the Ansible installation directory so that Ansible can automatically run the script trusted by the App Control policy. The current behavior of <code>New-AnsiblePowerShellSignature</code> is to sign all the modules in the collection and the Ansible execution wrapper script even if they could include an escape hatch. It is recommended to skip any modules using the <code>-Skip</code> parameter that are not needed in the playbook, for example:</p> <pre data-language="powershell">New-AnsiblePowerShellSignature ... -Skip @(
+    'ansible.windows.win_dsc'
+    'ansible.windows.win_timezone'
+)
+</pre> <p>Any PowerShell content that is not part of a collection, like custom scripts or code used in <code>ansible.windows.win_powershell</code>, must be signed manually using the <code>Set-AuthenticodeSignature</code> cmdlet on Windows or <code>Set-OpenAuthenticodeSignature</code> through <code>OpenAuthenticode</code> module on Linux. It is important that these signed scripts are used in a way that will not modify the contents of the script or else the signature will be invalidated. For example the <code>ansible.builtin.script</code> module will copy the script file to the target host as is leaving the signature intact but using the <code>ansible.builtin.file</code> lookup will strip any remaining newline characters unless the <code>rstrip=False</code> option is used.</p> </section> <section id="known-module-differences"> <h2>Known Module Differences</h2> <p>When App Control is enabled, some modules may not work, or behave differently, even if signed. Some of the known differences are:</p> <ul class="simple"> <li>
+<code>ansible.windows.win_command</code> can only execute executables trusted by the App Control policy. If the executable is not trusted, the module will fail</li> <li>
+<code>ansible.windows.win_shell</code> will run all code in Constrained Language Mode (<code>CLM</code>) which is highly restricted and may cause some scripts to fail</li> <li>
+<code>ansible.windows.win_powershell</code> will run in CLM by default unless the provided script is signed</li> <li>
+<code>ansible.builtin.script</code> will run in CLM by default unless the provided script is signed</li> <li>
+<code>ansible.windows.win_package</code> can only run executables trusted by the App Control policy so may or may not work depending on the executable</li> <li>
+<code>ansible.windows.win_updates</code> is currently not supported and will not work</li> </ul> <p>Other modules that start sub-processes or rely on unsigned PowerShell content will most likely not work with App Control enabled.</p> <p>If trying to run a PowerShell script with <code>ansible.windows.win_powershell</code> or <code>ansible.builtin.script</code>, the script itself must be signed or else it will be run in CLM.</p> <pre data-language="yaml">- name: Test out LanguageMode
+  ansible.windows.win_powershell:
+    script: $ExecutionContext.SessionState.LanguageMode
+</pre> <p>It is important that when referencing a signed script that the script is not modified in any way. This means the line endings and whitespace that were present when it was signed must be the same when Ansible uses the signed script.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Ansible will always load the script with the UTF-8 encoding even if no Byte Order Mark (<code>BOM</code>) is present. It is important that the script was encoded with UTF-8 without a BOM when it was signed so that the signature stays valid. If the script was signed with a different encoding, the signature could be invalidated or PowerShell may interpret it with different characters.</p> </div> <p>When referencing a signed script in Ansible, it is important that it is used in a way that does not modify the contents of the script which would break the signature. For example you should have the signed script in the local <code>files</code> directory associated with the playbook/tasks and reference in one of the following ways:</p> <pre data-language="yaml">- name: Run signed script through the script module
+  ansible.builtin.script: signed-script.ps1
+
+- name: Run signed script through win_powershell as a path
+  ansible.windows.win_powershell:
+    path: signed-script.ps1
+
+- name: Run signed script through win_powershell as inline content
+  ansible.windows.win_powershell:
+    # rstrip=False is important so the last \r\n of the signature is not removed.
+    script: "{{ lookup('ansible.builtin.file', 'signed-script.ps1', rstrip=False) }}"
+</pre> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012&ndash;2018 Michael DeHaan<br>&copy; 2018&ndash;2025 Red Hat, Inc.<br>Licensed under the GNU General Public License version 3.<br>
+    <a href="https://docs.ansible.com/projects/ansible/latest/os_guide/windows_app_control.html" class="_attribution-link">https://docs.ansible.com/projects/ansible/latest/os_guide/windows_app_control.html</a>
+  </p>
+</div>

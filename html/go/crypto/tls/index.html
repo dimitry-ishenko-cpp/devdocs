@@ -220,9 +220,14 @@
 <pre data-language="go">type Certificate struct {
     Certificate [][]byte
     // PrivateKey contains the private key corresponding to the public key in
-    // Leaf. This must implement crypto.Signer with an RSA, ECDSA or Ed25519 PublicKey.
+    // Leaf. This must implement [crypto.Signer] with an RSA, ECDSA or Ed25519
+    // PublicKey.
+    //
     // For a server up to TLS 1.2, it can also implement crypto.Decrypter with
     // an RSA PublicKey.
+    //
+    // If it implements [crypto.MessageSigner], SignMessage will be used instead
+    // of Sign for TLS 1.2 and later.
     PrivateKey crypto.PrivateKey
     // SupportedSignatureAlgorithms is an optional list restricting what
     // signature algorithms the PrivateKey can be used for.
@@ -424,6 +429,10 @@ log.Fatal(srv.ListenAndServeTLS("", ""))
     // from, or write to, this connection; that will cause the TLS
     // connection to fail.
     Conn net.Conn // Go 1.8
+
+    // HelloRetryRequest indicates whether the ClientHello was sent in response
+    // to a HelloRetryRequest message.
+    HelloRetryRequest bool // Go 1.26
     // contains filtered or unexported fields
 }
 </pre> <h3 id="ClientHelloInfo.Context">func (*ClientHelloInfo) <span>Context</span>  <span title="Added in Go 1.17">1.17</span> </h3> <pre data-language="go">func (c *ClientHelloInfo) Context() context.Context</pre> <p>Context returns the context of the handshake that is in progress. This context is a child of the context passed to HandshakeContext, if any, and is canceled when the handshake concludes. </p>
@@ -446,10 +455,10 @@ log.Fatal(srv.ListenAndServeTLS("", ""))
 <pre data-language="go">type ClientSessionState struct {
     // contains filtered or unexported fields
 }
-</pre> <h3 id="NewResumptionState">func <span>NewResumptionState</span>  <span title="Added in Go 1.21">1.21</span> </h3> <pre data-language="go">func NewResumptionState(ticket []byte, state *SessionState) (*ClientSessionState, error)</pre> <p>NewResumptionState returns a state value that can be returned by [ClientSessionCache.Get] to resume a previous session. </p>
+</pre> <h3 id="NewResumptionState">func <span>NewResumptionState</span>  <span title="Added in Go 1.21">1.21</span> </h3> <pre data-language="go">func NewResumptionState(ticket []byte, state *SessionState) (*ClientSessionState, error)</pre> <p>NewResumptionState returns a state value that can be returned by <a href="#ClientSessionCache.Get">ClientSessionCache.Get</a> to resume a previous session. </p>
 <p>state needs to be returned by <a href="#ParseSessionState">ParseSessionState</a>, and the ticket and session state must have been returned by <a href="#ClientSessionState.ResumptionState">ClientSessionState.ResumptionState</a>. </p>
 <h3 id="ClientSessionState.ResumptionState">func (*ClientSessionState) <span>ResumptionState</span>  <span title="Added in Go 1.21">1.21</span> </h3> <pre data-language="go">func (cs *ClientSessionState) ResumptionState() (ticket []byte, state *SessionState, err error)</pre> <p>ResumptionState returns the session ticket sent by the server (also known as the session's identity) and the state necessary to resume this session. </p>
-<p>It can be called by [ClientSessionCache.Put] to serialize (with <a href="#SessionState.Bytes">SessionState.Bytes</a>) and store the session. </p>
+<p>It can be called by <a href="#ClientSessionCache.Put">ClientSessionCache.Put</a> to serialize (with <a href="#SessionState.Bytes">SessionState.Bytes</a>) and store the session. </p>
 <h2 id="Config">type <span>Config</span>  </h2> <p>A Config structure is used to configure a TLS client or server. After one has been passed to a TLS function it must not be modified. A Config may be reused; the tls package will also not modify it. </p>
 <pre data-language="go">type Config struct {
     // Rand provides the source of entropy for nonces and RSA blinding.
@@ -521,10 +530,13 @@ log.Fatal(srv.ListenAndServeTLS("", ""))
     // If GetConfigForClient is nil, the Config passed to Server() will be
     // used for all connections.
     //
-    // If SessionTicketKey was explicitly set on the returned Config, or if
-    // SetSessionTicketKeys was called on the returned Config, those keys will
+    // If SessionTicketKey is explicitly set on the returned Config, or if
+    // SetSessionTicketKeys is called on the returned Config, those keys will
     // be used. Otherwise, the original Config keys will be used (and possibly
-    // rotated if they are automatically managed).
+    // rotated if they are automatically managed). WARNING: this allows session
+    // resumtion of connections originally established with the parent (or a
+    // sibling) Config, which may bypass the [Config.VerifyPeerCertificate]
+    // value of the returned Config.
     GetConfigForClient func(*ClientHelloInfo) (*Config, error) // Go 1.8
 
     // VerifyPeerCertificate, if not nil, is called after normal
@@ -542,8 +554,10 @@ log.Fatal(srv.ListenAndServeTLS("", ""))
     // rawCerts may be empty on the server if ClientAuth is RequestClientCert or
     // VerifyClientCertIfGiven.
     //
-    // This callback is not invoked on resumed connections, as certificates are
-    // not re-verified on resumption.
+    // This callback is not invoked on resumed connections. WARNING: this
+    // includes connections resumed across Configs returned by [Config.Clone] or
+    // [Config.GetConfigForClient] and their parents. If that is not intended,
+    // use [Config.VerifyConnection] instead, or set [Config.SessionTicketsDisabled].
     //
     // verifiedChains and its contents should not be modified.
     VerifyPeerCertificate func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error // Go 1.8
@@ -688,6 +702,11 @@ log.Fatal(srv.ListenAndServeTLS("", ""))
     // From Go 1.24, the default includes the [X25519MLKEM768] hybrid
     // post-quantum key exchange. To disable it, set CurvePreferences explicitly
     // or use the GODEBUG=tlsmlkem=0 environment variable.
+    //
+    // From Go 1.26, the default includes the [SecP256r1MLKEM768] and
+    // [SecP256r1MLKEM768] hybrid post-quantum key exchanges, too. To disable
+    // them, set CurvePreferences explicitly or use either the
+    // GODEBUG=tlsmlkem=0 or the GODEBUG=tlssecpmlkem=0 environment variable.
     CurvePreferences []CurveID // Go 1.3
 
     // DynamicRecordSizingDisabled disables adaptive sizing of TLS records.
@@ -868,9 +887,10 @@ _ = &amp;tls.Config{
 </pre>   <h3 id="Config.BuildNameToCertificate">func (*Config) <span>BuildNameToCertificate</span>  </h3> <pre data-language="go">func (c *Config) BuildNameToCertificate()</pre> <p>BuildNameToCertificate parses c.Certificates and builds c.NameToCertificate from the CommonName and SubjectAlternateName fields of each of the leaf certificates. </p>
 <p>Deprecated: NameToCertificate only allows associating a single certificate with a given name. Leave that field nil to let the library select the first compatible chain from Certificates. </p>
 <h3 id="Config.Clone">func (*Config) <span>Clone</span>  <span title="Added in Go 1.8">1.8</span> </h3> <pre data-language="go">func (c *Config) Clone() *Config</pre> <p>Clone returns a shallow clone of c or nil if c is nil. It is safe to clone a <a href="#Config">Config</a> that is being used concurrently by a TLS client or server. </p>
-<h3 id="Config.DecryptTicket">func (*Config) <span>DecryptTicket</span>  <span title="Added in Go 1.21">1.21</span> </h3> <pre data-language="go">func (c *Config) DecryptTicket(identity []byte, cs ConnectionState) (*SessionState, error)</pre> <p>DecryptTicket decrypts a ticket encrypted by <a href="#Config.EncryptTicket">Config.EncryptTicket</a>. It can be used as a [Config.UnwrapSession] implementation. </p>
+<p>The returned Config can share session ticket keys with the original Config, which means connections could be resumed across the two Configs. WARNING: <a href="#Config.VerifyPeerCertificate">Config.VerifyPeerCertificate</a> does not get called on resumed connections, including connections that were originally established on the parent Config. If that is not intended, use <a href="#Config.VerifyConnection">Config.VerifyConnection</a> instead, or set <a href="#Config.SessionTicketsDisabled">Config.SessionTicketsDisabled</a>. </p>
+<h3 id="Config.DecryptTicket">func (*Config) <span>DecryptTicket</span>  <span title="Added in Go 1.21">1.21</span> </h3> <pre data-language="go">func (c *Config) DecryptTicket(identity []byte, cs ConnectionState) (*SessionState, error)</pre> <p>DecryptTicket decrypts a ticket encrypted by <a href="#Config.EncryptTicket">Config.EncryptTicket</a>. It can be used as a <a href="#Config.UnwrapSession">Config.UnwrapSession</a> implementation. </p>
 <p>If the ticket can't be decrypted or parsed, DecryptTicket returns (nil, nil). </p>
-<h3 id="Config.EncryptTicket">func (*Config) <span>EncryptTicket</span>  <span title="Added in Go 1.21">1.21</span> </h3> <pre data-language="go">func (c *Config) EncryptTicket(cs ConnectionState, ss *SessionState) ([]byte, error)</pre> <p>EncryptTicket encrypts a ticket with the <a href="#Config">Config</a>'s configured (or default) session ticket keys. It can be used as a [Config.WrapSession] implementation. </p>
+<h3 id="Config.EncryptTicket">func (*Config) <span>EncryptTicket</span>  <span title="Added in Go 1.21">1.21</span> </h3> <pre data-language="go">func (c *Config) EncryptTicket(cs ConnectionState, ss *SessionState) ([]byte, error)</pre> <p>EncryptTicket encrypts a ticket with the <a href="#Config">Config</a>'s configured (or default) session ticket keys. It can be used as a <a href="#Config.WrapSession">Config.WrapSession</a> implementation. </p>
 <h3 id="Config.SetSessionTicketKeys">func (*Config) <span>SetSessionTicketKeys</span>  <span title="Added in Go 1.5">1.5</span> </h3> <pre data-language="go">func (c *Config) SetSessionTicketKeys(keys [][32]byte)</pre> <p>SetSessionTicketKeys updates the session ticket keys for a server. </p>
 <p>The first key will be used when creating new tickets, while all keys can be used for decrypting tickets. It is safe to call this function while the server is running in order to rotate the session ticket keys. The function will panic if keys is empty. </p>
 <p>Calling this function will turn off automatic session ticket key rotation. </p>
@@ -1023,6 +1043,10 @@ conn.Close()
     // and accepted by the server. Currently, ECH is supported only on the
     // client side.
     ECHAccepted bool // Go 1.23
+
+    // HelloRetryRequest indicates whether we sent a HelloRetryRequest if we
+    // are a server, or if we received a HelloRetryRequest if we are a client.
+    HelloRetryRequest bool // Go 1.26
     // contains filtered or unexported fields
 }
 </pre> <h3 id="ConnectionState.ExportKeyingMaterial">func (*ConnectionState) <span>ExportKeyingMaterial</span>  <span title="Added in Go 1.11">1.11</span> </h3> <pre data-language="go">func (cs *ConnectionState) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error)</pre> <p>ExportKeyingMaterial returns length bytes of exported key material in a new slice as defined in RFC 5705. If context is nil, it is not used as part of the seed. If the connection was set to allow renegotiation via Config.Renegotiation, or if the connections supports neither TLS 1.3 nor Extended Master Secret, this function will return an error. </p>
@@ -1030,11 +1054,13 @@ conn.Close()
 <h2 id="CurveID">type <span>CurveID</span>  <span title="Added in Go 1.3">1.3</span> </h2> <p>CurveID is the type of a TLS identifier for a key exchange mechanism. See <a href="https://www.iana.org/assignments/tls-parameters/tls-parameters.xml#tls-parameters-8">https://www.iana.org/assignments/tls-parameters/tls-parameters.xml#tls-parameters-8</a>. </p>
 <p>In TLS 1.2, this registry used to support only elliptic curves. In TLS 1.3, it was extended to other groups and renamed NamedGroup. See RFC 8446, Section 4.2.7. It was then also extended to other mechanisms, such as hybrid post-quantum KEMs. </p>
 <pre data-language="go">type CurveID uint16</pre> <pre data-language="go">const (
-    CurveP256      CurveID = 23
-    CurveP384      CurveID = 24
-    CurveP521      CurveID = 25
-    X25519         CurveID = 29
-    X25519MLKEM768 CurveID = 4588
+    CurveP256          CurveID = 23
+    CurveP384          CurveID = 24
+    CurveP521          CurveID = 25
+    X25519             CurveID = 29
+    X25519MLKEM768     CurveID = 4588
+    SecP256r1MLKEM768  CurveID = 4587
+    SecP384r1MLKEM1024 CurveID = 4589
 )</pre> <h3 id="CurveID.String">func (CurveID) <span>String</span>  <span title="Added in Go 1.15">1.15</span> </h3> <pre data-language="go">func (i CurveID) String() string</pre> <h2 id="Dialer">type <span>Dialer</span>  <span title="Added in Go 1.15">1.15</span> </h2> <p>Dialer dials TLS connections given a configuration and a Dialer for the underlying connection. </p>
 <pre data-language="go">type Dialer struct {
     // NetDialer is the optional dialer to use for the TLS connections'
@@ -1062,13 +1088,29 @@ conn.Close()
 </pre> <h3 id="ECHRejectionError.Error">func (*ECHRejectionError) <span>Error</span>  <span title="Added in Go 1.23">1.23</span> </h3> <pre data-language="go">func (e *ECHRejectionError) Error() string</pre> <h2 id="EncryptedClientHelloKey">type <span>EncryptedClientHelloKey</span>  <span title="Added in Go 1.24">1.24</span> </h2> <p>EncryptedClientHelloKey holds a private key that is associated with a specific ECH config known to a client. </p>
 <pre data-language="go">type EncryptedClientHelloKey struct {
     // Config should be a marshalled ECHConfig associated with PrivateKey. This
-    // must match the config provided to clients byte-for-byte. The config
-    // should only specify the DHKEM(X25519, HKDF-SHA256) KEM ID (0x0020), the
-    // HKDF-SHA256 KDF ID (0x0001), and a subset of the following AEAD IDs:
-    // AES-128-GCM (0x0001), AES-256-GCM (0x0002), ChaCha20Poly1305 (0x0003).
+    // must match the config provided to clients byte-for-byte. The config must
+    // use as KEM one of
+    //
+    //   - DHKEM(P-256, HKDF-SHA256) (0x0010)
+    //   - DHKEM(P-384, HKDF-SHA384) (0x0011)
+    //   - DHKEM(P-521, HKDF-SHA512) (0x0012)
+    //   - DHKEM(X25519, HKDF-SHA256) (0x0020)
+    //
+    // and as KDF one of
+    //
+    //   - HKDF-SHA256 (0x0001)
+    //   - HKDF-SHA384 (0x0002)
+    //   - HKDF-SHA512 (0x0003)
+    //
+    // and as AEAD one of
+    //
+    //   - AES-128-GCM (0x0001)
+    //   - AES-256-GCM (0x0002)
+    //   - ChaCha20Poly1305 (0x0003)
+    //
     Config []byte
-    // PrivateKey should be a marshalled private key. Currently, we expect
-    // this to be the output of [ecdh.PrivateKey.Bytes].
+    // PrivateKey should be a marshalled private key, in the format expected by
+    // HPKE's DeserializePrivateKey (see RFC 9180), for the KEM used in Config.
     PrivateKey []byte
     // SendAsRetry indicates if Config should be sent as part of the list of
     // retry configs when ECH is requested by the client but rejected by the
@@ -1123,6 +1165,10 @@ conn.Close()
 
     // Set for QUICResumeSession and QUICStoreSession.
     SessionState *SessionState // Go 1.23
+
+    // Set for QUICErrorEvent.
+    // The error will wrap AlertError.
+    Err error // Go 1.26
 }
 </pre> <h2 id="QUICEventKind">type <span>QUICEventKind</span>  <span title="Added in Go 1.21">1.21</span> </h2> <p>A QUICEventKind is a type of operation on a QUIC connection. </p>
 <pre data-language="go">type QUICEventKind int</pre> <pre data-language="go">const (
@@ -1181,6 +1227,11 @@ conn.Close()
     // The application may modify the [SessionState] before storing it.
     // This event only occurs on client connections.
     QUICStoreSession
+
+    // QUICErrorEvent indicates that a fatal error has occurred.
+    // The handshake cannot proceed and the connection must be closed.
+    // QUICEvent.Err is set.
+    QUICErrorEvent
 )</pre> <h2 id="QUICSessionTicketOptions">type <span>QUICSessionTicketOptions</span>  <span title="Added in Go 1.21">1.21</span> </h2> <pre data-language="go">type QUICSessionTicketOptions struct {
     // EarlyData specifies whether the ticket may be used for 0-RTT.
     EarlyData bool

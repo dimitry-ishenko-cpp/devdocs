@@ -1,0 +1,356 @@
+<div id="top-content"> <div class="heading-with-actions top-heading"> <h1>Security</h1> <a href="https://github.com/phoenixframework/phoenix/blob/v1.8.8/guides/security.md#L1" title="View Source" class="source" rel="help nofollow">Source</a> </div> <p>All software exposed to the public internet will be attacked. Most Phoenix applications fall into this category, so it is useful to understand common types of web application security vulnerabilities, the impact of each, and how to avoid them. Consider the following scenario:</p>
+<p>You are responsible for a banking application which handles transactions via a Phoenix backend. A new code change introduces a remote code execution (RCE) vulnerability, granting an attacker production SSH access to the server. This results in the database being exfiltrated, user accounts being compromised, and customer funds being stolen. </p>
+<p>With the rise of generative AI coding tools, proper judgement on the security of code has become more important than ever. This document will detail how severe vulnerabilities can occur in a Phoenix project and secure coding best practices to help avoid an incident. </p>
+<h2 id="remote-code-execution-rce" class="section-heading">
+<span class="text">Remote Code Execution (RCE)</span>
+</h2>
+<p>A remote code execution (RCE) vulnerability grants an attacker the equivalent of production SSH access to your web server. This type of vulnerability is often considered the worst possible case, because it does not require user interaction and allows an attacker to bypass all security controls in your application.</p>
+<p>You should never pass untrusted user input to the following functions:</p>
+<pre data-language="elixir"># Code functions
+Code.eval_string/3
+Code.eval_file/2
+Code.eval_quoted/3
+
+# EEX functions
+eval_string/3
+eval_file/3
+
+# Command injection functions
+:os.cmd/2
+System.cmd/3
+System.shell/2</pre>
+<p>All of these functions execute arbitrary code on your server if passed external input. The risk here is obvious to most programmers, so it is rare to find a Phoenix application vulnerable in this way. </p>
+<p>The more common and often unexpected way a Phoenix application is vulnerable to RCE is via the Erlang function <code class="inline">binary_to_term</code>. From <a href="https://www.erlang.org/doc/apps/erts/erlang.html#binary_to_term/2">the Erlang docs:</a></p>
+<blockquote><p>When decoding binaries from untrusted sources, the untrusted source may submit data in a way to create resources, such as atoms and remote references, that cannot be garbage collected and lead to a Denial of Service (DoS) attack. In such cases, use <code class="inline">binary_to_term/2</code> with the <code class="inline">safe</code> option.</p></blockquote>
+<p>This warning is confusing, because the <code class="inline">safe</code> option mentioned above only prevents the creation of new atoms at runtime. It does not prevent the creation of executable terms via malicious user input, which is a much greater risk. </p>
+<pre data-language="elixir"># Not safe
+:erlang.binary_to_term(user_input, [:safe])
+
+# Safe
+Plug.Crypto.non_executable_binary_to_term(user_input, [:safe])</pre>
+<p>The function <code class="inline">Plug.Crypto.non_executable_binary_to_term</code> prevents the creation of executable terms at runtime. If you are curious how this vulnerability can occur in the real world, see the writeup on <a rel="nofollow" href="https://www.alphabot.com/security/blog/2020/elixir/Remote-code-execution-vulnerability-in-Elixir-based-Paginator-project.html">CVE-2020-15150 in the library Paginator.</a></p>
+<h2 id="sql-injection" class="section-heading">
+<span class="text">SQL Injection</span>
+</h2>
+<p>SQL injection is on par with RCE as a highly severe vulnerability that leads to your entire database being leaked, and can even be leveraged to achieve code execution in some contexts. The good news for Phoenix developers is the majority of applications use Ecto, which is the interface to a dedicated database, typically PostgreSQL or MySQL. The Ecto query syntax protects against SQL injection by default:</p>
+<pre data-language="elixir"># Safe, using query syntax 
+def a_get_fruit(min_q) do
+  from(
+    f in Fruit,
+    where:
+      f.quantity &gt;= ^min_q and
+        f.secret == false
+  )
+  |&gt; Repo.all()
+end</pre>
+<p>The <code class="inline">fragment</code> function seems to be a vector for SQL injection:</p>
+<pre data-language="elixir"># Fails to compile 
+def b_get_fruit(min_q) do
+  from(
+    f in Fruit,
+    where: fragment("f0.quantity &gt;= #{min_q} AND f0.secret = FALSE")
+  )
+  |&gt; Repo.all()
+end</pre>
+<p>Yet if you try to compile the above code it fails:</p>
+<pre data-language="elixir">Compiling 1 file (.ex)
+
+== Compilation error in file lib/basket/goods.ex ==
+** (Ecto.Query.CompileError) to prevent SQL injection attacks, fragment(...) 
+does not allow strings to be interpolated as the first argument via the `^` 
+operator, got: `"f0.quantity &gt;= #{min_q} AND f0.secret = FALSE"`</pre>
+<p>What about passing arguments via fragment?</p>
+<pre data-language="elixir"># Safe
+def c_get_fruit(min_q) do
+  min_q = String.to_integer(min_q)
+  from(
+    f in Fruit,
+    where: fragment("f0.quantity &gt;= ? AND f0.secret = FALSE", ^min_q)
+  )
+  |&gt; Repo.all()
+end</pre>
+<p>The above code is safe because the external user input is safely parameterized into the query. What if you decide to pass arguments directly into raw SQL?</p>
+<pre data-language="elixir"># Safe
+def d_get_fruit(min_q) do
+  q = """
+  SELECT f.id, f.name, f.quantity, f.secret
+  FROM fruits AS f
+  WHERE f.quantity &gt; $1 AND f.secret = FALSE
+  """
+  {:ok, %{rows: rows}} =
+    Ecto.Adapters.SQL.query(Repo, q, [String.to_integer(min_q)])
+end</pre>
+<p>The above code is safe, similar to the fragment example, because the user input is being safely parameterized. </p>
+<p>Constructing a SQL query string via user input, then passing it directly to the query function does lead to SQL injection: </p>
+<pre data-language="elixir"># Vulnerable to SQL injection
+def e_get_fruit(min_q) do
+  q = """
+  SELECT f.id, f.name, f.quantity, f.secret
+  FROM fruits AS f
+  WHERE f.quantity &gt; #{min_q} AND f.secret = FALSE
+  """
+  {:ok, %{rows: rows}} =
+    Ecto.Adapters.SQL.query(Repo, q)
+end</pre>
+<p>If you find yourself writing raw SQL, take care not to interpolate directly into the string, but rather use parameters for external input into the query.</p>
+<h2 id="server-side-request-forgery-ssrf" class="section-heading">
+<span class="text">Server Side Request Forgery (SSRF)</span>
+</h2>
+<p>Server Side Request Forgery (SSRF) is a critical vulnerability that has been the root cause of major data breaches. The problem is untrusted user input being used to make outbound HTTP requests, which leads to the exploitation of services reachable from your Phoenix application. </p>
+<p>When you create a server in most cloud providers today, for example AWS EC2, there will be a <a rel="nofollow" href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html">metadata service</a> exposed on a private IP address. In the case of AWS it's on <code class="inline">169.254.169.254</code>. If you send an HTTP request to:</p>
+<p><code class="inline">http://169.254.169.254/iam/security-credentials</code></p>
+<p>From the server, it will return credentials for the AWS account. If you write a web application (for example in Phoenix) where a user can enter a URL, and then view the response of an HTTP request sent to that URL, that functionality is potentially vulnerable to SSRF. For a real world incident see <a rel="nofollow" href="https://dl.acm.org/doi/pdf/10.1145/3546068">the Capital One breach.</a></p>
+<p>Your reaction to this may be "This seems like an unsafe feature, considering they named an entire vulnerability class after it." You are not alone in this opinion, AWS introduced some SSRF specific mitigations in <a rel="nofollow" href="https://aws.amazon.com/blogs/security/defense-in-depth-open-firewalls-reverse-proxies-ssrf-vulnerabilities-ec2-instance-metadata-service/">2019 via IMDSv2</a>, requiring HTTP requests to the metadata endpoint to have session authentication. </p>
+<p>The instance metadata service of cloud servers is not the only target for SSRF: services such as PostgreSQL, MySQL, Redis, Elasticsearch, even custom micro-services that you believe are not exposed to the public internet may be vulnerable to SSRF. Consider an internal server with vulnerabilities that can be exploited via HTTP requests, not directly exposed to the public internet. Yet if that network also has a Phoenix application vulnerable to SSRF, an attacker can go through the Phoenix server to attack the private server. </p>
+<p>To summarize, using an HTTP client does not necessarily mean your application is vulnerable to SSRF. Rather the following conditions must be met:</p>
+<ol>
+<li>You are using external user input to construct URLs</li>
+<li>An attacker is able to send HTTP requests to some vulnerable server on your network </li>
+</ol>
+<p>For an Elixir specific example consider the Req library:</p>
+<pre data-language="elixir">req = Req.new(base_url: "https://api.github.com")
+
+Req.get!(req, url: "/repos/sneako/finch").body["description"]
+#=&gt; "Elixir HTTP client, focused on performance"</pre>
+<p>It is possible to override the <code class="inline">base_url</code> value:</p>
+<pre data-language="elixir">req = Req.new(base_url: "https://elixir-lang.org/")
+user_input = "https://dashbit.co/blog"
+Req.get!(req, url: user_input) </pre>
+<p>The above code sends a request to <code class="inline">https://dashbit.co/blog</code>, NOT <code class="inline">https://elixir-lang.org/</code>. </p>
+<p>Consider a similar example in Tesla:</p>
+<pre data-language="elixir">plug Tesla.Middleware.BaseUrl, "https://example.com/foo"
+
+MyClient.get("http://example.com/bar") # equals to GET http://example.com/bar</pre>
+<p>Even if you are setting a base URL in your application, don't treat it as a security barrier, because as these examples show it can be overwritten. Take care to avoid sending HTTP requests based on user input if you can avoid it, and be mindful of services on the same network as your Phoenix application that could be exploited via SSRF.</p>
+<h2 id="cross-origin-resource-sharing-cors-misconfiguration" class="section-heading">
+<span class="text">Cross Origin Resource Sharing (CORS) Misconfiguration</span>
+</h2>
+<p>Cross Origin Resource Sharing (CORS) is a feature in modern web browsers which can be used to bypass the same origin policy, which is useful because your application can now load resources from a different site in the user's web browser. This is normally restricted by default. </p>
+<p>Consider a Phoenix API with a single page application (SPA) on a different domain:</p>
+<p><code class="inline">app.example.com</code> - React frontend </p>
+<p><code class="inline">api.example.com</code> - Backend in Elixir/Phoenix </p>
+<p>The frontend <code class="inline">(app.example.com)</code> needs to fetch information about the current user, however the origins of these projects are different. The user's web browser will block the request unless CORS is enabled between the sites.</p>
+<p>Setting the following in the Phoenix application:</p>
+<pre data-language="elixir">plug CORSPlug, origin: ["https://app.example.com"]</pre>
+<p>Is the correct way to do this. However it is also possible to set a policy that is far too broad, for example:</p>
+<pre data-language="elixir">plug CORSPlug, origin: ~r/^http.*/</pre>
+<p>This is a major security risk, because now a malicious site loaded by a user who is logged into the application can read sensitive data, for example API keys. Take care to ensure only trusted sites are allowed here. </p>
+<h2 id="broken-access-control" class="section-heading">
+<span class="text">Broken Access Control</span>
+</h2>
+<p>In Phoenix controllers the standard way to handle authorization is putting the current user in the assigns, and then doing:</p>
+<pre data-language="elixir">user = conn.assigns.current_user</pre>
+<p>Many projects add this as a third argument in the controller actions:</p>
+<pre data-language="elixir">def action(conn, _) do
+  args = [conn, conn.params, conn.assigns.current_user]
+  apply(__MODULE__, action_name(conn), args)
+end</pre>
+<p>This is the correct approach. The wrong approach is to accept arbitrary user input when making authorization decisions, for example:</p>
+<pre data-language="elixir"># Not safe
+def index(conn, %{"user" =&gt; user_email})
+  user = Accounts.get_user_by_email(user_email)</pre>
+<p>In the above example an attacker can simply change the submitted <code class="inline">user_email</code> string to an arbitrary value to perform an action as a different user. Using <code class="inline">conn.assigns.current_user</code> avoids this problem. </p>
+<p>Related to the above concept, the design of Ecto in Phoenix takes the risk of mass assignment into consideration, because you have to explicitly define what parameters are allowed to be set from user supplied data. Consider a simple users schema:</p>
+<pre data-language="elixir">  schema "users" do
+    field :email, :string
+    field :password, :string, virtual: true, redact: true
+    field :hashed_password, :string, redact: true
+    field :confirmed_at, :naive_datetime
+    field :is_admin, :boolean 
+
+    timestamps(type: :utc_datetime)
+  end
+
+
+  def registration_changeset(user, attrs, opts \\ []) do
+    user
+    |&gt; cast(attrs, [:email, :password, :is_admin])
+    |&gt; validate_email()
+    |&gt; validate_password(opts)
+  end</pre>
+<p>Assume that the corresponding signup form is exposed to the public internet. Can you spot the vulnerability? The problem is that <code class="inline">:is_admin</code> should never be set via external user input. Anyone on the public internet can now create a user where <code class="inline">:is_admin</code> is set to true in the database, which is likely not the intent of the developer.</p>
+<h2 id="cross-site-scripting-xss" class="section-heading">
+<span class="text">Cross Site Scripting (XSS)</span>
+</h2>
+<p>By default, user input in Phoenix is escaped so that:</p>
+<pre data-language="elixir">&lt;%= "&lt;hello&gt;" %&gt;</pre>
+<p>is shown in your browser as:</p>
+<pre data-language="elixir">&amp;lt;hello&amp;gt;</pre>
+<p>Note that this looks like a normal string of <code class="inline">&lt;hello&gt;</code> from an end user perspective, the <code class="inline">&amp;lt;</code> and <code class="inline">&amp;gt;</code> are only visible if you inspect the page with your browser tools. </p>
+<p>It is possible to bypass this protection via the <code class="inline">raw/1</code> function. For example, consider the string <code class="inline">&lt;b&gt;hello&lt;/b&gt;</code>. </p>
+<pre data-language="elixir"># This will render the literal string &lt;b&gt;hello&lt;/b&gt;
+&lt;%= "&lt;b&gt;hello&lt;/b&gt;" %&gt;
+
+# This will render a bold hello 
+&lt;%= raw "&lt;b&gt;hello&lt;/b&gt;" %&gt;</pre>
+<p>With the ability to inject script tags, an attacker now has the ability to execute JavaScript in a victim's browser, for example by submitting a string such as: </p>
+<pre data-language="elixir">&lt;script&gt;alert(1)&lt;/script&gt;</pre>
+<p>If someone submits the above input to your application, and it is displayed to logged in users, you have a serious problem. See the <a rel="nofollow" href="https://en.wikipedia.org/wiki/Samy_(computer_worm)">2005 MySpace worm</a> for a real world example of this. </p>
+<p>User input should never be passed into the <code class="inline">raw/1</code> function. There are some additional vectors for XSS in Phoenix applications, for example consider the following controller functions: </p>
+<pre data-language="elixir">def html_resp(conn, %{"i" =&gt; i}) do
+  html(conn, "&lt;html&gt;&lt;head&gt;#{i}&lt;/head&gt;&lt;/html&gt;")
+end</pre>
+<p>Because the HTML is being generated from user input, the function is vulnerable to XSS. This can also happen with <code class="inline">put_resp_content_type</code>:</p>
+<pre data-language="elixir">def send_resp_html(conn, %{"i" =&gt; i}) do
+  conn
+  |&gt; put_resp_content_type("text/html")
+  |&gt; send_resp(200, "#{i}")
+end</pre>
+<p>File uploads can also lead to XSS.</p>
+<pre data-language="elixir">def new_upload(conn, _params) do
+  render(conn, "new_upload.html")
+end
+
+def upload(conn, %{"upload" =&gt; upload}) do
+  %Plug.Upload{content_type: content_type, filename: filename, path: path} = upload
+  ImgServer.put(filename, %{content_type: content_type, bin: File.read!(path)})
+  redirect(conn, to: Routes.page_path(conn, :view_photo, filename))
+end
+
+def view_photo(conn, %{"filename" =&gt; filename}) do
+  case ImgServer.get(filename) do
+    %{content_type: content_type, bin: bin} -&gt;
+      conn
+      |&gt; put_resp_content_type(content_type)
+      |&gt; send_resp(200, bin)
+    _ -&gt;
+      conn
+      |&gt; put_resp_content_type("text/html")
+      |&gt; send_resp(404, "Not Found")
+  end
+end</pre>
+<p>User input determines the <code class="inline">content-type</code> of the file. There is no validation on the type of file being uploaded, meaning <code class="inline">content-type</code> can be set so an HTML page is rendered. This is the source of the vulnerability. Consider the file <code class="inline">xss.html</code>, with the contents:</p>
+<pre data-language="elixir">&lt;html&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;/html&gt;</pre>
+<p>This will result in JavaScript being executed in the browser of the victim who views the image. Restricting the <code class="inline">put_resp_content_type</code> argument to only image files would fix this vulnerability. </p>
+<h2 id="cross-site-request-forgery-csrf" class="section-heading">
+<span class="text">Cross Site Request Forgery (CSRF)</span>
+</h2>
+<h3 id="standard-csrf-in-html-forms" class="section-heading">
+<span class="text">Standard CSRF in HTML forms</span>
+</h3>
+<p>Cross site request forgery (CSRF) is a vulnerability that exists due to a quirk in how web browsers work. Consider a social media website that is vulnerable to CSRF. An attacker creates a malicious website aimed at legitimate users. When a victim visits the malicious site, it triggers a POST request in the victim’s browser, sending a message that was written by the attacker. This results in the victim’s account making a post written by the attacker.</p>
+<p>But why is this possible? Shouldn't the web browser block POST requests initiated by a different website? There is a cookie feature called SameSite that addresses this problem, however it's good to understand what CSRF is and why Phoenix has built in protections. </p>
+<p>Consider the following form:</p>
+<pre data-language="elixir">&lt;form action="/posts" method="post"&gt;
+
+  &lt;label for="post_title"&gt;Title&lt;/label&gt;
+  &lt;input id="post_title" name="post[title]" type="text"&gt;
+
+  &lt;label for="post_body"&gt;Body&lt;/label&gt;
+  &lt;textarea id="post_body" name="post[body]"&gt;
+  &lt;/textarea&gt;
+
+  &lt;div&gt;
+    &lt;button type="submit"&gt;Save&lt;/button&gt;
+  &lt;/div&gt;
+&lt;/form&gt;
+</pre>
+<p>This maps to the following HTTP request:</p>
+<pre data-language="elixir">POST /posts HTTP/1.1
+Host: example.com
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 53
+
+post[title]=My+Title&amp;post[body]=This+is+the+body</pre>
+<p>An attacker can embed the following form on <code class="inline">attacker.com</code>:</p>
+<pre data-language="elixir">&lt;form action="https://example.com/posts" method="post"&gt;
+
+  &lt;label for="post_title"&gt;Title&lt;/label&gt;
+  &lt;input id="post_title" name="post[title]" type="text" value="Attacker post"&gt;
+
+  &lt;label for="post_body"&gt;Body&lt;/label&gt;
+  &lt;textarea id="post_body" name="post[body]"&gt;This post was written by the bad guy&lt;/textarea&gt;
+
+  &lt;div&gt;
+    &lt;button type="submit"&gt;Save&lt;/button&gt;
+  &lt;/div&gt;
+&lt;/form&gt;</pre>
+<p>Note that this form does not even have to be visible to the victim user. When the user visits <code class="inline">attacker.com</code> the form will automatically submit a POST request on behalf of the victim, with the victim's current session cookie, to the vulnerable site. </p>
+<p>The way most web frameworks, including Phoenix, mitigate this vulnerability is by requiring a CSRF token when submitting a form.</p>
+<pre data-language="elixir">&lt;!-- A typical CSRF token seen in a Phoenix form --&gt;
+&lt;input name="_csrf_token" type="hidden" hidden="" 
+  value="WUZXJh07BhAIJ24jP1d-KQEpLwYmMDwQ0-2eYNLH_x8oHoO_qv_HJDqZ"&gt;</pre>
+<p>This changes the previous HTTP request to:</p>
+<pre data-language="elixir">POST /posts HTTP/1.1
+Host: example.com
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 53
+
+post[title]=My+Title&amp;post[body]=This+is+the+body&amp;post[_csrf_token]=WUZXJh07BhAIJ24jP1d-KQEpLwYmMDwQ0-2eYNLH_x8oHoO_qv_HJDqZ</pre>
+<p>Because the token is randomly generated, an attacker cannot predict what the value will be. The application is safe against CSRF attacks because Phoenix checks the value of this token by default via the <code class="inline">:protect_from_forgery</code> plug, which is included in the default <code class="inline">:browser</code> pipeline of a new Phoenix project:</p>
+<pre data-language="elixir"># router.ex
+
+  pipeline :browser do
+    plug :accepts, ["html"]
+    plug :fetch_session
+    plug :fetch_live_flash
+    plug :put_root_layout, {CarafeWeb.LayoutView, :root}
+    plug :protect_from_forgery      # &lt;-- Checks the CSRF token value
+    plug :put_secure_browser_headers
+    plug :fetch_current_user
+  end</pre>
+<p>CSRF protections are included in Phoenix by default, so your application is most likely not vulnerable if you are using the default settings. </p>
+<h3 id="action-re-use-csrf" class="section-heading">
+<span class="text">Action Re-Use CSRF</span>
+</h3>
+<p>Most descriptions of CSRF focus on state changing POST requests and the need for random tokens, as was just covered. Is CSRF possible with a GET request? Yes, GET requests should never be used to perform state changing actions in a web application (place an order, transfer money, etc) because they cannot be protected against CSRF in the same way POST requests can. </p>
+<p>Consider the following form:</p>
+<pre data-language="elixir">&lt;.form :let={f} for={@bio_changeset} action={~p"/users/settings/edit_bio"} method="post" id="edit_bio"&gt;
+  &lt;div class="pt-4"&gt;
+    &lt;%= label f, :bio %&gt;
+    &lt;%= textarea f, :bio, required: true, class: "" %&gt;
+    &lt;%= error_tag f, :bio %&gt;
+  &lt;/div&gt;
+
+  &lt;div&gt;
+    &lt;%= submit "Update Bio", class: "" %&gt;
+  &lt;/div&gt;
+&lt;/.form&gt;</pre>
+<p>Submitting this form triggers a POST request:</p>
+<pre data-language="elixir">[info] POST /users/settings/edit_bio
+[debug] Processing with CarafeWeb.UserSettingsController.edit_bio/2
+  Parameters: %{"_csrf_token" =&gt; "cigMDlcdAnxbWW88OAAiBHoZZ3cmCW0l1refzZ7D666RWvjCLi02UZXq", "user" =&gt; %{"bio" =&gt; "My bio here"}}
+  Pipelines: [:browser, :require_authenticated_user]</pre>
+<p>The important point is that the above parameters match the route and controller action:</p>
+<pre data-language="elixir"># router.ex
+post "/users/settings/edit_bio", UserSettingsController, :edit_bio
+
+# user_settings_controller.ex
+def edit_bio(conn, %{"user" =&gt; params}) do
+  case Accounts.update_user_bio(conn.assigns.current_user, params) do
+    {:ok, _bio} -&gt;
+      conn
+      |&gt; put_flash(:info, "Bio Update Successful")
+      |&gt; redirect(to: Routes.user_settings_path(conn, :edit))
+    {:error, changeset} -&gt;
+      render(conn, "edit.html", bio_changeset: changeset)
+  end
+end</pre>
+<p>The parameters:</p>
+<pre data-language="elixir">%{"_csrf_token" =&gt; "cigMDlcdAnxbWW88OAAiBHoZZ3cmCW0l1refzZ7D666RWvjCLi02UZXq", "user" =&gt; %{"bio" =&gt; "My bio here"}}</pre>
+<p>Match the <code class="inline">edit_bio/2</code> action. Note that the <code class="inline">_csrf_token</code> is processed in the router by the plug <code class="inline">:protect_from_forgery</code> built into Phoenix. </p>
+<p>Now consider the following update to the router:</p>
+<pre data-language="elixir"># router.ex
+get "/users/settings/edit_bio", UserSettingsController, :edit_bio
+post "/users/settings/edit_bio", UserSettingsController, :edit_bio</pre>
+<p>Allowing access to the <code class="inline">edit_bio/2</code> controller action via a GET request introduces an action re-use CSRF vulnerability. If the victim visits the following URL:</p>
+<p><code class="inline">/users/settings/edit_bio?user%5Bbio%5D=Hacked+LOL</code></p>
+<p>It will trigger the following:</p>
+<pre data-language="elixir">[info] GET /users/settings/edit_bio
+[debug] Processing with CarafeWeb.UserSettingsController.edit_bio/2
+  Parameters: %{"user" =&gt; %{"bio" =&gt; "Hacked LOL"}}
+  Pipelines: [:browser, :require_authenticated_user]</pre>
+<p>These parameters will match the <code class="inline">edit_bio/2</code> controller action, updating the user biography. The key lesson here is that state changing actions (transferring money, creating a post, updating account information) should occur via a POST request with proper CSRF protections, never via a GET request. </p>
+<h2 id="further-reading" class="section-heading">
+<span class="text">Further Reading</span>
+</h2>
+<p>The Erlang Ecosystem Foundation also publishes in-depth documents which are relevant for Erlang, Elixir, and Phoenix developers. These include:</p>
+<ul>
+<li><p><a rel="nofollow" href="https://security.erlef.org/web_app_security_best_practices_beam/">Web Application Security Best Practices for BEAM languages</a></p></li>
+<li><p><a rel="nofollow" href="https://security.erlef.org/secure_coding_and_deployment_hardening/">Secure Coding and Deployment Hardening Guidelines</a></p></li>
+</ul> </div> <div class="bottom-actions" id="bottom-actions"> <div class="bottom-actions-item"> <a href="telemetry.html" class="bottom-actions-button" rel="prev"> <span class="subheader"> ← Previous Page </span> <span class="title"> Telemetry </span> </a> </div> <div class="bottom-actions-item"> <a href="contexts.html" class="bottom-actions-button" rel="next"> <span class="subheader"> Next Page → </span> <span class="title"> 1. Intro to Contexts </span> </a> </div> </div> <footer class="footer"> <p> <span class="line"> <a href="https://hex.pm/packages/phoenix/1.8.8">Hex Package</a> <a href="https://preview.hex.pm/preview/phoenix/1.8.8">Hex Preview</a> (<a href="https://preview.hex.pm/preview/phoenix/1.8.8/show/guides/security.md">current file</a>) </span> <span class="line"> <button class="a-main footer-button display-quick-switch" title="Go to package docs"> Go to package docs </button> <a href="phoenix.epub.html"> Download ePub version </a> </span> </p> <p class="built-using"> Built using <a href="https://github.com/elixir-lang/ex_doc" title="ExDoc" target="_blank" rel="help noopener nofollow" translate="no">ExDoc</a> (v0.40.3) for the <a href="https://elixir-lang.org" title="Elixir" target="_blank" translate="no">Elixir programming language</a> </p> </footer><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2014 Chris McCord<br>Licensed under the MIT License.<br>
+    <a href="https://phoenix.hexdocs.pm/security.html" class="_attribution-link">https://phoenix.hexdocs.pm/security.html</a>
+  </p>
+</div>

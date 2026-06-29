@@ -1,0 +1,254 @@
+<h1 id="The-World-Age-mechanism">The World Age mechanism</h1>
+<div class="admonition is-info" id="Note-9e09b85080846bd5">
+
+<div class="admonition-body"><p>World age is an advanced concept. For the vast majority of Julia users, the world age mechanism operates invisibly in the background. This documentation is intended for the few users who may encounter world-age related issues or error messages.</p></div>
+</div>
+<div class="admonition is-compat" id="Julia-1.12-3d7a009279ac593c">
+
+<div class="admonition-body"><p>Prior to Julia 1.12, the world age mechanism did not apply to changes to the global binding table. The documentation in this chapter is specific to Julia 1.12+.</p></div>
+</div>
+<div class="admonition is-warning" id="Warning-7981dfcc59e2a809">
+
+<div class="admonition-body"><p>This manual chapter uses internal functions to introspect world age and runtime data structures as an explanatory aid. In general, unless otherwise noted the world age mechanism is not a stable interface and should be interacted with in packages through stable APIs (e.g. <code>invokelatest</code>) only. In particular, do not assume that world ages are always integers or that they have a linear order.</p></div>
+</div>
+<h2 id="World-age-in-general">
+<a class="docs-heading-anchor" href="#World-age-in-general">World age in general</a>
+</h2>
+<p>The "world age counter" is a monotonically increasing counter that is incremented for every change to the global method table or the global binding table (e.g. through method definition, type definition, <code>import</code>/<code>using</code> declaration, creation of (typed) globals or definition of constants).</p>
+<p>The current value of the global world age counter can be retrieved using the (internal) function <a href="#Base.get_world_counter"><code>Base.get_world_counter</code></a>.</p>
+<pre data-language="julia">julia&gt; Base.get_world_counter()
+0x0000000000009632
+
+julia&gt; const x = 1
+
+julia&gt; Base.get_world_counter()
+0x0000000000009633</pre>
+<p>In addition, each <a href="../../base/parallel/index.html#Core.Task"><code>Task</code></a> stores a local world age that determines which modifications to the global binding and method tables are currently visible to the running task. The world age of the running task will never exceed the global world age counter, but may run arbitrarily behind it. In general the term "current world age" refers to the local world age of the currently running task. The current world age may be retrieved using the (internal) function <a href="#Base.tls_world_age"><code>Base.tls_world_age</code></a></p>
+<pre data-language="julia">julia&gt; function f end
+f (generic function with 0 methods)
+
+julia&gt; begin
+           @show (Int(Base.get_world_counter()), Int(Base.tls_world_age()))
+           Core.eval(@__MODULE__, :(f() = 1))
+           @show (Int(Base.get_world_counter()), Int(Base.tls_world_age()))
+           f()
+       end
+(Int(Base.get_world_counter()), Int(Base.tls_world_age())) = (38452, 38452)
+(Int(Base.get_world_counter()), Int(Base.tls_world_age())) = (38453, 38452)
+ERROR: MethodError: no method matching f()
+The applicable method may be too new: running in current world age 38452, while global world is 38453.
+
+Closest candidates are:
+  f() (method too new to be called from this world context.)
+   @ Main REPL[2]:3
+
+Stacktrace:
+ [1] top-level scope
+   @ REPL[2]:5
+
+julia&gt; (f(), Int(Base.tls_world_age()))
+(1, 38453)</pre>
+<p>Here the definition of the method <code>f</code> raised the global world counter, but the current world age did not change. As a result, the definition of <code>f</code> was not visible in the currently executing task and a <a href="../../base/base/index.html#Core.MethodError"><code>MethodError</code></a> resulted.</p>
+<div class="admonition is-info" id="Note-9a257f20fdc789e1">
+
+<div class="admonition-body"><p>The method error printing provided additional information that <code>f()</code> is available in a newer world age. This information is added by the error display, not the task that threw the <code>MethodError</code>. The thrown <code>MethodError</code> is identical whether or not a matching definition of <code>f()</code> exists in a newer world age.</p></div>
+</div>
+<p>However, note that the definition of <code>f()</code> was subsequently available at the next REPL prompt, because the current task's world age had been raised. In general, certain syntactic constructs (in particular most definitions) will raise the current task's world age to the latest global world age, thus making all changes (both from the current task and any concurrently executing other tasks) visible. The following statements raise the current world age:</p>
+<ol>
+<li>An explicit invocation of <code>Core.@latestworld</code>
+</li>
+<li>The start of every top-level statement</li>
+<li>The start of every REPL prompt</li>
+<li>Any type or struct definition</li>
+<li>Any method definition</li>
+<li>Any constant declaration</li>
+<li>Any global variable declaration (but not a global variable assignment)</li>
+<li>Any <code>using</code>, <code>import</code>, <code>export</code> or <code>public</code> statement</li>
+<li>Certain other macros like <a href="../../base/base/index.html#Base.@eval"><code>@eval</code></a> (depends on the macro implementation)</li>
+</ol>
+<p>Note, however, that the current task's world age may only ever be permanently incremented at top level. As a general rule, using any of the above statements in non-top-level scope is a syntax error:</p>
+<pre data-language="julia">julia&gt; f() = Core.@latestworld
+ERROR: syntax: World age increment not at top level
+Stacktrace:
+ [1] top-level scope
+   @ REPL[5]:1</pre>
+<p>When it isn't (for example for <code>@eval</code>), the world age side effect is ignored.</p>
+<p>As a result of these rules, Julia may assume that the world age does not change within the execution of an ordinary function.</p>
+<pre data-language="julia">function my_function()
+    before = Base.tls_world_age()
+    # Any arbitrary code
+    after = Base.tls_world_age()
+    @assert before === after # always true
+end</pre>
+<p>This is the key invariant that allows Julia to optimize based on the current state of its global data structures, while still having the well-defined ability to change these data structures.</p>
+<h2 id="Temporarily-raising-the-world-age-using-invokelatest">
+<a class="docs-heading-anchor" href="#Temporarily-raising-the-world-age-using-invokelatest">Temporarily raising the world age using <code>invokelatest</code></a>
+</h2>
+<p>As described above, it is not possible to permanently raise the world age for the remainder of a <code>Task</code>'s execution unless the task is executing top-level statements. However, it is possible to temporarily change the world age in a scoped manner using <code>invokelatest</code>:</p>
+<pre data-language="julia">julia&gt; function f end
+f (generic function with 0 methods)
+
+julia&gt; begin
+           Core.eval(@__MODULE__, :(f() = 1))
+           invokelatest(f)
+       end
+1</pre>
+<p><code>invokelatest</code> will temporarily raise the current task's world age to the latest global world age (at entry to <code>invokelatest</code>) and execute the provided function. Note that the world age will return to its prior value upon exit from <code>invokelatest</code>.</p>
+<h2 id="World-age-and-const-struct-redefinitions">
+<a class="docs-heading-anchor" href="#World-age-and-const-struct-redefinitions">World age and const struct redefinitions</a>
+</h2>
+<p>The semantics described above for method redefinition also apply to redefinition of constants:</p>
+<pre data-language="julia">julia&gt; const x = 1
+1
+
+julia&gt; get_const() = x
+get_const (generic function with 1 method)
+
+julia&gt; begin
+           @show get_const()
+           Core.eval(@__MODULE__, :(const x = 2))
+           @show get_const()
+           Core.@latestworld
+           @show get_const()
+       end
+get_const() = 1
+get_const() = 1
+get_const() = 2
+2</pre>
+<p>However, for the avoidance of doubt, they do not apply to ordinary assignment to global variables, which becomes visible immediately:</p>
+<pre data-language="julia">julia&gt; global y = 1
+1
+
+julia&gt; get_global() = y
+get_global (generic function with 1 method)
+
+julia&gt; begin
+           @show get_global()
+           Core.eval(@__MODULE__, :(y = 2))
+           @show get_global()
+       end
+get_global() = 1
+get_global() = 2
+2</pre>
+<p>One particular special case of constant reassignment is the redefinition of struct types:</p>
+<pre data-language="julia">julia&gt; struct MyStruct
+           x::Int
+       end
+
+julia&gt; const one_field = MyStruct(1)
+MyStruct(1)
+
+julia&gt; struct MyStruct
+           x::Int
+           y::Float64
+       end
+
+julia&gt; const two_field = MyStruct(1, 2.0)
+MyStruct(1, 2.0)
+
+julia&gt; one_field
+@world(MyStruct, 38452:38455)(1)
+
+julia&gt; two_field
+MyStruct(1, 2.0)</pre>
+<p>Internally the two definitions of <code>MyStruct</code> are entirely separate types. However, after the new <code>MyStruct</code> type is defined, there is no longer any default binding for the original definition of <code>MyStruct</code>. To nevertheless facilitate access to these types, the special <a href="#Base.@world"><code>@world</code></a> macro may be used to access the meaning of a name in a previous world. However, this facility is intended for introspection only and in particular note that world age numbers are not stable across precompilation and should in general be treated opaquely.</p>
+<h3 id="Binding-partition-introspection">
+<a class="docs-heading-anchor" href="#Binding-partition-introspection">Binding partition introspection</a>
+</h3>
+<p>In certain cases, it can be helpful to introspect the system's understanding of what a binding means in any particular world age. The default display printing of <code>Core.Binding</code> provides a helpful summary (e.g. on the <code>MyStruct</code> example from above):</p>
+<pre data-language="julia">julia&gt; convert(Core.Binding, GlobalRef(@__MODULE__, :MyStruct))
+Binding Main.MyStruct
+   38456:∞ - constant binding to MyStruct
+   38452:38455 - constant binding to @world(MyStruct, 38452:38455)
+   38451:38451 - backdated constant binding to @world(MyStruct, 38452:38455)
+   0:38450 - backdated constant binding to @world(MyStruct, 38452:38455)</pre>
+<h2 id="World-age-and-using/import">
+<a class="docs-heading-anchor" href="#World-age-and-using/import">World age and <code>using</code>/<code>import</code></a>
+</h2>
+<p>Bindings provided via <code>using</code> and <code>import</code> also operate via the world age mechanism. Binding resolution is a stateless function of the <code>import</code> and <code>using</code> definitions visible in the current world age. For example:</p>
+<pre data-language="julia">julia&gt; module M1; const x = 1; export x; end
+
+julia&gt; module M2; const x = 2; export x; end
+
+julia&gt; using .M1
+
+julia&gt; x
+1
+
+julia&gt; using .M2
+
+julia&gt; x
+ERROR: UndefVarError: `x` not defined in `Main`
+Hint: It looks like two or more modules export different bindings with this name, resulting in ambiguity. Try explicitly importing it from a particular module, or qualifying the name with the module it should come from.
+
+julia&gt; convert(Core.Binding, GlobalRef(@__MODULE__, :x))
+Binding Main.x
+   38458:∞ - ambiguous binding - guard entry
+   38457:38457 - implicit `using` resolved to constant 1</pre>
+<h2 id="World-age-capture">
+<a class="docs-heading-anchor" href="#World-age-capture">World age capture</a>
+</h2>
+<p>Certain language features capture the current task's world age. Perhaps the most common of these is creation of new tasks. Newly created tasks will inherit the creating task's local world age at creation time and will retain said world age (unless explicitly raised) even if the originating tasks raises its world age:</p>
+<pre data-language="julia">julia&gt; const x = 1
+
+julia&gt; t = @task (wait(); println("Running now"); x);
+
+julia&gt; const x = 2
+
+julia&gt; schedule(t);
+Running now
+
+julia&gt; x
+2
+
+julia&gt; fetch(t)
+1</pre>
+<p>In addition to tasks, opaque closures also capture their world age at creation. See <a href="#Base.Experimental.@opaque"><code>Base.Experimental.@opaque</code></a>.</p>
+<article><summary id="Base.@world"><a class="docstring-binding" href="#Base.@world"><code>Base.@world</code></a> — <span class="docstring-category">Macro</span></summary><section><pre data-language="julia">@world(sym, world)</pre>
+<p>Resolve the binding <code>sym</code> in world <code>world</code>. See <a href="#Base.invoke_in_world"><code>invoke_in_world</code></a> for running arbitrary code in fixed worlds. <code>world</code> may be <code>UnitRange</code>, in which case the macro will error unless the binding is valid and has the same value across the entire world range.</p>
+<p>As a special case, the world <code>∞</code> always refers to the latest world, even if that world is newer than the world currently running.</p>
+<p>The <code>@world</code> macro is primarily used in the printing of bindings that are no longer available in the current world.</p>
+<p><strong>Example</strong></p>
+<pre data-language="julia">julia&gt; struct Foo; a::Int; end
+Foo
+
+julia&gt; fold = Foo(1)
+
+julia&gt; Int(Base.get_world_counter())
+26866
+
+julia&gt; struct Foo; a::Int; b::Int end
+Foo
+
+julia&gt; fold
+@world(Foo, 26866)(1)</pre>
+<div class="admonition is-compat" id="Julia-1.12-7075968798ac9ece">
+
+<div class="admonition-body"><p>This functionality requires at least Julia 1.12.</p></div>
+</div>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/15346901f0039751c5488744f1f62de7d87510a8/base/essentials.jl#L1207-L1240">source</a></section></article><article><summary id="Base.get_world_counter"><a class="docstring-binding" href="#Base.get_world_counter"><code>Base.get_world_counter</code></a> — <span class="docstring-category">Function</span></summary><section><pre data-language="julia">get_world_counter()</pre>
+<p>Returns the current maximum world-age counter. This counter is global and monotonically increasing.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/15346901f0039751c5488744f1f62de7d87510a8/base/runtime_internals.jl#L1263-L1268">source</a></section></article><article><summary id="Base.tls_world_age"><a class="docstring-binding" href="#Base.tls_world_age"><code>Base.tls_world_age</code></a> — <span class="docstring-category">Function</span></summary><section><pre data-language="julia">tls_world_age()</pre>
+<p>Returns the world the <a href="../../base/parallel/index.html#Base.current_task">current_task()</a> is executing within.</p>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/15346901f0039751c5488744f1f62de7d87510a8/base/runtime_internals.jl#L1271-L1275">source</a></section></article><article><summary id="Base.invoke_in_world"><a class="docstring-binding" href="#Base.invoke_in_world"><code>Base.invoke_in_world</code></a> — <span class="docstring-category">Function</span></summary><section><pre data-language="julia">invoke_in_world(world, f, args...; kwargs...)</pre>
+<p>Call <code>f(args...; kwargs...)</code> in a fixed world age, <code>world</code>.</p>
+<p>This is useful for infrastructure running in the user's Julia session which is not part of the user's program. For example, things related to the REPL, editor support libraries, etc. In these cases it can be useful to prevent unwanted method invalidation and recompilation latency, and to prevent the user from breaking supporting infrastructure by mistake.</p>
+<p>The global world age can be queried using <a href="#Base.get_world_counter"><code>Base.get_world_counter()</code></a> and stored for later use within the lifetime of the current Julia session, or when serializing and reloading the system image.</p>
+<p>Technically, <code>invoke_in_world</code> will prevent any function called by <code>f</code> from being extended by the user during their Julia session. That is, generic function method tables seen by <code>f</code> (and any functions it calls) will be frozen as they existed at the given <code>world</code> age. In a sense, this is like the opposite of <a href="../../base/base/index.html#Base.invokelatest"><code>invokelatest</code></a>.</p>
+<div class="admonition is-info" id="Note-50ba4ce8b89286b6">
+
+<div class="admonition-body"><p>It is not valid to store world ages obtained in precompilation for later use. This is because precompilation generates a "parallel universe" where the world age refers to system state unrelated to the main Julia session.</p></div>
+</div>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/15346901f0039751c5488744f1f62de7d87510a8/base/Base_compiler.jl#L254-L279">source</a></section></article><article><summary id="Base.Experimental.@opaque"><a class="docstring-binding" href="#Base.Experimental.@opaque"><code>Base.Experimental.@opaque</code></a> — <span class="docstring-category">Macro</span></summary><section><pre data-language="julia">@opaque ([type, ]args...) -&gt; body</pre>
+<p>Marks a given closure as "opaque". Opaque closures capture the world age of their creation (as opposed to their invocation). This allows for more aggressive optimization of the capture list, but trades off against the ability to inline opaque closures at the call site, if their creation is not statically visible.</p>
+<p>An argument tuple type (<code>type</code>) may optionally be specified, to specify allowed argument types in a more flexible way. In particular, the argument type may be fixed length even if the function is variadic.</p>
+<div class="admonition is-warning" id="Warning-23f186d96d6aac42">
+
+<div class="admonition-body"><p>This interface is experimental and subject to change or removal without notice.</p></div>
+</div>
+<a class="docs-sourcelink" target="_blank" href="https://github.com/JuliaLang/julia/blob/15346901f0039751c5488744f1f62de7d87510a8/base/opaque_closure.jl#L3-L19">source</a></section></article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2009&ndash;2026 Jeff Bezanson, Stefan Karpinski, Viral B. Shah, and other contributors<br>Licensed under the MIT License.<br>
+    <a href="https://docs.julialang.org/en/v1.12/manual/worldage/" class="_attribution-link">https://docs.julialang.org/en/v1.12/manual/worldage/</a>
+  </p>
+</div>

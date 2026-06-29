@@ -1,0 +1,130 @@
+<div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList"> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Reference API"> <meta itemprop="position" content="1"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compiler"> <meta itemprop="position" content="2"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compile Programming Model"> <meta itemprop="position" content="3"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Working with Graph Breaks"> <meta itemprop="position" content="4"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Working with &lt;code class=" docutils literal notranslate>fullgraph=False"&gt; <meta itemprop="position" content="5"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem"> <meta itemprop="name" content="Nested Graph Breaks"> <meta itemprop="position" content="6"> </div> </div>  <article class="bd-article">  <h1 id="nested-graph-breaks">Nested Graph Breaks</h1> <p class="date-info-last-verified" style="color: #6c6c6d; font-size: small;">Created On: Jul 28, 2025 | Last Updated On: Jul 28, 2025</p> <p>Summary:</p> <ul class="simple"> <li>Graph breaks in nested functions can result in hard-to-understand compiler behavior, which we document below</li> <li>A nested graph break results in <span class="math"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="script">O</mi><mo stretchy="false">(</mo><mi>N</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\mathcal O(N)</annotation></semantics></math></span></span></span> duplicate graph break behavior</li> </ul> <p>Recall that when <code>torch.compile</code> is applied to a function, any nested function calls are also traced. A <strong>nested graph break</strong> refers to any graph break that happens in a nested function call.</p> <pre data-language="python">def inner(x):
+    ...
+    torch._dynamo.graph_break()  # nested graph break
+    ...
+
+@torch.compile
+def outer(x):
+    ...
+    y = inner(x)
+    ...
+</pre> <p>The resumption semantics around nested graph breaks can be confusing, so we describe the behavior here.</p> <p>Recall that in <code>fullgraph=False</code>, <a class="reference internal" href="programming_model.dynamo_core_concepts.html#programming-model-dynamo-core-concepts-graph-breaks"><span class="std std-ref">graph breaks are handled</span></a> by compiling the FX graph that has been determined so far, running the unsupported code in regular Python, then resuming tracing after the unsupported code with a new FX graph. Resuming a function is actually a fairly complicated technical feat, so resuming tracing is only supported on top-level functions.</p> <p>We can therefore resume tracing after a nested graph break with this restriction in the following way:</p> <p>First, consider the below example where <code>torch.compile</code> traces from <code>f</code> and traces all the way until the graph break in <code>inner1</code> is encountered.</p> <pre data-language="python">def inner1(x):
+    x = x + 1
+    torch._dynamo.graph_break()  # stop tracing due to graph break
+    return x + 2
+
+def inner2(x):
+    x = x + 4
+    x = inner1(x)
+    x = x + 8
+
+@torch.compile
+def f(x):
+    # start tracing from here
+    x = x + 16
+    x = inner2(x)
+    x = x + 32
+
+f(torch.randn(3))
+</pre> <p>Since we can only resume from top-level functions, we graph break on the <code>inner2</code> call in <code>f</code>.</p> <pre data-language="python"># The semantics of torch.compile(f)(x) is roughly this:
+def compiled_f_semantics(x):
+    y = x + 16
+    z = inner2(y)
+    return torch.compile(resume_f_semantics)(z)
+
+def resume_f_semantics(x):
+    return x + 32
+
+compiled_f_semantics(torch.randn(3))
+</pre> <p><code>inner2</code> is then automatically compiled as a top-level function. We trace all the way until the graph break in <code>inner1</code> is encountered again.</p> <pre data-language="python">def inner1(x):
+    x = x + 1
+    torch._dynamo.graph_break()  # stop tracing due to graph break
+    return x + 2
+
+# this torch.compile is automatically applied
+@torch.compile
+def inner2(x):
+    # start tracing from here
+    x = x + 4
+    x = inner1(x)
+    x = x + 8
+
+def compiled_f_semantics(x):
+    y = x + 16
+    z = inner2(y)
+    return torch.compile(resume_f_semantics)(z)
+
+def resume_f_semantics(x):
+    return x + 32
+
+compiled_f_semantics(torch.randn(3))
+</pre> <p>Then we graph break on the <code>inner1</code> call in <code>inner2</code>.</p> <pre data-language="python">def compiled_inner2_semantics(x):
+    y = x + 4
+    z = inner1(y)
+    return torch.compile(resume_inner2_semantics)(z)
+
+def resume_inner2_semantics(x):
+    return x + 8
+</pre> <p><code>inner1</code> is then automatically compiled as a top-level function. The graph break is from <code>inner1</code>, so we handle the graph break normally.</p> <pre data-language="python"># this torch.compile is automatically applied
+@torch.compile
+def inner1(x):
+    # start tracing from here
+    x = x + 1
+    torch._dynamo.graph_break()  # stop tracing due to graph break
+    return x + 2
+
+def compiled_f_semantics(x):
+    y = x + 16
+    z = compiled_inner2_semantics(y)
+    return torch.compile(resume_f_semantics)(z)
+
+def resume_f_semantics(x):
+    return x + 32
+
+def compiled_inner2_semantics(x):
+    y = x + 4
+    z = inner1(y)
+    return torch.compile(resume_inner2_semantics)(z)
+
+def resume_inner2_semantics(x):
+    return x + 8
+
+compiled_f_semantics(torch.randn(3))
+</pre> <p><code>inner1</code> is handled normally:</p> <pre data-language="python">def compiled_inner1_semantics(x):
+    y = x + 1
+    torch._dynamo.graph_break()
+    return torch.compile(resume_inner1_semantics)(y)
+
+def resume_inner1_semantics(x):
+    return x + 2
+</pre> <p>So the initial code is semantically equivalent to</p> <pre data-language="python">def compiled_f_semantics(x):
+    y = x + 16
+    z = compiled_inner2_semantics(y)
+    return torch.compile(resume_f_semantics)(z)
+
+def resume_f_semantics(x):
+    return x + 32
+
+def compiled_inner2_semantics(x):
+    y = x + 4
+    z = compiled_inner1_semantics(y)
+    return torch.compile(resume_inner2_semantics)(z)
+
+def resume_inner2_semantics(x):
+    return x + 8
+
+def compiled_inner1_semantics(x):
+    y = x + 1
+    torch._dynamo.graph_break()
+    return torch.compile(resume_inner1_semantics)(y)
+
+def resume_inner1_semantics(x):
+    return x + 2
+
+compiled_f_semantics(torch.randn(3))
+</pre> <p>Note in particular that we traced 3 top-level functions, and that we traced the same graph break 3 times. <strong>This explains why you may encounter duplicate graph breaks when using <code>torch.compile</code>.</strong></p> <p>In summary, nested graph breaks are handled by:</p> <ul class="simple"> <li>Tracing from the top-level function all the way to the nested graph break</li> <li>Graph breaking on the top-level function at the call to the second-level function</li> <li>Compiling the PyTorch ops tracked so far and running the compiled graph</li> <li>Calling the second-level function, which gets automatically compiled as a top-level function</li> <li>Resuming tracing after the second-level function call</li> </ul> <p>Note that the runtime of handling this graph break is <span class="math"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="script">O</mi><mo stretchy="false">(</mo><mi>N</mi><mi>K</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\mathcal O(NK)</annotation></semantics></math></span></span></span>, where <span class="math"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi></mrow><annotation encoding="application/x-tex">N</annotation></semantics></math></span></span></span> is the nesting depth, and <span class="math"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi></mrow><annotation encoding="application/x-tex">K</annotation></semantics></math></span></span></span> is the number of instructions from the top-level function to the graph break. We end up tracing <span class="math"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="script">O</mi><mo stretchy="false">(</mo><msup><mi>N</mi><mn>2</mn></msup><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\mathcal O(N^2)</annotation></semantics></math></span></span></span> frames, and we trace the same graph break <span class="math"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="script">O</mi><mo stretchy="false">(</mo><mi>N</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\mathcal O(N)</annotation></semantics></math></span></span></span> times.</p>  </article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2025, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.9/compile/programming_model.nested_graph_breaks.html" class="_attribution-link">https://docs.pytorch.org/docs/2.9/compile/programming_model.nested_graph_breaks.html</a>
+  </p>
+</div>

@@ -1,0 +1,110 @@
+<h1 id="class-ActiveJob::Continuation" class="anchor-link class"> class ActiveJob::Continuation </h1>
+<dl class="meta">
+<dt>Parent:</dt>
+<dd class="meta-parent"><a href="../object.html">Object</a></dd>
+</dl> <section class="description"> <h1 id="class-ActiveJob::Continuation-label-Active+Job+Continuation">Active Job Continuation</h1> <p>Continuations provide a mechanism for interrupting and resuming jobs. This allows long-running jobs to make progress across application restarts.</p> <p>Jobs should include the <a href="continuable.html"><code>ActiveJob::Continuable</code></a> module to enable continuations. Continuable jobs are automatically retried when interrupted.</p> <p>Use the <code>step</code> method to define the steps in your job. Steps can use an optional cursor to track progress in the step.</p> <p>Steps are executed as soon as they are encountered. If a job is interrupted, previously completed steps will be skipped. If a step is in progress, it will be resumed with the last recorded cursor.</p> <p>Code that is not part of a step will be executed on each job run.</p> <p>You can pass a block or a method name to the step method. The block will be called with the step object as an argument. Methods can either take no arguments or a single argument for the step object.</p> <pre class="ruby" data-language="ruby">class ProcessImportJob &lt; ApplicationJob
+  include ActiveJob::Continuable
+
+  def perform(import_id)
+    # This always runs, even if the job is resumed.
+    @import = Import.find(import_id)
+
+    step :validate do
+      @import.validate!
+    end
+
+    step(:process_records) do |step|
+      @import.records.find_each(start: step.cursor) do |record|
+        record.process
+        step.advance! from: record.id
+      end
+    end
+
+    step :reprocess_records
+    step :finalize
+  end
+
+  def reprocess_records(step)
+    @import.records.find_each(start: step.cursor) do |record|
+      record.reprocess
+      step.advance! from: record.id
+    end
+  end
+
+  def finalize
+    @import.finalize!
+  end
+end
+</pre> <h3 id="class-ActiveJob::Continuation-label-Cursors">Cursors</h3> <p>Cursors are used to track progress within a step. The cursor can be any object that is serializable as an argument to <a href="core.html#method-i-serialize"><code>ActiveJob::Base.serialize</code></a>. It defaults to <code>nil</code>.</p> <p>When a step is resumed, the last cursor value is restored. The code in the step is responsible for using the cursor to continue from the right point.</p> <p><code>set!</code> sets the cursor to a specific value.</p> <pre class="ruby" data-language="ruby">step :iterate_items do |step|
+  items[step.cursor..].each do |item|
+    process(item)
+    step.set! (step.cursor || 0) + 1
+  end
+end
+</pre> <p>An starting value for the cursor can be set when defining the step:</p> <pre class="ruby" data-language="ruby">step :iterate_items, start: 0 do |step|
+  items[step.cursor..].each do |item|
+    process(item)
+    step.set! step.cursor + 1
+  end
+end
+</pre> <p>The cursor can be advanced with <code>advance!</code>. This calls <code>succ</code> on the current cursor value. It raises an <a href="continuation/unadvanceablecursorerror.html"><code>ActiveJob::Continuation::UnadvanceableCursorError</code></a> if the cursor does not implement <code>succ</code>.</p> <pre class="ruby" data-language="ruby">step :iterate_items, start: 0 do |step|
+  items[step.cursor..].each do |item|
+    process(item)
+    step.advance!
+  end
+end
+</pre> <p>You can optionally pass a <code>from</code> argument to <code>advance!</code>. This is useful when iterating over a collection of records where IDs may not be contiguous.</p> <pre class="ruby" data-language="ruby">step :process_records do |step|
+  import.records.find_each(start: step.cursor) do |record|
+    record.process
+    step.advance! from: record.id
+  end
+end
+</pre> <p>You can use an array to iterate over nested records:</p> <pre class="ruby" data-language="ruby">step :process_nested_records, start: [ 0, 0 ] do |step|
+  Account.find_each(start: step.cursor[0]) do |account|
+    account.records.find_each(start: step.cursor[1]) do |record|
+      record.process
+      step.set! [ account.id, record.id + 1 ]
+    end
+    step.set! [ account.id + 1, 0 ]
+  end
+end
+</pre> <p>Setting or advancing the cursor creates a checkpoint. You can also create a checkpoint manually by calling the <code>checkpoint!</code> method on the step. This is useful if you want to allow interruptions, but don’t need to update the cursor.</p> <pre class="ruby" data-language="ruby">step :destroy_records do |step|
+  import.records.find_each do |record|
+    record.destroy!
+    step.checkpoint!
+  end
+end
+</pre> <h3 id="class-ActiveJob::Continuation-label-Checkpoints">Checkpoints</h3> <p>A checkpoint is where a job can be interrupted. At a checkpoint the job will call <code>queue_adapter.stopping?</code>. If it returns true, the job will raise an <a href="continuation/interrupt.html"><code>ActiveJob::Continuation::Interrupt</code></a> exception.</p> <p>There is an automatic checkpoint before the start of each step except for the first for each job execution. Within a step one is created when calling <code>set!</code>, <code>advance!</code> or <code>checkpoint!</code>.</p> <p>Jobs are not automatically interrupted when the queue adapter is marked as stopping - they will continue to run either until the next checkpoint, or when the process is stopped.</p> <p>This is to allow jobs to be interrupted at a safe point, but it also means that the jobs should checkpoint more frequently than the shutdown timeout to ensure a graceful restart.</p> <p>When interrupted, the job will automatically retry with the progress serialized in the job data under the <code>continuation</code> key.</p> <p>The serialized progress contains:</p> <ul>
+<li> <p>a list of the completed steps</p> </li>
+<li> <p>the current step and its cursor value (if one is in progress)</p> </li>
+</ul> <h3 id="class-ActiveJob::Continuation-label-Isolated+Steps">Isolated Steps</h3> <p>Steps run sequentially in a single job execution, unless the job is interrupted.</p> <p>You can specify that a step should always run in its own execution by passing the +isolated: true+ option.</p> <p>This is useful for long-running steps where it may not be possible to checkpoint within the job grace period - it ensures that progress is serialized back into the job data before the step starts.</p> <pre class="ruby" data-language="ruby">step :quick_step1
+step :slow_step, isolated: true
+step :quick_step2
+step :quick_step3
+</pre> <h3 id="class-ActiveJob::Continuation-label-Errors">Errors</h3> <p>If a job raises an error and is not retried via Active Job, it will be passed back to the underlying queue backend and any progress in this execution will be lost.</p> <p>To mitigate this, the job will be automatically retried if it raises an error after it has made progress. Making progress is defined as having completed a step or advanced the cursor within the current step.</p> <h3 id="class-ActiveJob::Continuation-label-Configuration">Configuration</h3> <p><a href="continuable.html"><code>Continuable</code></a> jobs have several configuration options:</p> <ul>
+<li> <p><code>:max_resumptions</code> - The maximum number of times a job can be resumed. Defaults to <code>nil</code> which means unlimited resumptions.</p> </li>
+<li> <p><code>:resume_options</code> - Options to pass to <code>retry_job</code> when resuming the job. Defaults to <code>{ wait: 5.seconds }</code>. See <a href="exceptions.html#method-i-retry_job"><code>ActiveJob::Exceptions#retry_job</code></a> for available options.</p> </li>
+<li> <p><code>:resume_errors_after_advancing</code> - Whether to resume errors after advancing the continuation. Defaults to <code>true</code>.</p> </li>
+</ul> </section> <section id="5Buntitled-5D" class="documentation-section anchor-link"> <section id="public-instance-5Buntitled-5D-method-details" class="method-section anchor-link"> <header> <h3>Public Instance Methods</h3> </header> <div class="method-detail anchor-link "> <div class="method-header"> <div class="method-heading" id="method-i-advanced-3F"> <a href="#method-i-advanced-3F" title="Link to this method"> <span class="method-name">advanced?</span> <span class="method-args">()</span> </a> <a class="method-click-advice">Show source</a>
+</div> </div>  <div class="method-description">
+<div class="method-source-code" id="advanced-3F-source"> <pre class="ruby" data-language="ruby"># File activejob/lib/active_job/continuation.rb, line 256
+def advanced?
+  @advanced
+end</pre> </div>  </div> </div> <div class="method-detail anchor-link "> <div class="method-header"> <div class="method-heading" id="method-i-instrumentation"> <a href="#method-i-instrumentation" title="Link to this method"> <span class="method-name">instrumentation</span> <span class="method-args">()</span> </a> <a class="method-click-advice">Show source</a>
+</div> </div>  <div class="method-description">
+<div class="method-source-code" id="instrumentation-source"> <pre class="ruby" data-language="ruby"># File activejob/lib/active_job/continuation.rb, line 260
+def instrumentation
+  { description: description,
+    completed_steps: completed,
+    current_step: current }
+end</pre> </div>  </div> </div> <div class="method-detail anchor-link "> <div class="method-header"> <div class="method-heading" id="method-i-started-3F"> <a href="#method-i-started-3F" title="Link to this method"> <span class="method-name">started?</span> <span class="method-args">()</span> </a> <a class="method-click-advice">Show source</a>
+</div> </div>  <div class="method-description">
+<div class="method-source-code" id="started-3F-source"> <pre class="ruby" data-language="ruby"># File activejob/lib/active_job/continuation.rb, line 252
+def started?
+  completed.any? || current.present?
+end</pre> </div>  </div> </div> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2004&ndash;2021 David Heinemeier Hansson<br>Licensed under the MIT License.<br>
+    
+  </p>
+</div>

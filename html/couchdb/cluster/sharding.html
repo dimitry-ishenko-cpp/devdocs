@@ -1,0 +1,260 @@
+<section id="shard-management"> <h1>Shard Management</h1> <section id="introduction"> <h2>Introduction</h2> <p>This document discusses how sharding works in CouchDB along with how to safely add, move, remove, and create placement rules for shards and shard replicas.</p> <p>A <a class="reference external" href="https://en.wikipedia.org/wiki/Shard_(database_architecture)">shard</a> is a horizontal partition of data in a database. Partitioning data into shards and distributing copies of each shard (called “shard replicas” or just “replicas”) to different nodes in a cluster gives the data greater durability against node loss. CouchDB clusters automatically shard databases and distribute the subsets of documents that compose each shard among nodes. Modifying cluster membership and sharding behavior must be done manually.</p> <section id="shards-and-replicas"> <h3>Shards and Replicas</h3> <p>How many shards and replicas each database has can be set at the global level, or on a per-database basis. The relevant parameters are <code class="docutils literal notranslate"><span class="pre">q</span></code> and <code class="docutils literal notranslate"><span class="pre">n</span></code>.</p> <p><em>q</em> is the number of database shards to maintain. <em>n</em> is the number of copies of each document to distribute. The default value for <code class="docutils literal notranslate"><span class="pre">n</span></code> is <code class="docutils literal notranslate"><span class="pre">3</span></code>, and for <code class="docutils literal notranslate"><span class="pre">q</span></code> is <code class="docutils literal notranslate"><span class="pre">2</span></code>. With <code class="docutils literal notranslate"><span class="pre">q=2</span></code>, the database is split into 2 shards. With <code class="docutils literal notranslate"><span class="pre">n=3</span></code>, the cluster distributes three replicas of each shard. Altogether, that’s 6 shard replicas for a single database.</p> <p>In a 3-node cluster with <code class="docutils literal notranslate"><span class="pre">q=8</span></code>, each node would receive 8 shards. In a 4-node cluster, each node would receive 6 shards. We recommend in the general case that the number of nodes in your cluster should be a multiple of <code class="docutils literal notranslate"><span class="pre">n</span></code>, so that shards are distributed evenly.</p> <p>CouchDB nodes have a <code class="docutils literal notranslate"><span class="pre">etc/default.ini</span></code> file with a section named <a class="reference external" href="https://docs.couchdb.org/en/3.5.1/config/cluster.html">cluster</a> which looks like this:</p> <pre data-language="javascript">[cluster]
+q=2
+n=3</pre> <p>These settings specify the default sharding parameters for newly created databases. These can be overridden in the <code class="docutils literal notranslate"><span class="pre">etc/local.ini</span></code> file by copying the text above, and replacing the values with your new defaults. If <code class="docutils literal notranslate"><span class="pre">[couch_peruser]</span></code> <code class="docutils literal notranslate"><span class="pre">q</span></code> is set, that value is used for per-user databases. (By default, it is set to 1, on the assumption that per-user dbs will be quite small and there will be many of them.) The values can also be set on a per-database basis by specifying the <code class="docutils literal notranslate"><span class="pre">q</span></code> and <code class="docutils literal notranslate"><span class="pre">n</span></code> query parameters when the database is created. For example:</p> <pre data-language="bash">$ curl -X PUT "$COUCH_URL:5984/database-name?q=4&amp;n=2"</pre> <p>This creates a database that is split into 4 shards and 2 replicas, yielding 8 shard replicas distributed throughout the cluster.</p> </section> <section id="quorum"> <h3>Quorum</h3> <p>Depending on the size of the cluster, the number of shards per database, and the number of shard replicas, not every node may have access to every shard, but every node knows where all the replicas of each shard can be found through CouchDB’s internal shard map.</p> <p>Each request that comes in to a CouchDB cluster is handled by any one random coordinating node. This coordinating node proxies the request to the other nodes that have the relevant data, which may or may not include itself. The coordinating node sends a response to the client once a <a class="reference external" href="https://en.wikipedia.org/wiki/Quorum_(distributed_computing)">quorum</a> of database nodes have responded; 2, by default. The default required size of a quorum is equal to <code class="docutils literal notranslate"><span class="pre">r=w=((n</span> <span class="pre">div</span> <span class="pre">2)</span> <span class="pre">+</span> <span class="pre">1)</span></code> where <code class="docutils literal notranslate"><span class="pre">r</span></code> refers to the size of a read quorum, <code class="docutils literal notranslate"><span class="pre">w</span></code> refers to the size of a write quorum, <code class="docutils literal notranslate"><span class="pre">n</span></code> refers to the number of replicas of each shard, and <code class="docutils literal notranslate"><span class="pre">div</span></code> is integer division, rounding down. In a default cluster where <code class="docutils literal notranslate"><span class="pre">n</span></code> is 3, <code class="docutils literal notranslate"><span class="pre">((n</span> <span class="pre">div</span> <span class="pre">2)</span> <span class="pre">+</span> <span class="pre">1)</span></code> would be 2.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Each node in a cluster can be a coordinating node for any one request. There are no special roles for nodes inside the cluster.</p> </div> <p>The size of the required quorum can be configured at request time by setting the <code class="docutils literal notranslate"><span class="pre">r</span></code> parameter for document reads, and the <code class="docutils literal notranslate"><span class="pre">w</span></code> parameter for document writes. The <code class="docutils literal notranslate"><span class="pre">_view</span></code>, <code class="docutils literal notranslate"><span class="pre">_find</span></code>, and <code class="docutils literal notranslate"><span class="pre">_search</span></code> endpoints read only one copy no matter what quorum is configured, effectively making a quorum of 1 for these requests.</p> <p>For example, here is a request that directs the coordinating node to send a response once at least two nodes have responded:</p> <pre data-language="bash">$ curl "$COUCH_URL:5984/{db}/{doc}?r=2"</pre> <p>Here is a similar example for writing a document:</p> <pre data-language="bash">$ curl -X PUT "$COUCH_URL:5984/{db}/{doc}?w=2" -d '{...}'</pre> <p>Setting <code class="docutils literal notranslate"><span class="pre">r</span></code> or <code class="docutils literal notranslate"><span class="pre">w</span></code> to be equal to <code class="docutils literal notranslate"><span class="pre">n</span></code> (the number of replicas) means you will only receive a response once all nodes with relevant shards have responded or timed out, and as such this approach does not guarantee <a class="reference external" href="https://en.wikipedia.org/wiki/ACID#Consistency">ACIDic consistency</a>. Setting <code class="docutils literal notranslate"><span class="pre">r</span></code> or <code class="docutils literal notranslate"><span class="pre">w</span></code> to 1 means you will receive a response after only one relevant node has responded.</p> </section> </section> <section id="examining-database-shards"> <h2>Examining database shards</h2> <p>There are a few API endpoints that help you understand how a database is sharded. Let’s start by making a new database on a cluster, and putting a couple of documents into it:</p> <pre data-language="bash">$ curl -X PUT $COUCH_URL:5984/mydb
+{"ok":true}
+$ curl -X PUT $COUCH_URL:5984/mydb/joan -d '{"loves":"cats"}'
+{"ok":true,"id":"joan","rev":"1-cc240d66a894a7ee7ad3160e69f9051f"}
+$ curl -X PUT $COUCH_URL:5984/mydb/robert -d '{"loves":"dogs"}'
+{"ok":true,"id":"robert","rev":"1-4032b428c7574a85bc04f1f271be446e"}</pre> <p>First, the top level <a class="reference internal" href="../api/database/common.html#api-db"><span class="std std-ref">/{db}</span></a> endpoint will tell you what the sharding parameters are for your database:</p> <pre data-language="bash">$ curl -s $COUCH_URL:5984/db | jq .
+{
+  "db_name": "mydb",
+...
+  "cluster": {
+    "q": 8,
+    "n": 3,
+    "w": 2,
+    "r": 2
+  },
+...
+}</pre> <p>So we know this database was created with 8 shards (<code class="docutils literal notranslate"><span class="pre">q=8</span></code>), and each shard has 3 replicas (<code class="docutils literal notranslate"><span class="pre">n=3</span></code>) for a total of 24 shard replicas across the nodes in the cluster.</p> <p>Now, let’s see how those shard replicas are placed on the cluster with the <a class="reference internal" href="../api/database/shard.html#api-db-shards"><span class="std std-ref">/{db}/_shards</span></a> endpoint:</p> <pre data-language="bash">$ curl -s $COUCH_URL:5984/mydb/_shards | jq .
+{
+  "shards": {
+    "00000000-1fffffff": [
+      "node1@127.0.0.1",
+      "node2@127.0.0.1",
+      "node4@127.0.0.1"
+    ],
+    "20000000-3fffffff": [
+      "node1@127.0.0.1",
+      "node2@127.0.0.1",
+      "node3@127.0.0.1"
+    ],
+    "40000000-5fffffff": [
+      "node2@127.0.0.1",
+      "node3@127.0.0.1",
+      "node4@127.0.0.1"
+    ],
+    "60000000-7fffffff": [
+      "node1@127.0.0.1",
+      "node3@127.0.0.1",
+      "node4@127.0.0.1"
+    ],
+    "80000000-9fffffff": [
+      "node1@127.0.0.1",
+      "node2@127.0.0.1",
+      "node4@127.0.0.1"
+    ],
+    "a0000000-bfffffff": [
+      "node1@127.0.0.1",
+      "node2@127.0.0.1",
+      "node3@127.0.0.1"
+    ],
+    "c0000000-dfffffff": [
+      "node2@127.0.0.1",
+      "node3@127.0.0.1",
+      "node4@127.0.0.1"
+    ],
+    "e0000000-ffffffff": [
+      "node1@127.0.0.1",
+      "node3@127.0.0.1",
+      "node4@127.0.0.1"
+    ]
+  }
+}</pre> <p>Now we see that there are actually 4 nodes in this cluster, and CouchDB has spread those 24 shard replicas evenly across all 4 nodes.</p> <p>We can also see exactly which shard contains a given document with the <a class="reference internal" href="../api/database/shard.html#api-db-shards-doc"><span class="std std-ref">/{db}/_shards/{docid}</span></a> endpoint:</p> <pre data-language="bash">$ curl -s $COUCH_URL:5984/mydb/_shards/joan | jq .
+{
+  "range": "e0000000-ffffffff",
+  "nodes": [
+    "node1@127.0.0.1",
+    "node3@127.0.0.1",
+    "node4@127.0.0.1"
+  ]
+}
+$ curl -s $COUCH_URL:5984/mydb/_shards/robert | jq .
+{
+  "range": "60000000-7fffffff",
+  "nodes": [
+    "node1@127.0.0.1",
+    "node3@127.0.0.1",
+    "node4@127.0.0.1"
+  ]
+}</pre> <p>CouchDB shows us the specific shard into which each of the two sample documents is mapped.</p> </section> <section id="moving-a-shard"> <h2>Moving a shard</h2> <p>When moving shards or performing other shard manipulations on the cluster, it is advisable to stop all resharding jobs on the cluster. See <a class="reference internal" href="#cluster-sharding-stop-resharding"><span class="std std-ref">Stopping Resharding Jobs</span></a> for more details.</p> <p>This section describes how to manually place and replace shards. These activities are critical steps when you determine your cluster is too big or too small, and want to resize it successfully, or you have noticed from server metrics that database/shard layout is non-optimal and you have some “hot spots” that need resolving.</p> <p>Consider a three-node cluster with q=8 and n=3. Each database has 24 shards, distributed across the three nodes. If you <a class="reference internal" href="nodes.html#cluster-nodes-add"><span class="std std-ref">add a fourth node</span></a> to the cluster, CouchDB will not redistribute existing database shards to it. This leads to unbalanced load, as the new node will only host shards for databases created after it joined the cluster. To balance the distribution of shards from existing databases, they must be moved manually.</p> <p>Moving shards between nodes in a cluster involves the following steps:</p> <ol class="arabic simple" start="0"> <li><p><a class="reference internal" href="nodes.html#cluster-nodes-add"><span class="std std-ref">Ensure the target node has joined the cluster</span></a>.</p></li> <li><p>Copy the shard(s) and any secondary <a class="reference internal" href="#cluster-sharding-copying"><span class="std std-ref">index shard(s) onto the target node</span></a>.</p></li> <li><p><a class="reference internal" href="#cluster-sharding-mm"><span class="std std-ref">Set the target node to maintenance mode</span></a>.</p></li> <li><p>Update cluster metadata <a class="reference internal" href="#cluster-sharding-add-shard"><span class="std std-ref">to reflect the new target shard(s)</span></a>.</p></li> <li><p>Monitor internal replication <a class="reference internal" href="#cluster-sharding-verify"><span class="std std-ref">to ensure up-to-date shard(s)</span></a>.</p></li> <li><p><a class="reference internal" href="#cluster-sharding-mm-2"><span class="std std-ref">Clear the target node’s maintenance mode</span></a>.</p></li> <li><p>Update cluster metadata again <a class="reference internal" href="#cluster-sharding-remove-shard"><span class="std std-ref">to remove the source shard(s)</span></a></p></li> <li><p>Remove the shard file(s) and secondary index file(s) <a class="reference internal" href="#cluster-sharding-remove-shard-files"><span class="std std-ref">from the source node</span></a>.</p></li> </ol> <section id="copying-shard-files"> <h3>Copying shard files</h3> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Technically, copying database and secondary index shards is optional. If you proceed to the next step without performing this data copy, CouchDB will use internal replication to populate the newly added shard replicas. However, copying files is faster than internal replication, especially on a busy cluster, which is why we recommend performing this manual data copy first.</p> </div> <p>Shard files live in the <code class="docutils literal notranslate"><span class="pre">data/shards</span></code> directory of your CouchDB install. Within those subdirectories are the shard files themselves. For instance, for a <code class="docutils literal notranslate"><span class="pre">q=8</span></code> database called <code class="docutils literal notranslate"><span class="pre">abc</span></code>, here is its database shard files:</p> <pre data-language="javascript">data/shards/00000000-1fffffff/abc.1529362187.couch
+data/shards/20000000-3fffffff/abc.1529362187.couch
+data/shards/40000000-5fffffff/abc.1529362187.couch
+data/shards/60000000-7fffffff/abc.1529362187.couch
+data/shards/80000000-9fffffff/abc.1529362187.couch
+data/shards/a0000000-bfffffff/abc.1529362187.couch
+data/shards/c0000000-dfffffff/abc.1529362187.couch
+data/shards/e0000000-ffffffff/abc.1529362187.couch</pre> <p>Secondary indexes (including JavaScript views, Erlang views and Mango indexes) are also sharded, and their shards should be moved to save the new node the effort of rebuilding the view. View shards live in <code class="docutils literal notranslate"><span class="pre">data/.shards</span></code>. For example:</p> <pre data-language="javascript">data/.shards
+data/.shards/e0000000-ffffffff/_replicator.1518451591_design
+data/.shards/e0000000-ffffffff/_replicator.1518451591_design/mrview
+data/.shards/e0000000-ffffffff/_replicator.1518451591_design/mrview/3e823c2a4383ac0c18d4e574135a5b08.view
+data/.shards/c0000000-dfffffff
+data/.shards/c0000000-dfffffff/_replicator.1518451591_design
+data/.shards/c0000000-dfffffff/_replicator.1518451591_design/mrview
+data/.shards/c0000000-dfffffff/_replicator.1518451591_design/mrview/3e823c2a4383ac0c18d4e574135a5b08.view
+...</pre> <p>Since they are files, you can use <code class="docutils literal notranslate"><span class="pre">cp</span></code>, <code class="docutils literal notranslate"><span class="pre">rsync</span></code>, <code class="docutils literal notranslate"><span class="pre">scp</span></code> or other file-copying command to copy them from one node to another. For example:</p> <pre data-language="bash"># one one machine
+$ mkdir -p data/.shards/{range}
+$ mkdir -p data/shards/{range}
+# on the other
+$ scp {couch-dir}/data/.shards/{range}/{database}.{datecode}* \
+  {node}:{couch-dir}/data/.shards/{range}/
+$ scp {couch-dir}/data/shards/{range}/{database}.{datecode}.couch \
+  {node}:{couch-dir}/data/shards/{range}/</pre> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Remember to move view files before database files! If a view index is ahead of its database, the database will rebuild it from scratch.</p> </div> </section> <section id="set-the-target-node-to-true-maintenance-mode"> <h3>Set the target node to <code class="docutils literal notranslate"><span class="pre">true</span></code> maintenance mode</h3> <p>Before telling CouchDB about these new shards on the node, the node must be put into maintenance mode. Maintenance mode instructs CouchDB to return a <code class="docutils literal notranslate"><span class="pre">404</span> <span class="pre">Not</span> <span class="pre">Found</span></code> response on the <code class="docutils literal notranslate"><span class="pre">/_up</span></code> endpoint, and ensures it does not participate in normal interactive clustered requests for its shards. A properly configured load balancer that uses <code class="docutils literal notranslate"><span class="pre">GET</span>
+<span class="pre">/_up</span></code> to check the health of nodes will detect this 404 and remove the node from circulation, preventing requests from being sent to that node. For example, to configure HAProxy to use the <code class="docutils literal notranslate"><span class="pre">/_up</span></code> endpoint, use:</p> <pre data-language="javascript">http-check disable-on-404
+option httpchk GET /_up</pre> <p>If you do not set maintenance mode, or the load balancer ignores this maintenance mode status, after the next step is performed the cluster may return incorrect responses when consulting the node in question. You don’t want this! In the next steps, we will ensure that this shard is up-to-date before allowing it to participate in end-user requests.</p> <p>To enable maintenance mode:</p> <pre data-language="bash">$ curl -X PUT -H "Content-type: application/json" \
+    $COUCH_URL:5984/_node/{node-name}/_config/couchdb/maintenance_mode \
+    -d "\"true\""</pre> <p>Then, verify that the node is in maintenance mode by performing a <code class="docutils literal notranslate"><span class="pre">GET</span>
+<span class="pre">/_up</span></code> on that node’s individual endpoint:</p> <pre data-language="bash">$ curl -v $COUCH_URL/_up
+…
+&lt; HTTP/1.1 404 Object Not Found
+…
+{"status":"maintenance_mode"}</pre> <p>Finally, check that your load balancer has removed the node from the pool of available backend nodes.</p> </section> <section id="updating-cluster-metadata-to-reflect-the-new-target-shard-s"> <h3>Updating cluster metadata to reflect the new target shard(s)</h3> <p>Now we need to tell CouchDB that the target node (which must already be <a class="reference internal" href="nodes.html#cluster-nodes-add"><span class="std std-ref">joined to the cluster</span></a>) should be hosting shard replicas for a given database.</p> <p>To update the cluster metadata, use the special <code class="docutils literal notranslate"><span class="pre">/_dbs</span></code> database, which is an internal CouchDB database that maps databases to shards and nodes. This database is automatically replicated between nodes. It is accessible only through the special <code class="docutils literal notranslate"><span class="pre">/_node/_local/_dbs</span></code> endpoint.</p> <p>First, retrieve the database’s current metadata:</p> <pre data-language="bash">$ curl http://adm:pass@localhost:5984/_node/_local/_dbs/{name}
+{
+  "_id": "{name}",
+  "_rev": "1-e13fb7e79af3b3107ed62925058bfa3a",
+  "shard_suffix": [46, 49, 53, 51, 48, 50, 51, 50, 53, 50, 54],
+  "changelog": [
+    ["add", "00000000-1fffffff", "node1@xxx.xxx.xxx.xxx"],
+    ["add", "00000000-1fffffff", "node2@xxx.xxx.xxx.xxx"],
+    ["add", "00000000-1fffffff", "node3@xxx.xxx.xxx.xxx"],
+    …
+  ],
+  "by_node": {
+    "node1@xxx.xxx.xxx.xxx": [
+      "00000000-1fffffff",
+      …
+    ],
+    …
+  },
+  "by_range": {
+    "00000000-1fffffff": [
+      "node1@xxx.xxx.xxx.xxx",
+      "node2@xxx.xxx.xxx.xxx",
+      "node3@xxx.xxx.xxx.xxx"
+    ],
+    …
+  }
+}</pre> <p>Here is a brief anatomy of that document:</p> <ul class="simple"> <li><p><code class="docutils literal notranslate"><span class="pre">_id</span></code>: The name of the database.</p></li> <li><p><code class="docutils literal notranslate"><span class="pre">_rev</span></code>: The current revision of the metadata.</p></li> <li><p><code class="docutils literal notranslate"><span class="pre">shard_suffix</span></code>: A timestamp of the database’s creation, marked as seconds after the Unix epoch mapped to the codepoints for ASCII numerals.</p></li> <li><p><code class="docutils literal notranslate"><span class="pre">changelog</span></code>: History of the database’s shards.</p></li> <li><p><code class="docutils literal notranslate"><span class="pre">by_node</span></code>: List of shards on each node.</p></li> <li><p><code class="docutils literal notranslate"><span class="pre">by_range</span></code>: On which nodes each shard is.</p></li> </ul> <p>To reflect the shard move in the metadata, there are three steps:</p> <ol class="arabic simple"> <li><p>Add appropriate changelog entries.</p></li> <li><p>Update the <code class="docutils literal notranslate"><span class="pre">by_node</span></code> entries.</p></li> <li><p>Update the <code class="docutils literal notranslate"><span class="pre">by_range</span></code> entries.</p></li> </ol> <div class="admonition warning"> <p class="admonition-title">Warning</p> <p>Be very careful! Mistakes during this process can irreparably corrupt the cluster!</p> </div> <p>As of this writing, this process must be done manually.</p> <p>To add a shard to a node, add entries like this to the database metadata’s <code class="docutils literal notranslate"><span class="pre">changelog</span></code> attribute:</p> <pre data-language="javascript">["add", "{range}", "{node-name}"]</pre> <p>The <code class="docutils literal notranslate"><span class="pre">{range}</span></code> is the specific shard range for the shard. The <code class="docutils literal notranslate"><span class="pre">{node-name}</span></code> should match the name and address of the node as displayed in <code class="docutils literal notranslate"><span class="pre">GET</span>
+<span class="pre">/_membership</span></code> on the cluster.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>When removing a shard from a node, specify <code class="docutils literal notranslate"><span class="pre">remove</span></code> instead of <code class="docutils literal notranslate"><span class="pre">add</span></code>.</p> </div> <p>Once you have figured out the new changelog entries, you will need to update the <code class="docutils literal notranslate"><span class="pre">by_node</span></code> and <code class="docutils literal notranslate"><span class="pre">by_range</span></code> to reflect who is storing what shards. The data in the changelog entries and these attributes must match. If they do not, the database may become corrupted.</p> <p>Continuing our example, here is an updated version of the metadata above that adds shards to an additional node called <code class="docutils literal notranslate"><span class="pre">node4</span></code>:</p> <pre data-language="javascript">{
+  "_id": "{name}",
+  "_rev": "1-e13fb7e79af3b3107ed62925058bfa3a",
+  "shard_suffix": [46, 49, 53, 51, 48, 50, 51, 50, 53, 50, 54],
+  "changelog": [
+    ["add", "00000000-1fffffff", "node1@xxx.xxx.xxx.xxx"],
+    ["add", "00000000-1fffffff", "node2@xxx.xxx.xxx.xxx"],
+    ["add", "00000000-1fffffff", "node3@xxx.xxx.xxx.xxx"],
+    ...
+    ["add", "00000000-1fffffff", "node4@xxx.xxx.xxx.xxx"]
+  ],
+  "by_node": {
+    "node1@xxx.xxx.xxx.xxx": [
+      "00000000-1fffffff",
+      ...
+    ],
+    ...
+    "node4@xxx.xxx.xxx.xxx": [
+      "00000000-1fffffff"
+    ]
+  },
+  "by_range": {
+    "00000000-1fffffff": [
+      "node1@xxx.xxx.xxx.xxx",
+      "node2@xxx.xxx.xxx.xxx",
+      "node3@xxx.xxx.xxx.xxx",
+      "node4@xxx.xxx.xxx.xxx"
+    ],
+    ...
+  }
+}</pre> <p>Now you can <code class="docutils literal notranslate"><span class="pre">PUT</span></code> this new metadata:</p> <pre data-language="bash">$ curl -X PUT http://adm:pass@localhost:5984/_node/_local/_dbs/{name} -d '{...}'</pre> </section> <section id="forcing-synchronization-of-the-shard-s"> <h3>Forcing synchronization of the shard(s)</h3> <div class="versionadded"> <p><span class="versionmodified added">Added in version 2.4.0.</span></p> </div> <p>Whether you pre-copied shards to your new node or not, you can force CouchDB to synchronize all replicas of all shards in a database with the <a class="reference internal" href="../api/database/shard.html#api-db-sync-shards"><span class="std std-ref">/{db}/_sync_shards</span></a> endpoint:</p> <pre data-language="bash">$ curl -X POST $COUCH_URL:5984/{db}/_sync_shards
+{"ok":true}</pre> <p>This starts the synchronization process. Note that this will put additional load onto your cluster, which may affect performance.</p> <p>It is also possible to force synchronization on a per-shard basis by writing to a document that is stored within that shard.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Admins may want to bump their <code class="docutils literal notranslate"><span class="pre">[mem3]</span> <span class="pre">sync_concurrency</span></code> value to a larger figure for the duration of the shards sync.</p> </div> </section> <section id="monitor-internal-replication-to-ensure-up-to-date-shard-s"> <h3>Monitor internal replication to ensure up-to-date shard(s)</h3> <p>After you complete the previous step, CouchDB will have started synchronizing the shards. You can observe this happening by monitoring the <code class="docutils literal notranslate"><span class="pre">/_node/{node-name}/_system</span></code> endpoint, which includes the <code class="docutils literal notranslate"><span class="pre">internal_replication_jobs</span></code> metric.</p> <p>Once this metric has returned to the baseline from before you started the shard sync, or is <code class="docutils literal notranslate"><span class="pre">0</span></code>, the shard replica is ready to serve data and we can bring the node out of maintenance mode.</p> </section> <section id="clear-the-target-node-s-maintenance-mode"> <h3>Clear the target node’s maintenance mode</h3> <p>You can now let the node start servicing data requests by putting <code class="docutils literal notranslate"><span class="pre">"false"</span></code> to the maintenance mode configuration endpoint, just as in step 2.</p> <p>Verify that the node is not in maintenance mode by performing a <code class="docutils literal notranslate"><span class="pre">GET</span>
+<span class="pre">/_up</span></code> on that node’s individual endpoint.</p> <p>Finally, check that your load balancer has returned the node to the pool of available backend nodes.</p> </section> <section id="update-cluster-metadata-again-to-remove-the-source-shard"> <h3>Update cluster metadata again to remove the source shard</h3> <p>Now, remove the source shard from the shard map the same way that you added the new target shard to the shard map in step 2. Be sure to add the <code class="docutils literal notranslate"><span class="pre">["remove",</span> <span class="pre">{range},</span> <span class="pre">{source-shard}]</span></code> entry to the end of the changelog as well as modifying both the <code class="docutils literal notranslate"><span class="pre">by_node</span></code> and <code class="docutils literal notranslate"><span class="pre">by_range</span></code> sections of the database metadata document.</p> </section> <section id="remove-the-shard-and-secondary-index-files-from-the-source-node"> <h3>Remove the shard and secondary index files from the source node</h3> <p>Finally, you can remove the source shard replica by deleting its file from the command line on the source host, along with any view shard replicas:</p> <pre data-language="bash">$ rm {couch-dir}/data/shards/{range}/{db}.{datecode}.couch
+$ rm -r {couch-dir}/data/.shards/{range}/{db}.{datecode}*</pre> <p>Congratulations! You have moved a database shard replica. By adding and removing database shard replicas in this way, you can change the cluster’s shard layout, also known as a shard map.</p> </section> </section> <section id="specifying-database-placement"> <h2>Specifying database placement</h2> <p>You can configure CouchDB to put shard replicas on certain nodes at database creation time using placement rules.</p> <div class="admonition warning"> <p class="admonition-title">Warning</p> <p>Use of the <code class="docutils literal notranslate"><span class="pre">placement</span></code> option will <strong>override</strong> the <code class="docutils literal notranslate"><span class="pre">n</span></code> option, both in the <code class="docutils literal notranslate"><span class="pre">.ini</span></code> file as well as when specified in a <code class="docutils literal notranslate"><span class="pre">URL</span></code>.</p> </div> <p>First, each node must be labeled with a zone attribute. This defines which zone each node is in. You do this by editing the node’s document in the special <code class="docutils literal notranslate"><span class="pre">/_nodes</span></code> database, which is accessed through the special node-local API endpoint at <code class="docutils literal notranslate"><span class="pre">/_node/_local/_nodes/{node-name}</span></code>. Add a key value pair of the form:</p> <pre data-language="javascript">"zone": "{zone-name}"</pre> <p>Do this for all of the nodes in your cluster. For example:</p> <pre data-language="bash">$ curl -X PUT http://adm:pass@localhost:5984/_node/_local/_nodes/{node-name} \
+    -d '{ \
+        "_id": "{node-name}",
+        "_rev": "{rev}",
+        "zone": "{zone-name}"
+        }'</pre> <p>Alternatively, you can set the <code class="docutils literal notranslate"><span class="pre">COUCHDB_ZONE</span></code> environment variable on each node and CouchDB will configure this document for you on startup.</p> <p>In the local config file (<code class="docutils literal notranslate"><span class="pre">local.ini</span></code>) of each node, define a consistent cluster-wide setting like:</p> <pre data-language="javascript">[cluster]
+placement = {zone-name-1}:2,{zone-name-2}:1</pre> <p>In this example, CouchDB will ensure that two replicas for a shard will be hosted on nodes with the zone attribute set to <code class="docutils literal notranslate"><span class="pre">{zone-name-1}</span></code> and one replica will be hosted on a new with the zone attribute set to <code class="docutils literal notranslate"><span class="pre">{zone-name-2}</span></code>.</p> <p>This approach is flexible, since you can also specify zones on a per- database basis by specifying the placement setting as a query parameter when the database is created, using the same syntax as the ini file:</p> <pre data-language="bash">curl -X PUT $COUCH_URL:5984/{db}?placement={zone}</pre> <p>The <code class="docutils literal notranslate"><span class="pre">placement</span></code> argument may also be specified. Note that this <em>will</em> override the logic that determines the number of created replicas!</p> <p>Note that you can also use this system to ensure certain nodes in the cluster do not host any replicas for newly created databases, by giving them a zone attribute that does not appear in the <code class="docutils literal notranslate"><span class="pre">[cluster]</span></code> placement string.</p> </section> <section id="splitting-shards"> <h2>Splitting Shards</h2> <p>The <a class="reference internal" href="../api/server/common.html#api-server-reshard"><span class="std std-ref">/_reshard</span></a> is an HTTP API for shard manipulation. Currently it only supports shard splitting. To perform shard merging, refer to the manual process outlined in the <a class="reference internal" href="#cluster-sharding-merging-shards"><span class="std std-ref">Merging Shards</span></a> section.</p> <p>The main way to interact with <a class="reference internal" href="../api/server/common.html#api-server-reshard"><span class="std std-ref">/_reshard</span></a> is to create resharding jobs, monitor those jobs, wait until they complete, remove them, post new jobs, and so on. What follows are a few steps one might take to use this API to split shards.</p> <p>At first, it’s a good idea to call <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/_reshard</span></code> to see a summary of resharding on the cluster.</p> <pre data-language="bash">$ curl -s $COUCH_URL:5984/_reshard | jq .
+{
+  "state": "running",
+  "state_reason": null,
+  "completed": 3,
+  "failed": 0,
+  "running": 0,
+  "stopped": 0,
+  "total": 3
+}</pre> <p>Two important things to pay attention to are the total number of jobs and the state.</p> <p>The <code class="docutils literal notranslate"><span class="pre">state</span></code> field indicates the state of resharding on the cluster. Normally it would be <code class="docutils literal notranslate"><span class="pre">running</span></code>, however, another user could have disabled resharding temporarily. Then, the state would be <code class="docutils literal notranslate"><span class="pre">stopped</span></code> and hopefully, there would be a reason or a comment in the value of the <code class="docutils literal notranslate"><span class="pre">state_reason</span></code> field. See <a class="reference internal" href="#cluster-sharding-stop-resharding"><span class="std std-ref">Stopping Resharding Jobs</span></a> for more details.</p> <p>The <code class="docutils literal notranslate"><span class="pre">total</span></code> number of jobs is important to keep an eye on because there is a maximum number of resharding jobs per node, and creating new jobs after the limit has been reached will result in an error. Before staring new jobs it’s a good idea to remove already completed jobs. See <a class="reference internal" href="https://docs.couchdb.org/en/3.5.1/config/resharding.html#config-reshard"><span class="std std-ref">reshard configuration section</span></a> for the default value of <code class="docutils literal notranslate"><span class="pre">max_jobs</span></code> parameter and how to adjust if needed.</p> <p>For example, to remove all the completed jobs run:</p> <pre data-language="bash">$ for jobid in $(curl -s $COUCH_URL:5984/_reshard/jobs | jq -r '.jobs[] | select (.job_state=="completed") | .id'); do \
+      curl -s -XDELETE $COUCH_URL:5984/_reshard/jobs/$jobid \
+  done</pre> <p>Then it’s a good idea to see what the db shard map looks like.</p> <pre data-language="bash">$ curl -s $COUCH_URL:5984/db1/_shards | jq '.'
+{
+  "shards": {
+    "00000000-7fffffff": [
+      "node1@127.0.0.1",
+      "node2@127.0.0.1",
+      "node3@127.0.0.1"
+    ],
+    "80000000-ffffffff": [
+      "node1@127.0.0.1",
+      "node2@127.0.0.1",
+      "node3@127.0.0.1"
+    ]
+  }
+}</pre> <p>In this example we’ll split all the copies of the <code class="docutils literal notranslate"><span class="pre">00000000-7fffffff</span></code> range. The API allows a combination of parameters such as: splitting all the ranges on all the nodes, all the ranges on just one node, or one particular range on one particular node. These are specified via the <code class="docutils literal notranslate"><span class="pre">db</span></code>, <code class="docutils literal notranslate"><span class="pre">node</span></code> and <code class="docutils literal notranslate"><span class="pre">range</span></code> job parameters.</p> <p>To split all the copies of <code class="docutils literal notranslate"><span class="pre">00000000-7fffffff</span></code> we issue a request like this:</p> <pre data-language="bash">$ curl -s -H "Content-type: application/json" -XPOST $COUCH_URL:5984/_reshard/jobs \
+  -d '{"type": "split", "db":"db1", "range":"00000000-7fffffff"}' | jq '.'
+[
+  {
+    "ok": true,
+    "id": "001-ef512cfb502a1c6079fe17e9dfd5d6a2befcc694a146de468b1ba5339ba1d134",
+    "node": "node1@127.0.0.1",
+    "shard": "shards/00000000-7fffffff/db1.1554242778"
+  },
+  {
+    "ok": true,
+    "id": "001-cec63704a7b33c6da8263211db9a5c74a1cb585d1b1a24eb946483e2075739ca",
+    "node": "node2@127.0.0.1",
+    "shard": "shards/00000000-7fffffff/db1.1554242778"
+  },
+  {
+    "ok": true,
+    "id": "001-fc72090c006d9b059d4acd99e3be9bb73e986d60ca3edede3cb74cc01ccd1456",
+    "node": "node3@127.0.0.1",
+    "shard": "shards/00000000-7fffffff/db1.1554242778"
+  }
+]</pre> <p>The request returned three jobs, one job for each of the three copies.</p> <p>To check progress of these jobs use <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/_reshard/jobs</span></code> or <code class="docutils literal notranslate"><span class="pre">GET</span>
+<span class="pre">/_reshard/jobs/{jobid}</span></code>.</p> <p>Eventually, these jobs should complete and the shard map should look like this:</p> <pre data-language="bash">$ curl -s $COUCH_URL:5984/db1/_shards | jq '.'
+{
+  "shards": {
+    "00000000-3fffffff": [
+      "node1@127.0.0.1",
+      "node2@127.0.0.1",
+      "node3@127.0.0.1"
+    ],
+    "40000000-7fffffff": [
+      "node1@127.0.0.1",
+      "node2@127.0.0.1",
+      "node3@127.0.0.1"
+    ],
+    "80000000-ffffffff": [
+      "node1@127.0.0.1",
+      "node2@127.0.0.1",
+      "node3@127.0.0.1"
+    ]
+  }
+}</pre> </section> <section id="stopping-resharding-jobs"> <h2>Stopping Resharding Jobs</h2> <p>Resharding at the cluster level could be stopped and then restarted. This can be helpful to allow external tools which manipulate the shard map to avoid interfering with resharding jobs. To stop all resharding jobs on a cluster issue a <code class="docutils literal notranslate"><span class="pre">PUT</span></code> to <code class="docutils literal notranslate"><span class="pre">/_reshard/state</span></code> endpoint with the <code class="docutils literal notranslate"><span class="pre">"state":</span> <span class="pre">"stopped"</span></code> key and value. You can also specify an optional note or reason for stopping.</p> <p>For example:</p> <pre data-language="bash">$ curl -s -H "Content-type: application/json" \
+  -XPUT $COUCH_URL:5984/_reshard/state \
+  -d '{"state": "stopped", "reason":"Moving some shards"}'
+{"ok": true}</pre> <p>This state will then be reflected in the global summary:</p> <pre data-language="bash">$ curl -s $COUCH_URL:5984/_reshard | jq .
+{
+  "state": "stopped",
+  "state_reason": "Moving some shards",
+  "completed": 74,
+  "failed": 0,
+  "running": 0,
+  "stopped": 0,
+  "total": 74
+}</pre> <p>To restart, issue a <code class="docutils literal notranslate"><span class="pre">PUT</span></code> request like above with <code class="docutils literal notranslate"><span class="pre">running</span></code> as the state. That should resume all the shard splitting jobs since their last checkpoint.</p> <p>See the API reference for more details: <a class="reference internal" href="../api/server/common.html#api-server-reshard"><span class="std std-ref">/_reshard</span></a>.</p> </section> <section id="merging-shards"> <h2>Merging Shards</h2> <p>The <code class="docutils literal notranslate"><span class="pre">q</span></code> value for a database can be set when the database is created or it can be increased later by splitting some of the shards <a class="reference internal" href="#cluster-sharding-splitting-shards"><span class="std std-ref">Splitting Shards</span></a>. In order to decrease <code class="docutils literal notranslate"><span class="pre">q</span></code> and merge some shards together, the database must be regenerated. Here are the steps:</p> <ol class="arabic simple"> <li><p>If there are running shard splitting jobs on the cluster, stop them via the HTTP API <a class="reference internal" href="#cluster-sharding-stop-resharding"><span class="std std-ref">Stopping Resharding Jobs</span></a>.</p></li> <li><p>Create a temporary database with the desired shard settings, by specifying the q value as a query parameter during the PUT operation.</p></li> <li><p>Stop clients accessing the database.</p></li> <li><p>Replicate the primary database to the temporary one. Multiple replications may be required if the primary database is under active use.</p></li> <li><p>Delete the primary database. <strong>Make sure nobody is using it!</strong></p></li> <li><p>Recreate the primary database with the desired shard settings.</p></li> <li><p>Clients can now access the database again.</p></li> <li><p>Replicate the temporary back to the primary.</p></li> <li><p>Delete the temporary database.</p></li> </ol> <p>Once all steps have completed, the database can be used again. The cluster will create and distribute its shards according to placement rules automatically.</p> <p>Downtime can be avoided in production if the client application(s) can be instructed to use the new database instead of the old one, and a cut- over is performed during a very brief outage window.</p> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    Copyright &copy; 2025 The Apache Software Foundation &mdash; Licensed under the Apache License 2.0<br>
+    <a href="https://docs.couchdb.org/en/3.5.1/cluster/sharding.html" class="_attribution-link">https://docs.couchdb.org/en/3.5.1/cluster/sharding.html</a>
+  </p>
+</div>

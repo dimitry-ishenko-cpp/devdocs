@@ -1,0 +1,1300 @@
+<h1 id="host05-sample">Host05 Sample</h1> <p>This sample shows how to build an interactive console-based host application that reads commands from the command line, executes the commands, and then displays the results to the console. This host application also supports calls to remote computers by using the <a href="../../powershell/module/microsoft.powershell.core/enter-pssession.html">Enter-PSSession</a> and <a href="../../powershell/module/microsoft.powershell.core/exit-pssession.html">Exit-PSSession</a> cmdlets.</p> <h2 id="requirements">Requirements</h2> <ul> <li><p>This sample requires Windows PowerShell 2.0.</p></li> <li><p>This application must be run in elevated mode (Run as administrator).</p></li> </ul> <h2 id="demonstrates">Demonstrates</h2> <ul> <li><p>Creating a custom host whose classes derive from the <a href="../../dotnet/api/system.management.automation.host.pshost.html">System.Management.Automation.Host.PSHost</a> class, the <a href="../../dotnet/api/system.management.automation.host.pshostuserinterface.html">System.Management.Automation.Host.PSHostUserInterface</a> class, and the <a href="../../dotnet/api/system.management.automation.host.pshostrawuserinterface.html">System.Management.Automation.Host.PSHostRawUserInterface</a> class.</p></li> <li><p>Building a console application that uses these host classes to build an interactive Windows PowerShell shell.</p></li> <li>
+<p>Creating a <code>$PROFILE</code> variable and loading the following profiles.</p> <ul> <li>current user, current host</li> <li>current user, all hosts</li> <li>all users, current host</li> <li>all users, all hosts</li> </ul>
+</li> <li><p>Implement the <a href="../../dotnet/api/system.management.automation.host.ihostuisupportsmultiplechoiceselection.html">System.Management.Automation.Host.IHostUISupportsMultipleChoiceSelection</a> interface.</p></li> <li><p>Implement the <a href="../../dotnet/api/system.management.automation.host.ihostsupportsinteractivesession.html">System.Management.Automation.Host.IHostSupportsInteractiveSession</a> interface to support interactive remoting by using the <a href="../../powershell/module/microsoft.powershell.core/enter-pssession.html">Enter-PSSession</a> and <a href="../../powershell/module/microsoft.powershell.core/exit-pssession.html">Exit-PSSession</a> cmdlets.</p></li> </ul> <h2 id="example-1">Example 1</h2> <p>This example allows the user to enter commands at a command line, processes those commands, and then prints out the results.</p> <pre><code class="csharp">namespace Microsoft.Samples.PowerShell.Host
+{
+  using System;
+  using System.Collections.Generic;
+  using System.Collections.ObjectModel;
+  using System.Management.Automation;
+  using System.Management.Automation.Host;
+  using System.Management.Automation.Runspaces;
+  using System.Text;
+  using PowerShell = System.Management.Automation.PowerShell;
+
+  /// &lt;summary&gt;
+  /// Simple PowerShell interactive console host listener implementation. This class
+  /// implements a basic read-evaluate-print loop or 'listener' allowing you to
+  /// interactively work with the PowerShell engine.
+  /// &lt;/summary&gt;
+  internal class PSListenerConsoleSample
+  {
+    /// &lt;summary&gt;
+    /// Holds a reference to the runspace for this interpreter.
+    /// &lt;/summary&gt;
+    internal Runspace myRunSpace;
+
+    /// &lt;summary&gt;
+    /// Indicator to tell the host application that it should exit.
+    /// &lt;/summary&gt;
+    private bool shouldExit;
+
+    /// &lt;summary&gt;
+    /// The exit code that the host application will use to exit.
+    /// &lt;/summary&gt;
+    private int exitCode;
+
+    /// &lt;summary&gt;
+    /// Holds a reference to  the PSHost object for this interpreter.
+    /// &lt;/summary&gt;
+    private MyHost myHost;
+
+    /// &lt;summary&gt;
+    /// Holds a reference to the currently executing pipeline so that
+    /// it can be stopped by the control-C handler.
+    /// &lt;/summary&gt;
+    private PowerShell currentPowerShell;
+
+    /// &lt;summary&gt;
+    /// Used to serialize access to instance data.
+    /// &lt;/summary&gt;
+    private object instanceLock = new object();
+
+    /// &lt;summary&gt;
+    /// Gets or sets a value indicating whether the host application
+    /// should exit.
+    /// &lt;/summary&gt;
+    public bool ShouldExit
+    {
+      get { return this.shouldExit; }
+      set { this.shouldExit = value; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets or sets the exit code that the host application will use
+    /// when exiting.
+    /// &lt;/summary&gt;
+    public int ExitCode
+    {
+      get { return this.exitCode; }
+      set { this.exitCode = value; }
+    }
+
+    /// &lt;summary&gt;
+    /// Creates and initiates the listener.
+    /// &lt;/summary&gt;
+    /// &lt;param name="args"&gt;The parameter is not used.&lt;/param&gt;
+    private static void Main(string[] args)
+    {
+      // Display the welcome message.
+      Console.Title = "Windows PowerShell Console Host Application Sample";
+      ConsoleColor oldFg = Console.ForegroundColor;
+      Console.ForegroundColor = ConsoleColor.Cyan;
+      Console.WriteLine("    Windows PowerShell Console Host Interactive Sample");
+      Console.WriteLine("    ==================================================");
+      Console.WriteLine(string.Empty);
+      Console.WriteLine("This is an example of a simple interactive console host that uses ");
+      Console.WriteLine("the Windows PowerShell engine to interpret commands.");
+      Console.WriteLine("Type 'exit' to exit.");
+      Console.WriteLine(string.Empty);
+      Console.ForegroundColor = oldFg;
+
+      // Create the listener and runs it. This method never returns.
+      PSListenerConsoleSample listener = new PSListenerConsoleSample();
+      listener.Run();
+    }
+
+    /// &lt;summary&gt;
+    /// Create an instance of the console listener.
+    /// &lt;/summary&gt;
+    private PSListenerConsoleSample()
+    {
+      // Create the host and runspace instances for this interpreter. Note
+      // that this application doesn't support console files so only the
+      // default snap-ins will be available.
+      this.myHost = new MyHost(this);
+      this.myRunSpace = RunspaceFactory.CreateRunspace(this.myHost);
+      this.myRunSpace.Open();
+
+      // Create a PowerShell object to run the commands used to create
+      // $PROFILE and load the profiles.
+      lock (this.instanceLock)
+      {
+        this.currentPowerShell = PowerShell.Create();
+      }
+
+      try
+      {
+        this.currentPowerShell.Runspace = this.myRunSpace;
+
+        PSCommand[] profileCommands = Microsoft.Samples.PowerShell.Host.HostUtilities.GetProfileCommands("SampleHost05");
+        foreach (PSCommand command in profileCommands)
+        {
+          this.currentPowerShell.Commands = command;
+          this.currentPowerShell.Invoke();
+        }
+      }
+      finally
+      {
+        // Dispose of the pipeline line and set it to null, locked because currentPowerShell
+        // may be accessed by the ctrl-C handler...
+        lock (this.instanceLock)
+        {
+          this.currentPowerShell.Dispose();
+          this.currentPowerShell = null;
+        }
+      }
+    }
+
+    /// &lt;summary&gt;
+    /// A helper class that builds and executes a pipeline that writes to the
+    /// default output path. Any exceptions that are thrown are just passed to
+    /// the caller. Since all output goes to the default
+    /// outputter, this method does not return anything.
+    /// &lt;/summary&gt;
+    /// &lt;param name="cmd"&gt;The script to run.&lt;/param&gt;
+    /// &lt;param name="input"&gt;Any input arguments to pass to the script.
+    /// If null then nothing is passed in.&lt;/param&gt;
+    private void executeHelper(string cmd, object input)
+    {
+      // Ignore empty command lines.
+      if (String.IsNullOrEmpty(cmd))
+      {
+        return;
+      }
+
+      // Create the pipeline object and make it available to the
+      // ctrl-C handle through the currentPowerShell instance
+      // variable.
+      lock (this.instanceLock)
+      {
+        this.currentPowerShell = PowerShell.Create();
+      }
+
+      // Create a pipeline for this execution, and then place the
+      // result in the currentPowerShell variable so it is available
+      // to be stopped.
+      try
+      {
+        this.currentPowerShell.Runspace = this.myRunSpace;
+        this.currentPowerShell.AddScript(cmd);
+
+        // Add the default outputter to the end of the pipe and then
+        // call the MergeMyResults method to merge the output and
+        // error streams from the pipeline. This will result in the
+        // output being written using the PSHost and PSHostUserInterface
+        // classes instead of returning objects to the host application.
+        this.currentPowerShell.AddCommand("Out-Default");
+        this.currentPowerShell.Commands.Commands[0].MergeMyResults(PipelineResultTypes.Error, PipelineResultTypes.Output);
+
+        // If there is any input pass it in, otherwise just invoke the
+        // the pipeline.
+        if (input != null)
+        {
+          this.currentPowerShell.Invoke(new object[] { input });
+        }
+        else
+        {
+          this.currentPowerShell.Invoke();
+        }
+      }
+      finally
+      {
+        // Dispose the PowerShell object and set currentPowerShell to null.
+        // It is locked because currentPowerShell may be accessed by the
+        // ctrl-C handler.
+        lock (this.instanceLock)
+        {
+          this.currentPowerShell.Dispose();
+          this.currentPowerShell = null;
+        }
+      }
+    }
+
+    /// &lt;summary&gt;
+    /// To display an exception using the display formatter,
+    /// run a second pipeline passing in the error record.
+    /// The runtime will bind this to the $input variable,
+    /// which is why $input is being piped to the Out-String
+    /// cmdlet. The WriteErrorLine method is called to make sure
+    /// the error gets displayed in the correct error color.
+    /// &lt;/summary&gt;
+    /// &lt;param name="e"&gt;The exception to display.&lt;/param&gt;
+    private void ReportException(Exception e)
+    {
+      if (e != null)
+      {
+        object error;
+        IContainsErrorRecord icer = e as IContainsErrorRecord;
+        if (icer != null)
+        {
+          error = icer.ErrorRecord;
+        }
+        else
+        {
+          error = (object)new ErrorRecord(e, "Host.ReportException", ErrorCategory.NotSpecified, null);
+        }
+
+        lock (this.instanceLock)
+        {
+          this.currentPowerShell = PowerShell.Create();
+        }
+
+        this.currentPowerShell.Runspace = this.myRunSpace;
+
+        try
+        {
+          this.currentPowerShell.AddScript("$input").AddCommand("Out-String");
+
+          // Do not merge errors, this function will swallow errors.
+          Collection&lt;PSObject&gt; result;
+          PSDataCollection&lt;object&gt; inputCollection = new PSDataCollection&lt;object&gt;();
+          inputCollection.Add(error);
+          inputCollection.Complete();
+          result = this.currentPowerShell.Invoke(inputCollection);
+
+          if (result.Count &gt; 0)
+          {
+            string str = result[0].BaseObject as string;
+            if (!string.IsNullOrEmpty(str))
+            {
+              // Remove \r\n, which is added by the Out-String cmdlet.
+              this.myHost.UI.WriteErrorLine(str.Substring(0, str.Length - 2));
+            }
+          }
+        }
+        finally
+        {
+          // Dispose of the pipeline and set it to null, locking it  because
+          // currentPowerShell may be accessed by the ctrl-C handler.
+          lock (this.instanceLock)
+          {
+            this.currentPowerShell.Dispose();
+            this.currentPowerShell = null;
+          }
+        }
+      }
+    }
+
+    /// &lt;summary&gt;
+    /// Basic script execution routine. Any runtime exceptions are
+    /// caught and passed back to the Windows PowerShell engine to
+    /// display.
+    /// &lt;/summary&gt;
+    /// &lt;param name="cmd"&gt;Script to run.&lt;/param&gt;
+    private void Execute(string cmd)
+    {
+      try
+      {
+        // Execute the command with no input.
+        this.executeHelper(cmd, null);
+      }
+      catch (RuntimeException rte)
+      {
+        this.ReportException(rte);
+      }
+    }
+
+    /// &lt;summary&gt;
+    /// Method used to handle control-C's from the user. It calls the
+    /// pipeline Stop() method to stop execution. If any exceptions occur
+    /// they are printed to the console but otherwise ignored.
+    /// &lt;/summary&gt;
+    /// &lt;param name="sender"&gt;See sender property documentation of
+    /// ConsoleCancelEventHandler.&lt;/param&gt;
+    /// &lt;param name="e"&gt;See e property documentation of
+    /// ConsoleCancelEventHandler.&lt;/param&gt;
+    private void HandleControlC(object sender, ConsoleCancelEventArgs e)
+    {
+      try
+      {
+        lock (this.instanceLock)
+        {
+          if (this.currentPowerShell != null &amp;&amp; this.currentPowerShell.InvocationStateInfo.State == PSInvocationState.Running)
+          {
+            this.currentPowerShell.Stop();
+          }
+        }
+
+        e.Cancel = true;
+      }
+      catch (Exception exception)
+      {
+        this.myHost.UI.WriteErrorLine(exception.ToString());
+      }
+    }
+
+    /// &lt;summary&gt;
+    /// Implements the basic listener loop. It sets up the ctrl-C handler, then
+    /// reads a command from the user, executes it and repeats until the ShouldExit
+    /// flag is set.
+    /// &lt;/summary&gt;
+    private void Run()
+    {
+      // Set up the control-C handler.
+      Console.CancelKeyPress += new ConsoleCancelEventHandler(this.HandleControlC);
+      Console.TreatControlCAsInput = false;
+
+      // Read commands to execute until ShouldExit is set by
+      // the user calling "exit".
+      while (!this.ShouldExit)
+      {
+        string prompt;
+        if (this.myHost.IsRunspacePushed)
+        {
+          prompt = string.Format("\n[{0}] PSConsoleSample: ", this.myRunSpace.ConnectionInfo.ComputerName);
+        }
+        else
+        {
+          prompt = "\nPSConsoleSample: ";
+        }
+
+        this.myHost.UI.Write(ConsoleColor.Cyan, ConsoleColor.Black, prompt);
+        string cmd = Console.ReadLine();
+        this.Execute(cmd);
+      }
+
+      // Exit with the desired exit code that was set by exit command.
+      // This is set in the host by the MyHost.SetShouldExit() implementation.
+      Environment.Exit(this.ExitCode);
+    }
+  }
+}
+</code></pre> <h2 id="example-2">Example 2</h2> <p>The following code is the implementation of the <a href="../../dotnet/api/system.management.automation.host.pshost.html">System.Management.Automation.Host.PSHost</a> class that is used by this host application. Those elements that are not implemented throw an exception or return nothing.</p> <pre><code class="csharp">namespace Microsoft.Samples.PowerShell.Host
+{
+  using System;
+  using System.Globalization;
+  using System.Management.Automation.Host;
+  using System.Management.Automation.Runspaces;
+
+  /// &lt;summary&gt;
+  /// This is a sample implementation of the PSHost abstract class for
+  /// console applications. Not all members are implemented. Those that
+  /// are not implemented throw a NotImplementedException exception or
+  /// return nothing.
+  /// &lt;/summary&gt;
+  internal class MyHost : PSHost, IHostSupportsInteractiveSession
+  {
+
+    /// &lt;summary&gt;
+    /// A reference to the PSHost implementation.
+    /// &lt;/summary&gt;
+    private PSListenerConsoleSample program;
+
+    /// &lt;summary&gt;
+    /// The culture information of the thread that created
+    /// this object.
+    /// &lt;/summary&gt;
+    private CultureInfo originalCultureInfo =
+        System.Threading.Thread.CurrentThread.CurrentCulture;
+
+    /// &lt;summary&gt;
+    /// The UI culture information of the thread that created
+    /// this object.
+    /// &lt;/summary&gt;
+    private CultureInfo originalUICultureInfo =
+        System.Threading.Thread.CurrentThread.CurrentUICulture;
+
+    /// &lt;summary&gt;
+    /// The identifier of this PSHost implementation.
+    /// &lt;/summary&gt;
+    private static Guid instanceId = Guid.NewGuid();
+
+    /// &lt;summary&gt;
+    /// Initializes a new instance of the MyHost class. Keep
+    /// a reference to the host application object so that it
+    /// can be informed of when to exit.
+    /// &lt;/summary&gt;
+    /// &lt;param name="program"&gt;
+    /// A reference to the host application object.
+    /// &lt;/param&gt;
+    public MyHost(PSListenerConsoleSample program)
+    {
+      this.program = program;
+    }
+
+    /// &lt;summary&gt;
+    /// A reference to the implementation of the PSHostUserInterface
+    /// class for this application.
+    /// &lt;/summary&gt;
+    private MyHostUserInterface myHostUserInterface = new MyHostUserInterface();
+
+    /// &lt;summary&gt;
+    /// A reference to the runspace used to start an interactive session.
+    /// &lt;/summary&gt;
+    public Runspace pushedRunspace = null;
+
+    /// &lt;summary&gt;
+    /// Gets the culture information to use. This implementation
+    /// returns a snapshot of the culture information of the thread
+    /// that created this object.
+    /// &lt;/summary&gt;
+    public override CultureInfo CurrentCulture
+    {
+      get { return this.originalCultureInfo; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets the UI culture information to use. This implementation
+    /// returns a snapshot of the UI culture information of the thread
+    /// that created this object.
+    /// &lt;/summary&gt;
+    public override CultureInfo CurrentUICulture
+    {
+      get { return this.originalUICultureInfo; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets an identifier for this host. This implementation always
+    /// returns the GUID allocated at instantiation time.
+    /// &lt;/summary&gt;
+    public override Guid InstanceId
+    {
+      get { return instanceId; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets a string that contains the name of this host implementation.
+    /// Keep in mind that this string may be used by script writers to
+    /// identify when your host is being used.
+    /// &lt;/summary&gt;
+    public override string Name
+    {
+      get { return "MySampleConsoleHostImplementation"; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets an instance of the implementation of the PSHostUserInterface
+    /// class for this application. This instance is allocated once at startup time
+    /// and returned every time thereafter.
+    /// &lt;/summary&gt;
+    public override PSHostUserInterface UI
+    {
+      get { return this.myHostUserInterface; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets the version object for this application. Typically this
+    /// should match the version resource in the application.
+    /// &lt;/summary&gt;
+    public override Version Version
+    {
+      get { return new Version(1, 0, 0, 0); }
+    }
+
+    #region IHostSupportsInteractiveSession Properties
+
+    /// &lt;summary&gt;
+    /// Gets a value indicating whether a request
+    /// to open a PSSession has been made.
+    /// &lt;/summary&gt;
+    public bool IsRunspacePushed
+    {
+      get { return this.pushedRunspace != null; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets or sets the runspace used by the PSSession.
+    /// &lt;/summary&gt;
+    public Runspace Runspace
+    {
+      get { return this.program.myRunSpace; }
+      internal set { this.program.myRunSpace = value; }
+    }
+    #endregion IHostSupportsInteractiveSession Properties
+
+    /// &lt;summary&gt;
+    /// This API Instructs the host to interrupt the currently running
+    /// pipeline and start a new nested input loop. In this example this
+    /// functionality is not needed so the method throws a
+    /// NotImplementedException exception.
+    /// &lt;/summary&gt;
+    public override void EnterNestedPrompt()
+    {
+      throw new NotImplementedException(
+            "The method or operation is not implemented.");
+    }
+
+    /// &lt;summary&gt;
+    /// This API instructs the host to exit the currently running input loop.
+    /// In this example this functionality is not needed so the method
+    /// throws a NotImplementedException exception.
+    /// &lt;/summary&gt;
+    public override void ExitNestedPrompt()
+    {
+      throw new NotImplementedException(
+            "The method or operation is not implemented.");
+    }
+
+    /// &lt;summary&gt;
+    /// This API is called before an external application process is
+    /// started. Typically it is used to save state so that the parent
+    /// can restore state that has been modified by a child process (after
+    /// the child exits). In this example this functionality is not
+    /// needed so the method returns nothing.
+    /// &lt;/summary&gt;
+    public override void NotifyBeginApplication()
+    {
+      return;
+    }
+
+    /// &lt;summary&gt;
+    /// This API is called after an external application process finishes.
+    /// Typically it is used to restore state that a child process has
+    /// altered. In this example, this functionality is not needed so
+    /// the method returns nothing.
+    /// &lt;/summary&gt;
+    public override void NotifyEndApplication()
+    {
+      return;
+    }
+
+    /// &lt;summary&gt;
+    /// Indicate to the host application that exit has
+    /// been requested. Pass the exit code that the host
+    /// application should use when exiting the process.
+    /// &lt;/summary&gt;
+    /// &lt;param name="exitCode"&gt;The exit code that the
+    /// host application should use.&lt;/param&gt;
+    public override void SetShouldExit(int exitCode)
+    {
+      this.program.ShouldExit = true;
+      this.program.ExitCode = exitCode;
+    }
+
+    #region IHostSupportsInteractiveSession Methods
+
+    /// &lt;summary&gt;
+    /// Requests to close a PSSession.
+    /// &lt;/summary&gt;
+    public void PopRunspace()
+    {
+      Runspace = this.pushedRunspace;
+      this.pushedRunspace = null;
+    }
+
+    /// &lt;summary&gt;
+    /// Requests to open a PSSession.
+    /// &lt;/summary&gt;
+    /// &lt;param name="runspace"&gt;Runspace to use.&lt;/param&gt;
+    public void PushRunspace(Runspace runspace)
+    {
+      this.pushedRunspace = Runspace;
+      Runspace = runspace;
+    }
+
+    #endregion IHostSupportsInteractiveSession Methods
+  }
+}
+</code></pre> <h2 id="example-3">Example 3</h2> <p>The following code is the implementation of the <a href="../../dotnet/api/system.management.automation.host.pshostuserinterface.html">System.Management.Automation.Host.PSHostUserInterface</a> class that is used by this host application.</p> <pre><code class="csharp">namespace Microsoft.Samples.PowerShell.Host
+{
+  using System;
+  using System.Collections.Generic;
+  using System.Collections.ObjectModel;
+  using System.Globalization;
+  using System.Management.Automation;
+  using System.Management.Automation.Host;
+  using System.Text;
+
+  /// &lt;summary&gt;
+  /// A sample implementation of the PSHostUserInterface abstract class for
+  /// console applications. Not all members are implemented. Those that are
+  /// not implemented throw a NotImplementedException exception or return
+  /// nothing. Members that are implemented include those that map easily to
+  /// Console APIs and a basic implementation of the prompt API provided.
+  /// &lt;/summary&gt;
+  internal class MyHostUserInterface : PSHostUserInterface, IHostUISupportsMultipleChoiceSelection
+  {
+    /// &lt;summary&gt;
+    /// A reference to the PSRawUserInterface implementation.
+    /// &lt;/summary&gt;
+    private MyRawUserInterface myRawUi = new MyRawUserInterface();
+
+    /// &lt;summary&gt;
+    /// Gets an instance of the PSRawUserInterface object for this host
+    /// application.
+    /// &lt;/summary&gt;
+    public override PSHostRawUserInterface RawUI
+    {
+      get { return this.myRawUi; }
+    }
+
+    /// &lt;summary&gt;
+    /// Prompts the user for input.
+    /// &lt;param name="caption"&gt;The caption or title of the prompt.&lt;/param&gt;
+    /// &lt;param name="message"&gt;The text of the prompt.&lt;/param&gt;
+    /// &lt;param name="descriptions"&gt;A collection of FieldDescription objects
+    /// that describe each field of the prompt.&lt;/param&gt;
+    /// &lt;returns&gt;A dictionary object that contains the results of the user
+    /// prompts.&lt;/returns&gt;
+    public override Dictionary&lt;string, PSObject&gt; Prompt(
+                              string caption,
+                              string message,
+                              Collection&lt;FieldDescription&gt; descriptions)
+    {
+      this.Write(
+                 ConsoleColor.Blue,
+                 ConsoleColor.Black,
+                 caption + "\n" + message + " ");
+      Dictionary&lt;string, PSObject&gt; results =
+                 new Dictionary&lt;string, PSObject&gt;();
+      foreach (FieldDescription fd in descriptions)
+      {
+        string[] label = GetHotkeyAndLabel(fd.Label);
+        this.WriteLine(label[1]);
+        string userData = Console.ReadLine();
+        if (userData == null)
+        {
+          return null;
+        }
+
+        results[fd.Name] = PSObject.AsPSObject(userData);
+      }
+
+      return results;
+    }
+
+    /// &lt;summary&gt;
+
+    /// Provides a set of choices that enable the user to choose a
+    /// single option from a set of options.
+    /// &lt;/summary&gt;
+    /// &lt;param name="caption"&gt;Text that proceeds (a title) the choices.&lt;/param&gt;
+    /// &lt;param name="message"&gt;A message that describes the choice.&lt;/param&gt;
+    /// &lt;param name="choices"&gt;A collection of ChoiceDescription objects that
+    /// describe each choice.&lt;/param&gt;
+    /// &lt;param name="defaultChoice"&gt;The index of the label in the Choices
+    /// parameter collection. To indicate no default choice, set to -1.&lt;/param&gt;
+    /// &lt;returns&gt;The index of the Choices parameter collection element that
+    /// corresponds to the option that is selected by the user.&lt;/returns&gt;
+    public override int PromptForChoice(
+                                        string caption,
+                                        string message,
+                                        Collection&lt;ChoiceDescription&gt; choices,
+                                        int defaultChoice)
+    {
+      // Write the caption and message strings in Blue.
+      this.WriteLine(
+                     ConsoleColor.Blue,
+                     ConsoleColor.Black,
+                     caption + "\n" + message + "\n");
+
+      // Convert the choice collection into something that is
+      // easier to work with. See the BuildHotkeysAndPlainLabels
+      // method for details.
+      string[,] promptData = BuildHotkeysAndPlainLabels(choices);
+
+      // Format the overall choice prompt string to display.
+      StringBuilder sb = new StringBuilder();
+      for (int element = 0; element &lt; choices.Count; element++)
+      {
+        sb.Append(String.Format(
+                                CultureInfo.CurrentCulture,
+                                "|{0}&gt; {1} ",
+                                promptData[0, element],
+                                promptData[1, element]));
+      }
+
+      sb.Append(String.Format(
+                              CultureInfo.CurrentCulture,
+                              "[Default is ({0}]",
+                              promptData[0, defaultChoice]));
+
+      // Read prompts until a match is made, the default is
+      // chosen, or the loop is interrupted with ctrl-C.
+      while (true)
+      {
+        this.WriteLine(ConsoleColor.Cyan, ConsoleColor.Black, sb.ToString());
+        string data = Console.ReadLine().Trim().ToUpper(CultureInfo.CurrentCulture);
+
+        // If the choice string was empty, use the default selection.
+        if (data.Length == 0)
+        {
+          return defaultChoice;
+        }
+
+        // See if the selection matched and return the
+        // corresponding index if it did.
+        for (int i = 0; i &lt; choices.Count; i++)
+        {
+          if (promptData[0, i] == data)
+          {
+            return i;
+          }
+        }
+
+        this.WriteErrorLine("Invalid choice: " + data);
+      }
+    }
+
+    #region IHostUISupportsMultipleChoiceSelection Members
+
+    /// &lt;summary&gt;
+    /// Provides a set of choices that enable the user to choose a one or
+    /// more options from a set of options.
+    /// &lt;/summary&gt;
+    /// &lt;param name="caption"&gt;Text that proceeds (a title) the choices.&lt;/param&gt;
+    /// &lt;param name="message"&gt;A message that describes the choice.&lt;/param&gt;
+    /// &lt;param name="choices"&gt;A collection of ChoiceDescription objects that
+    /// describe each choice.&lt;/param&gt;
+    /// &lt;param name="defaultChoices"&gt;The index of the label in the Choices
+    /// parameter collection. To indicate no default choice, set to -1.&lt;/param&gt;
+    /// &lt;returns&gt;The index of the Choices parameter collection element that
+    /// corresponds to the option that is selected by the user.&lt;/returns&gt;
+    public Collection&lt;int&gt; PromptForChoice(
+                                           string caption,
+                                           string message,
+                                           Collection&lt;ChoiceDescription&gt; choices,
+                                           IEnumerable&lt;int&gt; defaultChoices)
+    {
+      // Write the caption and message strings in Blue.
+      this.WriteLine(
+                     ConsoleColor.Blue,
+                     ConsoleColor.Black,
+                     caption + "\n" + message + "\n");
+
+      // Convert the choice collection into something that is
+      // easier to work with. See the BuildHotkeysAndPlainLabels
+      // method for details.
+      string[,] promptData = BuildHotkeysAndPlainLabels(choices);
+
+      // Format the overall choice prompt string to display.
+      StringBuilder sb = new StringBuilder();
+      for (int element = 0; element &lt; choices.Count; element++)
+      {
+        sb.Append(String.Format(
+                                CultureInfo.CurrentCulture,
+                                "|{0}&gt; {1} ",
+                                promptData[0, element],
+                                promptData[1, element]));
+      }
+
+      Collection&lt;int&gt; defaultResults = new Collection&lt;int&gt;();
+      if (defaultChoices != null)
+      {
+        int countDefaults = 0;
+        foreach (int defaultChoice in defaultChoices)
+        {
+          ++countDefaults;
+          defaultResults.Add(defaultChoice);
+        }
+
+        if (countDefaults != 0)
+        {
+          sb.Append(countDefaults == 1 ? "[Default choice is " : "[Default choices are ");
+          foreach (int defaultChoice in defaultChoices)
+          {
+            sb.AppendFormat(
+                             CultureInfo.CurrentCulture,
+                             "\"{0}\",",
+                             promptData[0, defaultChoice]);
+          }
+
+          sb.Remove(sb.Length - 1, 1);
+          sb.Append("]");
+        }
+      }
+
+      this.WriteLine(
+                     ConsoleColor.Cyan,
+                     ConsoleColor.Black,
+                     sb.ToString());
+
+      // Read prompts until a match is made, the default is
+      // chosen, or the loop is interrupted with ctrl-C.
+      Collection&lt;int&gt; results = new Collection&lt;int&gt;();
+      while (true)
+      {
+        ReadNext:
+        string prompt = string.Format(CultureInfo.CurrentCulture, "Choice[{0}]:", results.Count);
+        this.Write(ConsoleColor.Cyan, ConsoleColor.Black, prompt);
+        string data = Console.ReadLine().Trim().ToUpper(CultureInfo.CurrentCulture);
+
+        // If the choice string was empty, no more choices have been made.
+        // If there were no choices made, return the defaults
+        if (data.Length == 0)
+        {
+          return (results.Count == 0) ? defaultResults : results;
+        }
+
+        // See if the selection matched and return the
+        // corresponding index if it did.
+        for (int i = 0; i &lt; choices.Count; i++)
+        {
+          if (promptData[0, i] == data)
+          {
+            results.Add(i);
+            goto ReadNext;
+          }
+        }
+
+        this.WriteErrorLine("Invalid choice: " + data);
+      }
+    }
+
+    #endregion
+
+    /// &lt;summary&gt;
+    /// Prompts the user for credentials with a specified prompt window
+    /// caption, prompt message, user name, and target name. In this
+    /// example this functionality is not needed so the method throws a
+    /// NotImplementException exception.
+    /// &lt;/summary&gt;
+    /// &lt;param name="caption"&gt;The caption for the message window.&lt;/param&gt;
+    /// &lt;param name="message"&gt;The text of the message.&lt;/param&gt;
+    /// &lt;param name="userName"&gt;The user name whose credential is to be
+    /// prompted for.&lt;/param&gt;
+    /// &lt;param name="targetName"&gt;The name of the target for which the
+    /// credential is collected.&lt;/param&gt;
+    /// &lt;returns&gt;Throws a NotImplementedException exception.&lt;/returns&gt;
+    public override PSCredential PromptForCredential(
+                                                     string caption,
+                                                     string message,
+                                                     string userName,
+                                                     string targetName)
+    {
+      throw new NotImplementedException(
+                           "The method or operation is not implemented.");
+    }
+
+    /// &lt;summary&gt;
+    /// Prompts the user for credentials by using a specified prompt window
+    /// caption, prompt message, user name and target name, credential
+    /// types allowed to be returned, and UI behavior options. In this
+    /// example this functionality is not needed so the method throws a
+    /// NotImplementException exception.
+    /// &lt;/summary&gt;
+    /// &lt;param name="caption"&gt;The caption for the message window.&lt;/param&gt;
+    /// &lt;param name="message"&gt;The text of the message.&lt;/param&gt;
+    /// &lt;param name="userName"&gt;The user name whose credential is to be
+    /// prompted for.&lt;/param&gt;
+    /// &lt;param name="targetName"&gt;The name of the target for which the
+    /// credential is collected.&lt;/param&gt;
+    /// &lt;param name="allowedCredentialTypes"&gt;A PSCredentialTypes constant
+    /// that identifies the type of credentials that can be returned.&lt;/param&gt;
+    /// &lt;param name="options"&gt;A PSCredentialUIOptions constant that
+    /// identifies the UI behavior when it gathers the credentials.&lt;/param&gt;
+    /// &lt;returns&gt;Throws a NotImplementedException exception.&lt;/returns&gt;
+    public override PSCredential PromptForCredential(
+                                       string caption,
+                                       string message,
+                                       string userName,
+                                       string targetName,
+                                       PSCredentialTypes allowedCredentialTypes,
+                                       PSCredentialUIOptions options)
+    {
+      throw new NotImplementedException(
+                              "The method or operation is not implemented.");
+    }
+
+    /// &lt;summary&gt;
+    /// Reads characters that are entered by the user until a newline
+    /// (carriage return) is encountered.
+    /// &lt;/summary&gt;
+    /// &lt;returns&gt;The characters that are entered by the user.&lt;/returns&gt;
+    public override string ReadLine()
+    {
+      return Console.ReadLine();
+    }
+
+    /// &lt;summary&gt;
+    /// Reads characters entered by the user until a newline (carriage return)
+    /// is encountered and returns the characters as a secure string. In this
+    /// example this functionality is not needed so the method throws a
+    /// NotImplementException exception.
+    /// &lt;/summary&gt;
+    /// &lt;returns&gt;Throws a NotImplemented exception.&lt;/returns&gt;
+    public override System.Security.SecureString ReadLineAsSecureString()
+    {
+      throw new NotImplementedException("The method or operation is not implemented.");
+    }
+
+    /// &lt;summary&gt;
+    /// Writes characters to the output display of the host.
+    /// &lt;/summary&gt;
+    /// &lt;param name="value"&gt;The characters to be written.&lt;/param&gt;
+    public override void Write(string value)
+    {
+      Console.Write(value);
+    }
+
+    /// &lt;summary&gt;
+    /// Writes characters to the output display of the host with possible
+    /// foreground and background colors.
+    /// &lt;/summary&gt;
+    /// &lt;param name="foregroundColor"&gt;The color of the characters.&lt;/param&gt;
+    /// &lt;param name="backgroundColor"&gt;The background color to use.&lt;/param&gt;
+    /// &lt;param name="value"&gt;The characters to be written.&lt;/param&gt;
+    public override void Write(
+                               ConsoleColor foregroundColor,
+                               ConsoleColor backgroundColor,
+                               string value)
+    {
+      ConsoleColor oldFg = Console.ForegroundColor;
+      ConsoleColor oldBg = Console.BackgroundColor;
+      Console.ForegroundColor = foregroundColor;
+      Console.BackgroundColor = backgroundColor;
+      Console.Write(value);
+      Console.ForegroundColor = oldFg;
+      Console.BackgroundColor = oldBg;
+    }
+
+    /// &lt;summary&gt;
+    /// Writes a line of characters to the output display of the host
+    /// with foreground and background colors and appends a newline (carriage return).
+    /// &lt;/summary&gt;
+    /// &lt;param name="foregroundColor"&gt;The foreground color of the display. &lt;/param&gt;
+    /// &lt;param name="backgroundColor"&gt;The background color of the display. &lt;/param&gt;
+    /// &lt;param name="value"&gt;The line to be written.&lt;/param&gt;
+    public override void WriteLine(
+                                   ConsoleColor foregroundColor,
+                                   ConsoleColor backgroundColor,
+                                   string value)
+    {
+      ConsoleColor oldFg = Console.ForegroundColor;
+      ConsoleColor oldBg = Console.BackgroundColor;
+      Console.ForegroundColor = foregroundColor;
+      Console.BackgroundColor = backgroundColor;
+      Console.WriteLine(value);
+      Console.ForegroundColor = oldFg;
+      Console.BackgroundColor = oldBg;
+    }
+
+    /// &lt;summary&gt;
+    /// Writes a debug message to the output display of the host.
+    /// &lt;/summary&gt;
+    /// &lt;param name="message"&gt;The debug message that is displayed.&lt;/param&gt;
+    public override void WriteDebugLine(string message)
+    {
+      this.WriteLine(
+                     ConsoleColor.DarkYellow,
+                     ConsoleColor.Black,
+                     String.Format(CultureInfo.CurrentCulture, "DEBUG: {0}", message));
+    }
+
+    /// &lt;summary&gt;
+    /// Writes an error message to the output display of the host.
+    /// &lt;/summary&gt;
+    /// &lt;param name="value"&gt;The error message that is displayed.&lt;/param&gt;
+    public override void WriteErrorLine(string value)
+    {
+      this.WriteLine(
+                     ConsoleColor.Red,
+                     ConsoleColor.Black,
+                     value);
+    }
+
+    /// &lt;summary&gt;
+    /// Writes a newline character (carriage return)
+    /// to the output display of the host.
+    /// &lt;/summary&gt;
+    public override void WriteLine()
+    {
+      Console.WriteLine();
+    }
+
+       /// &lt;summary&gt;
+    /// Writes a line of characters to the output display of the host
+    /// and appends a newline character(carriage return).
+    /// &lt;/summary&gt;
+    /// &lt;param name="value"&gt;The line to be written.&lt;/param&gt;
+    public override void WriteLine(string value)
+    {
+      Console.WriteLine(value);
+    }
+
+    /// &lt;summary&gt;
+    /// Writes a progress report to the output display of the host.
+    /// &lt;/summary&gt;
+    /// &lt;param name="sourceId"&gt;Unique identifier of the source of the record. &lt;/param&gt;
+    /// &lt;param name="record"&gt;A ProgressReport object.&lt;/param&gt;
+    public override void WriteProgress(long sourceId, ProgressRecord record)
+    {
+
+    }
+
+    /// &lt;summary&gt;
+    /// Writes a verbose message to the output display of the host.
+    /// &lt;/summary&gt;
+    /// &lt;param name="message"&gt;The verbose message that is displayed.&lt;/param&gt;
+    public override void WriteVerboseLine(string message)
+    {
+      this.WriteLine(
+                     ConsoleColor.Green,
+                     ConsoleColor.Black,
+                     String.Format(CultureInfo.CurrentCulture, "VERBOSE: {0}", message));
+    }
+
+    /// &lt;summary&gt;
+    /// Writes a warning message to the output display of the host.
+    /// &lt;/summary&gt;
+    /// &lt;param name="message"&gt;The warning message that is displayed.&lt;/param&gt;
+    public override void WriteWarningLine(string message)
+    {
+      this.WriteLine(
+                     ConsoleColor.Yellow,
+                     ConsoleColor.Black,
+                     String.Format(CultureInfo.CurrentCulture, "WARNING: {0}", message));
+    }
+
+    /// &lt;summary&gt;
+    /// Parse a string containing a hotkey character.
+    /// Take a string of the form
+    ///    Yes to &amp;all
+    /// and returns a two-dimensional array split out as
+    ///    "A", "Yes to all".
+    /// &lt;/summary&gt;
+    /// &lt;param name="input"&gt;The string to process&lt;/param&gt;
+    /// &lt;returns&gt;
+    /// A two dimensional array containing the parsed components.
+    /// &lt;/returns&gt;
+    private static string[] GetHotkeyAndLabel(string input)
+    {
+      string[] result = new string[] { String.Empty, String.Empty };
+      string[] fragments = input.Split('&amp;');
+      if (fragments.Length == 2)
+      {
+        if (fragments[1].Length &gt; 0)
+        {
+          result[0] = fragments[1][0].ToString().
+          ToUpper(CultureInfo.CurrentCulture);
+        }
+
+        result[1] = (fragments[0] + fragments[1]).Trim();
+      }
+      else
+      {
+        result[1] = input;
+      }
+
+      return result;
+    }
+
+    /// &lt;summary&gt;
+    /// This is a private worker function splits out the
+    /// accelerator keys from the menu and builds a two
+    /// dimensional array with the first access containing the
+    /// accelerator and the second containing the label string
+    /// with the &amp; removed.
+    /// &lt;/summary&gt;
+    /// &lt;param name="choices"&gt;The choice collection to process&lt;/param&gt;
+    /// &lt;returns&gt;
+    /// A two dimensional array containing the accelerator characters
+    /// and the cleaned-up labels&lt;/returns&gt;
+    private static string[,] BuildHotkeysAndPlainLabels(
+         Collection&lt;ChoiceDescription&gt; choices)
+    {
+      // Allocate the result array
+      string[,] hotkeysAndPlainLabels = new string[2, choices.Count];
+
+      for (int i = 0; i &lt; choices.Count; ++i)
+      {
+        string[] hotkeyAndLabel = GetHotkeyAndLabel(choices[i].Label);
+        hotkeysAndPlainLabels[0, i] = hotkeyAndLabel[0];
+        hotkeysAndPlainLabels[1, i] = hotkeyAndLabel[1];
+      }
+
+      return hotkeysAndPlainLabels;
+    }
+  }
+}
+</code></pre> <h2 id="example-4">Example 4</h2> <p>The following code is the implementation of the <a href="../../dotnet/api/system.management.automation.host.pshostrawuserinterface.html">System.Management.Automation.Host.PSHostRawUserInterface</a> class that is used by this host application. Those elements that are not implemented throw an exception or return nothing.</p> <pre><code class="csharp">namespace Microsoft.Samples.PowerShell.Host
+{
+  using System;
+  using System.Management.Automation.Host;
+
+  /// &lt;summary&gt;
+  /// A sample implementation of the PSHostRawUserInterface for console
+  /// applications. Members of this class that easily map to the .NET
+  /// console class are implemented. More complex methods are not
+  /// implemented and throw a NotImplementedException exception.
+  /// &lt;/summary&gt;
+  internal class MyRawUserInterface : PSHostRawUserInterface
+  {
+    /// &lt;summary&gt;
+    /// Gets or sets the background color of text to be written.
+    /// This maps to the corresponding Console.Background property.
+    /// &lt;/summary&gt;
+    public override ConsoleColor BackgroundColor
+    {
+      get { return Console.BackgroundColor; }
+      set { Console.BackgroundColor = value; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets or sets the host buffer size adapted from the Console buffer
+    /// size members.
+    /// &lt;/summary&gt;
+    public override Size BufferSize
+    {
+      get { return new Size(Console.BufferWidth, Console.BufferHeight); }
+      set { Console.SetBufferSize(value.Width, value.Height); }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets or sets the cursor position. In this example this
+    /// functionality is not needed so the property throws a
+    /// NotImplementException exception.
+    /// &lt;/summary&gt;
+    public override Coordinates CursorPosition
+    {
+      get { throw new NotImplementedException(
+                 "The method or operation is not implemented."); }
+      set { throw new NotImplementedException(
+                 "The method or operation is not implemented."); }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets or sets the cursor size taken directly from the
+    /// Console.CursorSize property.
+    /// &lt;/summary&gt;
+    public override int CursorSize
+    {
+      get { return Console.CursorSize; }
+      set { Console.CursorSize = value; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets or sets the foreground color of the text to be written.
+    /// This maps to the corresponding Console.ForegroundColor property.
+    /// &lt;/summary&gt;
+    public override ConsoleColor ForegroundColor
+    {
+      get { return Console.ForegroundColor; }
+      set { Console.ForegroundColor = value; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets a value indicating whether a key is available. This maps to
+    /// the corresponding Console.KeyAvailable property.
+    /// &lt;/summary&gt;
+    public override bool KeyAvailable
+    {
+      get { return Console.KeyAvailable; }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets the maximum physical size of the window adapted from the
+    /// Console.LargestWindowWidth and Console.LargestWindowHeight
+    /// properties.
+    /// &lt;/summary&gt;
+    public override Size MaxPhysicalWindowSize
+    {
+      get { return new Size(Console.LargestWindowWidth, Console.LargestWindowHeight); }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets the maximum window size adapted from the
+    /// Console.LargestWindowWidth and console.LargestWindowHeight
+    /// properties.
+    /// &lt;/summary&gt;
+    public override Size MaxWindowSize
+    {
+      get { return new Size(Console.LargestWindowWidth, Console.LargestWindowHeight); }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets or sets the window position adapted from the Console window position
+    /// members.
+    /// &lt;/summary&gt;
+    public override Coordinates WindowPosition
+    {
+      get { return new Coordinates(Console.WindowLeft, Console.WindowTop); }
+      set { Console.SetWindowPosition(value.X, value.Y); }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets or sets the window size adapted from the corresponding Console
+    /// calls.
+    /// &lt;/summary&gt;
+    public override Size WindowSize
+    {
+      get { return new Size(Console.WindowWidth, Console.WindowHeight); }
+      set { Console.SetWindowSize(value.Width, value.Height); }
+    }
+
+    /// &lt;summary&gt;
+    /// Gets or sets the title of the window mapped to the Console.Title
+    /// property.
+    /// &lt;/summary&gt;
+    public override string WindowTitle
+    {
+      get { return Console.Title; }
+      set { Console.Title = value; }
+    }
+
+    /// &lt;summary&gt;
+    /// This API resets the input buffer. In this example this
+    /// functionality is not needed so the method returns nothing.
+    /// &lt;/summary&gt;
+    public override void FlushInputBuffer()
+    {
+    }
+
+    /// &lt;summary&gt;
+    /// This API returns a rectangular region of the screen buffer. In
+    /// this example this functionality is not needed so the method throws
+    /// a NotImplementException exception.
+    /// &lt;/summary&gt;
+    /// &lt;param name="rectangle"&gt;Defines the size of the rectangle.&lt;/param&gt;
+    /// &lt;returns&gt;Throws a NotImplementedException exception.&lt;/returns&gt;
+    public override BufferCell[,] GetBufferContents(Rectangle rectangle)
+    {
+      throw new NotImplementedException(
+               "The method or operation is not implemented.");
+    }
+
+    /// &lt;summary&gt;
+    /// This API Reads a pressed, released, or pressed and released keystroke
+    /// from the keyboard device, blocking processing until a keystroke is
+    /// typed that matches the specified keystroke options. In this example
+    /// this functionality is not needed so the method throws a
+    /// NotImplementException exception.
+    /// &lt;/summary&gt;
+    /// &lt;param name="options"&gt;Options, such as IncludeKeyDown,  used when
+    /// reading the keyboard.&lt;/param&gt;
+    /// &lt;returns&gt;Throws a NotImplementedException exception.&lt;/returns&gt;
+    public override KeyInfo ReadKey(ReadKeyOptions options)
+    {
+      throw new NotImplementedException(
+                "The method or operation is not implemented.");
+    }
+
+    /// &lt;summary&gt;
+    /// This API crops a region of the screen buffer. In this example
+    /// this functionality is not needed so the method throws a
+    /// NotImplementException exception.
+    /// &lt;/summary&gt;
+    /// &lt;param name="source"&gt;The region of the screen to be scrolled.&lt;/param&gt;
+    /// &lt;param name="destination"&gt;The region of the screen to receive the
+    /// source region contents.&lt;/param&gt;
+    /// &lt;param name="clip"&gt;The region of the screen to include in the operation.&lt;/param&gt;
+    /// &lt;param name="fill"&gt;The character and attributes to be used to fill all cell.&lt;/param&gt;
+    public override void ScrollBufferContents(Rectangle source, Coordinates destination, Rectangle clip, BufferCell fill)
+    {
+      throw new NotImplementedException(
+                "The method or operation is not implemented.");
+    }
+
+    /// &lt;summary&gt;
+    /// This API copies an array of buffer cells into the screen buffer
+    /// at a specified location. In this example this  functionality is
+    /// not needed si the method  throws a NotImplementedException exception.
+    /// &lt;/summary&gt;
+    /// &lt;param name="origin"&gt;The parameter is not used.&lt;/param&gt;
+    /// &lt;param name="contents"&gt;The parameter is not used.&lt;/param&gt;
+    public override void SetBufferContents(Coordinates origin, BufferCell[,] contents)
+    {
+      throw new NotImplementedException(
+                "The method or operation is not implemented.");
+    }
+
+    /// &lt;summary&gt;
+    /// This API Copies a given character, foreground color, and background
+    /// color to a region of the screen buffer. In this example this
+    /// functionality is not needed so the method throws a
+    /// NotImplementException exception./// &lt;/summary&gt;
+    /// &lt;param name="rectangle"&gt;Defines the area to be filled. &lt;/param&gt;
+    /// &lt;param name="fill"&gt;Defines the fill character.&lt;/param&gt;
+    public override void SetBufferContents(Rectangle rectangle, BufferCell fill)
+    {
+      throw new NotImplementedException(
+                "The method or operation is not implemented.");
+    }
+  }
+}
+</code></pre> <h2 id="see-also">See Also</h2> <p><a href="../../dotnet/api/system.management.automation.host.pshost.html">System.Management.Automation.Host.PSHost</a></p> <p><a href="../../dotnet/api/system.management.automation.host.pshostuserinterface.html">System.Management.Automation.Host.PSHostUserInterface</a></p> <p><a href="../../dotnet/api/system.management.automation.host.pshostrawuserinterface.html">System.Management.Automation.Host.PSHostRawUserInterface</a></p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Microsoft CorporationCode licensed under an MIT-style License. Documentation licensed under CC BY 4.0.<br>
+    <a href="https://learn.microsoft.com/en-us/powershell/scripting/developer/hosting/host05-sample?view=powershell-Scripting" class="_attribution-link">https://learn.microsoft.com/en-us/powershell/scripting/developer/hosting/host05-sample?view=powershell-Scripting</a>
+  </p>
+</div>

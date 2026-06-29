@@ -1,0 +1,859 @@
+<h1 id="Data-Loaders" tabindex="-1">Data Loaders </h1>
+<ul>
+<li>Start Date: 2022-07-14</li>
+<li>Target Major Version: Vue 3, Vue Router 4</li>
+<li>Reference Issues: -</li>
+<li><a href="https://github.com/vuejs/rfcs/discussions/460" target="_blank" rel="noreferrer">Discussion</a></li>
+<li><a href="https://github.com/posva/unplugin-vue-router/tree/main/src/data-loaders" target="_blank" rel="noreferrer">Implementation PR</a></li>
+</ul>
+<h2 id="Todo-List" tabindex="-1">Todo List </h2>
+<p>List of things that haven't been added to the document yet:</p>
+<ul>
+<li>[ ] Extendable API for data fetching libraries like vue-apollo, vuefire, vue-query, etc</li>
+<li>[ ] Warn if a non lazy loader is used without data: meaning it was used in a component without it being exported by a page component. Either make it lazy or export it</li>
+</ul>
+<h2 id="Summary" tabindex="-1">Summary </h2>
+<p>There is no silver bullet to data fetching because of the different data fetching strategies and how they can define the architecture of the application and its UX. However, I think it's possible to find a solution that is flexible enough to <strong>promote good practices</strong> and <strong>reduce the complexity</strong> of data fetching in applications. That is the goal of this RFC, to standardize and improve data fetching with vue-router:</p>
+<ul>
+<li>Integrate data fetching to the navigation cycle <ul><li>Blocks navigation while fetching or <em>defer</em> less important data (known as <em>lazy</em> in Nuxt)</li></ul>
+</li>
+<li>Deduplicate requests</li>
+<li>Delay data updates until all data loaders are resolved <ul>
+<li>Avoids displaying partially up-to-date data and inconsistent state</li>
+<li>Configurable through a <code>commit</code> option</li>
+</ul>
+</li>
+<li>Optimal data fetching <ul>
+<li>Defaults to parallel fetching</li>
+<li>Semantic sequential fetching if needed</li>
+</ul>
+</li>
+<li>Avoid <code>&lt;Suspense&gt;</code><ul>
+<li>No cascading loading states</li>
+<li>No double mounting</li>
+<li><a href="#suspense">more...</a></li>
+</ul>
+</li>
+<li>Provide atomic and global access to loading/error states</li>
+<li>Allow 3rd party libraries to extend the loaders functionality by establish a set of Interfaces that can be implemented. This targets libraries like <a href="https://vuefire.vuejs.org" target="_blank" rel="noreferrer">VueFire</a>, <a href="https://github.com/posva/pinia-colada" title="@pinia/colada" target="_blank" rel="noreferrer">@pinia/colada</a>, <a href="https://apollo.vuejs.org/" target="_blank" rel="noreferrer">vue-apollo</a>, <a href="https://tanstack.com/query/latest/docs/framework/vue/overview" title="@tanstack/vue-query" target="_blank" rel="noreferrer">@tanstack/vue-query</a>, etc to provide features like caching, pagination, etc. specific to their use cases.</li>
+</ul>
+<p>This proposal concerns Vue Router 4 and is implemented under <a href="https://github.com/posva/unplugin-vue-router" title="unplugin-vue-router" target="_blank" rel="noreferrer">unplugin-vue-router</a>. This enables types in data loaders but <strong>is not necessary</strong>. This feature is independent of the rest of the plugin and can be used without it, namely <strong>without file-based routing</strong>.</p>
+<blockquote class="tip custom-block">
+<strong class="custom-block-title">TIP</strong><p>In this RFC, data loaders are often referred as <em>loaders</em> for short. API names also use the word <em>loader</em> instead of <em>data loader</em> for brevity.</p>
+<p>💡 Some of the examples are interactive: hover or tap on the code to see the types and other information.</p>
+</blockquote>
+<h2 id="Basic-example" tabindex="-1">Basic example </h2>
+<p>We create data loaders with a <code>defineLoader()</code> function that returns a <strong>composable that can be used in any component</strong> (not only pages component).</p>
+<p>The loader is then picked up by a Navigation Guard. It can be attached to a page component in two ways:</p>
+<ul>
+<li>Export the loader from the page component it is attached to. It must be lazy loaded (<code>() =&gt; import('~/pages/users-details.vue')</code>)</li>
+<li>Manually add the loader to the route definition's <code>meta.loaders[]</code>
+</li>
+</ul>
+<p>Exported from a non-setup <code>&lt;script&gt;</code> in a page component:</p>
+<div class="language-vue vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">&lt;script lang="ts"&gt;
+import { getUserById } from '../api'
+
+// name the loader however you want **and export it**
+export const useUserData = defineLoader(async route =&gt; {
+  const user = await getUserById(route.params.id as string)
+  // ...
+  // return anything you want to expose
+  return user
+})
+
+// Optional: define other component options
+export default defineComponent({
+  name: 'custom-name',
+  inheritAttrs: false,
+})
+&lt;/script&gt;
+
+&lt;script lang="ts" setup&gt;
+// find the user as `data` and some other properties
+const { data: user, isLoading, error, reload } = useUserData()
+// data is always present, isLoading changes when going from '/users/2' to '/users/3'
+&lt;/script&gt;</pre>
+</div>
+<p>When a loader is exported by the page component, it is <strong>automatically</strong> picked up as long as the route is <strong>lazy loaded</strong> (which is a best practice). If the route isn't lazy loaded, the loader can be directly defined in an array of data loaders on <code>meta.loaders</code>:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">import { createRouter, createWebHistory } from 'vue-router'
+import UserList from './pages/UserList.vue'
+// could be anywhere
+import { useUserList, useUserData, type User } from './loaders/users'
+
+export const router = createRouter({
+  history: createWebHistory(),
+  routes: [
+    {
+      path: '/users',
+      component: UserList,
+      meta: {
+        // Required when the component is not lazy loaded
+        loaders: [useUserList],
+      },
+    },
+    {
+      path: '/users/:id',
+      // automatically picks up all exported loaders
+      component: () =&gt; import('./pages/UserDetails.vue'),
+    },
+  ],
+})</pre>
+</div>
+<p>Regarding the returned values from <code>useUserData()</code>:</p>
+<ul>
+<li>
+<code>data</code> (aliased to <code>user</code>), <code>isLoading</code>, and <code>error</code> are shallow ref and therefore reactive.</li>
+<li>
+<code>reload</code> is a function that can be called to force a reload of the data without a new navigation.</li>
+</ul>
+<p>Note <code>useUserData()</code> can be used in <strong>any component</strong>, not only in the page component: just import the function and call it within <code>&lt;script setup&gt;</code> like other composables</p>
+<p>By default, <strong>data loaders block the navigation</strong>, meaning they <em>just work</em> with SSR and errors are propagated to the router level (<code>router.onError()</code>). On top of that, data loads are deduplicated, which means that no mather how many page components use the same loader (e.g. nested pages), <strong>it will still load the data just once per navigation</strong>.</p>
+<p>The simplest of data loaders can be defined in just one line and types will be automatically inferred:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useBookCollection = defineLoader(fetchBookCollection)
+const { data } = useBookCollection()</pre>
+</div>
+<p>Note that this syntax will intentionally be avoided in the RFC. Instead, we will often use slightly longer examples to make things easier to follow.</p>
+<h2 id="Motivation" tabindex="-1">Motivation </h2>
+<p>There are currently too many ways of handling data fetching with vue-router and all of them have problems:</p>
+<ul>
+<li>With navigation guards: <ul>
+<li>using <code>onBeforeRouteUpdate()</code>: only works on subsequent navigations. Cannot be properly combined with <code>beforeRouteEnter()</code>.</li>
+<li>using <code>beforeRouteEnter()</code>: non typed and non-ergonomic API with <code>next()</code>, requires a data store (pinia, vuex, apollo, etc), does not exist in script setup</li>
+<li>using <code>meta</code>: complex to setup even for simple cases, too low level for such a common case</li>
+</ul>
+</li>
+<li>using a watcher on <code>route.params...</code>: component renders without the data (doesn't work with SSR)</li>
+<li>Using Suspense and <em>awaiting</em> data within page components <ul>
+<li>Cascading (slow) async states</li>
+<li>Only loads once (on mounting)</li>
+<li>Does not wait for navigation (or requires double mounting: pending + current view)</li>
+<li>Requires handling UI loading state</li>
+<li><a href="#suspense">And more</a></li>
+</ul>
+</li>
+</ul>
+<p>People are left with a low level API (navigation guards) to handle data fetching themselves. This is often a difficult problem to solve because it requires an extensive knowledge of the Router concepts and in reality, very few people know them. This leads to incomplete implementations that don't handle all the edge cases and don't provide a good user experience.</p>
+<p>Thus, the goal of this proposal is to provide a simple yet extendable way of defining data loading in your application that is easy to understand and use. It should also be compatible with SSR and not limited to simple <em>fetch calls</em>, but rather any async state. It should be adoptable by frameworks like Nuxt.js to provide an augmented data fetching layer that integrates well with Vue.js concepts and the future of Web APIs like the <a href="https://github.com/WICG/navigation-api/" target="_blank" rel="noreferrer">Navigation API</a>.</p>
+<h2 id="Detailed-design" tabindex="-1">Detailed design </h2>
+<p>The design of Data Loaders is split into two parts</p>
+<ul>
+<li>
+<a href="#implementations">Implementations</a><ul>
+<li>A bare-bone data loader</li>
+<li>A more advanced data loader with client side caching using <a href="https://github.com/posva/pinia-colada" title="@pinia/colada" target="_blank" rel="noreferrer">@pinia/colada</a>
+</li>
+</ul>
+</li>
+<li>The set of <a href="#interfaces">Interfaces (types)</a> that define a Data Loader (WIP)</li>
+</ul>
+<blockquote class="tip custom-block">
+<strong class="custom-block-title">TIP</strong><p>You might only be interested in trying out Data Loaders. In that case, check out the <a href="#implementations">implementations</a> section for instructions on how to use this. It's still recommended to read the rest of the RFC to understand what to expect from Data Loaders.</p>
+</blockquote>
+<h3 id="Data-Loader-Setup" tabindex="-1">Data Loader Setup </h3>
+<p><code>DataLoaderPlugin</code> adds the <a href="#the-navigation-guard">navigation guard</a> that handles the data loaders. It requires access to the router instance to attach the navigation guard as well as some other options:</p>
+<ul>
+<li>
+<code>router</code>: The Vue Router instance.</li>
+<li>
+<code>selectNavigationResult</code> (optional): Called wih an array of <code>NavigationResult</code> returned by loaders. It allows to decide the <em>fate</em> of the navigation that was modified by loaders. See <a href="#handling-multiple-navigation-results">NavigationResult</a>
+</li>
+</ul>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">import { createApp } from 'vue'
+import { createRouter } from 'vue-router'
+import { DataLoaderPlugin } from 'vue-router/experimental'
+
+const router = createRouter({
+  // ...
+})
+
+const app = createApp(App)
+app.use(DataLoaderPlugin, { router })
+// add the router after the DataLoaderPlugin
+app.use(router)</pre>
+</div>
+<p>It's important to add the <code>DataLoaderPlugin</code> before the router to ensure the navigation guards are attached before the router initiates the first navigation.</p>
+<h3 id="Core-Data-Loader-features" tabindex="-1">Core Data Loader features </h3>
+<p>These are the core features of the Data Loader API that every data loader should implement. Throughout the RFC, we will use a <strong>non-existent</strong>, <strong>generic</strong> <code>defineLoader()</code>. This is a placeholder for the actual name of the function, e.g. <a href="basic/index.html"><code>defineBasicLoader()</code></a>, <a href="colada/index.html"><code>defineColadaLoader()</code></a>, etc. In practice, one can globally alias the function to <code>defineLoader</code> with <a href="https://github.com/unplugin/unplugin-auto-import" target="_blank" rel="noreferrer">unplugin-auto-import</a>.</p>
+<p>Data Loaders should be able to load data based <strong>solely on the URL</strong>. This ensures that the page can be shared and that the rendering is consistent between the server and the client.</p>
+<h4 id="defineLoader-signature" tabindex="-1">
+<code>defineLoader()</code> signature </h4>
+<p>Data Loaders must accept an optional first parameter to type the route:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">import { getUserById } from '../api'
+
+export const useUserData = defineLoader('/users/[id]', async route =&gt; {
+  return getUserById(route.params.id)
+})</pre>
+</div>
+<p>The rest of the parameters are up to the implementation of the loader but they should accept <a href="#defineloader-options">extra options</a>.</p>
+<p>Within loaders there is no access to the current component or page instance, but it's possible to access global injections created with <code>app.provide()</code>. This includes stores created with <a href="https://pinia.vuejs.org" target="_blank" rel="noreferrer">Pinia</a>.</p>
+<h4 id="Returned-Composables" tabindex="-1">Returned Composables </h4>
+<p>Data Loaders are composables that return a set of properties:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">const {
+  // hover over each property to see the type
+  data,
+  isLoading,
+  error,
+  reload,
+} = useUserData()</pre>
+</div>
+<ul>
+<li>
+<code>data</code> contains the resolved value returned by the loader. It's a shallow ref to be more performant, especially with large data-sets</li>
+<li>
+<code>isLoading</code> is <code>true</code> while a request is isLoading and becomes <code>false</code> once the request is settled</li>
+<li>
+<code>error</code> contains any error thrown by the loader. It's also a shallow ref</li>
+<li>
+<code>reload()</code> reruns the loader outside of a navigation</li>
+</ul>
+<p>In practice, rename <code>data</code> (or others) to something more meaningful:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">const { data: user } = useUserData()</pre>
+</div>
+<h4 id="defineLoader-options" tabindex="-1">
+<code>defineLoader()</code> options </h4>
+<ul>
+<li>
+<p><code>lazy</code>: By default, loaders block the navigation. This means that the navigation is only allowed to continue once all loaders are resolved. Lazy loaders <strong>do not block the navigation</strong>. <code>data</code>, <code>error</code> and other properties might be updated after the navigation finishes. Setting this to <code>true</code> is useful for non-critical data fetching and will change the type of the returned <code>data</code> to <code>ShallowRef&lt;T | undefined&gt;</code>:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useBookCollection = defineLoader(fetchBookCollection, {
+  lazy: true,
+})
+const { data: bookCollection } = useBookCollection()
+//            ^ can be undefined</pre>
+</div>
+</li>
+<li>
+<p><code>commit</code>: Controls when the async state is reflected in <code>data</code> and <code>error</code>. You can choose to immediately reflect the state of the loader or delay the update of the data until all loaders are resolved (default). The latter is useful to avoid displaying partially up-to-date data and inconsistent state.</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useBookCollection = defineLoader(fetchBookCollection, {
+  commit: 'immediate',
+})</pre>
+</div>
+<p>A lazy loader can use <code>commit: 'after-load'</code> but since it's not awaited during the navigation, it might be reflected <strong>after the navigation</strong>.</p>
+</li>
+<li>
+<p><code>server</code>: By default, loaders are executed on both, client, and server. Setting this to false will skip its execution on the server. Like <code>lazy: true</code>, this also changes the type of the returned <code>data</code> to <code>ShallowRef&lt;T | undefined&gt;</code>:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useBookCollection = defineLoader(fetchBookCollection, {
+  server: false,
+})</pre>
+</div>
+</li>
+</ul>
+<p>Each custom implementation can augment the returned properties with more information. For example, <a href="colada/index.html">Pinia Colada</a> adds <code>refresh()</code>, <code>status</code> and other properties specific to its features.</p>
+<h4 id="Parallel-Fetching" tabindex="-1">Parallel Fetching </h4>
+<p>By default, loaders are executed as soon as possible, in parallel. This scenario works well for most use cases where data fetching only requires route params/query params or nothing at all.</p>
+<h4 id="Sequential-fetching" tabindex="-1">Sequential fetching </h4>
+<p>Sometimes, requests depend on other fetched data (e.g. fetching additional user information). For these scenarios, we can simply import the other loaders and use them <strong>within a different loader</strong>:</p>
+<p>Call <strong>and <code>await</code></strong> the loader inside the one that needs it, it will only be fetched once no matter how many times it is called during a navigation:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">// import the loader for user information
+import { useUserData } from './loaders/users'
+import { getCommonFriends, getCurrentUser } from './api'
+
+export const useUserCommonFriends = defineLoader(async route =&gt; {
+  // loaders must be awaited inside other loaders
+  // .        ⤵
+  const user = await useUserData() // magically works
+  const me = await getCurrentUser()
+
+  // fetch other data
+  const commonFriends = await getCommonFriends(me.id, user.id)
+  return { ...user, commonFriends }
+})</pre>
+</div>
+<p>You will notice here that we have two different usages for <code>useUserData()</code>:</p>
+<ul>
+<li>One that returns all the necessary information we need <em>synchronously</em> (not used here). This is the composable that we use in components</li>
+<li>A second version that <strong>only returns a promise of the data</strong>. This is the version used within data loaders that enables sequential fetching.</li>
+</ul>
+<blockquote class="danger custom-block">
+<strong class="custom-block-title">DANGER</strong><p><code>useUserData()</code> expects the route to have an <code>id</code> param to fetch the current user. We could maybe allow passing the route as a parameter to ensure the type safety as well to further differentiate the two usages (and their type).</p>
+</blockquote>
+<h5 id="Nested-invalidation" tabindex="-1">Nested invalidation </h5>
+<p>Since <code>useUserCommonFriends()</code> loader calls <code>useUserData()</code>, if <code>useUserData()</code> is somehow <em>invalidated</em>, it will also automatically invalidate <code>useUserCommonFriends()</code>. This depends on the implementation of the loader and is not a requirement of the API.</p>
+<blockquote class="warning custom-block">
+<strong class="custom-block-title">WARNING</strong><p>Two loaders cannot use each other as that would create a <em>dead lock</em>.</p>
+</blockquote>
+<p>This can get complex with multiple pages exposing the same loader and other pages using some of their <em>already exported</em> loaders within other loaders. But it's not an issue, <strong>the user shouldn't need to handle anything differently</strong>, loaders are still only called once:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">import {
+  getFriends,
+  getCommonFriends,
+  getUserById,
+  getCurrentUser,
+} from './api'
+
+export const useUserData = defineLoader('/users/[id]', async route =&gt; {
+  return getUserById(route.params.id)
+})
+
+export const useCurrentUserData = defineLoader('/users/[id]', async route =&gt; {
+  const me = await getCurrentUser()
+  // imagine legacy APIs that cannot be grouped into one single fetch
+  const friends = await getFriends(me.id)
+
+  return { ...me, friends }
+})
+
+export const useUserCommonFriends = defineLoader('/users/[id]', async route =&gt; {
+  const user = await useUserData()
+  const me = await useCurrentUserData()
+
+  const friends = await getCommonFriends(user.id, me.id)
+  return { ...me, commonFriends: { with: user, friends } }
+})</pre>
+</div>
+<p>In the example above we are exporting multiple loaders but we don't need to care about the order in which they are called nor try optimizing them because <strong>they are only called once and share the data</strong>.</p>
+<blockquote class="danger custom-block">
+<strong class="custom-block-title">DANGER</strong><p><strong>Caveat</strong>: must call <strong>and await</strong> all nested loaders at the top of the parent loader (see <code>useUserData()</code> and <code>useCurrentUserData()</code>). You cannot put a different regular <code>await</code> in between. If you really need to await <strong>anything that isn't a loader</strong> in between, wrap the promise with <code>withDataContext()</code> to ensure the loader context is properly restored:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useUserCommonFriends = defineLoader(async (route) =&gt; {
+  const user = await useUserData()
+  await withContext(functionThatReturnsAPromise())
+  const me = await useCurrentUserData()
+
+  // ...
+})</pre>
+</div>
+<p>This allows nested loaders to be aware of their <em>parent loader</em>. This could probably be linted with an eslint plugin. It is similar to the problem <code>&lt;script setup&gt;</code> had before introducing the automatic <code>withAsyncContext()</code>. The same feature could be introduced (via a vite plugin) but will also have a performance cost. In the future, this <em>should</em> be solved with the <a href="https://github.com/tc39/proposal-async-context" target="_blank" rel="noreferrer">async-context</a> proposal (stage 2).</p>
+</blockquote>
+<h4 id="Cache-" tabindex="-1">Cache <span class="VPBadge warning">&gt;=0.8.0</span> </h4>
+<blockquote class="warning custom-block">
+<strong class="custom-block-title">WARNING</strong><p>This part has been removed from the core features of the API. It's now part of custom implementations like <a href="colada/index.html">Pinia Colada</a>.</p>
+</blockquote>
+<h4 id="Smart-Refreshing" tabindex="-1">Smart Refreshing </h4>
+<p>This is not a requirement of the API.</p>
+<p>When navigating, depending on the loader, the data is refreshed <strong>automatically based on what params, query params, and hash</strong> are used within the loader.</p>
+<p>e.g. using <a href="colada/index.html">Pinia Colada</a>, given this loader in page <code>/users/:id</code>:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useUserData = defineColadaLoader(async route =&gt; {
+  const user = await getUserById(route.params.id)
+  return user
+})</pre>
+</div>
+<p>Going from <code>/users/1</code> to <code>/users/2</code> will reload the data but going from <code>/users/2</code> to <code>/users/2#projects</code> will not unless the cache expires or is manually invalidated (known as <em>refresh</em>).</p>
+<h4 id="Deduplication" tabindex="-1">Deduplication </h4>
+<p>Loaders also have the advantage of behaving as singleton requests. This means that they are only fetched once per navigation no matter how many times the loader is attached or how many regular components use it. It also means that all the refs (<code>data</code>, <code>isLoading</code>, etc) are created only once and shared by all components, reducing memory usage.</p>
+<h4 id="SSR" tabindex="-1">SSR </h4>
+<p>Each Data Loader implementation is responsible for providing a way to serialize the data loaded on the server and pass it to the client. This is a requirement for SSR to work properly.</p>
+<p>Different implementations could have different kind of keys. The simplest form is a string:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useBookCollection = defineLoader(
+  async () =&gt; {
+    const books = await fetchBookCollection()
+    return books
+  },
+  { key: 'bookCollection' }
+)</pre>
+</div>
+<h5 id="Avoiding-double-fetch-on-the-client" tabindex="-1">Avoiding double fetch on the client </h5>
+<p>One of the advantages of having an initial state is that we can avoid fetching on the client. Data Loaders can implement a mechanism to skip fetching on the client if the initial state is provided (<a href="colada/index.html">Pinia Colada</a> implements this). This means nested loaders <strong>aren't executed either</strong>. Since data loaders shouldn't contain side effects besides data fetching, this shouldn't be a problem.</p>
+<h3 id="The-Navigation-Guard" tabindex="-1">The Navigation Guard </h3>
+<p>The bulk of the logic of data loaders is handled with navigation guards:</p>
+<ul>
+<li>one <code>router.beforeEach()</code> to collect loaders from lazy loaded components</li>
+<li>one <code>router.beforeResolve()</code> (triggers after other guards) to execute the loaders</li>
+</ul>
+<p><code>router.afterEach()</code> and <code>router.onError()</code> are also used to handle errors and cleanup.</p>
+<p>Handling the data loading in a navigation guards has the following advantages:</p>
+<ul>
+<li>Ensure data is present before mounting the component</li>
+<li>Flexibility to not wait for non critical data with lazy data loaders</li>
+<li>Enables the UX pattern of letting the browser handle loading state (aligns with <a href="https://github.com/WICG/navigation-api" target="_blank" rel="noreferrer">future Navigation API</a>)</li>
+<li>Makes scrolling work out of the box when navigating between pages (when data loaders are blocking)</li>
+<li>Ensure one single request per loader and navigation</li>
+<li>Allows controlling the navigation (aborting, redirecting, etc)</li>
+</ul>
+<h4 id="Controlling-the-navigation" tabindex="-1">Controlling the navigation </h4>
+<p>Since the data fetching happens within a navigation guard, it's possible to control the navigation like in regular navigation guards:</p>
+<ul>
+<li>Thrown errors (or rejected Promises) cancel the navigation (same behavior as in a regular navigation guard) and are intercepted by <a href="../api/interfaces/router.html#onerror" rel="noreferrer" target="_blank">Vue Router's error handling</a>
+</li>
+<li>Redirection: <code>return new NavigationResult(targetLocation)</code> -&gt; like <code>return targetLocation</code> in a regular navigation guard</li>
+<li>Cancelling the navigation: <code>return new NavigationResult(false)</code> like <code>return false</code> in a regular navigation guard</li>
+<li>Any other returned value is considered as the <em>resolved data</em>
+</li>
+</ul>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">import { NavigationResult } from 'vue-router'
+
+export const useUserData = defineLoader(
+  async (to) =&gt; {
+    try {
+      const user = await getUserById(to.params.id)
+
+      return user
+    } catch (error) {
+      if (error.status === 404) {
+        return new NavigationResult({ name: 'not-found', params: { pathMatch: '' } }
+        )
+      } else {
+        throw error // aborts the vue router navigation
+      }
+    }
+  }
+)</pre>
+</div>
+<p><code>new NavigationResult()</code> accepts as its only argument anything that <a href="../guide/advanced/navigation-guards.html#global-before-guards" rel="noreferrer" target="_blank">can be returned in a navigation guard</a> to alter the navigation. e.g. it doesn't accept <code>true</code> or <code>undefined</code> as these do not modify the navigation.</p>
+<p>Some alternatives:</p>
+<blockquote class="details custom-block">
+<summary>Details</summary><ul>
+<li>
+<code>createNavigationResult()</code>: too verbose</li>
+<li>
+<code>NavigationResult()</code> (no <code>new</code>): <code>NavigationResult</code> is not a primitive so it should use <code>new</code>
+</li>
+<li>Accept a second argument for extra custom context that can be retrieved in <code>selectNavigationResult()</code>
+</li>
+</ul>
+</blockquote>
+<blockquote class="tip custom-block">
+<strong class="custom-block-title">TIP</strong><p>Throwing an error does not trigger the <code>selectNavigationResult()</code> method. Instead, it immediately cancels the navigation and triggers the <code>router.onError()</code> method, just like in a regular navigation guard.</p>
+</blockquote>
+<h4 id="Handling-multiple-navigation-results" tabindex="-1">Handling multiple navigation results </h4>
+<p>Since navigation loaders can run in parallel, they can return different navigation results as well. In this case, you can decide which result should be used by providing a <code>selectNavigationResult()</code> method to <a href="#data-loader-setup"><code>DataLoaderPlugin</code></a>:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">app.use(DataLoaderPlugin, {
+  router,
+  selectNavigationResult(results) {
+    for (const { value } of results) {
+      if (
+        typeof value === 'object' &amp;&amp;
+        'name' in value &amp;&amp;
+        value.name === 'not-found'
+      ) {
+        return value
+      }
+    }
+  },
+})</pre>
+</div>
+<p><code>selectNavigationResult()</code> is called with an array of all the returned <code>new NavigationResult(value)</code> <strong>after all data loaders</strong> have been resolved. <strong>If any of them throws an error</strong> or if none of them return a <code>NavigationResult</code>, <code>selectNavigationResult()</code> isn't called.</p>
+<p>By default, <code>selectNavigation</code> returns the first value of the array.</p>
+<h4 id="Eagerly-changing-the-navigation" tabindex="-1">Eagerly changing the navigation </h4>
+<p>If a loader wants to eagerly alter the navigation, it can <code>throw</code> the <code>NavigationResult</code> instead of returning it. This skips the <code>selectNavigationResult()</code> and take precedence without triggering <code>router.onError()</code>.</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">import { NavigationResult } from 'vue-router/experimental'
+
+export const useUserData = defineLoader(
+  async (to) =&gt; {
+    try {
+      const user = await getUserById(to.params.id)
+
+      return user
+    } catch (error) {
+      throw new NavigationResult({
+        name: 'not-found',
+        params: { pathMatch: to.path.split('/') },
+        query: to.query,
+        hash: to.hash,
+      })
+    }
+  }
+)</pre>
+</div>
+<blockquote class="info custom-block">
+<strong class="custom-block-title">INFO</strong><p>When using vue router named views, each named view can have their own loaders but note any navigation to the route will trigger <strong>all loaders from all page components</strong>. This is because the router doesn't know which named views will be used.</p>
+</blockquote>
+<h3 id="Advanced-Error-handling" tabindex="-1">Advanced Error handling </h3>
+<p>Since throwing an error in a loader cancels the navigation, this doesn't allow to have an error property in <em>non lazy loaders</em> to display the error in the UI. To solve this, we can specify expected errors when defining the loader:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">// custom error class
+class MyError extends Error {
+  // override is only needed in TS
+  override name = 'MyError' // Displays in logs instead of 'Error'
+  // defining a constructor is optional
+  constructor(message: string) {
+    super(message)
+  }
+}
+
+export const useUserData = defineLoader(
+  async (to) =&gt; {
+    // ...
+  },
+  {
+    errors: [MyError],
+  }
+)</pre>
+</div>
+<p>These can also be specified globally:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">class MyError extends Error {
+  name = 'MyError'
+  constructor(message: string) {
+    super(message)
+  }
+}
+
+app.use(DataLoaderPlugin, {
+  router,
+// checks with `instanceof MyError`
+  errors: [MyError],
+})</pre>
+</div>
+<blockquote class="tip custom-block">
+<strong class="custom-block-title">TIP</strong><p>In a lazy loader, you can throw an error and since it doesn't block the navigation it will <strong>always</strong> appear in the <code>error</code> property. Defining an <code>errors</code> property won't change anything.</p>
+</blockquote>
+<h3 id="Usage-outside-of-page-components" tabindex="-1">Usage outside of page components </h3>
+<p>Loaders can be attached to a page even if the page component doesn't use it (invoke the composable returned by <code>defineLoader()</code>). This is possible if a nested component uses the data. It can be used in any component by importing the <em>returned composable</em>, even outside of the scope of the page components, even by a parent.</p>
+<p>On top of that, loaders can be <strong>defined anywhere</strong> and imported where using the data makes sense. This allows to define loaders in a separate <code>src/loaders</code> folder and reuse them across pages:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">// src/loaders/user.ts
+export const useUserData = defineLoader(...)
+// ...</pre>
+</div>
+<p>Then, in a page component, export it:</p>
+<div class="language-vue vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">&lt;!-- src/pages/users/[id].vue --&gt;
+&lt;script&gt;
+export { useUserData } from '~/loaders/user.ts'
+&lt;/script&gt;
+&lt;script setup&gt;
+// ...
+&lt;/script&gt;</pre>
+</div>
+<p>The page component might not even use <code>useUserData()</code> but we can still use it anywhere else:</p>
+<div class="language-vue vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">&lt;!-- src/components/NavBar.vue --&gt;
+&lt;script setup&gt;
+import { useUserData } from '~/loaders/user.ts'
+
+const { data: user } = useUserData()
+&lt;/script&gt;</pre>
+</div>
+<blockquote class="warning custom-block">
+<strong class="custom-block-title">WARNING</strong><p>If you use a loader in a component while it wasn't exported by a page, it won't be awaited during navigation. This can lead to unexpected behavior but it can be caught during development with a warning.</p>
+</blockquote>
+<h3 id="TypeScript" tabindex="-1">TypeScript </h3>
+<p>Types are automatically generated for the routes by <a href="https://github.com/posva/unplugin-vue-router" title="unplugin-vue-router" target="_blank" rel="noreferrer">unplugin-vue-router</a> and can be referenced with the name of each route to hint <code>defineLoader()</code> the possible values of the current types. On top of that, <code>defineLoader()</code> infers the returned types:</p>
+<div class="language-vue vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">&lt;script lang="ts"&gt;
+import { getUserById } from '../api'
+
+export const useUserData = defineLoader('/users/[id]', async route =&gt; {
+
+  //
+  const user = await getUserById(route.params.id)
+  // ...
+  return user
+})
+&lt;/script&gt;
+
+&lt;script lang="ts" setup&gt;
+const { data: user, isLoading, error } = useUserData()
+//            👆 hover or tap
+&lt;/script&gt;</pre>
+</div>
+<p>The arguments can be removed during the compilation step in production mode since they are only used for types and are ignored at runtime.</p>
+<h3 id="Non-blocking-data-fetching-Lazy-Loaders-" tabindex="-1">Non blocking data fetching (Lazy Loaders) </h3>
+<p>Also known as <a href="https://v3.nuxtjs.org/api/composables/use-async-data" target="_blank" rel="noreferrer">lazy async data in Nuxt</a>, loaders can be marked as lazy to <strong>not block the navigation</strong>.</p>
+<div class="language-vue vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">&lt;script lang="ts"&gt;
+import { getUserById } from '../api'
+
+export const useUserData = defineLoader(
+  '/users/[id]',
+  async (route) =&gt; {
+    const user = await getUserById(route.params.id)
+    return user
+  },
+  { lazy: true } // 👈  marked as lazy
+)
+&lt;/script&gt;
+
+&lt;script setup&gt;
+// Differently from the example above, `user.value` can and will be initially `undefined`
+const { data: user, isLoading, error } = useUserData()
+//            👆 hover or tap
+&lt;/script&gt;</pre>
+</div>
+<p>This patterns is useful to avoid blocking the navigation while <em>non critical data</em> is being fetched. It will display the page earlier while some of the parts of it are still loading and you are able to display loader indicators thanks to the <code>isLoading</code> property.</p>
+<p>Note this still allows for having different behavior during SSR and client side navigation, e.g.: if we want to wait for the loader during SSR but not during client side navigation:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useUserData = defineLoader(
+  async (route) =&gt; {
+    // ...
+  },
+  {
+    lazy: !import.env.SSR, // Vite
+    lazy: process.client, // NuxtJS
+  }
+)</pre>
+</div>
+<p>Existing questions:</p>
+<ul>
+<li><a href="https://github.com/vuejs/rfcs/discussions/460#discussioncomment-3532011" target="_blank" rel="noreferrer"><s>Should it be possible to await all pending loaders with <code>await allPendingLoaders()</code>? Is it useful for SSR? Otherwise we could always ignore lazy loaders in SSR. Do we need both? Do we need to selectively await some of them?</s></a></li>
+<li>Should we be able to transform a loader into a lazy version of it: <code>const useUserDataLazy = asLazyLoader(useUserData)</code>
+</li>
+</ul>
+<h3 id="AbortSignal" tabindex="-1">AbortSignal </h3>
+<p>The loader receives in a second argument access to an <a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal" target="_blank" rel="noreferrer"><code>AbortSignal</code></a> that can be passed on to <code>fetch</code> and other Web APIs. If the navigation is cancelled because of errors or a new navigation, the signal aborts, causing any request using it to abort as well.</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code twoslash lsp" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useBookCollection = defineLoader(async (_route, { signal }) =&gt; {
+  return fetchBookCollection({ signal })
+})</pre>
+</div>
+<p>This aligns with the future <a href="https://github.com/WICG/navigation-api#navigation-monitoring-and-interception" target="_blank" rel="noreferrer">Navigation API</a> and other web APIs that use the <code>AbortSignal</code> to cancel an ongoing invocation.</p>
+<h3 id="Implementations" tabindex="-1">Implementations </h3>
+<h3 id="Interfaces" tabindex="-1">Interfaces </h3>
+<p>Defining a minimal set of information and options for Data Loaders is what enables external libraries to implement their own data loaders. They are meant to extend these interfaces to add more features that are specific to them. You can see a practical example with the <a href="colada/index.html">Pinia Colada</a> implementation.</p>
+<blockquote class="danger custom-block">
+<strong class="custom-block-title">DANGER</strong><p>This section is still a work in progress, see the <a href="#implementations">implementations</a> instead.</p>
+</blockquote>
+<h3 id="Global-API" tabindex="-1">Global API </h3>
+<p>It's possible to access a global state of when data loaders are fetching (during navigation or when <code>reload()</code> is called) as well as when the data fetching navigation guard is running (only when navigating).</p>
+<ul>
+<li>
+<code>isFetchingData: Ref&lt;boolean&gt;</code>: is any loader currently fetching data? e.g. calling the <code>reload()</code> method of a loader</li>
+<li>
+<code>isNavigationFetching: Ref&lt;boolean&gt;</code>: is navigation being hold by a loader? (implies <code>isFetchingData.value === true</code>). Calling the <code>reload()</code> method of a loader doesn't change this.</li>
+</ul>
+<p>TBD: is this worth it? Are any other functions needed?</p>
+<h3 id="Limitations" tabindex="-1">Limitations </h3>
+<ul>
+<li>
+<s>Injections (<code>inject</code>/<code>provide</code>) cannot be used within a loader</s> They can now</li>
+<li>Watchers and other composables shouldn't be used within data loaders: <ul>
+<li>if <code>await</code> is used before calling a composable e.g. <code>watch()</code>, the scope <strong>is not guaranteed</strong>
+</li>
+<li>In practice, <strong>this shouldn't be a problem</strong> because there is <strong>no need</strong> to create composables within a loader</li>
+</ul>
+</li>
+</ul>
+<h2 id="Drawbacks" tabindex="-1">Drawbacks </h2>
+<ul>
+<li>At first, it looks less intuitive than just awaiting something inside <code>setup()</code> with <code>&lt;Suspense&gt;</code> <a href="#suspense">but it doesn't have its limitations</a> and have many more features</li>
+<li>Requires an extra <code>&lt;script&gt;</code> tag but only for page components. A macro <code>definePageLoader()</code>/<code>defineLoader()</code> could be error-prone as it's very tempting to use reactive state declared within the component's <code>&lt;script setup&gt;</code> but that's not possible as the loader must be created outside of its <code>setup()</code> function</li>
+</ul>
+<h2 id="Alternatives" tabindex="-1">Alternatives </h2>
+<h3 id="Suspense" tabindex="-1">Suspense </h3>
+<p>Using Suspense is probably the first alternative that comes to mind and it has been considered as a solution for data fetching by implementing proofs of concepts. It however suffers from major drawbacks that are tied to its current design and is not a viable solution for data fetching.</p>
+<p>One could imagine being able to write something like:</p>
+<div class="language-vue vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">&lt;!-- src/pages/users.vue = /users --&gt;
+&lt;!-- Displays a list of all users --&gt;
+&lt;script setup&gt;
+const userList = shallowRef(await fetchUserList())
+
+// manually expose a reload function to be called whenever needed
+function reload() {
+  userList.value = await fetchUserList()
+}
+&lt;/script&gt;</pre>
+</div>
+<p>Or when params are involved in the data fetching:</p>
+<div class="language-vue vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">&lt;!-- src/pages/users.[id].vue = /users/:id --&gt;
+&lt;!-- Displays a list of all users --&gt;
+&lt;script setup&gt;
+const route = useRoute()
+const user = shallowRef(await fetchUserData(route.params.id))
+
+// manually expose a reload function to be called whenever needed
+function reload() {
+  user.value = await fetchUserData(route.params.id)
+}
+
+// hook into navigation instead of a watcher because we want to block the navigation
+onBeforeRouteUpdate(async (to) =&gt; {
+  // note how we need to use `to` and not `route` here
+  user.value = await fetchUserData(to.params.id)
+})
+&lt;/script&gt;</pre>
+</div>
+<p>This setup has many limitations:</p>
+<ul>
+<li><p>Nested routes will force <strong>sequential data fetching</strong>: it's not possible to ensure an <strong>optimal parallel fetching</strong></p></li>
+<li><p>Manual data refreshing is necessary <strong>unless you add a <code>key</code> attribute</strong> to the <code>&lt;RouterView&gt;</code> which will force a remount of the component on navigation. This is not ideal because it will remount the component on every navigation, even when the data is the same. It's necessary if you want to do a <code>&lt;transition&gt;</code> but less flexible than the proposed solution which also works with a <code>key</code> if needed.</p></li>
+<li>
+<p>By putting the fetching logic within the <code>setup()</code> of the component we face other issues:</p>
+<ul>
+<li>No abstraction of the fetching logic =&gt; <strong>code duplication</strong> when fetching the same data in multiple components</li>
+<li>No native way to deduplicate requests among multiple components using them: it requires using a store and extra logic to skip redundant fetches when multiple components are using the same data</li>
+<li>Does not block the navigation <ul><li>We can block it by mounting the upcoming page component (while the navigation is still blocked by the data loader navigation guard) which can be <strong>expensive in terms of rendering and memory</strong> as we still need to render the old page while we <em><strong>try</strong> to mount the new page</em>.</li></ul>
+</li>
+<li>Cannot modify the output of the navigation (e.g. redirecting, cancelling, etc), if the fetching fails, we end up in an error state</li>
+</ul>
+</li>
+<li><p>No native way of caching data, even for very simple cases (e.g. no refetching when fast traveling back and forward through browser UI)</p></li>
+<li><p>Not possible to precisely read (or write) the loading state (see <a href="https://github.com/vuejs/core/issues/1347" target="_blank" rel="noreferrer">vuejs/core#1347</a>])</p></li>
+</ul>
+<p>On top of this it's important to note that this RFC doesn't limit you: you can still use Suspense for data fetching or other async state or even use both, <strong>this API is completely tree shakable</strong> and doesn't add any runtime overhead if you don't use it. Aligning with the progressive enhancement nature of Vue.js.</p>
+<h3 id="Other-alternatives" tabindex="-1">Other alternatives </h3>
+<ul>
+<li>
+<p>Allowing blocking data loaders to return objects of properties:</p>
+<blockquote class="details custom-block">
+<summary>Details</summary><div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useUserData = defineLoader(async route =&gt; {
+  const user = await getUserById(route.params.id)
+  // instead of return user
+  return { user }
+})
+// instead of const { data: user } = useUserData()
+const { user } = useUserData()</pre>
+</div>
+<p>This was the initial proposal but since this is not possible with lazy loaders it was more complex and less intuitive. Having one single version is overall easier to handle. It does allow to return pending promises in the object that aren't awaited:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">  export const useUserData = defineLoader(async (route) =&gt; {
+  return {
+    // awaited
+    user: await getUserById(route.params.id)
+    // not awaited, like lazy
+    nonCriticalData: getNonCriticalData() // Promise&lt;...&gt;
+  }
+})</pre>
+</div>
+<p>But this version overlaps with <code>lazy: true</code>. While semantically it would be more natural if it was defined with <strong>one</strong> loader, it limits the API to one loader per page and not being able to reuse the data, loading state, error, etc across pages and components, which also limits the extensibility.</p>
+</blockquote>
+</li>
+<li>
+<p>Adding a new <code>&lt;script loader&gt;</code> similar to <code>&lt;script setup&gt;</code>:</p>
+<blockquote class="details custom-block">
+<summary>Details</summary><div class="language-vue vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">&lt;script lang="ts" loader="useUserData"&gt;
+import { getUserById } from '~/api/users'
+import { useRoute } from 'vue-router' // could be automatically imported
+
+const route = useRoute()
+// any variable created here is available in useLoader()
+const user = await getUserById(route.params.id)
+&lt;/script&gt;
+
+&lt;script lang="ts" setup&gt;
+const { user, isLoading, error } = useUserData()
+&lt;/script&gt;</pre>
+</div>
+<p>Too magical without clear benefit.</p>
+</blockquote>
+</li>
+<li>
+<p>Pass route properties instead of the whole <code>route</code> object:</p>
+<blockquote class="details custom-block">
+<summary>Details</summary><div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">import { getUserById } from '../api'
+
+export const useUserData = defineLoader(async ({ params }) =&gt; {
+  const user = await getUserById(params.id)
+  return { user }
+})</pre>
+</div>
+<p>This has the problem of not being able to use the <code>route.name</code> to determine the correct typed params (with <a href="https://github.com/posva/unplugin-vue-router" title="unplugin-vue-router" target="_blank" rel="noreferrer">unplugin-vue-router</a>):</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">import { getUserById } from '../api'
+
+export const useUserData = defineLoader(async route =&gt; {
+  if (route.name === 'user-details') {
+    const user = await getUserById(route.params.id)
+    //                                    ^ typed!
+    return { user }
+  }
+})</pre>
+</div>
+</blockquote>
+</li>
+<li>
+<p>Naming</p>
+<blockquote class="details custom-block">
+<summary>Details</summary><p>Variables could be named differently and proposals are welcome:</p>
+<ul>
+<li>
+<code>isLoading</code> -&gt; <code>isPending</code>, <code>pending</code> (same as Nuxt)</li>
+<li>Rename <code>defineLoader()</code> to <code>defineDataFetching()</code> (or others)</li>
+</ul>
+</blockquote>
+</li>
+<li>
+<p>Nested/Sequential Loaders drawbacks</p>
+<blockquote class="details custom-block">
+<summary>Details</summary><ul>
+<li><p>Allowing <code>await getUserById()</code> could make people think they should also await inside <code>&lt;script setup&gt;</code> and that would be a problem because it would force them to use <code>&lt;Suspense&gt;</code> when they don't need to. I think this is solved by changing the return type of the loader to a promise of just data, making it easy to spot the mistake. It could also be solved by forcing the need of a parameter <code>to</code> to ensure the type safety as explained <a href="#sequential-fetching">above</a>.</p></li>
+<li>
+<p>Another alternative is to pass an array of loaders to the loader that needs them and let it retrieve them through an argument, but it feels <em>considerably</em> less ergonomic:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">import { useUserData } from '~/pages/users/[id].vue'
+
+export const useUserFriends = defineLoader(
+  async (route, { loaders: [userData] }) =&gt; {
+    const friends = await getFriends(user.value.id)
+    return { ...userData.value, friends }
+  },
+  {
+    // explicit dependencies
+    waitFor: [useUserData],
+  }
+)</pre>
+</div>
+</li>
+</ul>
+</blockquote>
+</li>
+<li>
+<p>Advanced <code>lazy</code></p>
+<blockquote class="details custom-block">
+<summary>Details</summary><p>The <code>lazy</code> flag could be extended to also accept a number (timeout) or a function (dynamic value). I think this is too much and should therefore not be included. It can always be implemented by custom data loaders but I don't think it should be a requirement for the basic API.</p>
+<p>Passing a <em>number</em> to <code>lazy</code> could block the navigation for that number of milliseconds, then let it be:</p>
+<div class="language-vue vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">&lt;script lang="ts"&gt;
+import { getUserById } from '../api'
+
+export const useUserData = defineLoader(
+  async route =&gt; {
+    const user = await getUserById(route.params.id)
+    return user
+  },
+  // block the navigation for 1 second and then let the navigation go through
+  { lazy: 1000 }
+)
+&lt;/script&gt;
+
+&lt;script setup&gt;
+const { data, isLoading, error } = useUserData()
+//      ^ Ref&lt;User | undefined&gt;
+&lt;/script&gt;</pre>
+</div>
+<p>Note that lazy loaders can only control their own blocking mechanism. They can't control the blocking of other loaders. If multiple loaders are being used and one of them is blocking, the navigation will be blocked until all of the blocking loaders are resolved.</p>
+<p>A function could allow to conditionally block upon navigation:</p>
+<div class="language-ts vp-adaptive-theme">
+<pre class="shiki shiki-themes one-dark-pro github-light vp-code" style="--shiki-dark:#abb2bf;--shiki-light:#24292e;--shiki-dark-bg:#282c34;--shiki-light-bg:#fff;" tabindex="0" data-language="js">export const useUserData = defineLoader(
+  loader,
+  // ...
+  {
+    lazy: route =&gt; {
+      // ...
+      return true // or a number
+    },
+  }
+)</pre>
+</div>
+</blockquote>
+</li>
+<li><p>One could argue being able to reuse the result of loaders across any component other than page makes this more complex. Other frameworks expose a single <em>load</em> function from page components (SvelteKit, Remix)</p></li>
+</ul>
+<h2 id="Adoption-strategy" tabindex="-1">Adoption strategy </h2>
+<p>Introduce this as part of <a href="https://github.com/posva/unplugin-vue-router" title="unplugin-vue-router" target="_blank" rel="noreferrer">unplugin-vue-router</a> to test it first and make it part of the router later on.</p>
+<h2 id="Unresolved-questions" tabindex="-1">Unresolved questions </h2>
+<ul>
+<li>Integration with Server specifics in Frameworks like Nuxt: cookies, headers, server only loaders (can create redirect codes)</li>
+<li>Should there by a <code>beforeLoad()</code> hook that is called and awaited before all data loaders</li>
+<li>Same for <code>afterLoad()</code> that is always called after all data loaders</li>
+<li>What else is needed besides the <code>route</code> inside loaders?</li>
+<li>
+<s>Add option for placeholder data?</s> Data Loaders should implement this themselves</li>
+<li>What other operations might be necessary for users?</li>
+</ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2014-present Evan You, Eduardo San Martin Morote<br>Licensed under the MIT License.<br>
+    <a href="https://router.vuejs.org/data-loaders/rfc" class="_attribution-link">https://router.vuejs.org/data-loaders/rfc</a>
+  </p>
+</div>

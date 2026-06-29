@@ -1,0 +1,174 @@
+     <h1 class="fancy_title"> Bridging Tcl and JSON with the SQLite Extension </h1> <details class="fancy_toc"> <summary>Table Of Contents</summary> <div id="toc_sub">
+<div class="fancy-toc1"><a href="#using_sqlite_to_bridge_tcl_and_json">1. Using SQLite to Bridge Tcl and JSON</a></div> <div class="fancy-toc2"><a href="#consuming_json">1.1. Consuming JSON</a></div> <div class="fancy-toc2"><a href="#emitting_json_db_table_as_a_json_object">1.2. Emitting JSON: Db Table as a JSON Object</a></div> <div class="fancy-toc2"><a href="#emitting_json_incremental_build_up">1.3. Emitting JSON: Incremental Build-up</a></div> </div> </details>  <h1 id="using_sqlite_to_bridge_tcl_and_json">
+<span>1. </span>Using SQLite to Bridge Tcl and JSON</h1> <p><a href="tclsqlite.html">The Tcl SQLite extension</a> can act as a bridge to smooth over Tcl's impedance mismatch with JSON, shifting all of the parsing and escaping from Tcl to SQLite with very little effort. The sections below demonstrate techniques for consuming and emitting JSON via SQLite. </p> <h2 id="consuming_json">
+<span>1.1. </span>Consuming JSON</h2> <p>One of the simplest way to consume and break down a JSON payload is to feed it to SQLite and extract the results using Tcl's <code>lassign</code> function: </p>
+<pre data-language="sql">
+set json theJSON...
+lassign &amp;lbrack;db eval {
+  with payload(j) as (select jsonb($json)) select
+  -- A simple value:
+  j-&gt;&gt;'foo',
+  -- A sub-object or array:
+  CASE WHEN json_valid(j-&gt;&gt;'bar') THEN j-&gt;&gt;'bar' ELSE NULL END
+  -- Any other fields...
+  from payload
+}] foo bar
+</pre> <p>Arrays can be injested using <code>json_each()</code>:</p> <pre data-language="sql">
+set json {&amp;lbrack;1, "two", 3.0, {"nested": true}, null]}
+set myList &amp;lbrack;db eval {
+  select value from json_each($json)
+}]
+
+# Emits: 1 two 3.0 {{"nested":true}} {}
+</pre> <p>Arrays of objects can be decomposed into a list of dict objects:</p> <pre data-language="sql">
+set json {&amp;lbrack;{"id":1, "v":"A"}, {"id":2, "v":"B"}]}
+set myDictList &amp;lbrack;db eval {
+  select json_object('id', value-&gt;&gt;'id', 'v', value-&gt;&gt;'v')
+  from json_each($json)
+}]
+
+# Emits: {{"id":1,"v":"A"}} {{"id":2,"v":"B"}}
+</pre> <p>Object entries in array objects can be decomposed using an approach like the first example shown above.</p> <h2 id="emitting_json_db_table_as_a_json_object">
+<span>1.2. </span>Emitting JSON: Db Table as a JSON Object</h2> <p>The approach described here uses an in-memory db to incrementally build up a JSON object, automatically smoothing over the edges between data types such as numbers and strings. </p> <pre data-language="sql">
+#
+# Initialize, if needed, the sqlite3 connection for the JR temp db and
+# return its command name.
+#
+# JR = JSON Response (to an HTTP request)
+#
+proc jr-db {} {
+  if {"" eq &amp;lbrack;info command ::__jrdb]} {
+    sqlite3 ::__jrdb ":memory:"
+    ::__jrdb eval {
+      -- Holds a list of key/value pairs for a JSON response object
+      create table jr(k TEXT UNIQUE ON CONFLICT REPLACE,v ANY);
+    }
+  }
+  return ::__jrdb
+}
+
+#
+# Remove all entries from the JR buffer.
+#
+proc jr-reset {args} {
+  &amp;lbrack;jr-db] eval {delete from jr}
+}
+
+#
+# Set one or more key/value pairs in the JR object.
+#
+proc jr-set {args} {
+  set db &amp;lbrack;jr-db]
+  foreach {k v} $args {
+    $db eval {insert into jr(k,v) values($k,$v)}
+  }
+}
+
+#
+# Returns a JSON-format object representing the current JR state.
+#
+proc jr-get {} {
+  &amp;lbrack;jr-db] onecolumn {
+    select json_group_object(k,CASE WHEN json_valid(v,1)
+                             THEN json(v) ELSE v END) from jr
+  }
+}
+</pre> <p>Example usage:</p> <pre data-language="sql">
+jr-set message "This is a message."
+jr-set aBool true isNull null anInt 37 aFloat 42.42
+puts &amp;lbrack;jr-get]
+</pre> <p>Results in:</p> <pre data-language="sql">
+{"message":"This is a message.","aBool":true,"isNull":null,"anInt":37,"aFloat":42.42}
+</pre> <h2 id="emitting_json_incremental_build_up">
+<span>1.3. </span>Emitting JSON: Incremental Build-up</h2> <p>The approach shown here uses a couple of routines to incrementally build up a nested object or array, faithfully navigating the type handling, such that integers, null, and boolean-looking values can be emitted as such instead of strings.</p> <pre data-language="sql">
+#
+# Returns the command name of the shared SQLite3 instance used by the
+# X-to-JSON APIs, initializing it on demand.
+#
+proc json-db {} {
+  if {"" eq &amp;lbrack;info command ::__jsonDb]} {
+    sqlite3 ::__jsonDb ":memory:"
+  }
+  return ::__jsonDb
+}
+
+#
+# Given a dict-style object, this creates a JSON object representation.
+# It does not handle nested objects but each value may itself be the result
+# of its own call to this method, which has a similar effect.
+#
+proc json-obj {kvps} {
+  set q "select json_object("
+  set n 0
+  set nn 1
+  foreach {k v} $kvps {
+    set $n $k
+    set $nn $v
+    if {$n} {append q ","}
+    append q "\$$n, CASE WHEN json_valid(\$$nn) THEN json(\$$nn) ELSE \$$nn END"
+    # This may look like an SQL injection opportunity, but it's
+    # injecting prepared statement placeholders, not values.
+    incr n 2
+    incr nn 2
+  }
+  append q ")"
+  &amp;lbrack;json-db] onecolumn $q
+}
+
+#
+# Returns a JSON-format array of the given arguments. See json-object
+# for notes about nesting.
+#
+proc json-array {args} {
+  set n 0
+  set q "select json_array("
+  foreach a $args {
+    set $n $a
+    if {$n} {append q ","}
+    append q "CASE WHEN json_valid(\$$n) THEN json(\$$n) ELSE \$$n END"
+    incr n
+  }
+  append q ")"
+  &amp;lbrack;json-db] onecolumn $q
+}
+</pre> <p>Example usage:</p> <pre data-language="sql">
+proc json-pretty {arg {space "  "}} {
+  &amp;lbrack;json-db] onecolumn {select json_pretty($arg,$space)}
+}
+set o {
+  hi world
+  number 17.3
+  truth true
+  lies false
+  nil null
+  nada "null"
+  notNull "Null"
+}
+lappend o list &amp;lbrack;json-array hello there &amp;lbrack;json-obj {nested true}]]
+lappend o obj &amp;lbrack;json-obj {name "Nested object"}]
+puts &amp;lbrack;json-pretty &amp;lbrack;json-obj $o]]
+</pre> <p>Results in:</p> <pre data-language="sql">{
+  "hi": "world",
+  "number": 17.3,
+  "truth": true,
+  "lies": false,
+  "nil": null,
+  "nada": null,
+  "notNull": "Null",
+  "list": &amp;lbrack;
+    "hello",
+    "there",
+    {
+      "nested": true
+    }
+  ],
+  "obj": {
+    "name": "Nested object"
+  }
+}
+</pre> <p><small><i>This page was last updated on 2026-02-24 16:01:53Z </i></small></p> <div class="_attribution">
+  <p class="_attribution-p">
+    SQLite is in the Public Domain.<br>
+    <a href="https://sqlite.org/tcljson.html" class="_attribution-link">https://sqlite.org/tcljson.html</a>
+  </p>
+</div>

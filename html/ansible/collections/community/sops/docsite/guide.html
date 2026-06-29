@@ -1,0 +1,319 @@
+<section id="protecting-ansible-secrets-with-sops"> <h1 id="ansible-collections-community-sops-docsite-guide">Protecting Ansible secrets with SOPS</h1> <p><a class="reference external" href="https://github.com/getsops/sops">CNCF SOPS</a> allows to encrypt and decrypt files using various key sources (GPG, AWS KMS, GCP KMS, …). For structured data, such as YAML, JSON, INI and ENV files, it will encrypt values, but not mapping keys. For YAML files, it also encrypts comments. This makes it a great tool for encrypting credentials with Ansible: you can easily see which files contain which variable, but the variables themselves are encrypted.</p> <p>The ability to utilize various keysources makes it easier to use in complex environments than <a class="reference internal" href="../../../../vault_guide/index.html#vault-guide-index"><span class="std std-ref">Ansible Vault</span></a>.</p>  <ul class="simple"> <li><a class="reference internal" href="#installing-sops" id="id1">Installing SOPS</a></li> <li><a class="reference internal" href="#installing-community-sops-in-an-execution-environment" id="id2">Installing community.sops in an Execution Environment</a></li> <li><a class="reference internal" href="#setting-up-sops" id="id3">Setting up SOPS</a></li> <li><a class="reference internal" href="#working-with-encrypted-files" id="id4">Working with encrypted files</a></li> <li><a class="reference internal" href="#working-with-encrypted-data-from-other-sources" id="id5">Working with encrypted data from other sources</a></li> <li><a class="reference internal" href="#working-with-encrypted-variables" id="id6">Working with encrypted variables</a></li> </ul>  <section id="installing-sops"> <h2>Installing SOPS</h2> <p>You can find binaries and packages <a class="reference external" href="https://github.com/getsops/sops/releases">on the project’s release page</a>. Depending on your operating system, you might also be able to install it with your system’s package manager.</p> <p>This collection provides a <a class="reference internal" href="../install_role.html#ansible-collections-community-sops-install-role"><span class="std std-ref">role community.sops.install</span></a> which allows to install SOPS and <a class="reference external" href="https://en.wikipedia.org/wiki/GNU_Privacy_Guard">GNU Privacy Guard (GPG)</a>. The role allows to install SOPS from the system’s package manager or from GitHub; see <code><strong><a class="reference internal" href="../install_role.html#ansible-collections-community-sops-install-role-parameter-main-sops-source"><span class="std std-ref">sops_source</span></a></strong></code> for details. Both SOPS and GPG can be installed on the remote hosts or the Ansible controller; see <code><strong><a class="reference internal" href="../install_role.html#ansible-collections-community-sops-install-role-parameter-main-sops-install-on-localhost"><span class="std std-ref">sops_install_on_localhost</span></a></strong></code> for details.</p> <pre data-language="yaml">- name: Playbook to install SOPS
+  hosts: all
+  tasks:
+    # To use the sops_encrypt module on a remote host, you need to install SOPS on it:
+    - name: Install SOPS on remote hosts
+      ansible.builtin.include_role:
+        name: community.sops.install
+      vars:
+        sops_version: 2.7.0  # per default installs the latest version
+
+    # To use the lookup plugin, filter plugin, vars plugin, or the load_vars action,
+    # you need SOPS installed on localhost:
+    - name: Install SOPS on localhost
+      ansible.builtin.include_role:
+        name: community.sops.install
+      vars:
+        sops_install_on_localhost: true
+</pre> <p>When using ansible-core 2.11 or later, you can also use two convenience playbooks:</p> <pre data-language="console"># Install SOPS on Ansible controller
+$ ansible-playbook community.sops.install_localhost
+
+# Install SOPS on remote servers
+$ ansible-playbook community.sops.install --inventory /path/to/inventory
+</pre> </section> <section id="installing-community-sops-in-an-execution-environment"> <h2>Installing community.sops in an Execution Environment</h2> <p>When building an execution environment containing community.sops, please note that by default SOPS is not automatically installed. This is due to a limitation of the dependency specification system for execution environments. If you are building an execution environment that contains community.sops, you should make sure that SOPS is installed in it.</p> <p>The simplest way of ensuring this is to use the <code>community.sops.install_localhost</code> playbook. When defining an execution environment, you can add a <code>RUN</code> additional build step to your <code>execution-environment.yml</code>:</p> <pre data-language="yaml">---
+version: 3
+dependencies:
+  galaxy: requirements.yml
+additional_build_steps:
+  append_final:
+    # Ensure that SOPS is installed in the EE, assuming the EE is for ansible-core 2.11 or newer
+    - RUN ansible-playbook -v community.sops.install_localhost
+</pre> <p>Note that this only works if the execution environment is built with ansible-core 2.11 or newer. When using an execution environment with Ansible 2.9, you have to use the <a class="reference internal" href="../install_role.html#ansible-collections-community-sops-install-role"><span class="std std-ref">community.sops.install</span></a> role manually. Also note that you need to make sure that Ansible 2.9 uses the correct Python interpreter to be able to install system packages with; in the below example we are assuming a RHEL/CentOS based execution environment base image:</p> <pre data-language="yaml">---
+version: 3
+dependencies:
+  galaxy: requirements.yml
+additional_build_steps:
+  append_final:
+    # Special step needed for Ansible 2.9 based EEs
+    - &gt;-
+      RUN ansible localhost -m include_role -a name=community.sops.install
+          -e sops_install_on_localhost=true
+          -e ansible_python_interpreter=/usr/libexec/platform-python
+</pre> <p>Once this step has been taken care of, you can use all plugins and modules (on <code>localhost</code>) from community.sops in the execution environment.</p> </section> <section id="setting-up-sops"> <h2>Setting up SOPS</h2> <p>From now on this guide assumes that you have installed SOPS.</p> <p>For simplicity, you can work with GPG keys. If you do not have one, or do not want to use yours, you can run <code>gpg --quick-generate-key me@example.com</code> to create a GPG key for the user ID <code>me@example.com</code>. You will need its 40 hex-digit key ID that is printed at the end. The first step is to create a <code>.sops.yaml</code> file in the directory tree you are working in:</p> <pre data-language="yaml">creation_rules:
+  - pgp: 'FBC7B9E2A4F9289AC0C1D4843D16CEE4A27381B4'
+</pre> <p>Here, <code>FBC7B9E2A4F9289AC0C1D4843D16CEE4A27381B4</code> is the 40 hex-digit key ID. With this file you can create a SOPS-encrypted file by running the following in the directory where <code>.sops.yaml</code> was placed, or a subdirectory of it:</p> <pre data-language="console">$ sops test.sops.yaml
+</pre> <p>This will open an editor window with an example YAML file. Put the following content in:</p> <pre data-language="yaml"># This is a comment
+hello: world
+foo:
+  - bar
+  - baz
+</pre> <p>After closing the editor, SOPS will create <code>test.sops.yaml</code> with the encrypted contents:</p> <pre data-language="yaml">#ENC[AES256_GCM,data:r6Ok05DzzHBO4tonlz2t49CF,iv:Y0P39iXwaGYU9NG5oRC3NuaGVL40uruSze0CxbDTpTk=,tag:EzoG+X+BJAHbxE0asSyGlQ==,type:comment]
+hello: ENC[AES256_GCM,data:onBZqWk=,iv:bwj4bwaeh3vpVDYqY2AnYo1thF955i5vbFpCC1DwJtM=,tag:4qbVzuHTaPrXm64r2Rqz1Q==,type:str]
+foo:
+    - ENC[AES256_GCM,data:UsY8,iv:USv71rKfvbTF+3a5T2WO56wGVu609/0uigqkO0pa6U4=,tag:s8NdqLp+8OOQg4xDfE78oA==,type:str]
+    - ENC[AES256_GCM,data:Dhmo,iv:qWs5gN2SCXYq0EfGelZhODsdViKB9w2taQMhsqy0D2g=,tag:I+ZFvuxnsvQmywqz+a/M9w==,type:str]
+sops:
+    kms: []
+    gcp_kms: []
+    azure_kv: []
+    hc_vault: []
+    age: []
+    lastmodified: "2021-06-15T19:36:34Z"
+    mac: ENC[AES256_GCM,data:HAvLeOvt7xWI7B5TCeDEsL6sOSzGGeTbgBSJaZkwadmoAm3Ny4IZPF8JAbFaPPLmN8FJVAt4D61aIWa6Xwi3xMj1g6DmxFfgK6JFJqWqW122UlMhqZ/WuMWFV6yVxpTLDXgemndgGDJqUTUi14FMh/MzPDg4f6kFP64kA9fpLrY=,iv:LdhswnMymZG8J9na/jnF3WYnX0DvzvoBlvjUCu4nI6c=,tag:Qt4d7L3FXsgfmg9iOs8P4A==,type:str]
+    pgp:
+        - created_at: "2021-06-15T19:36:01Z"
+          enc: |-
+            -----BEGIN PGP MESSAGE-----
+
+            wcBMAyUpShfNkFB/AQgAT8OAKnWLBQRG3kT5lZCmyoPzK6RwF0zRkwCzJkLNl6xg
+            nQjUjpD03ZD4FtiRidspXEj7NvCLDghJ0UETtDjmrwsTeJ5YAK/JxouWmoNhVVdF
+            p0qOlj/THXIV+ypVaqrisZGZiTqeWjUNFuayknvjm3XduOOPZA1MIJ14pQxcgca4
+            NWmKwPwXTWEy3RJ0ZsnjjjYvKHjHyvbHdbDgARu8R1jEgdNPKPBRVpEY6RNeafXI
+            gFBVRfrhPKD6HmnmNvjHwUc/K+wOa1ciIYVrT4mPXoyBsFkyV0egh/QRf0JO8+X7
+            Ut/jEtCrl9BXJCNYGmC5EU3PPiFlAu1MRxlCiPNWltLmASn2w62wMpgih6f+OpI/
+            zyEOdz0qx80LEfhv3+jBbDfBwz4GqpAHUr0fCXDzeDiKfzlU6isagoIAhJfwX6oG
+            NeQ47ktk1XhPmgIwxxuvonG14iQoU2cA
+            =GoXQ
+            -----END PGP MESSAGE-----
+          fp: FBC7B9E2A4F9289AC0C1D4843D16CEE4A27381B4
+    unencrypted_suffix: _unencrypted
+    version: 3.7.1
+</pre> <p>The first line contains the encrypted content. The second line contains the unencrypted key of <code>hello: world</code>, and the encrypted string value <code>world</code>. The next few lines contain the unencrypted key <code>foo</code> with the encrypted list elements.</p> <p>At the end, the <code>sops</code> section contains metadata, which includes the private key needed to decrypt the file encrypted with the public key of the GPG key ID <code>FBC7B9E2A4F9289AC0C1D4843D16CEE4A27381B4</code>. If you had multiple GPG keys configured, or also other key sources, you can also find the file secret key encrypted with these keys here.</p> </section> <section id="working-with-encrypted-files"> <h2>Working with encrypted files</h2> <p>You can decrypt SOPS-encrypted files with the <a class="reference internal" href="../sops_lookup.html#ansible-collections-community-sops-sops-lookup"><span class="std std-ref">community.sops.sops lookup plugin</span></a>, and dynamically encrypt data with the <a class="reference internal" href="../sops_encrypt_module.html#ansible-collections-community-sops-sops-encrypt-module"><span class="std std-ref">community.sops.sops_encrypt module</span></a>. Being able to encrypt is useful when you create or update secrets in your Ansible playbooks.</p> <p>Assume that you have an encrypted private key <code>keys/private_key.pem.sops</code>, which was in PEM format before being encrypted by SOPS:</p> <pre data-language="console">$ openssl genrsa -out keys/private_key.pem 2048
+$ sops --encrypt keys/private_key.pem &gt; keys/private_key.pem.sops
+$ wipe keys/private_key.pem
+</pre> <p>To use it in a playbook, for example to pass it to the <a class="reference internal" href="../../crypto/openssl_csr_module.html#ansible-collections-community-crypto-openssl-csr-module"><span class="std std-ref">community.crypto.openssl_csr module</span></a> to create a certificate signing request (CSR), you can use the <a class="reference internal" href="../sops_lookup.html#ansible-collections-community-sops-sops-lookup"><span class="std std-ref">community.sops.sops lookup plugin</span></a> to load it:</p> <pre data-language="yaml+jinja">---
+- name: Load SOPS-encrypted private key
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Create CSR with encrypted private key
+      community.crypto.openssl_csr:
+        # The private key is provided with SOPS:
+        privatekey_content: "{{ lookup('community.sops.sops', 'keys/private_key.pem.sops') }}"
+        # Store the CSR on disk unencrypted:
+        path: ansible.com.csr
+        # This is going to be a CSR for ansible.com and www.ansible.com
+        subject_alt_name:
+          - DNS:ansible.com
+          - DNS:www.ansible.com
+        use_common_name_for_san: false
+</pre> <p>This results in the following output:</p> <pre data-language="ansible">PLAY [Load SOPS-encrypted private key] ***************************************************************************
+
+TASK [Create CSR with encrypted private key] *********************************************************************
+ok: [localhost]
+
+PLAY RECAP *******************************************************************************************************
+localhost                  : ok=1    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+</pre> <p>Afterwards, you will have a CSR <code>ansible.com.csr</code> for the encrypted private key <code>keys/private_key.pem.sops</code>.</p> <p>If you want to use Ansible to generate (or update) the encrypted private key, you can use the <a class="reference internal" href="../../crypto/openssl_privatekey_pipe_module.html#ansible-collections-community-crypto-openssl-privatekey-pipe-module"><span class="std std-ref">community.crypto.openssl_privatekey_pipe module</span></a> to generate (or update) the private key, and use the <a class="reference internal" href="../sops_encrypt_module.html#ansible-collections-community-sops-sops-encrypt-module"><span class="std std-ref">community.sops.sops_encrypt module</span></a> to write it to disk in encrypted form:</p> <pre data-language="yaml+jinja">---
+- name: Create SOPS-encrypted private key
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - name: Create private key
+          community.crypto.openssl_privatekey_pipe:
+            size: 2048
+          no_log: true  # Always use this with openssl_privatekey_pipe!
+          register: private_key
+
+        - name: Write encrypted key to disk
+          community.sops.sops_encrypt:
+            path: keys/private_key.pem.sops
+            content_text: "{{ private_key.privatekey }}"
+
+      always:
+        - name: Wipe private key from Ansible's facts
+          # This is particularly important if the playbook doesn't end here!
+          set_fact:
+            private_key: ''
+</pre> <p>This playbook creates a new key on every run. If you want the private key creation to be idempotent, you need to do a little more work:</p> <pre data-language="yaml+jinja">---
+- name: Create SOPS-encrypted private key
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - name: Create private key
+          community.crypto.openssl_privatekey_pipe:
+            size: 2048
+            content: &gt;-
+              {{ lookup(
+                    'community.sops.sops',
+                    'keys/private_key.pem.sops',
+                    empty_on_not_exist=true
+                 ) }}
+          no_log: true  # Always use this with openssl_privatekey_pipe!
+          register: private_key
+
+        - name: Write encrypted key to disk
+          community.sops.sops_encrypt:
+            path: keys/private_key.pem.sops
+            content_text: "{{ private_key.privatekey }}"
+          when: private_key is changed
+
+      always:
+        - name: Wipe private key from Ansible's facts
+          # This is particularly important if the playbook doesn't end here!
+          set_fact:
+            private_key: ''
+</pre> <p>The <code><a class="reference internal" href="../sops_lookup.html#ansible-collections-community-sops-sops-lookup-parameter-empty-on-not-exist"><span class="std std-ref">empty_on_not_exist=true</span></a></code> flag is needed to avoid the lookup to fail when the key does not yet exist. When this playbook is run twice, the output will be:</p> <pre data-language="ansible">PLAY [Create SOPS-encrypted private key] *************************************************************************
+
+TASK [Create private key] ****************************************************************************************
+ok: [localhost]
+
+TASK [Write encrypted key to disk] *******************************************************************************
+skipping: [localhost]
+
+TASK [Wipe private key from Ansible's facts] *********************************************************************
+ok: [localhost]
+
+PLAY RECAP *******************************************************************************************************
+localhost                  : ok=2    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+</pre> </section> <section id="working-with-encrypted-data-from-other-sources"> <h2>Working with encrypted data from other sources</h2> <p>You can use the <a class="reference internal" href="../decrypt_filter.html#ansible-collections-community-sops-decrypt-filter"><span class="std std-ref">community.sops.decrypt Jinja2 filter</span></a> to decrypt arbitrary data. This can be data read earlier from a file, returned from an action, or obtained through some other means.</p> <p>For example, assume that you want to decrypt a file retrieved from a HTTPS server with the <a class="reference internal" href="../../../ansible/builtin/uri_module.html#ansible-collections-ansible-builtin-uri-module"><span class="std std-ref">ansible.builtin.uri module</span></a>. To use the <a class="reference internal" href="../sops_lookup.html#ansible-collections-community-sops-sops-lookup"><span class="std std-ref">community.sops.sops lookup</span></a>, you have to write it to a file first. With the filter, you can directly decrypt it:</p> <pre data-language="yaml+jinja">---
+- name: Decrypt file fetched from URL
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Fetch file from URL
+      ansible.builtin.uri:
+        url: https://raw.githubusercontent.com/getsops/sops/master/functional-tests/res/comments.enc.yaml
+        return_content: true
+      register: encrypted_content
+
+    - name: Show encrypted data
+      debug:
+        msg: "{{ encrypted_content.content | ansible.builtin.from_yaml }}"
+
+    - name: Decrypt data and decode decrypted YAML
+      set_fact:
+        decrypted_data: "{{ encrypted_content.content | community.sops.decrypt | ansible.builtin.from_yaml }}"
+
+    - name: Show decrypted data
+      debug:
+        msg: "{{ decrypted_data }}"
+</pre> <p>The output will be:</p> <pre data-language="ansible">PLAY [Decrypt file fetched from URL] *****************************************************************************
+
+TASK [Fetch file from URL] ***************************************************************************************
+ok: [localhost]
+
+TASK [Show encrypted data] ***************************************************************************************
+ok: [localhost] =&gt; {
+    "msg": {
+        "dolor": "ENC[AES256_GCM,data:IgvT,iv:wtPNYbDTARFE810PH6ldOLzCDcAjkB/dzPsZjpgHcko=,tag:zwE8P+AwO1hrHkgF6pTbZw==,type:str]",
+        "lorem": "ENC[AES256_GCM,data:PhmSdTs=,iv:J5ugEWq6RfyNx+5zDXvcTdoQ18YYZkqesDED7LNzou4=,tag:0Qrom6J6aUnZMZzGz5XCxw==,type:str]",
+        "sops": {
+            "age": [],
+            "azure_kv": [],
+            "gcp_kms": [],
+            "hc_vault": [],
+            "kms": [],
+            "lastmodified": "2020-10-07T15:49:13Z",
+            "mac": "ENC[AES256_GCM,data:2dhyKdHYSynjXPwYrn9356wA7vRKw+T5qwBenI2vZrgthpQBOCQG4M6f7eeH3VLTxB4mN4CAchb25dsNRoGr6A38VruaSSAhPco3Rh4AlvKSvXuhgRnzZvNxE/bnHX1D4K5cdTb4FsJg/Ue1l7UcWrlrv1s3H3SwLHP/nf+suD0=,iv:6xBYURjjaQzlUOKOrs2NWOChiNFZVAGPJZQZ59MwX3o=,tag:uXD5VYme+c8eHcCc5TD2YA==,type:str]",
+            "pgp": [
+                {
+                    "created_at": "2019-08-29T21:52:32Z",
+                    "enc": "-----BEGIN PGP MESSAGE-----\n\nhQEMAyUpShfNkFB/AQgAlvpTj0NYqF4mQyIeM7wX2SHLb4U07/flpqDpp2W/30Pz\nAHA7sYrgP0l8BrjT2kwtgCN0cdfoIHJudezrNjANp2P5TbP2b9kYYNxpehzB9PFj\nFixnCS7Zp8WIt1yXr1TX+ANZoXLopVcRbMaQ5OdH7CN1pNQtMR+R3FR3X/IqKxiU\nDo1YLaooRJICUC8LJw2Tb4K+lYnTSqd/HalLGym++ivFvdDB1Ya1GhT1FswXidXK\nIRjsOVbxV0q5VeNOR0zxsheOvuHyCje16c7NXJtATJVWtTFABJB8u7CY5HhZSgq+\nrXJHyLHqVLzJ8E4WqHQkMNUlVcrqAz7glZ6xbAhfI9JeAYk5SuBOQOQ4yvASqH4K\nb0N3+/abluBY7YPqKuRZBiEtmcYlZ+zIHuOTP1rD/7L5VY8CwE5U8SFlEqwM7nQJ\n6/vtl6qngOFjwt34WrhZzUfLPB/wRV/m1Qv2kr0RNA==\n=Ykiw\n-----END PGP MESSAGE-----\n",
+                    "fp": "FBC7B9E2A4F9289AC0C1D4843D16CEE4A27381B4"
+                }
+            ],
+            "unencrypted_suffix": "_unencrypted",
+            "version": "3.6.1"
+        }
+    }
+}
+
+TASK [Decrypt data] **********************************************************************************************
+ok: [localhost]
+
+TASK [Show decrypted data] ***************************************************************************************
+ok: [localhost] =&gt; {
+    "msg": {
+        "dolor": "sit",
+        "lorem": "ipsum"
+    }
+}
+
+PLAY RECAP *******************************************************************************************************
+localhost                  : ok=4    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+</pre> <p>Please note that if you put a Jinja2 expression in a variable, it will be evaluated <strong>every time it is used</strong>. Decrypting data takes a certain amount of time. If you need to use an expression multiple times, it is better to store its evaluated form as a fact with <a class="reference internal" href="../../../ansible/builtin/set_fact_module.html#ansible-collections-ansible-builtin-set-fact-module"><span class="std std-ref">ansible.bulitin.set_fact</span></a> first. This can be important if decrypted data should be passed to a role</p> <pre data-language="yaml+jinja">---
+- name: Decrypt file fetched from URL
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Fetch file from URL
+      ansible.builtin.uri:
+        url: https://raw.githubusercontent.com/getsops/sops/master/functional-tests/res/comments.enc.yaml
+        return_content: true
+      register: encrypted_content
+
+    # BAD: every time the role uses decrypted_data, the data will be decrypted!
+
+    - name: Call role with decrypted data
+      include_role:
+        name: myrole
+      vars:
+        role_parameter: "{{ encrypted_content.content | community.sops.decrypt | ansible.builtin.from_yaml }}"
+
+    # GOOD: the data is decrypted once before the role is called,
+
+    - name: Store decrypted data as fact
+      set_fact:
+        decrypted_data: "{{ encrypted_content.content | community.sops.decrypt | ansible.builtin.from_yaml }}"
+
+    - name: Call role with decrypted data
+      include_role:
+        name: myrole
+      vars:
+        role_parameter: "{{ decrypted_data }}"
+</pre> </section> <section id="working-with-encrypted-variables"> <h2>Working with encrypted variables</h2> <p>You can load encrypted variables similarly to the <a class="reference internal" href="../../../ansible/builtin/host_group_vars_vars.html#ansible-collections-ansible-builtin-host-group-vars-vars"><span class="std std-ref">ansible.builtin.host_group_vars vars plugin</span></a> with the <a class="reference internal" href="../sops_vars.html#ansible-collections-community-sops-sops-vars"><span class="std std-ref">community.sops.sops vars plugin</span></a>. If you need to load variables dynamically similarly to the <a class="reference internal" href="../../../ansible/builtin/include_vars_module.html#ansible-collections-ansible-builtin-include-vars-module"><span class="std std-ref">ansible.builtin.include_vars action</span></a>, you can use the <a class="reference internal" href="../load_vars_module.html#ansible-collections-community-sops-load-vars-module"><span class="std std-ref">community.sops.load_vars action</span></a>.</p> <p>To use the vars plugin, you need to enable it in your Ansible config file (<code>ansible.cfg</code>):</p> <pre data-language="ini">[defaults]
+vars_plugins_enabled = host_group_vars,community.sops.sops
+</pre> <p>See <a class="reference internal" href="../../../../reference_appendices/config.html#variable-plugins-enabled"><span class="std std-ref">VARIABLE_PLUGINS_ENABLED</span></a> for more details on enabling vars plugins. Then you can put files with the following extensions into the <code>group_vars</code> and <code>host_vars</code> directories:</p> <ul class="simple"> <li><code>.sops.yaml</code></li> <li><code>.sops.yml</code></li> <li><code>.sops.json</code></li> </ul> <p>(The list of extensions can be adjusted with <code><strong><a class="reference internal" href="../sops_vars.html#ansible-collections-community-sops-sops-vars-parameter-valid-extensions"><span class="std std-ref">valid_extensions</span></a></strong></code>.) The vars plugin will decrypt them and you can use their unencrypted content transparently.</p> <p>If you need to dynamically load encrypted variables, similar to the built-in <a class="reference internal" href="../../../ansible/builtin/include_vars_module.html#ansible-collections-ansible-builtin-include-vars-module"><span class="std std-ref">ansible.builtin.include_vars action</span></a>, you can use the <a class="reference internal" href="../load_vars_module.html#ansible-collections-community-sops-load-vars-module"><span class="std std-ref">community.sops.load_vars action</span></a> action. Please note that it is not a perfect replacement, since the built-in action relies on some hard-coded special casing in ansible-core which allows it to load the variables actually as variables (more precisely: as “unsafe” Jinja2 expressions which are automatically evaluated when used). Other action plugins, such as <a class="reference internal" href="../load_vars_module.html#ansible-collections-community-sops-load-vars-module"><span class="std std-ref">community.sops.load_vars</span></a>, cannot do that and have to load the variables as facts instead.</p> <p>This is mostly relevant if you use Jinja2 expressions in the encrypted variable file. When <a class="reference internal" href="../../../ansible/builtin/include_vars_module.html#ansible-collections-ansible-builtin-include-vars-module"><span class="std std-ref">ansible.builtin.include_vars</span></a> loads a variable file with expressions, these expressions will only be evaluated when the variable that defines them needs to be evaluated (lazy evaluation). Since <a class="reference internal" href="../load_vars_module.html#ansible-collections-community-sops-load-vars-module"><span class="std std-ref">community.sops.load_vars</span></a> returns facts, it has to directly evaluate expressions at load time. (For this, set its <code><strong><a class="reference internal" href="../load_vars_module.html#ansible-collections-community-sops-load-vars-module-parameter-expressions"><span class="std std-ref">expressions</span></a></strong></code> option to <code>evaluate-on-load</code>.) This is mostly relevant if you want to refer to other variables from the same file: this will not work, since Ansible does not know the other variable yet while evaluating the first. It will only “know” them as facts after all have been evaluated and the action finishes.</p> <p>For the following example, assume you have the encrypted file <code>keys/credentials.sops.yml</code> which decrypts to:</p> <pre data-language="yaml">encrypted_password: foo
+expression: "{{ inventory_hostname }}"
+</pre> <p>Consider the following playbook:</p> <pre data-language="yaml+jinja">---
+- name: Create SOPS-encrypted private key
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Load encrypted credentials
+      community.sops.load_vars:
+        file: keys/credentials.sops.yml
+        expressions: ignore  # explicitly do not evaluate expressions
+                             # on load (this is the default)
+
+    - name: Show password
+      debug:
+        msg: "The password is {{ encrypted_password }}"
+
+    - name: Show expression
+      debug:
+        msg: "The expression is {{ expression }}"
+</pre> <p>Running it produces:</p> <pre data-language="ansible">PLAY [Create SOPS-encrypted private key] *************************************************************************
+
+TASK [Load encrypted credentials] ********************************************************************************
+ok: [localhost]
+
+TASK [Show password] *********************************************************************************************
+ok: [localhost] =&gt; {
+    "msg": "The password is foo"
+}
+
+TASK [Show expression] *******************************************************************************************
+ok: [localhost] =&gt; {
+    "msg": "The expression is {{ inventory_hostname }}"
+}
+
+PLAY RECAP *******************************************************************************************************
+localhost                  : ok=3    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+</pre> <p>If you change the variable loading task to:</p> <pre data-language="yaml+jinja">- name: Load encrypted credentials
+  community.sops.load_vars:
+    file: keys/credentials.sops.yml
+    expressions: evaluate-on-load
+</pre> <p>The last task will now show the evaluated expression:</p> <pre data-language="ansible">TASK [Show expression] *******************************************************************************************
+ok: [localhost] =&gt; {
+    "msg": "The expression is localhost"
+}
+</pre> </section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012&ndash;2018 Michael DeHaan<br>&copy; 2018&ndash;2025 Red Hat, Inc.<br>Licensed under the GNU General Public License version 3.<br>
+    <a href="https://docs.ansible.com/projects/ansible/latest/collections/community/sops/docsite/guide.html" class="_attribution-link">https://docs.ansible.com/projects/ansible/latest/collections/community/sops/docsite/guide.html</a>
+  </p>
+</div>

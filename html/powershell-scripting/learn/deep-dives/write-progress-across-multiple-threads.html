@@ -1,0 +1,156 @@
+<h1 id="writing-progress-across-multiple-threads-with-foreach-object-parallel">Writing Progress across multiple threads with <code>ForEach-Object -Parallel</code>
+</h1> <p>Starting in PowerShell 7.0, the ability to work in multiple threads simultaneously is possible using the <strong>Parallel</strong> parameter in the <a href="../../powershell/module/microsoft.powershell.core/foreach-object.html">ForEach-Object</a> cmdlet. Monitoring the progress of these threads can be a challenge though. Normally, you can monitor the progress of a process using <a href="../../powershell/module/microsoft.powershell.utility/write-progress.html">Write-Progress</a>. However, since PowerShell uses a separate runspace for each thread when using <strong>Parallel</strong>, reporting the progress back to the host isn't as straight forward as normal use of <code>Write-Progress</code>.</p> <h2 id="using-a-synced-hashtable-to-track-progress">Using a synced hashtable to track progress</h2> <p>When writing the progress from multiple threads, tracking becomes difficult because when running parallel processes in PowerShell, each process has it's own runspace. To get around this, you can use a <a href="../../dotnet/api/system.collections.hashtable.synchronized.html">synchronized hashtable</a>. A synced hashtable is a thread safe data structure that can be modified by multiple threads simultaneously without throwing an error.</p> <h3 id="set-up">Set up</h3> <p>One of the downsides to this approach is it takes a, somewhat, complex set up to ensure everything runs without error.</p> <pre><code class="powershell">$dataset = @(
+    @{
+        Id   = 1
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+    @{
+        Id   = 2
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+    @{
+        Id   = 3
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+    @{
+        Id   = 4
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+    @{
+        Id   = 5
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+)
+
+# Create a hashtable for process.
+# Keys should be ID's of the processes
+$origin = @{}
+$dataset | ForEach-Object {$origin.($_.Id) = @{}}
+
+# Create synced hashtable
+$sync = [System.Collections.Hashtable]::Synchronized($origin)
+</code></pre> <p>This section creates three different data structures, for three different purposes.</p> <p>The <code>$dataSet</code> variable stores an array of hashtables that is used to coordinate the next steps without the risk of being modified. If an object collection is modified while iterating through the collection, PowerShell throws an error. You must keep the object collection in the loop separate from the objects being modified. The <code>Id</code> key in each hashtable is the identifier for a mock process. The <code>Wait</code> key simulates the workload of each mock process being tracked.</p> <p>The <code>$origin</code> variable stores a nested hashtable with each key being one of the mock process id's. Then, it is used to hydrate the synchronized hashtable stored in the <code>$sync</code> variable. The <code>$sync</code> variable is responsible for reporting the progress back to the parent runspace, which displays the progress.</p> <h3 id="running-the-processes">Running the processes</h3> <p>This section runs the multi-threaded processes and creates some of the output used to display progress.</p> <pre><code class="powershell">$job = $dataset | ForEach-Object -ThrottleLimit 3 -AsJob -Parallel {
+    $syncCopy = $Using:sync
+    $process = $syncCopy.$($PSItem.Id)
+
+    $process.Id = $PSItem.Id
+    $process.Activity = "Id $($PSItem.Id) starting"
+    $process.Status = "Processing"
+
+    # Fake workload start up that takes x amount of time to complete
+    Start-Sleep -Milliseconds ($PSItem.Wait*5)
+
+    # Process. update activity
+    $process.Activity = "Id $($PSItem.Id) processing"
+    foreach ($percent in 1..100)
+    {
+        # Update process on status
+        $process.Status = "Handling $percent/100"
+        $process.PercentComplete = (($percent / 100) * 100)
+
+        # Fake workload that takes x amount of time to complete
+        Start-Sleep -Milliseconds $PSItem.Wait
+    }
+
+    # Mark process as completed
+    $process.Completed = $true
+}
+</code></pre> <p>The mock processes are sent to <code>ForEach-Object</code> and started as jobs. The <strong>ThrottleLimit</strong> is set to <strong>3</strong> to highlight running multiple processes in a queue. The jobs are stored in the <code>$job</code> variable and allows us to know when all the processes have finished later on.</p> <p>When using the <code>Using:</code> statement to reference a parent scope variable in PowerShell, you can't use expressions to make it dynamic. For example, if you tried to create the <code>$process</code> variable like this, <code>$process = $Using:sync.$($PSItem.Id)</code>, you would get an error stating you can't use expressions there. So, we create the <code>$syncCopy</code> variable to be able to reference and modify the <code>$sync</code> variable without the risk of it failing.</p> <p>Next, we build out a hashtable to represent the progress of the process currently in the loop using the <code>$process</code> variable by referencing the synchronized hashtable keys. The <strong>Activity</strong> and the <strong>Status</strong> keys are used as parameter values for <code>Write-Progress</code> to display the status of a given mock process in the next section.</p> <p>The <code>foreach</code> loop is just a way to simulate the process working and is randomized based on the <code>$dataSet</code> <strong>Wait</strong> attribute to set <code>Start-Sleep</code> using milliseconds. How you calculate the progress of your process may vary.</p> <h3 id="displaying-the-progress-of-multiple-processes">Displaying the progress of multiple processes</h3> <p>Now that the mock processes are running as jobs, we can start to write the processes progress to the PowerShell window.</p> <pre><code class="powershell">while($job.State -eq 'Running')
+{
+    $sync.Keys | ForEach-Object {
+        # If key is not defined, ignore
+        if(![string]::IsNullOrEmpty($sync.$_.Keys))
+        {
+            # Create parameter hashtable to splat
+            $param = $sync.$_
+
+            # Execute Write-Progress
+            Write-Progress @param
+        }
+    }
+
+    # Wait to refresh to not overload gui
+    Start-Sleep -Seconds 0.1
+}
+</code></pre> <p>The <code>$job</code> variable contains the parent <strong>job</strong> and has a child <strong>job</strong> for each of the mock processes. While any of the child jobs are still running, the parent job <strong>State</strong> will remain "Running". This allows us to use the <code>while</code> loop to continually update the progress of every process until all processes are finished.</p> <p>Within the while loop, we loop through each of the keys in the <code>$sync</code> variable. Since this is a synchronized hashtable, it is constantly updated but can still be accessed without throwing any errors.</p> <p>There is a check to ensure that the process being reported is actually running using the <code>IsNullOrEmpty()</code> method. If the process hasn't been started, the loop won't report on it and move on to the next until it gets to a process that has been started. If the process is started, the hashtable from the current key is used to splat the parameters to <code>Write-Progress</code>.</p> <h3 id="full-example">Full example</h3> <pre><code class="powershell"># Example workload
+$dataset = @(
+    @{
+        Id   = 1
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+    @{
+        Id   = 2
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+    @{
+        Id   = 3
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+    @{
+        Id   = 4
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+    @{
+        Id   = 5
+        Wait = 3..10 | Get-Random | ForEach-Object {$_*100}
+    }
+)
+
+# Create a hashtable for process.
+# Keys should be ID's of the processes
+$origin = @{}
+$dataset | ForEach-Object {$origin.($_.Id) = @{}}
+
+# Create synced hashtable
+$sync = [System.Collections.Hashtable]::Synchronized($origin)
+
+$job = $dataset | ForEach-Object -ThrottleLimit 3 -AsJob -Parallel {
+    $syncCopy = $Using:sync
+    $process = $syncCopy.$($PSItem.Id)
+
+    $process.Id = $PSItem.Id
+    $process.Activity = "Id $($PSItem.Id) starting"
+    $process.Status = "Processing"
+
+    # Fake workload start up that takes x amount of time to complete
+    Start-Sleep -Milliseconds ($PSItem.Wait*5)
+
+    # Process. update activity
+    $process.Activity = "Id $($PSItem.Id) processing"
+    foreach ($percent in 1..100)
+    {
+        # Update process on status
+        $process.Status = "Handling $percent/100"
+        $process.PercentComplete = (($percent / 100) * 100)
+
+        # Fake workload that takes x amount of time to complete
+        Start-Sleep -Milliseconds $PSItem.Wait
+    }
+
+    # Mark process as completed
+    $process.Completed = $true
+}
+
+while($job.State -eq 'Running')
+{
+    $sync.Keys | ForEach-Object {
+        # If key is not defined, ignore
+        if(![string]::IsNullOrEmpty($sync.$_.Keys))
+        {
+            # Create parameter hashtable to splat
+            $param = $sync.$_
+
+            # Execute Write-Progress
+            Write-Progress @param
+        }
+    }
+
+    # Wait to refresh to not overload gui
+    Start-Sleep -Seconds 0.1
+}
+</code></pre> <h2 id="related-links">Related Links</h2> <ul> <li><a href="../../powershell/module/microsoft.powershell.core/about/about_jobs.html">about_Jobs</a></li> <li><a href="../../powershell/module/microsoft.powershell.core/about/about_scopes.html">about_Scopes</a></li> <li><a href="../../powershell/module/microsoft.powershell.core/about/about_splatting.html">about_Splatting</a></li> </ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Microsoft CorporationCode licensed under an MIT-style License. Documentation licensed under CC BY 4.0.<br>
+    <a href="https://learn.microsoft.com/en-us/powershell/scripting/learn/deep-dives/write-progress-across-multiple-threads?view=powershell-Scripting" class="_attribution-link">https://learn.microsoft.com/en-us/powershell/scripting/learn/deep-dives/write-progress-across-multiple-threads?view=powershell-Scripting</a>
+  </p>
+</div>

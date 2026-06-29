@@ -1,0 +1,1500 @@
+<section><h1 id="iterable-streams">Iterable Streams
+</h1>
+<div class="api_metadata"><span><b>Source Code: </b><a href="https://github.com/nodejs/node/blob/main/lib/stream/iter.js">lib/stream/iter.js</a></span></div>
+<div class="api_stability api_stability_1"><p><a href="https://nodejs.org/api/documentation.html#stability-index">Stability: 1</a> - Experimental</p></div>
+<p>The <code>node:stream/iter</code> module provides a streaming API built on iterables rather than the event-driven <code>Readable</code>/<code>Writable</code>/<code>Transform</code> class hierarchy, or the Web Streams <code>ReadableStream</code>/<code>WritableStream</code>/<code>TransformStream</code> interfaces.</p>
+<p>This module is available only when the <code>--experimental-stream-iter</code> CLI flag is enabled.</p>
+<p>Streams are represented as <code>AsyncIterable&lt;Uint8Array[]&gt;</code> (async) or <code>Iterable&lt;Uint8Array[]&gt;</code> (sync). There are no base classes to extend -- any object implementing the iterable protocol can participate. Transforms are plain functions or objects with a <code>transform</code> method.</p>
+<p>Data flows in <strong>batches</strong> (<code>Uint8Array[]</code> per iteration) to amortize the cost of async operations.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { from, pull, text } from 'node:stream/iter';
+import { compressGzip, decompressGzip } from 'node:zlib/iter';
+
+// Compress and decompress a string
+const compressed = pull(from('Hello, world!'), compressGzip());
+const result = await text(pull(compressed, decompressGzip()));
+console.log(result); // 'Hello, world!'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { from, pull, text } = require('node:stream/iter');
+const { compressGzip, decompressGzip } = require('node:zlib/iter');
+
+async function run() {
+  // Compress and decompress a string
+  const compressed = pull(from('Hello, world!'), compressGzip());
+  const result = await text(pull(compressed, decompressGzip()));
+  console.log(result); // 'Hello, world!'
+}
+
+run().catch(console.error);
+</pre></details><details open><summary>JavaScript modules</summary><pre data-language="js">import { open } from 'node:fs/promises';
+import { text, pipeTo } from 'node:stream/iter';
+import { compressGzip, decompressGzip } from 'node:zlib/iter';
+
+// Read a file, compress, write to another file
+const src = await open('input.txt', 'r');
+const dst = await open('output.gz', 'w');
+await pipeTo(src.pull(), compressGzip(), dst.writer({ autoClose: true }));
+await src.close();
+
+// Read it back
+const gz = await open('output.gz', 'r');
+console.log(await text(gz.pull(decompressGzip(), { autoClose: true })));
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { open } = require('node:fs/promises');
+const { text, pipeTo } = require('node:stream/iter');
+const { compressGzip, decompressGzip } = require('node:zlib/iter');
+
+async function run() {
+  // Read a file, compress, write to another file
+  const src = await open('input.txt', 'r');
+  const dst = await open('output.gz', 'w');
+  await pipeTo(src.pull(), compressGzip(), dst.writer({ autoClose: true }));
+  await src.close();
+
+  // Read it back
+  const gz = await open('output.gz', 'r');
+  console.log(await text(gz.pull(decompressGzip(), { autoClose: true })));
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h3 id="concepts">Concepts
+</h3>
+</section> <section><h4 id="byte-streams">Byte streams
+</h4>
+
+<p>All data in this API is represented as <code>Uint8Array</code> bytes. Strings are automatically UTF-8 encoded when passed to <code>from()</code>, <code>push()</code>, or <code>pipeTo()</code>. This removes ambiguity around encodings and enables zero-copy transfers between streams and native code.</p></section> <section><h4 id="batching">Batching
+</h4>
+
+<p>Each iteration yields a <strong>batch</strong> -- an array of <code>Uint8Array</code> chunks (<code>Uint8Array[]</code>). Batching amortizes the cost of <code>await</code> and Promise creation across multiple chunks. A consumer that processes one chunk at a time can simply iterate the inner array:</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">for await (const batch of source) {
+  for (const chunk of batch) {
+    handle(chunk);
+  }
+}
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">async function run() {
+  for await (const batch of source) {
+    for (const chunk of batch) {
+      handle(chunk);
+    }
+  }
+}
+</pre></details></section> <section><h4 id="transforms">Transforms
+</h4>
+
+<p>Transforms come in two forms:</p>
+<ul> <li> <p><strong>Stateless</strong> -- a function <code>(chunks, options) =&gt; result</code> called once per batch. Receives <code>Uint8Array[]</code> (or <code>null</code> as the flush signal) and an <code>options</code> object. Returns <code>Uint8Array[]</code>, <code>null</code>, or an iterable of chunks.</p> </li> <li> <p><strong>Stateful</strong> -- an object <code>{ transform(source, options) }</code> where <code>transform</code> is a generator (sync or async) that receives the entire upstream iterable and an <code>options</code> object, and yields output. This form is used for compression, encryption, and any transform that needs to buffer across batches.</p> </li> </ul>
+<p>Both forms receive an <code>options</code> parameter with the following property:</p>
+<ul> <li>
+<code>options.signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a> An AbortSignal that fires when the pipeline is cancelled, encounters an error, or the consumer stops reading. Transforms can check <code>signal.aborted</code> or listen for the <code>'abort'</code> event to perform early cleanup.</li> </ul>
+<p>The flush signal (<code>null</code>) is sent after the source ends, giving transforms a chance to emit trailing data (e.g., compression footers).</p>
+<pre class="catppuccin-latte catppuccin-mocha language-js shiki shiki-themes" style="background-color:#eff1f5;--shiki-dark-bg:#1e1e2e;color:#4c4f69;--shiki-dark:#cdd6f4" tabindex="0" data-language="js">// Stateless: uppercase transform
+const upper = (chunks) =&gt; {
+  if (chunks === null) return null; // flush
+  return chunks.map((c) =&gt; new TextEncoder().encode(
+    new TextDecoder().decode(c).toUpperCase(),
+  ));
+};
+
+// Stateful: line splitter
+const lines = {
+  transform: async function*(source) {
+    let partial = '';
+    for await (const chunks of source) {
+      if (chunks === null) {
+        if (partial) yield [new TextEncoder().encode(partial)];
+        continue;
+      }
+      for (const chunk of chunks) {
+        const str = partial + new TextDecoder().decode(chunk);
+        const parts = str.split('\n');
+        partial = parts.pop();
+        for (const line of parts) {
+          yield [new TextEncoder().encode(`${line}\n`)];
+        }
+      }
+    }
+  },
+};
+jscopy</pre></section> <section><h4 id="pull-vs-push">Pull vs. push
+</h4>
+
+<p>The API supports two models:</p>
+<ul> <li> <p><strong>Pull</strong> -- data flows on demand. <code>pull()</code> and <code>pullSync()</code> create lazy pipelines that only read from the source when the consumer iterates.</p> </li> <li> <p><strong>Push</strong> -- data is written explicitly. <code>push()</code> creates a writer/readable pair with backpressure. The writer pushes data in; the readable is consumed as an async iterable.</p> </li> </ul></section> <section><h4 id="backpressure">Backpressure
+</h4>
+
+<p>Pull streams have natural backpressure -- the consumer drives the pace, so the source is never read faster than the consumer can process. Push streams need explicit backpressure because the producer and consumer run independently. The <code>highWaterMark</code> and <code>backpressure</code> options on <code>push()</code>, <code>broadcast()</code>, and <code>share()</code> control how this works.</p></section> <section><h5 id="the-two-buffer-model">The two-buffer model
+</h5>
+
+<p>Push streams use a two-part buffering system. Think of it like a bucket (slots) being filled through a hose (pending writes), with a float valve that closes when the bucket is full:</p>
+<pre class="catppuccin-latte catppuccin-mocha language-text shiki shiki-themes" style="background-color:#eff1f5;--shiki-dark-bg:#1e1e2e;color:#4c4f69;--shiki-dark:#cdd6f4" tabindex="0" data-language="js">                          highWaterMark (e.g., 3)
+                                 |
+    Producer                     v
+       |                    +---------+
+       v                    |         |
+  [ write() ] ----+    +---&gt;| slots   |---&gt; Consumer pulls
+  [ write() ]     |    |    | (bucket)|     for await (...)
+  [ write() ]     v    |    +---------+
+              +--------+         ^
+              | pending|         |
+              | writes |    float valve
+              | (hose) |    (backpressure)
+              +--------+
+                   ^
+                   |
+          'strict' mode limits this too!
+textcopy</pre>
+<ul> <li> <p><strong>Slots (the bucket)</strong> -- data ready for the consumer, capped at <code>highWaterMark</code>. When the consumer pulls, it drains all slots at once into a single batch.</p> </li> <li> <p><strong>Pending writes (the hose)</strong> -- writes waiting for slot space. After the consumer drains, pending writes are promoted into the now-empty slots and their promises settle.</p> </li> </ul>
+<p>How each policy uses these buffers:</p>
+<table> <thead> <tr> <th>Policy</th> <th>Slots limit</th> <th>Pending writes limit</th> </tr> </thead> <tbody> <tr> <td><code>'strict'</code></td> <td><code>highWaterMark</code></td> <td><code>highWaterMark</code></td> </tr> <tr> <td><code>'block'</code></td> <td><code>highWaterMark</code></td> <td>Unbounded</td> </tr> <tr> <td><code>'drop-oldest'</code></td> <td><code>highWaterMark</code></td> <td>N/A (never waits)</td> </tr> <tr> <td><code>'drop-newest'</code></td> <td><code>highWaterMark</code></td> <td>N/A (never waits)</td> </tr> </tbody> </table></section> <section><h5 id="strict-default">Strict (default)
+</h5>
+
+<p>Strict mode catches "fire-and-forget" patterns where the producer calls <code>write()</code> without awaiting, which would cause unbounded memory growth. It limits both the slots buffer and the pending writes queue to <code>highWaterMark</code>.</p>
+<p>If you properly await each write, you can only ever have one pending write at a time (yours), so you never hit the pending writes limit. Unawaited writes accumulate in the pending queue and throw once it overflows:</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { push, text } from 'node:stream/iter';
+
+const { writer, readable } = push({ highWaterMark: 16 });
+
+// Consumer must run concurrently -- without it, the first write
+// that fills the buffer blocks the producer forever.
+const consuming = text(readable);
+
+// GOOD: awaited writes. The producer waits for the consumer to
+// make room when the buffer is full.
+for (const item of dataset) {
+  await writer.write(item);
+}
+await writer.end();
+console.log(await consuming);
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { push, text } = require('node:stream/iter');
+
+async function run() {
+  const { writer, readable } = push({ highWaterMark: 16 });
+
+  // Consumer must run concurrently -- without it, the first write
+  // that fills the buffer blocks the producer forever.
+  const consuming = text(readable);
+
+  // GOOD: awaited writes. The producer waits for the consumer to
+  // make room when the buffer is full.
+  for (const item of dataset) {
+    await writer.write(item);
+  }
+  await writer.end();
+  console.log(await consuming);
+}
+
+run().catch(console.error);
+</pre></details><p>Forgetting to <code>await</code> will eventually throw:</p>
+<pre class="catppuccin-latte catppuccin-mocha language-js shiki shiki-themes" style="background-color:#eff1f5;--shiki-dark-bg:#1e1e2e;color:#4c4f69;--shiki-dark:#cdd6f4" tabindex="0" data-language="js">// BAD: fire-and-forget. Strict mode throws once both buffers fill.
+for (const item of dataset) {
+  writer.write(item); // Not awaited -- queues without bound
+}
+// --&gt; throws "Backpressure violation: too many pending writes"
+jscopy</pre></section> <section><h5 id="block">Block
+</h5>
+
+<p>Block mode caps slots at <code>highWaterMark</code> but places no limit on the pending writes queue. Awaited writes block until the consumer makes room, just like strict mode. The difference is that unawaited writes silently queue forever instead of throwing -- a potential memory leak if the producer forgets to <code>await</code>.</p>
+<p>This is the mode that existing Node.js classic streams and Web Streams default to. Use it when you control the producer and know it awaits properly, or when migrating code from those APIs.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { push, text } from 'node:stream/iter';
+
+const { writer, readable } = push({
+  highWaterMark: 16,
+  backpressure: 'block',
+});
+
+const consuming = text(readable);
+
+// Safe -- awaited writes block until the consumer reads.
+for (const item of dataset) {
+  await writer.write(item);
+}
+await writer.end();
+console.log(await consuming);
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { push, text } = require('node:stream/iter');
+
+async function run() {
+  const { writer, readable } = push({
+    highWaterMark: 16,
+    backpressure: 'block',
+  });
+
+  const consuming = text(readable);
+
+  // Safe -- awaited writes block until the consumer reads.
+  for (const item of dataset) {
+    await writer.write(item);
+  }
+  await writer.end();
+  console.log(await consuming);
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h5 id="drop-oldest">Drop-oldest
+</h5>
+
+<p>Writes never wait. When the slots buffer is full, the oldest buffered chunk is evicted to make room for the incoming write. The consumer always sees the most recent data. Useful for live feeds, telemetry, or any scenario where stale data is less valuable than current data.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { push } from 'node:stream/iter';
+
+// Keep only the 5 most recent readings
+const { writer, readable } = push({
+  highWaterMark: 5,
+  backpressure: 'drop-oldest',
+});
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { push } = require('node:stream/iter');
+
+// Keep only the 5 most recent readings
+const { writer, readable } = push({
+  highWaterMark: 5,
+  backpressure: 'drop-oldest',
+});
+</pre></details></section> <section><h5 id="drop-newest">Drop-newest
+</h5>
+
+<p>Writes never wait. When the slots buffer is full, the incoming write is silently discarded. The consumer processes what is already buffered without being overwhelmed by new data. Useful for rate-limiting or shedding load under pressure.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { push } from 'node:stream/iter';
+
+// Accept up to 10 buffered items; discard anything beyond that
+const { writer, readable } = push({
+  highWaterMark: 10,
+  backpressure: 'drop-newest',
+});
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { push } = require('node:stream/iter');
+
+// Accept up to 10 buffered items; discard anything beyond that
+const { writer, readable } = push({
+  highWaterMark: 10,
+  backpressure: 'drop-newest',
+});
+</pre></details></section> <section><h4 id="writer-interface">Writer interface
+</h4>
+
+<p>A writer is any object conforming to the Writer interface. Only <code>write()</code> is required; all other methods are optional.</p>
+<p>Each async method has a synchronous <code>*Sync</code> counterpart designed for a try-fallback pattern: attempt the fast synchronous path first, and fall back to the async version only when the synchronous call indicates it could not complete:</p>
+<pre class="catppuccin-latte catppuccin-mocha language-mjs shiki shiki-themes" style="background-color:#eff1f5;--shiki-dark-bg:#1e1e2e;color:#4c4f69;--shiki-dark:#cdd6f4" tabindex="0" data-language="js">if (!writer.writeSync(chunk)) await writer.write(chunk);
+if (!writer.writevSync(chunks)) await writer.writev(chunks);
+if (writer.endSync() &lt; 0) await writer.end();
+writer.fail(err);  // Always synchronous, no fallback needed
+mjscopy</pre></section> <section><h5 id="writerdesiredsize">
+<code>writer.desiredSize</code>
+</h5>
+
+<ul> <li>
+<a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#null_type"><code>&lt;null&gt;</code></a>
+</li> </ul>
+<p>The number of buffer slots available before the high water mark is reached. Returns <code>null</code> if the writer is closed or the consumer has disconnected.</p>
+<p>The value is always non-negative.</p></section> <section><h5 id="writerendoptions">
+<code>writer.end([options])</code>
+</h5>
+
+<ul> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a> Cancel just this operation. The signal cancels only the pending <code>end()</code> call; it does not fail the writer itself.</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>&lt;Promise&gt;</code></a> Fulfills with the total number of bytes written.</li> </ul>
+<p>Signal that no more data will be written.</p></section> <section><h5 id="writerendsync">
+<code>writer.endSync()</code>
+</h5>
+
+<ul> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Total bytes written, or <code>-1</code> if the writer is not open.</li> </ul>
+<p>Synchronous variant of <code>writer.end()</code>. Returns <code>-1</code> if the writer is already closed or errored. Can be used as a try-fallback pattern:</p>
+<pre class="catppuccin-latte catppuccin-mocha language-cjs shiki shiki-themes" style="background-color:#eff1f5;--shiki-dark-bg:#1e1e2e;color:#4c4f69;--shiki-dark:#cdd6f4" tabindex="0" data-language="js">const result = writer.endSync();
+if (result &lt; 0) {
+  writer.end();
+}
+cjscopy</pre></section> <section><h5 id="writerfailreason">
+<code>writer.fail(reason)</code>
+</h5>
+
+<ul> <li>
+<code>reason</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#Data_types"><code>&lt;any&gt;</code></a>
+</li> </ul>
+<p>Put the writer into a terminal error state. If the writer is already closed or errored, this is a no-op. Unlike <code>write()</code> and <code>end()</code>, <code>fail()</code> is unconditionally synchronous because failing a writer is a pure state transition with no async work to perform.</p></section> <section><h5 id="writerwritechunk-options">
+<code>writer.write(chunk[, options])</code>
+</h5>
+
+<ul> <li>
+<code>chunk</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Uint8Array"><code>&lt;Uint8Array&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a>
+</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a> Cancel just this write operation. The signal cancels only the pending <code>write()</code> call; it does not fail the writer itself.</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>&lt;Promise&gt;</code></a> Fulfills with <code>undefined</code> when buffer space is available.</li> </ul>
+<p>Write a chunk.</p></section> <section><h5 id="writerwritesyncchunk">
+<code>writer.writeSync(chunk)</code>
+</h5>
+
+<ul> <li>
+<code>chunk</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Uint8Array"><code>&lt;Uint8Array&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a>
+</li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#boolean_type"><code>&lt;boolean&gt;</code></a> <code>true</code> if the write was accepted, <code>false</code> if the buffer is full.</li> </ul>
+<p>Synchronous write. Does not block; returns <code>false</code> if backpressure is active.</p></section> <section><h5 id="writerwritevchunks-options">
+<code>writer.writev(chunks[, options])</code>
+</h5>
+
+<ul> <li>
+<code>chunks</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Uint8Array"><code>&lt;Uint8Array[]&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string[]&gt;</code></a>
+</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a> Cancel just this write operation. The signal cancels only the pending <code>writev()</code> call; it does not fail the writer itself.</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>&lt;Promise&gt;</code></a>
+</li> </ul>
+<p>Write multiple chunks as a single batch.</p></section> <section><h5 id="writerwritevsyncchunks">
+<code>writer.writevSync(chunks)</code>
+</h5>
+
+<ul> <li>
+<code>chunks</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Uint8Array"><code>&lt;Uint8Array[]&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string[]&gt;</code></a>
+</li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#boolean_type"><code>&lt;boolean&gt;</code></a> <code>true</code> if the write was accepted, <code>false</code> if the buffer is full.</li> </ul>
+<p>Synchronous batch write.</p></section> <section><h3 id="the-streamiter-module">The <code>stream/iter</code> module
+</h3>
+
+<p>All functions are available both as named exports and as properties of the <code>Stream</code> namespace object:</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">// Named exports
+import { from, pull, bytes, Stream } from 'node:stream/iter';
+
+// Namespace access
+Stream.from('hello');
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">// Named exports
+const { from, pull, bytes, Stream } = require('node:stream/iter');
+
+// Namespace access
+Stream.from('hello');
+</pre></details><p>Including the <code>node:</code> prefix on the module specifier is optional.</p></section> <section><h3 id="sources">Sources
+</h3>
+</section> <section><h4 id="frominput">
+<code>from(input)</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>input</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer"><code>&lt;ArrayBuffer&gt;</code></a> | <a href="https://tc39.github.io/ecma262/#sec-asynciterable-interface"><code>&lt;AsyncIterable&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Must not be <code>null</code> or <code>undefined</code>.</li> <li>Returns: {AsyncIterable&lt;Uint8Array[]&gt;}</li> </ul>
+<p>Create an async byte stream from the given input. Strings are UTF-8 encoded. <code>ArrayBuffer</code> and <code>ArrayBufferView</code> values are wrapped as <code>Uint8Array</code>. Arrays and iterables are recursively flattened and normalized.</p>
+<p>Objects implementing <code>Symbol.for('Stream.toAsyncStreamable')</code> or <code>Symbol.for('Stream.toStreamable')</code> are converted via those protocols. The <code>toAsyncStreamable</code> protocol takes precedence over <code>toStreamable</code>, which takes precedence over the iteration protocols (<code>Symbol.asyncIterator</code>, <code>Symbol.iterator</code>).</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { Buffer } from 'node:buffer';
+import { from, text } from 'node:stream/iter';
+
+console.log(await text(from('hello')));       // 'hello'
+console.log(await text(from(Buffer.from('hello')))); // 'hello'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { Buffer } = require('node:buffer');
+const { from, text } = require('node:stream/iter');
+
+async function run() {
+  console.log(await text(from('hello')));       // 'hello'
+  console.log(await text(from(Buffer.from('hello')))); // 'hello'
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h4 id="fromsyncinput">
+<code>fromSync(input)</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>input</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer"><code>&lt;ArrayBuffer&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Must not be <code>null</code> or <code>undefined</code>.</li> <li>Returns: {Iterable&lt;Uint8Array[]&gt;}</li> </ul>
+<p>Synchronous version of <a href="#frominput"><code>from()</code></a>. Returns a sync iterable. Cannot accept async iterables or promises. Objects implementing <code>Symbol.for('Stream.toStreamable')</code> are converted via that protocol (takes precedence over <code>Symbol.iterator</code>). The <code>toAsyncStreamable</code> protocol is ignored entirely.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { fromSync, textSync } from 'node:stream/iter';
+
+console.log(textSync(fromSync('hello'))); // 'hello'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { fromSync, textSync } = require('node:stream/iter');
+
+console.log(textSync(fromSync('hello'))); // 'hello'
+</pre></details></section> <section><h3 id="pipelines">Pipelines
+</h3>
+</section> <section><h4 id="pipetosource-transforms-writer-options">
+<code>pipeTo(source[, ...transforms], writer[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> <a href="https://tc39.github.io/ecma262/#sec-asynciterable-interface"><code>&lt;AsyncIterable&gt;</code></a> The data source.</li> <li>
+<code>...transforms</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Zero or more transforms to apply.</li> <li>
+<code>writer</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Destination with <code>write(chunk)</code> method.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a> Abort the pipeline.</li> <li>
+<code>preventClose</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#boolean_type"><code>&lt;boolean&gt;</code></a> If <code>true</code>, do not call <code>writer.end()</code> when the source ends. <strong>Default:</strong> <code>false</code>.</li> <li>
+<code>preventFail</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#boolean_type"><code>&lt;boolean&gt;</code></a> If <code>true</code>, do not call <code>writer.fail()</code> on error. <strong>Default:</strong> <code>false</code>.</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>&lt;Promise&gt;</code></a> Fulfills with the total number of bytes written.</li> </ul>
+<p>Pipe a source through transforms into a writer. If the writer has a <code>writev(chunks)</code> method, entire batches are passed in a single call (enabling scatter/gather I/O).</p>
+<p>If the writer implements the optional <code>*Sync</code> methods (<code>writeSync</code>, <code>writevSync</code>, <code>endSync</code>), <code>pipeTo()</code> will attempt to use the synchronous methods first as a fast path, and fall back to the async versions only when the sync methods indicate they cannot complete (e.g., backpressure or waiting for the next tick). <code>fail()</code> is always called synchronously.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { from, pipeTo } from 'node:stream/iter';
+import { compressGzip } from 'node:zlib/iter';
+import { open } from 'node:fs/promises';
+
+const fh = await open('output.gz', 'w');
+const totalBytes = await pipeTo(
+  from('Hello, world!'),
+  compressGzip(),
+  fh.writer({ autoClose: true }),
+);
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { from, pipeTo } = require('node:stream/iter');
+const { compressGzip } = require('node:zlib/iter');
+const { open } = require('node:fs/promises');
+
+async function run() {
+  const fh = await open('output.gz', 'w');
+  const totalBytes = await pipeTo(
+    from('Hello, world!'),
+    compressGzip(),
+    fh.writer({ autoClose: true }),
+  );
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h4 id="pipetosyncsource-transforms-writer-options">
+<code>pipeToSync(source[, ...transforms], writer[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {Iterable} The sync data source.</li> <li>
+<code>...transforms</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Zero or more sync transforms.</li> <li>
+<code>writer</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Destination with <code>write(chunk)</code> method.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>preventClose</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#boolean_type"><code>&lt;boolean&gt;</code></a> <strong>Default:</strong> <code>false</code>.</li> <li>
+<code>preventFail</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#boolean_type"><code>&lt;boolean&gt;</code></a> <strong>Default:</strong> <code>false</code>.</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Total bytes written.</li> </ul>
+<p>Synchronous version of <a href="#pipetosource-transforms-writer-options"><code>pipeTo()</code></a>. The <code>source</code>, all transforms, and the <code>writer</code> must be synchronous. Cannot accept async iterables or promises.</p>
+<p>The <code>writer</code> must have the <code>*Sync</code> methods (<code>writeSync</code>, <code>writevSync</code>, <code>endSync</code>) and <code>fail()</code> for this to work.</p></section> <section><h4 id="pullsource-transforms-options">
+<code>pull(source[, ...transforms][, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> <a href="https://tc39.github.io/ecma262/#sec-asynciterable-interface"><code>&lt;AsyncIterable&gt;</code></a> The data source.</li> <li>
+<code>...transforms</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Zero or more transforms to apply.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a> Abort the pipeline.</li> </ul> </li> <li>Returns: {AsyncIterable&lt;Uint8Array[]&gt;}</li> </ul>
+<p>Create a lazy async pipeline. Data is not read from <code>source</code> until the returned iterable is consumed. Transforms are applied in order.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { from, pull, text } from 'node:stream/iter';
+
+const asciiUpper = (chunks) =&gt; {
+  if (chunks === null) return null;
+  return chunks.map((c) =&gt; {
+    for (let i = 0; i &lt; c.length; i++) {
+      c[i] -= (c[i] &gt;= 97 &amp;&amp; c[i] &lt;= 122) * 32;
+    }
+    return c;
+  });
+};
+
+const result = pull(from('hello'), asciiUpper);
+console.log(await text(result)); // 'HELLO'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { from, pull, text } = require('node:stream/iter');
+
+const asciiUpper = (chunks) =&gt; {
+  if (chunks === null) return null;
+  return chunks.map((c) =&gt; {
+    for (let i = 0; i &lt; c.length; i++) {
+      c[i] -= (c[i] &gt;= 97 &amp;&amp; c[i] &lt;= 122) * 32;
+    }
+    return c;
+  });
+};
+
+async function run() {
+  const result = pull(from('hello'), asciiUpper);
+  console.log(await text(result)); // 'HELLO'
+}
+
+run().catch(console.error);
+</pre></details><p>Using an <code>AbortSignal</code>:</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { pull } from 'node:stream/iter';
+
+const ac = new AbortController();
+const result = pull(source, transform, { signal: ac.signal });
+ac.abort(); // Pipeline throws AbortError on next iteration
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { pull } = require('node:stream/iter');
+
+const ac = new AbortController();
+const result = pull(source, transform, { signal: ac.signal });
+ac.abort(); // Pipeline throws AbortError on next iteration
+</pre></details></section> <section><h4 id="pullsyncsource-transforms">
+<code>pullSync(source[, ...transforms])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {Iterable} The sync data source.</li> <li>
+<code>...transforms</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Zero or more sync transforms.</li> <li>Returns: {Iterable&lt;Uint8Array[]&gt;}</li> </ul>
+<p>Synchronous version of <a href="#pullsource-transforms-options"><code>pull()</code></a>. All transforms must be synchronous.</p></section> <section><h3 id="push-streams">Push streams
+</h3>
+</section> <section><h4 id="pushtransforms-options">
+<code>push([...transforms][, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>...transforms</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Optional transforms applied to the readable side.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>highWaterMark</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Maximum number of buffered slots before backpressure is applied. Must be &gt;= 1; values below 1 are clamped to 1. <strong>Default:</strong> <code>4</code>.</li> <li>
+<code>backpressure</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> Backpressure policy: <code>'strict'</code>, <code>'block'</code>, <code>'drop-oldest'</code>, or <code>'drop-newest'</code>. <strong>Default:</strong> <code>'strict'</code>.</li> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a> Abort the stream.</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>writer</code> {PushWriter} The writer side.</li> <li>
+<code>readable</code> {AsyncIterable&lt;Uint8Array[]&gt;} The readable side.</li> </ul> </li> </ul>
+<p>Create a push stream with backpressure. The writer pushes data in; the readable side is consumed as an async iterable.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { push, text } from 'node:stream/iter';
+
+const { writer, readable } = push();
+
+// Producer and consumer must run concurrently. With strict backpressure
+// (the default), awaited writes block until the consumer reads.
+const producing = (async () =&gt; {
+  await writer.write('hello');
+  await writer.write(' world');
+  await writer.end();
+})();
+
+console.log(await text(readable)); // 'hello world'
+await producing;
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { push, text } = require('node:stream/iter');
+
+async function run() {
+  const { writer, readable } = push();
+
+  // Producer and consumer must run concurrently. With strict backpressure
+  // (the default), awaited writes block until the consumer reads.
+  const producing = (async () =&gt; {
+    await writer.write('hello');
+    await writer.write(' world');
+    await writer.end();
+  })();
+
+  console.log(await text(readable)); // 'hello world'
+  await producing;
+}
+
+run().catch(console.error);
+</pre></details><p>The writer returned by <code>push()</code> conforms to the [Writer interface][].</p></section> <section><h3 id="duplex-channels">Duplex channels
+</h3>
+</section> <section><h4 id="duplexoptions">
+<code>duplex([options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>highWaterMark</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Buffer size for both directions. <strong>Default:</strong> <code>4</code>.</li> <li>
+<code>backpressure</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> Policy for both directions. <strong>Default:</strong> <code>'strict'</code>.</li> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a> Cancellation signal for both channels.</li> <li>
+<code>a</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Options specific to the A-to-B direction. Overrides shared options. <ul> <li>
+<code>highWaterMark</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a>
+</li> <li>
+<code>backpressure</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a>
+</li> </ul> </li> <li>
+<code>b</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Options specific to the B-to-A direction. Overrides shared options. <ul> <li>
+<code>highWaterMark</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a>
+</li> <li>
+<code>backpressure</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a>
+</li> </ul> </li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Array"><code>&lt;Array&gt;</code></a> A pair <code>[channelA, channelB]</code> of duplex channels.</li> </ul>
+<p>Create a pair of connected duplex channels for bidirectional communication, similar to <code>socketpair()</code>. Data written to one channel's writer appears in the other channel's readable.</p>
+<p>Each channel has:</p>
+<ul> <li>
+<code>writer</code> — a [Writer interface][] object for sending data to the peer.</li> <li>
+<code>readable</code> — an <code>AsyncIterable&lt;Uint8Array[]&gt;</code> for reading data from the peer.</li> <li>
+<code>close()</code> — close this end of the channel (idempotent).</li> <li>
+<code>[Symbol.asyncDispose]()</code> — async dispose support for <code>await using</code>.</li> </ul>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { duplex, text } from 'node:stream/iter';
+
+const [client, server] = duplex();
+
+// Server echoes back
+const serving = (async () =&gt; {
+  for await (const chunks of server.readable) {
+    await server.writer.writev(chunks);
+  }
+})();
+
+await client.writer.write('hello');
+await client.writer.end();
+
+console.log(await text(server.readable)); // handled by echo
+await serving;
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { duplex, text } = require('node:stream/iter');
+
+async function run() {
+  const [client, server] = duplex();
+
+  // Server echoes back
+  const serving = (async () =&gt; {
+    for await (const chunks of server.readable) {
+      await server.writer.writev(chunks);
+    }
+  })();
+
+  await client.writer.write('hello');
+  await client.writer.end();
+
+  console.log(await text(server.readable)); // handled by echo
+  await serving;
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h3 id="consumers">Consumers
+</h3>
+</section> <section><h4 id="arraysource-options">
+<code>array(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {AsyncIterable&lt;Uint8Array[]&gt;|Iterable&lt;Uint8Array[]&gt;}</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a>
+</li> <li>
+<code>limit</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Maximum number of bytes to consume. If the total bytes collected exceeds limit, an <code>ERR_OUT_OF_RANGE</code> error is thrown</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>&lt;Promise&gt;</code></a> Fulfills with an array of <code>Uint8Array</code> objects.</li> </ul>
+<p>Collect all chunks as an array of <code>Uint8Array</code> values (without concatenating).</p></section> <section><h4 id="arraybuffersource-options">
+<code>arrayBuffer(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {AsyncIterable&lt;Uint8Array[]&gt;|Iterable&lt;Uint8Array[]&gt;}</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a>
+</li> <li>
+<code>limit</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Maximum number of bytes to consume. If the total bytes collected exceeds limit, an <code>ERR_OUT_OF_RANGE</code> error is thrown</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>&lt;Promise&gt;</code></a> Fulfills with an <code>ArrayBuffer</code> object.</li> </ul>
+<p>Collect all bytes into an <code>ArrayBuffer</code>.</p></section> <section><h4 id="arraybuffersyncsource-options">
+<code>arrayBufferSync(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {Iterable&lt;Uint8Array[]&gt;}</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>limit</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Maximum number of bytes to consume. If the total bytes collected exceeds limit, an <code>ERR_OUT_OF_RANGE</code> error is thrown</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer"><code>&lt;ArrayBuffer&gt;</code></a>
+</li> </ul>
+<p>Synchronous version of <a href="#arraybuffersource-options"><code>arrayBuffer()</code></a>.</p></section> <section><h4 id="arraysyncsource-options">
+<code>arraySync(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {Iterable&lt;Uint8Array[]&gt;}</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>limit</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Maximum number of bytes to consume. If the total bytes collected exceeds limit, an <code>ERR_OUT_OF_RANGE</code> error is thrown</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Uint8Array"><code>&lt;Uint8Array[]&gt;</code></a>
+</li> </ul>
+<p>Synchronous version of <a href="#arraysource-options"><code>array()</code></a>.</p></section> <section><h4 id="bytessource-options">
+<code>bytes(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {AsyncIterable&lt;Uint8Array[]&gt;|Iterable&lt;Uint8Array[]&gt;}</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a>
+</li> <li>
+<code>limit</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Maximum number of bytes to consume. If the total bytes collected exceeds limit, an <code>ERR_OUT_OF_RANGE</code> error is thrown</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>&lt;Promise&gt;</code></a> Fulfills with an <code>Uint8Array</code> object.</li> </ul>
+<p>Collect all bytes from a stream into a single <code>Uint8Array</code>.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { from, bytes } from 'node:stream/iter';
+
+const data = await bytes(from('hello'));
+console.log(data); // Uint8Array(5) [ 104, 101, 108, 108, 111 ]
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { from, bytes } = require('node:stream/iter');
+
+async function run() {
+  const data = await bytes(from('hello'));
+  console.log(data); // Uint8Array(5) [ 104, 101, 108, 108, 111 ]
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h4 id="bytessyncsource-options">
+<code>bytesSync(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {Iterable&lt;Uint8Array[]&gt;}</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>limit</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Maximum number of bytes to consume. If the total bytes collected exceeds limit, an <code>ERR_OUT_OF_RANGE</code> error is thrown</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Uint8Array"><code>&lt;Uint8Array&gt;</code></a>
+</li> </ul>
+<p>Synchronous version of <a href="#bytessource-options"><code>bytes()</code></a>.</p></section> <section><h4 id="textsource-options">
+<code>text(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {AsyncIterable&lt;Uint8Array[]&gt;|Iterable&lt;Uint8Array[]&gt;}</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>encoding</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> Text encoding. <strong>Default:</strong> <code>'utf-8'</code>.</li> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a>
+</li> <li>
+<code>limit</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Maximum number of bytes to consume. If the total bytes collected exceeds limit, an <code>ERR_OUT_OF_RANGE</code> error is thrown</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>&lt;Promise&gt;</code></a> Fulfills with a <code>string</code>.</li> </ul>
+<p>Collect all bytes and decode as text.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { from, text } from 'node:stream/iter';
+
+console.log(await text(from('hello'))); // 'hello'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { from, text } = require('node:stream/iter');
+
+async function run() {
+  console.log(await text(from('hello'))); // 'hello'
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h4 id="textsyncsource-options">
+<code>textSync(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {Iterable&lt;Uint8Array[]&gt;}</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>encoding</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> <strong>Default:</strong> <code>'utf-8'</code>.</li> <li>
+<code>limit</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Maximum number of bytes to consume. If the total bytes collected exceeds limit, an <code>ERR_OUT_OF_RANGE</code> error is thrown</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a>
+</li> </ul>
+<p>Synchronous version of <a href="#textsource-options"><code>text()</code></a>.</p></section> <section><h3 id="utilities">Utilities
+</h3>
+</section> <section><h4 id="ondraindrainable">
+<code>ondrain(drainable)</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>drainable</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> An object implementing the drainable protocol.</li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Promise"><code>&lt;Promise&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#null_type"><code>&lt;null&gt;</code></a>
+</li> </ul>
+<p>Wait for a drainable writer's backpressure to clear. Returns <code>null</code> if the object does not implement the drainable protocol, or a promise that fulfills with <code>true</code> when the writer can accept more data.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { push, ondrain, text } from 'node:stream/iter';
+
+const { writer, readable } = push({ highWaterMark: 2 });
+writer.writeSync('a');
+writer.writeSync('b');
+
+// Start consuming so the buffer can actually drain
+const consuming = text(readable);
+
+// Buffer is full -- wait for drain
+const canWrite = await ondrain(writer);
+if (canWrite) {
+  await writer.write('c');
+}
+await writer.end();
+await consuming;
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { push, ondrain, text } = require('node:stream/iter');
+
+async function run() {
+  const { writer, readable } = push({ highWaterMark: 2 });
+  writer.writeSync('a');
+  writer.writeSync('b');
+
+  // Start consuming so the buffer can actually drain
+  const consuming = text(readable);
+
+  // Buffer is full -- wait for drain
+  const canWrite = await ondrain(writer);
+  if (canWrite) {
+    await writer.write('c');
+  }
+  await writer.end();
+  await consuming;
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h4 id="mergesources-options">
+<code>merge(...sources[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>...sources</code> {AsyncIterable&lt;Uint8Array[]&gt;|Iterable&lt;Uint8Array[]&gt;} Two or more iterables.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a>
+</li> </ul> </li> <li>Returns: {AsyncIterable&lt;Uint8Array[]&gt;}</li> </ul>
+<p>Merge multiple async iterables by yielding batches in temporal order (whichever source produces data first). All sources are consumed concurrently.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { from, merge, text } from 'node:stream/iter';
+
+const merged = merge(from('hello '), from('world'));
+console.log(await text(merged)); // Order depends on timing
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { from, merge, text } = require('node:stream/iter');
+
+async function run() {
+  const merged = merge(from('hello '), from('world'));
+  console.log(await text(merged)); // Order depends on timing
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h4 id="tapcallback">
+<code>tap(callback)</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>callback</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a> <code>(chunks) =&gt; void</code> Called with each batch.</li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a> A stateless transform.</li> </ul>
+<p>Create a pass-through transform that observes batches without modifying them. Useful for logging, metrics, or debugging.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { from, pull, text, tap } from 'node:stream/iter';
+
+const result = pull(
+  from('hello'),
+  tap((chunks) =&gt; console.log('Batch size:', chunks.length)),
+);
+console.log(await text(result));
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { from, pull, text, tap } = require('node:stream/iter');
+
+async function run() {
+  const result = pull(
+    from('hello'),
+    tap((chunks) =&gt; console.log('Batch size:', chunks.length)),
+  );
+  console.log(await text(result));
+}
+
+run().catch(console.error);
+</pre></details><p><code>tap()</code> intentionally does not prevent in-place modification of the chunks by the tapping callback; but return values are ignored.</p></section> <section><h4 id="tapsynccallback">
+<code>tapSync(callback)</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>callback</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a>
+</li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a>
+</li> </ul>
+<p>Synchronous version of <a href="#tapcallback"><code>tap()</code></a>.</p></section> <section><h3 id="multi-consumer">Multi-consumer
+</h3>
+</section> <section><h4 id="broadcastoptions">
+<code>broadcast([options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>highWaterMark</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Buffer size in slots. Must be &gt;= 1; values below 1 are clamped to 1. <strong>Default:</strong> <code>16</code>.</li> <li>
+<code>backpressure</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> <code>'strict'</code>, <code>'block'</code>, <code>'drop-oldest'</code>, or <code>'drop-newest'</code>. <strong>Default:</strong> <code>'strict'</code>.</li> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a>
+</li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>writer</code> {BroadcastWriter}</li> <li>
+<code>broadcast</code> {Broadcast}</li> </ul> </li> </ul>
+<p>Create a push-model multi-consumer broadcast channel. A single writer pushes data to multiple consumers. Each consumer has an independent cursor into a shared buffer.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { broadcast, text } from 'node:stream/iter';
+
+const { writer, broadcast: bc } = broadcast();
+
+// Create consumers before writing
+const c1 = bc.push();  // Consumer 1
+const c2 = bc.push();  // Consumer 2
+
+// Producer and consumers must run concurrently. Awaited writes
+// block when the buffer fills until consumers read.
+const producing = (async () =&gt; {
+  await writer.write('hello');
+  await writer.end();
+})();
+
+const [r1, r2] = await Promise.all([text(c1), text(c2)]);
+console.log(r1); // 'hello'
+console.log(r2); // 'hello'
+await producing;
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { broadcast, text } = require('node:stream/iter');
+
+async function run() {
+  const { writer, broadcast: bc } = broadcast();
+
+  // Create consumers before writing
+  const c1 = bc.push();  // Consumer 1
+  const c2 = bc.push();  // Consumer 2
+
+  // Producer and consumers must run concurrently. Awaited writes
+  // block when the buffer fills until consumers read.
+  const producing = (async () =&gt; {
+    await writer.write('hello');
+    await writer.end();
+  })();
+
+  const [r1, r2] = await Promise.all([text(c1), text(c2)]);
+  console.log(r1); // 'hello'
+  console.log(r2); // 'hello'
+  await producing;
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h5 id="broadcastbuffersize">
+<code>broadcast.bufferSize</code>
+</h5>
+
+<ul> <li><a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a></li> </ul>
+<p>The number of chunks currently buffered.</p></section> <section><h5 id="broadcastcancelreason">
+<code>broadcast.cancel([reason])</code>
+</h5>
+
+<ul> <li>
+<code>reason</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Error"><code>&lt;Error&gt;</code></a>
+</li> </ul>
+<p>Cancel the broadcast. All consumers receive an error.</p></section> <section><h5 id="broadcastconsumercount">
+<code>broadcast.consumerCount</code>
+</h5>
+
+<ul> <li><a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a></li> </ul>
+<p>The number of active consumers.</p></section> <section><h5 id="broadcastpushtransforms-options">
+<code>broadcast.push([...transforms][, options])</code>
+</h5>
+
+<ul> <li>
+<code>...transforms</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a>
+</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a>
+</li> </ul> </li> <li>Returns: {AsyncIterable&lt;Uint8Array[]&gt;}</li> </ul>
+<p>Create a new consumer. Each consumer receives all data written to the broadcast from the point of subscription onward. Optional transforms are applied to this consumer's view of the data.</p></section> <section><h5 id="broadcastsymboldispose">
+<code>broadcast[Symbol.dispose]()</code>
+</h5>
+
+<p>Alias for <code>broadcast.cancel()</code>.</p></section> <section><h4 id="broadcastfrominput-options">
+<code>Broadcast.from(input[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>input</code> <a href="https://tc39.github.io/ecma262/#sec-asynciterable-interface"><code>&lt;AsyncIterable&gt;</code></a>
+</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Same as <code>broadcast()</code>.</li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <code>{ writer, broadcast }</code>
+</li> </ul>
+<p>Create a {Broadcast} from an existing source. The source is consumed automatically and pushed to all subscribers.</p></section> <section><h4 id="sharesource-options">
+<code>share(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> <a href="https://tc39.github.io/ecma262/#sec-asynciterable-interface"><code>&lt;AsyncIterable&gt;</code></a> The source to share.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>highWaterMark</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Buffer size. Must be &gt;= 1; values below 1 are clamped to 1. <strong>Default:</strong> <code>16</code>.</li> <li>
+<code>backpressure</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> <code>'strict'</code>, <code>'block'</code>, <code>'drop-oldest'</code>, or <code>'drop-newest'</code>. <strong>Default:</strong> <code>'strict'</code>.</li> </ul> </li> <li>Returns: {Share}</li> </ul>
+<p>Create a pull-model multi-consumer shared stream. Unlike <code>broadcast()</code>, the source is only read when a consumer pulls. Multiple consumers share a single buffer.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { from, share, text } from 'node:stream/iter';
+
+const shared = share(from('hello'));
+
+const c1 = shared.pull();
+const c2 = shared.pull();
+
+// Consume concurrently to avoid deadlock with small buffers.
+const [r1, r2] = await Promise.all([text(c1), text(c2)]);
+console.log(r1); // 'hello'
+console.log(r2); // 'hello'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { from, share, text } = require('node:stream/iter');
+
+async function run() {
+  const shared = share(from('hello'));
+
+  const c1 = shared.pull();
+  const c2 = shared.pull();
+
+  // Consume concurrently to avoid deadlock with small buffers.
+  const [r1, r2] = await Promise.all([text(c1), text(c2)]);
+  console.log(r1); // 'hello'
+  console.log(r2); // 'hello'
+}
+
+run().catch(console.error);
+</pre></details></section> <section><h5 id="sharebuffersize">
+<code>share.bufferSize</code>
+</h5>
+
+<ul> <li><a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a></li> </ul>
+<p>The number of chunks currently buffered.</p></section> <section><h5 id="sharecancelreason">
+<code>share.cancel([reason])</code>
+</h5>
+
+<ul> <li>
+<code>reason</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Error"><code>&lt;Error&gt;</code></a>
+</li> </ul>
+<p>Cancel the share. All consumers receive an error.</p></section> <section><h5 id="shareconsumercount">
+<code>share.consumerCount</code>
+</h5>
+
+<ul> <li><a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a></li> </ul>
+<p>The number of active consumers.</p></section> <section><h5 id="sharepulltransforms-options">
+<code>share.pull([...transforms][, options])</code>
+</h5>
+
+<ul> <li>
+<code>...transforms</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Function"><code>&lt;Function&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a>
+</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a>
+</li> </ul> </li> <li>Returns: {AsyncIterable&lt;Uint8Array[]&gt;}</li> </ul>
+<p>Create a new consumer of the shared source.</p></section> <section><h5 id="sharesymboldispose">
+<code>share[Symbol.dispose]()</code>
+</h5>
+
+<p>Alias for <code>share.cancel()</code>.</p></section> <section><h4 id="sharefrominput-options">
+<code>Share.from(input[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>input</code> <a href="https://tc39.github.io/ecma262/#sec-asynciterable-interface"><code>&lt;AsyncIterable&gt;</code></a>
+</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> Same as <code>share()</code>.</li> <li>Returns: {Share}</li> </ul>
+<p>Create a {Share} from an existing source.</p></section> <section><h4 id="sharesyncsource-options">
+<code>shareSync(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>source</code> {Iterable} The sync source to share.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>highWaterMark</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> Must be &gt;= 1; values below 1 are clamped to 1. <strong>Default:</strong> <code>16</code>.</li> <li>
+<code>backpressure</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> <strong>Default:</strong> <code>'strict'</code>.</li> </ul> </li> <li>Returns: {SyncShare}</li> </ul>
+<p>Synchronous version of <a href="#sharesource-options"><code>share()</code></a>.</p></section> <section><h4 id="syncsharefromsyncinput-options">
+<code>SyncShare.fromSync(input[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v25.9.0</span></div>
+<ul> <li>
+<code>input</code> {Iterable|SyncShareable}</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a>
+</li> <li>Returns: {SyncShare}</li> </ul></section> <section><h3 id="compression-and-decompression-transforms">Compression and decompression transforms
+</h3>
+
+<p>Compression and decompression transforms for use with <code>pull()</code>, <code>pullSync()</code>, <code>pipeTo()</code>, and <code>pipeToSync()</code> are available via the <a href="zlib.html#iterable-compression"><code>node:zlib/iter</code></a> module. See the <a href="zlib.html#iterable-compression"><code>node:zlib/iter</code> documentation</a> for details.</p></section> <section><h3 id="classic-stream-interop">Classic stream interop
+</h3>
+
+<p>These utility functions bridge between classic <a href="stream.html#class-streamreadable"><code>stream.Readable</code></a>/<a href="stream.html#class-streamwritable"><code>stream.Writable</code></a> streams and the <code>stream/iter</code> API.</p>
+<p>Both <code>fromReadable()</code> and <code>fromWritable()</code> accept duck-typed objects -- they do not require the input to extend <code>stream.Readable</code> or <code>stream.Writable</code> directly. The minimum contract is described below for each function.</p></section> <section><h4 id="fromreadablereadable">
+<code>fromReadable(readable)</code>
+</h4>
+<div class="api_metadata"><span>Added in: v26.1.0</span></div>
+<div class="api_stability api_stability_1"><p>Stability: 1 - Experimental</p></div>
+<ul> <li>
+<code>readable</code> <a href="stream.html#class-streamreadable"><code>&lt;stream.Readable&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> A classic Readable stream or any object with <code>read()</code> and <code>on()</code> methods.</li> <li>Returns: {AsyncIterable&lt;Uint8Array[]&gt;} A stream/iter async iterable source.</li> </ul>
+<p>Converts a classic Readable stream (or duck-typed equivalent) into a stream/iter async iterable source that can be passed to <a href="#frominput"><code>from()</code></a>, <a href="#pullsource-transforms-options"><code>pull()</code></a>, <a href="#textsource-options"><code>text()</code></a>, etc.</p>
+<p>If the object implements the <a href="#streamtoasyncstreamable"><code>toAsyncStreamable</code></a> protocol (as <code>stream.Readable</code> does), that protocol is used. Otherwise, the function duck-types on <code>read()</code> and <code>on()</code> (EventEmitter) and wraps the stream with a batched async iterator.</p>
+<p>The result is cached per instance -- calling <code>fromReadable()</code> twice with the same stream returns the same iterable.</p>
+<p>For object-mode or encoded Readable streams, chunks are automatically normalized to <code>Uint8Array</code>.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { Readable } from 'node:stream';
+import { fromReadable, text } from 'node:stream/iter';
+
+const readable = new Readable({
+  read() { this.push('hello world'); this.push(null); },
+});
+
+const result = await text(fromReadable(readable));
+console.log(result); // 'hello world'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { Readable } = require('node:stream');
+const { fromReadable, text } = require('node:stream/iter');
+
+const readable = new Readable({
+  read() { this.push('hello world'); this.push(null); },
+});
+
+async function run() {
+  const result = await text(fromReadable(readable));
+  console.log(result); // 'hello world'
+}
+run();
+</pre></details></section> <section><h4 id="fromwritablewritable-options">
+<code>fromWritable(writable[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v26.1.0</span></div>
+<div class="api_stability api_stability_1"><p>Stability: 1 - Experimental</p></div>
+<ul> <li>
+<code>writable</code> <a href="stream.html#class-streamwritable"><code>&lt;stream.Writable&gt;</code></a> | <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> A classic Writable stream or any object with <code>write()</code> and <code>on()</code> methods.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>backpressure</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#string_type"><code>&lt;string&gt;</code></a> Backpressure policy. <strong>Default:</strong> <code>'strict'</code>. <ul> <li>
+<code>'strict'</code> -- writes are rejected when the buffer is full. Catches callers that ignore backpressure.</li> <li>
+<code>'block'</code> -- writes wait for drain when the buffer is full. Recommended for use with <a href="#pipetosource-transforms-writer-options"><code>pipeTo()</code></a>.</li> <li>
+<code>'drop-newest'</code> -- writes are silently discarded when the buffer is full.</li> <li>
+<code>'drop-oldest'</code> -- <strong>not supported</strong>. Throws <code>ERR_INVALID_ARG_VALUE</code>.</li> </ul> </li> </ul> </li> <li>Returns: <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> A stream/iter Writer adapter.</li> </ul>
+<p>Creates a stream/iter Writer adapter from a classic Writable stream (or duck-typed equivalent). The adapter can be passed to <a href="#pipetosource-transforms-writer-options"><code>pipeTo()</code></a> as a destination.</p>
+<p>Since all writes on a classic Writable are fundamentally asynchronous, the synchronous Writer methods (<code>writeSync</code>, <code>writevSync</code>, <code>endSync</code>) always return <code>false</code> or <code>-1</code>, deferring to the async path. The per-write <code>options.signal</code> parameter from the Writer interface is also ignored.</p>
+<p>The result is cached per instance and backpressure policy -- calling <code>fromWritable()</code> twice with the same stream and <code>backpressure</code> option returns the same Writer.</p>
+<p>For duck-typed streams that do not expose <code>writableHighWaterMark</code>, <code>writableLength</code>, or similar properties, sensible defaults are used. Object-mode writables (if detectable) are rejected since the Writer interface is bytes-only.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { Writable } from 'node:stream';
+import { from, fromWritable, pipeTo } from 'node:stream/iter';
+
+const writable = new Writable({
+  write(chunk, encoding, cb) { console.log(chunk.toString()); cb(); },
+});
+
+await pipeTo(from('hello world'),
+             fromWritable(writable, { backpressure: 'block' }));
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { Writable } = require('node:stream');
+const { from, fromWritable, pipeTo } = require('node:stream/iter');
+
+async function run() {
+  const writable = new Writable({
+    write(chunk, encoding, cb) { console.log(chunk.toString()); cb(); },
+  });
+
+  await pipeTo(from('hello world'),
+               fromWritable(writable, { backpressure: 'block' }));
+}
+run();
+</pre></details></section> <section><h4 id="toreadablesource-options">
+<code>toReadable(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v26.1.0</span></div>
+<div class="api_stability api_stability_1"><p>Stability: 1 - Experimental</p></div>
+<ul> <li>
+<code>source</code> <a href="https://tc39.github.io/ecma262/#sec-asynciterable-interface"><code>&lt;AsyncIterable&gt;</code></a> An <code>AsyncIterable&lt;Uint8Array[]&gt;</code> source, such as the return value of <a href="#pullsource-transforms-options"><code>pull()</code></a> or <a href="#frominput"><code>from()</code></a>.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>highWaterMark</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> The internal buffer size in bytes before backpressure is applied. <strong>Default:</strong> <code>65536</code> (64 KB).</li> <li>
+<code>signal</code> <a href="globals.html#class-abortsignal"><code>&lt;AbortSignal&gt;</code></a> An optional signal to abort the readable.</li> </ul> </li> <li>Returns: <a href="stream.html#class-streamreadable"><code>&lt;stream.Readable&gt;</code></a>
+</li> </ul>
+<p>Creates a byte-mode <a href="stream.html#class-streamreadable"><code>stream.Readable</code></a> from an <code>AsyncIterable&lt;Uint8Array[]&gt;</code> (the native batch format used by the stream/iter API). Each <code>Uint8Array</code> in a yielded batch is pushed as a separate chunk into the Readable.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { createWriteStream } from 'node:fs';
+import { from, pull, toReadable } from 'node:stream/iter';
+import { compressGzip } from 'node:zlib/iter';
+
+const source = pull(from('hello world'), compressGzip());
+const readable = toReadable(source);
+
+readable.pipe(createWriteStream('output.gz'));
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { createWriteStream } = require('node:fs');
+const { from, pull, toReadable } = require('node:stream/iter');
+const { compressGzip } = require('node:zlib/iter');
+
+const source = pull(from('hello world'), compressGzip());
+const readable = toReadable(source);
+
+readable.pipe(createWriteStream('output.gz'));
+</pre></details></section> <section><h4 id="toreadablesyncsource-options">
+<code>toReadableSync(source[, options])</code>
+</h4>
+<div class="api_metadata"><span>Added in: v26.1.0</span></div>
+<div class="api_stability api_stability_1"><p>Stability: 1 - Experimental</p></div>
+<ul> <li>
+<code>source</code> {Iterable} An <code>Iterable&lt;Uint8Array[]&gt;</code> source, such as the return value of <a href="#pullsyncsource-transforms-options"><code>pullSync()</code></a> or <a href="#fromsyncinput"><code>fromSync()</code></a>.</li> <li>
+<code>options</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> <ul> <li>
+<code>highWaterMark</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Data_structures#number_type"><code>&lt;number&gt;</code></a> The internal buffer size in bytes before backpressure is applied. <strong>Default:</strong> <code>65536</code> (64 KB).</li> </ul> </li> <li>Returns: <a href="stream.html#class-streamreadable"><code>&lt;stream.Readable&gt;</code></a>
+</li> </ul>
+<p>Creates a byte-mode <a href="stream.html#class-streamreadable"><code>stream.Readable</code></a> from a synchronous <code>Iterable&lt;Uint8Array[]&gt;</code>. The <code>_read()</code> method pulls from the iterator synchronously, so data is available immediately via <code>readable.read()</code>.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { fromSync, toReadableSync } from 'node:stream/iter';
+
+const source = fromSync('hello world');
+const readable = toReadableSync(source);
+
+console.log(readable.read().toString()); // 'hello world'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { fromSync, toReadableSync } = require('node:stream/iter');
+
+const source = fromSync('hello world');
+const readable = toReadableSync(source);
+
+console.log(readable.read().toString()); // 'hello world'
+</pre></details></section> <section><h4 id="towritablewriter">
+<code>toWritable(writer)</code>
+</h4>
+<div class="api_metadata"><span>Added in: v26.1.0</span></div>
+<div class="api_stability api_stability_1"><p>Stability: 1 - Experimental</p></div>
+<ul> <li>
+<code>writer</code> <a href="https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object"><code>&lt;Object&gt;</code></a> A stream/iter Writer. Only the <code>write()</code> method is required; <code>end()</code>, <code>fail()</code>, <code>writeSync()</code>, <code>writevSync()</code>, <code>endSync()</code>, and <code>writev()</code> are optional.</li> <li>Returns: <a href="stream.html#class-streamwritable"><code>&lt;stream.Writable&gt;</code></a>
+</li> </ul>
+<p>Creates a classic <a href="stream.html#class-streamwritable"><code>stream.Writable</code></a> backed by a stream/iter Writer.</p>
+<p>Each <code>_write()</code> / <code>_writev()</code> call attempts the Writer's synchronous method first (<code>writeSync</code> / <code>writevSync</code>), falling back to the async method if the sync path returns <code>false</code> or throws. Similarly, <code>_final()</code> tries <code>endSync()</code> before <code>end()</code>. When the sync path succeeds, the callback is deferred via <code>queueMicrotask</code> to preserve the async resolution contract.</p>
+<p>The Writable's <code>highWaterMark</code> is set to <code>Number.MAX_SAFE_INTEGER</code> to effectively disable its internal buffering, allowing the underlying Writer to manage backpressure directly.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { push, toWritable } from 'node:stream/iter';
+
+const { writer, readable } = push();
+const writable = toWritable(writer);
+
+writable.write('hello');
+writable.end();
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { push, toWritable } = require('node:stream/iter');
+
+const { writer, readable } = push();
+const writable = toWritable(writer);
+
+writable.write('hello');
+writable.end();
+</pre></details></section> <section><h3 id="protocol-symbols">Protocol symbols
+</h3>
+
+<p>These well-known symbols allow third-party objects to participate in the streaming protocol without importing from <code>node:stream/iter</code> directly.</p></section> <section><h4 id="streambroadcastprotocol">
+<code>Stream.broadcastProtocol</code>
+</h4>
+
+<ul> <li>Value: <code>Symbol.for('Stream.broadcastProtocol')</code>
+</li> </ul>
+<p>The value must be a function. When called by <code>Broadcast.from()</code>, it receives the options passed to <code>Broadcast.from()</code> and must return an object conforming to the {Broadcast} interface. The implementation is fully custom -- it can manage consumers, buffering, and backpressure however it wants.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { Broadcast, text } from 'node:stream/iter';
+
+// This example defers to the built-in Broadcast, but a custom
+// implementation could use any mechanism.
+class MessageBus {
+  #broadcast;
+  #writer;
+
+  constructor() {
+    const { writer, broadcast } = Broadcast();
+    this.#writer = writer;
+    this.#broadcast = broadcast;
+  }
+
+  [Symbol.for('Stream.broadcastProtocol')](options) {
+    return this.#broadcast;
+  }
+
+  send(data) {
+    this.#writer.write(new TextEncoder().encode(data));
+  }
+
+  close() {
+    this.#writer.end();
+  }
+}
+
+const bus = new MessageBus();
+const { broadcast } = Broadcast.from(bus);
+const consumer = broadcast.push();
+bus.send('hello');
+bus.close();
+console.log(await text(consumer)); // 'hello'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { Broadcast, text } = require('node:stream/iter');
+
+// This example defers to the built-in Broadcast, but a custom
+// implementation could use any mechanism.
+class MessageBus {
+  #broadcast;
+  #writer;
+
+  constructor() {
+    const { writer, broadcast } = Broadcast();
+    this.#writer = writer;
+    this.#broadcast = broadcast;
+  }
+
+  [Symbol.for('Stream.broadcastProtocol')](options) {
+    return this.#broadcast;
+  }
+
+  send(data) {
+    this.#writer.write(new TextEncoder().encode(data));
+  }
+
+  close() {
+    this.#writer.end();
+  }
+}
+
+const bus = new MessageBus();
+const { broadcast } = Broadcast.from(bus);
+const consumer = broadcast.push();
+bus.send('hello');
+bus.close();
+text(consumer).then(console.log); // 'hello'
+</pre></details></section> <section><h4 id="streamdrainableprotocol">
+<code>Stream.drainableProtocol</code>
+</h4>
+
+<ul> <li>Value: <code>Symbol.for('Stream.drainableProtocol')</code>
+</li> </ul>
+<p>Implement to make a writer compatible with <code>ondrain()</code>. The method should return <code>null</code> if no backpressure, or a promise that fulfills with a truthy value when backpressure clears.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { ondrain } from 'node:stream/iter';
+
+class CustomWriter {
+  #queue = [];
+  #drain = null;
+  #closed = false;
+  [Symbol.for('Stream.drainableProtocol')]() {
+    if (this.#closed) return null;
+    if (this.#queue.length &lt; 3) return Promise.resolve(true);
+    this.#drain ??= Promise.withResolvers();
+    return this.#drain.promise;
+  }
+  write(chunk) {
+    this.#queue.push(chunk);
+  }
+  flush() {
+    this.#queue.length = 0;
+    this.#drain?.resolve(true);
+    this.#drain = null;
+  }
+  close() {
+    this.#closed = true;
+  }
+}
+const writer = new CustomWriter();
+const ready = ondrain(writer);
+console.log(ready); // Promise { true } -- no backpressure
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { ondrain } = require('node:stream/iter');
+
+class CustomWriter {
+  #queue = [];
+  #drain = null;
+  #closed = false;
+
+  [Symbol.for('Stream.drainableProtocol')]() {
+    if (this.#closed) return null;
+    if (this.#queue.length &lt; 3) return Promise.resolve(true);
+    this.#drain ??= Promise.withResolvers();
+    return this.#drain.promise;
+  }
+
+  write(chunk) {
+    this.#queue.push(chunk);
+  }
+
+  flush() {
+    this.#queue.length = 0;
+    this.#drain?.resolve(true);
+    this.#drain = null;
+  }
+
+  close() {
+    this.#closed = true;
+  }
+}
+
+const writer = new CustomWriter();
+const ready = ondrain(writer);
+console.log(ready); // Promise { true } -- no backpressure
+</pre></details></section> <section><h4 id="streamshareprotocol">
+<code>Stream.shareProtocol</code>
+</h4>
+
+<ul> <li>Value: <code>Symbol.for('Stream.shareProtocol')</code>
+</li> </ul>
+<p>The value must be a function. When called by <code>Share.from()</code>, it receives the options passed to <code>Share.from()</code> and must return an object conforming to the {Share} interface. The implementation is fully custom -- it can manage the shared source, consumers, buffering, and backpressure however it wants.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { share, Share, text } from 'node:stream/iter';
+
+// This example defers to the built-in share(), but a custom
+// implementation could use any mechanism.
+class DataPool {
+  #share;
+
+  constructor(source) {
+    this.#share = share(source);
+  }
+
+  [Symbol.for('Stream.shareProtocol')](options) {
+    return this.#share;
+  }
+}
+
+const pool = new DataPool(
+  (async function* () {
+    yield 'hello';
+  })(),
+);
+
+const shared = Share.from(pool);
+const consumer = shared.pull();
+console.log(await text(consumer)); // 'hello'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { share, Share, text } = require('node:stream/iter');
+
+// This example defers to the built-in share(), but a custom
+// implementation could use any mechanism.
+class DataPool {
+  #share;
+
+  constructor(source) {
+    this.#share = share(source);
+  }
+
+  [Symbol.for('Stream.shareProtocol')](options) {
+    return this.#share;
+  }
+}
+
+const pool = new DataPool(
+  (async function* () {
+    yield 'hello';
+  })(),
+);
+
+const shared = Share.from(pool);
+const consumer = shared.pull();
+text(consumer).then(console.log); // 'hello'
+</pre></details></section> <section><h4 id="streamsharesyncprotocol">
+<code>Stream.shareSyncProtocol</code>
+</h4>
+
+<ul> <li>Value: <code>Symbol.for('Stream.shareSyncProtocol')</code>
+</li> </ul>
+<p>The value must be a function. When called by <code>SyncShare.fromSync()</code>, it receives the options passed to <code>SyncShare.fromSync()</code> and must return an object conforming to the {SyncShare} interface. The implementation is fully custom -- it can manage the shared source, consumers, and buffering however it wants.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { shareSync, SyncShare, textSync } from 'node:stream/iter';
+
+// This example defers to the built-in shareSync(), but a custom
+// implementation could use any mechanism.
+class SyncDataPool {
+  #share;
+
+  constructor(source) {
+    this.#share = shareSync(source);
+  }
+
+  [Symbol.for('Stream.shareSyncProtocol')](options) {
+    return this.#share;
+  }
+}
+
+const encoder = new TextEncoder();
+const pool = new SyncDataPool(
+  function* () {
+    yield [encoder.encode('hello')];
+  }(),
+);
+
+const shared = SyncShare.fromSync(pool);
+const consumer = shared.pull();
+console.log(textSync(consumer)); // 'hello'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { shareSync, SyncShare, textSync } = require('node:stream/iter');
+
+// This example defers to the built-in shareSync(), but a custom
+// implementation could use any mechanism.
+class SyncDataPool {
+  #share;
+
+  constructor(source) {
+    this.#share = shareSync(source);
+  }
+
+  [Symbol.for('Stream.shareSyncProtocol')](options) {
+    return this.#share;
+  }
+}
+
+const encoder = new TextEncoder();
+const pool = new SyncDataPool(
+  function* () {
+    yield [encoder.encode('hello')];
+  }(),
+);
+
+const shared = SyncShare.fromSync(pool);
+const consumer = shared.pull();
+console.log(textSync(consumer)); // 'hello'
+</pre></details></section> <section><h4 id="streamtoasyncstreamable">
+<code>Stream.toAsyncStreamable</code>
+</h4>
+
+<ul> <li>Value: <code>Symbol.for('Stream.toAsyncStreamable')</code>
+</li> </ul>
+<p>The value must be a function that converts the object into a streamable value. When the object is encountered anywhere in the streaming pipeline (as a source passed to <code>from()</code>, or as a value returned from a transform), this method is called to produce the actual data. It may return any value that resolves to: a string, <code>Uint8Array</code>, <code>AsyncIterable</code>, <code>Iterable</code>, or another streamable object.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { from, text } from 'node:stream/iter';
+
+class Greeting {
+  #name;
+
+  constructor(name) {
+    this.#name = name;
+  }
+
+  [Symbol.for('Stream.toAsyncStreamable')]() {
+    return `hello ${this.#name}`;
+  }
+}
+
+const stream = from(new Greeting('world'));
+console.log(await text(stream)); // 'hello world'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { from, text } = require('node:stream/iter');
+
+class Greeting {
+  #name;
+
+  constructor(name) {
+    this.#name = name;
+  }
+
+  [Symbol.for('Stream.toAsyncStreamable')]() {
+    return `hello ${this.#name}`;
+  }
+}
+
+const stream = from(new Greeting('world'));
+text(stream).then(console.log); // 'hello world'
+</pre></details></section> <section><h4 id="streamtostreamable">
+<code>Stream.toStreamable</code>
+</h4>
+
+<ul> <li>Value: <code>Symbol.for('Stream.toStreamable')</code>
+</li> </ul>
+<p>The value must be a function that synchronously converts the object into a streamable value. When the object is encountered anywhere in the streaming pipeline (as a source passed to <code>fromSync()</code>, or as a value returned from a sync transform), this method is called to produce the actual data. It must synchronously return a streamable value: a string, <code>Uint8Array</code>, or <code>Iterable</code>.</p>
+<details open><summary>JavaScript modules</summary><pre data-language="js">import { fromSync, textSync } from 'node:stream/iter';
+
+class Greeting {
+  #name;
+
+  constructor(name) {
+    this.#name = name;
+  }
+
+  [Symbol.for('Stream.toStreamable')]() {
+    return `hello ${this.#name}`;
+  }
+}
+
+const stream = fromSync(new Greeting('world'));
+console.log(textSync(stream)); // 'hello world'
+</pre></details><details><summary>CommonJS</summary><pre data-language="js">const { fromSync, textSync } = require('node:stream/iter');
+
+class Greeting {
+  #name;
+
+  constructor(name) {
+    this.#name = name;
+  }
+
+  [Symbol.for('Stream.toStreamable')]() {
+    return `hello ${this.#name}`;
+  }
+}
+
+const stream = fromSync(new Greeting('world'));
+console.log(textSync(stream)); // 'hello world'
+</pre></details></section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Joyent, Inc. and other Node contributors<br>Licensed under the MIT License.<br>Node.js is a trademark of Joyent, Inc. and is used with its permission.<br>We are not endorsed by or affiliated with Joyent.<br>
+    <a href="https://nodejs.org/api/stream_iter.html" class="_attribution-link">https://nodejs.org/api/stream_iter.html</a>
+  </p>
+</div>
