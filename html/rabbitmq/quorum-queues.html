@@ -1,0 +1,822 @@
+<header><h1>Quorum Queues</h1></header> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="overview">Overview<a href="#overview" class="hash-link" aria-label="Direct link to Overview" title="Direct link to Overview" translate="no">​</a>
+</h2> <p>The RabbitMQ quorum queue is a modern queue type which implements a durable, replicated queue based on the <a href="https://raft.github.io/" target="_blank" rel="noopener noreferrer" class="">Raft consensus algorithm</a> and should be considered the default choice when needing a replicated, highly available queue.</p> <p>Quorum queues are designed for data safety as well as reliable and fast leader election properties that ensure high availability even during upgrades or other turbulence.</p> <p>Certain <a href="#use-cases" class="">use cases</a> fit quorum queues better than others and it is important to be aware of these when designing systems.</p> <p>There are some <a href="#behaviour" class="">differences in behaviour</a> compared to classic queues as well as some <a href="#feature-comparison" class="">limitations</a> that it is important to consider when converting from an application using classic queues.</p> <p>Some new features are specific to quorum queues such as <a href="#poison-message-handling" class="">poison message handling</a>, <a href="#activating-at-least-once-dead-lettering" class="">at least once dead-lettering</a>, <a href="#delayed-retry" class="">delayed retry</a>, <a href="#consumer-timeout" class="">consumer timeouts</a>, and the ability to annotate a message using the <code>modified</code> outcome when using <a class="" href="amqp.html">AMQP</a>.</p> <p>Quorum queues and <a class="" href="streams.html">streams</a> are the two replicated data structures available. Classic queue mirroring was removed starting with RabbitMQ 4.0.</p> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="toc">Topics Covered<a href="#toc" class="hash-link" aria-label="Direct link to Topics Covered" title="Direct link to Topics Covered" translate="no">​</a>
+</h2> <p>Topics covered in this document include:</p> <ul> <li class="">Primary <a href="#use-cases" class="">use cases</a> of quorum queues and when not to use them</li> <li class="">
+<a href="#feature-comparison" class="">How are quorum queues different</a> from classic queues</li> <li class="">How to <a href="#usage" class="">declare a quorum queue</a>
+</li> <li class="">
+<a href="#replication" class="">Replication</a>-related topics: <a href="#member-management" class="">member management</a>, <a href="#member-rebalancing" class="">leader rebalancing</a>, optimal number of members, etc</li> <li class="">What guarantees quorum queues offer in terms of <a href="#leader-election" class="">leader failure handling</a>, <a href="#data-safety" class="">data safety</a> and <a href="#availability" class="">availability</a>
+</li> <li class="">Continuous <a href="#member-reconciliation" class="">Membership Reconciliation</a>
+</li> <li class="">The additional <a href="#dead-lettering" class="">dead lettering</a> features supported by quorum queues</li> <li class="">
+<a href="#priorities" class="">Strict message priorities</a> for message ordering and delivery</li> <li class="">
+<a href="#consumer-timeout" class="">Consumer timeouts</a> for handling slow or stuck consumers</li> <li class="">
+<a href="#delayed-retry" class="">Delayed retry</a> mechanism for message redelivery with backoff</li> <li class="">
+<a href="#resource-use" class="">Memory and disk footprint</a> of quorum queues</li> <li class="">
+<a href="#performance" class="">Performance</a> characteristics of quorum queues</li> <li class="">
+<a href="#performance-tuning" class="">Performance tuning</a> for optimal quorum queue operation</li> <li class="">
+<a href="#poison-message-handling" class="">Poison message handling</a> (failure-redelivery loop protection)</li> <li class=""><a href="#migrate-from-cmqs" class="">Migrating from Mirrored Classic Queues</a></li> <li class="">Options to Relax <a href="#relaxed-property-equivalence" class="">Property Equivalence</a>
+</li> <li class="">
+<a href="#configuration" class="">Configurable settings</a> of quorum queues</li> </ul> <p>and more.</p> <p>General familiarity with <a class="" href="clustering.html">RabbitMQ clustering</a> would be helpful here when learning more about quorum queues.</p> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="what-is-quorum">What is a Quorum?<a href="#what-is-quorum" class="hash-link" aria-label="Direct link to What is a Quorum?" title="Direct link to What is a Quorum?" translate="no">​</a>
+</h2> <p>A <a href="https://en.wikipedia.org/wiki/Quorum_(distributed_computing)" target="_blank" rel="noopener noreferrer" class="">quorum</a> in a distributed system can be defined as an agreement between a majority of members (<code>(N/2)+1</code> where <code>N</code> is the total number of system participants).</p> <p>When applied to queue replication in RabbitMQ <a class="" href="clustering.html">clusters</a> it means that the majority of queue members (leader and followers) agree on the exact state of the queue and its contents.</p> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="use-cases">Use Cases<a href="#use-cases" class="hash-link" aria-label="Direct link to Use Cases" title="Direct link to Use Cases" translate="no">​</a>
+</h2> <p>Quorum queues are <em>not</em> designed to be used for every use case that requires a queue.</p> <p>The intended use of quorum queues is in topologies where queues typically exist for a long time, need high availability and are critical to certain aspects of an application's architecture.</p> <p>Examples of good use cases would be incoming orders in a sales system or votes cast in an electoral system where potentially losing messages would have a significant impact on overall system correctness and function.</p> <p>Stock tickers, instant messaging systems and RPC reply queues benefit less or not at all from use of quorum queues.</p> <p>For use cases that need replication and repeatable reads (e.g. fan-out notifications), <a class="" href="streams.html">streams</a> may be a better option than quorum queues.</p> <p>There are no hard limitations on the number of quorum queues that a system can sustain. However, if a use case requires more than ~5000 quorum queues it is recommended to review the topology and see if some quorum queues can be replaced with either classic queues or streams.</p> <p>Upgrade and failure testing is always recommended irrespective of the number of quorum queues in the system.</p> <p>Publishers should <a class="" href="publishers.html#data-safety">use publisher confirms</a> as this is how clients can interact with the quorum queue consensus system. Publisher confirms will <a class="" href="confirms.html#when-publishes-are-confirmed">only be issued</a> once a published message has been successfully replicated to a quorum of members and is considered "safe" within the context of the queue.</p> <p>Consumers should use <a class="" href="confirms.html">manual acknowledgements</a> to ensure messages that aren't successfully processed are returned to the queue so that another consumer can re-attempt processing.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="when-not-to-use-quorum-queues">When Not to Use Quorum Queues<a href="#when-not-to-use-quorum-queues" class="hash-link" aria-label="Direct link to When Not to Use Quorum Queues" title="Direct link to When Not to Use Quorum Queues" translate="no">​</a>
+</h4> <p>In some cases quorum queues should not be used. They typically involve:</p> <ul> <li class="">Temporary queues: transient or exclusive queues, high queue churn (declaration and deletion rates)</li> <li class="">Lowest possible latency: the underlying consensus algorithm has an inherently higher latency due to its data safety features</li> <li class="">When data safety is not a priority (e.g. applications do not use <a class="" href="confirms.html">manual acknowledgements and publisher confirms</a> are not used)</li> <li class="">Very long queue backlogs (5M+ messages) (<a class="" href="streams.html">streams</a> are likely to be a better fit)</li> <li class="">Large fanouts: (<a class="" href="streams.html">streams</a> are likely to be a better fit)</li> </ul> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="features">Features<a href="#features" class="hash-link" aria-label="Direct link to Features" title="Direct link to Features" translate="no">​</a>
+</h2> <p>Quorum queues share most of the fundamentals with other <a class="" href="queues.html">queue</a> types.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="feature-comparison">Comparison with Classic Queues<a href="#feature-comparison" class="hash-link" aria-label="Direct link to Comparison with Classic Queues" title="Direct link to Comparison with Classic Queues" translate="no">​</a>
+</h3> <p>The following operations work the same way for quorum queues as they do for classic queues:</p> <ul> <li class="">Consumption, consumer registration</li> <li class="">
+<a class="" href="confirms.html">Consumer acknowledgements</a> (except for global <a href="#global-qos" class="">QoS and prefetch</a>)</li> <li class="">Consumer cancellation</li> <li class="">Purging</li> <li class="">Deletion</li> </ul> <p>With some queue operations there are minor differences:</p> <ul> <li class=""><a href="#declaring" class="">Declaration</a></li> <li class="">Setting prefetch for consumers</li> </ul> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="feature-matrix">Feature Matrix<a href="#feature-matrix" class="hash-link" aria-label="Direct link to Feature Matrix" title="Direct link to Feature Matrix" translate="no">​</a>
+</h3> <table>
+<thead><tr>
+<th style="text-align:left">Feature</th>
+<th style="text-align:left">Classic queues</th>
+<th>Quorum queues</th>
+</tr></thead>
+<tbody>
+<tr>
+<td style="text-align:left"><a class="" href="queues.html">Non-durable queues</a></td>
+<td style="text-align:left">yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td style="text-align:left">Message replication</td>
+<td style="text-align:left">no</td>
+<td>yes</td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="queues.html">Exclusivity</a></td>
+<td style="text-align:left">yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td style="text-align:left">Per message persistence</td>
+<td style="text-align:left">per message</td>
+<td>always</td>
+</tr>
+<tr>
+<td style="text-align:left">Membership changes</td>
+<td style="text-align:left">no</td>
+<td><a href="#member-reconciliation" class="">semi-automatic</a></td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="ttl.html">Message TTL (Time-To-Live)</a></td>
+<td style="text-align:left">yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="ttl.html#queue-ttl">Queue TTL</a></td>
+<td style="text-align:left">yes</td>
+<td>partially (lease is not renewed on queue re-declaration)</td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="maxlength.html">Queue length limits</a></td>
+<td style="text-align:left">yes</td>
+<td>yes (except <code>x-overflow</code>: <code>reject-publish-dlx</code>)</td>
+</tr>
+<tr>
+<td style="text-align:left">Keeps messages in memory</td>
+<td style="text-align:left">see <a class="" href="classic-queues.html#memory">Classic Queues</a>
+</td>
+<td>never (see <a href="#resource-use" class="">Resource Use</a>)</td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="priority.html">Message priority</a></td>
+<td style="text-align:left">yes</td>
+<td><a href="#priorities" class="">yes, strict</a></td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="consumers.html#single-active-consumer">Single Active Consumer</a></td>
+<td style="text-align:left">yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="consumers.html#exclusivity">Consumer exclusivity</a></td>
+<td style="text-align:left">yes</td>
+<td>no (use <a class="" href="consumers.html#single-active-consumer">Single Active Consumer</a>)</td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="consumer-priority.html">Consumer priority</a></td>
+<td style="text-align:left">yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="dlx.html">Dead letter exchanges</a></td>
+<td style="text-align:left">yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td style="text-align:left">Adheres to <a class="" href="policies.html">policies</a>
+</td>
+<td style="text-align:left">yes</td>
+<td>yes (see <a href="#policy-support" class="">Policy support</a>)</td>
+</tr>
+<tr>
+<td style="text-align:left">Poison message handling</td>
+<td style="text-align:left">no</td>
+<td>yes</td>
+</tr>
+<tr>
+<td style="text-align:left"><a href="#consumer-timeout" class="">Consumer timeout</a></td>
+<td style="text-align:left">no</td>
+<td>yes</td>
+</tr>
+<tr>
+<td style="text-align:left"><a href="#delayed-retry" class="">Delayed retry</a></td>
+<td style="text-align:left">no</td>
+<td>yes</td>
+</tr>
+<tr>
+<td style="text-align:left"><a class="" href="queues.html#server-named-queues">Server-named queues</a></td>
+<td style="text-align:left">yes</td>
+<td>no</td>
+</tr>
+</tbody>
+</table> <p>Modern quorum queues also offer <a class="" href="https://www.rabbitmq.com/blog/2022/05/16/rabbitmq-3.10-performance-improvements">higher throughput and less latency variability</a> for many workloads.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="queue-and-per-message-ttl">Queue and Per-Message TTL<a href="#queue-and-per-message-ttl" class="hash-link" aria-label="Direct link to Queue and Per-Message TTL" title="Direct link to Queue and Per-Message TTL" translate="no">​</a>
+</h3> <p>Quorum queues support both <a class="" href="ttl.html#queue-ttl">Queue TTL</a> and message TTL (including <a class="" href="ttl.html#per-queue-message-ttl">Per-Queue Message TTL in Queues</a> and <a class="" href="ttl.html#per-message-ttl-in-publishers">Per-Message TTL in Publishers</a>). When using any form of message TTL, the memory overhead increases by 16 bytes per message.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="length-limit">Length Limit<a href="#length-limit" class="hash-link" aria-label="Direct link to Length Limit" title="Direct link to Length Limit" translate="no">​</a>
+</h3> <p>Quorum queues has support for <a class="" href="maxlength.html">queue length limits</a>.</p> <p>The <code>drop-head</code> and <code>reject-publish</code> overflow behaviours are supported but they do not support <code>reject-publish-dlx</code> configurations as Quorum queues take a different implementation approach than classic queues.</p> <p>The current implementation of <code>reject-publish</code> overflow behaviour does not strictly enforce the limit and allows a quorum queue to overshoot its limit by at least one message, therefore it should be taken with care in scenarios where a precise limit is required.</p> <p>When a quorum queue reaches the max-length limit and <code>reject-publish</code> is configured it notifies each publishing channel who from thereon will reject all messages back to the client. This means that quorum queues may overshoot their limit by some small number of messages as there may be messages in flight whilst the channels are notified. The number of additional messages that are accepted by the queue will vary depending on how many messages are in flight at the time.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="dead-lettering">Dead Lettering<a href="#dead-lettering" class="hash-link" aria-label="Direct link to Dead Lettering" title="Direct link to Dead Lettering" translate="no">​</a>
+</h4> <p>Quorum queues support <a class="" href="dlx.html">dead lettering via dead letter exchanges</a> (DLXs).</p> <p>Traditionally, using DLXs in a clustered environment has not been <a class="" href="dlx.html#safety">safe</a>.</p> <p>Quorum queues support a safer form of dead-lettering that uses <code>at-least-once</code> guarantees for the message transfer between queues (with the limitations and caveats outlined below).</p> <p>This is done by implementing a special, internal dead-letter consumer process that works similarly to a normal queue consumer with manual acknowledgements apart from it only consumes messages that have been dead-lettered.</p> <p>This means that the source quorum queue will retain the dead-lettered messages until they have been acknowledged. The internal consumer will consume dead-lettered messages and publish them to the target queue(s) using publisher confirms. It will only acknowledge once publisher confirms have been received, hence providing <code>at-least-once</code> guarantees.</p> <p><code>at-most-once</code> remains the default dead-letter-strategy for quorum queues and is useful for scenarios where the dead lettered messages are more of an informational nature and where it does not matter so much if they are lost in transit between queues or when the overflow configuration restriction outlined below is not suitable.</p> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="activating-at-least-once-dead-lettering">Activating at-least-once Dead-Lettering<a href="#activating-at-least-once-dead-lettering" class="hash-link" aria-label="Direct link to Activating at-least-once Dead-Lettering" title="Direct link to Activating at-least-once Dead-Lettering" translate="no">​</a>
+</h5> <p>To activate or turn on <code>at-least-once</code> dead-lettering for a source quorum queue, adapt the <a class="" href="dlx.html">policy that enables dead lettering</a> like so:</p> <ul> <li class="">Set <code>dead-letter-strategy</code> to <code>at-least-once</code> (default is <code>at-most-once</code>).</li> <li class="">Set <code>overflow</code> to <code>reject-publish</code> (default is <code>drop-head</code>).</li> <li class="">Configure a <code>dead-letter-exchange</code>
+</li> <li class="">Enable the <code>stream_queue</code> <a class="" href="feature-flags.html">feature flag</a> in case it is not enabled</li> </ul> <p>It is recommended to additionally configure <code>max-length</code> or <code>max-length-bytes</code> to prevent excessive message buildup in the source quorum queue (see caveats below).</p> <p>Optionally, configure a <code>dead-letter-routing-key</code>.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="limitations">Limitations<a href="#limitations" class="hash-link" aria-label="Direct link to Limitations" title="Direct link to Limitations" translate="no">​</a>
+</h4> <p><code>at-least-once</code> dead lettering does not work with the default <code>drop-head</code> overflow strategy even if a queue length limit is not set. Hence if <code>drop-head</code> is configured the dead-lettering will fall back to <code>at-most-once</code>. Use the overflow strategy <code>reject-publish</code> instead.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="caveats">Caveats<a href="#caveats" class="hash-link" aria-label="Direct link to Caveats" title="Direct link to Caveats" translate="no">​</a>
+</h4> <p><code>at-least-once</code> dead-lettering will require more system resources such as memory and CPU. Therefore, turn on <code>at-least-once</code> only if dead lettered messages should not be lost.</p> <p><code>at-least-once</code> guarantees opens up some specific failure cases that needs handling. As dead-lettered messages are now retained by the source quorum queue until they have been safely accepted by the dead-letter target queue(s) this means they have to contribute to the queue resource limits, such as max length limits so that the queue can refuse to accept more messages until some have been removed. Theoretically it is then possible for a queue to <em>only</em> contain dead-lettered messages, in the case where, say a target dead-letter queue isn't available to accept messages for a long time and normal queue consumers consume most of the messages.</p> <p>Dead-lettered messages are considered "live" until they have been confirmed by the dead-letter target queue(s).</p> <p>There are few cases for which dead lettered messages will not be removed from the source queue in a timely manner:</p> <ul> <li class="">The configured dead-letter exchange does not exist.</li> <li class="">The messages cannot be routed to any queue (equivalent to the <code>mandatory</code> message property).</li> <li class="">One (of possibly many) routed target queues does not confirm receipt of the message. This can happen when a target queue is not available or when a target queue rejects a message (e.g. due to exceeded queue length limit).</li> </ul> <p>The dead-letter consumer process will retry periodically if either of the scenarios above occur which means there is a possibility of duplicates appearing at the DLX target queue(s).</p> <p>For each quorum queue with <code>at-least-once</code> dead-lettering turned on, there will be one internal dead-letter consumer process. The internal dead-letter consumer process is co-located on the quorum queue leader node. It keeps all dead-lettered message bodies in memory. It uses a prefetch size of 32 messages to limit the amount of message bodies kept in memory if no confirms are received from the target queues.</p> <p>That prefetch size can be increased by the <code>dead_letter_worker_consumer_prefetch</code> setting in the <code>rabbit</code> app section of the <a class="" href="configure.html#advanced-config-file">advanced config file</a> if high dead-lettering throughput (thousands of messages per second) is required.</p> <p>For a source quorum queue, it is possible to switch dead-letter strategy dynamically from <code>at-most-once</code> to <code>at-least-once</code> and vice versa. If the dead-letter strategy is changed either directly from <code>at-least-once</code> to <code>at-most-once</code> or indirectly, for example by changing overflow from <code>reject-publish</code> to <code>drop-head</code>, any dead-lettered messages that have not yet been confirmed by all target queues will be deleted.</p> <p>Messages published to the source quorum queue are persisted on disk regardless of the message delivery mode (transient or persistent). However, messages that are dead lettered by the source quorum queue will keep the original message delivery mode. This means if dead lettered messages in the target queue should survive a broker restart, the target queue must be durable and the message delivery mode must be set to persistent when publishing messages to the source quorum queue.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="consumer-priorities">Consumer Priorities<a href="#consumer-priorities" class="hash-link" aria-label="Direct link to Consumer Priorities" title="Direct link to Consumer Priorities" translate="no">​</a>
+</h3> <p>Quorum queues support <a class="" href="consumer-priority.html">consumer priorities</a>.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="priorities">Message Priorities<a href="#priorities" class="hash-link" aria-label="Direct link to Message Priorities" title="Direct link to Message Priorities" translate="no">​</a>
+</h3> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>Strict message priority support for quorum queues is available as of RabbitMQ 4.3.</p></div>
+</div> <p>Quorum queues implement strict priority support with 32 priority levels (0-31): higher priority messages are dispatched ahead of lower priority ones, subject to consumer <a class="" href="confirms.html#channel-qos-prefetch">prefetch</a> and to the <a href="#returned-messages" class="">returned messages</a> exception described below.</p> <p>Priorities are clamped to the 0-31 range. Messages without a <code>priority</code> property are treated as priority 4 (classic queues default to 0).</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="priorities-are-always-enabled">Priorities Are Always Enabled<a href="#priorities-are-always-enabled" class="hash-link" aria-label="Direct link to Priorities Are Always Enabled" title="Direct link to Priorities Are Always Enabled" translate="no">​</a>
+</h4> <p>Quorum queues always provide the full 0-31 priority range. There is no opt-in argument: <code>x-max-priority</code> applies only to classic queues and is ignored by quorum queues.</p> <p>Using the Java client:</p> <div class="language-java codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-java codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="java">Channel ch = ...;
+Map&lt;String, Object&gt; args = new HashMap&lt;String, Object&gt;();
+// quorum queues always support priorities; no extra argument needed
+args.put("x-queue-type", "quorum");
+ch.queueDeclare("my-quorum-queue", true, false, false, args);</pre></div></div> <p>Publishers set message priority the same way as for classic queues: via the <code>priority</code> field of <code>basic.properties</code>, with larger numbers indicating higher priority.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="per-priority-message-counts">Per-Priority Message Counts<a href="#per-priority-message-counts" class="hash-link" aria-label="Direct link to Per-Priority Message Counts" title="Direct link to Per-Priority Message Counts" translate="no">​</a>
+</h4> <p>Each priority level maintains separate message counts that are visible in the Management UI. This allows operators to monitor queue depth per priority and ensure that high-priority messages are not getting stuck behind lower-priority ones.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="returned-messages">Redelivery of Returned Messages<a href="#returned-messages" class="hash-link" aria-label="Direct link to Redelivery of Returned Messages" title="Direct link to Redelivery of Returned Messages" translate="no">​</a>
+</h4> <p>When messages are returned to the queue (via <code>reject</code>, <code>nack</code>, or <code>modify</code>), they do not retain their original priority. Instead, they are added to the returns queue and are requeued in the exact order they were returned, regardless of their priority.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="priority-aware-message-expiration">Priority-Aware Message Expiration<a href="#priority-aware-message-expiration" class="hash-link" aria-label="Direct link to Priority-Aware Message Expiration" title="Direct link to Priority-Aware Message Expiration" translate="no">​</a>
+</h4> <p>Message expiration (TTL) scans run across all priority levels, ensuring that messages expire in the correct order regardless of their priority level. For each priority level, the scan will only process messages until it encounters the first unexpired message. This prevents low-priority messages from blocking the expiration of high-priority messages that have exceeded their TTL.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="consumer-timeout">Consumer Timeout<a href="#consumer-timeout" class="hash-link" aria-label="Direct link to Consumer Timeout" title="Direct link to Consumer Timeout" translate="no">​</a>
+</h3> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>Consumer timeout support for quorum queues is available as of RabbitMQ 4.3.</p></div>
+</div> <p>Quorum queues support configurable consumer timeouts to handle slow or stuck consumers. When a consumer holds unacknowledged messages beyond the configured timeout period, the messages are automatically returned to the queue and become available for redelivery by another consumer.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="how-it-works">How It Works<a href="#how-it-works" class="hash-link" aria-label="Direct link to How It Works" title="Direct link to How It Works" translate="no">​</a>
+</h4> <p>When a consumer timeout fires:</p> <ol> <li class=""> <p><strong>For AMQP 1.0 clients</strong>: The broker sends a <code>DISPOSITION</code> frame with <code>state=released</code> instead of detaching the link. This allows the client to auto-settle the delivery and potentially recover without needing to re-establish the link. Until the consumer settles the timed out message it will not be assigned any further messages.</p> </li> <li class=""> <p><strong>For AMQP 0.9.1 clients</strong>: The consumer is cancelled (if the client supports the <code>consumer_cancel_notify</code> capability), otherwise the channel is closed with a <code>precondition_failed</code> error. In both cases, the messages are returned to the queue for redelivery.</p> </li> <li class=""> <p><strong>For MQTT clients</strong>: The consumer subscription is ended and messages are returned to the queue.</p> </li> </ol> <p>This graceful handling (especially for AMQP 1.0) provides better reliability and reduces connection thrashing compared to forcefully closing the link.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="configuration-options">Configuration Options<a href="#configuration-options" class="hash-link" aria-label="Direct link to Configuration Options" title="Direct link to Configuration Options" translate="no">​</a>
+</h4> <p>Consumer timeout can be configured at the consumer level, queue level, or globally:</p> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="consumer-attach-property-amqp-10">Consumer Attach Property (AMQP 1.0)<a href="#consumer-attach-property-amqp-10" class="hash-link" aria-label="Direct link to Consumer Attach Property (AMQP 1.0)" title="Direct link to Consumer Attach Property (AMQP 1.0)" translate="no">​</a>
+</h5> <div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">rabbitmq:consumer-timeout</pre></div></div> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="consumer-argument-amqp-091">Consumer Argument (AMQP 0.9.1)<a href="#consumer-argument-amqp-091" class="hash-link" aria-label="Direct link to Consumer Argument (AMQP 0.9.1)" title="Direct link to Consumer Argument (AMQP 0.9.1)" translate="no">​</a>
+</h5> <div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">x-consumer-timeout</pre></div></div> <p>Set when creating a consumer to apply the timeout only to that consumer.</p> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="queue-argument">Queue Argument<a href="#queue-argument" class="hash-link" aria-label="Direct link to Queue Argument" title="Direct link to Queue Argument" translate="no">​</a>
+</h5> <div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">x-consumer-timeout</pre></div></div> <p>Set when declaring a queue to apply to all consumers of that queue.</p> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="policy-key">Policy Key<a href="#policy-key" class="hash-link" aria-label="Direct link to Policy Key" title="Direct link to Policy Key" translate="no">​</a>
+</h5> <div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">consumer-timeout</pre></div></div> <p>Apply a consumer timeout to all queues matching a pattern.</p> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="global-setting">Global Setting<a href="#global-setting" class="hash-link" aria-label="Direct link to Global Setting" title="Direct link to Global Setting" translate="no">​</a>
+</h5> <p>In <code>rabbitmq.conf</code>:</p> <div class="language-ini codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-ini codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">consumer_timeout = 1800000</pre></div></div> <p>The timeout value is specified in milliseconds.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="disconnected-consumer-node-timeout">Disconnected Consumer Node Timeout<a href="#disconnected-consumer-node-timeout" class="hash-link" aria-label="Direct link to Disconnected Consumer Node Timeout" title="Direct link to Disconnected Consumer Node Timeout" translate="no">​</a>
+</h4> <p>When a consumer's node becomes unreachable due to a network partition, quorum queues will wait a configurable period before returning messages held by that consumer. This is controlled by the <code>consumer_disconnected_timeout</code> setting:</p> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="policy-key-1">Policy Key<a href="#policy-key-1" class="hash-link" aria-label="Direct link to Policy Key" title="Direct link to Policy Key" translate="no">​</a>
+</h5> <div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">consumer-disconnected-timeout</pre></div></div> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="global-setting-1">Global Setting<a href="#global-setting-1" class="hash-link" aria-label="Direct link to Global Setting" title="Direct link to Global Setting" translate="no">​</a>
+</h5> <p>In <code>rabbitmq.conf</code>:</p> <div class="language-ini codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-ini codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">consumer_disconnected_timeout = 60000</pre></div></div> <p>Default is 60 seconds (60000 milliseconds).</p> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="queue-argument-1">Queue Argument<a href="#queue-argument-1" class="hash-link" aria-label="Direct link to Queue Argument" title="Direct link to Queue Argument" translate="no">​</a>
+</h5> <div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">x-consumer-disconnected-timeout</pre></div></div> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="management-ui-and-monitoring">Management UI and Monitoring<a href="#management-ui-and-monitoring" class="hash-link" aria-label="Direct link to Management UI and Monitoring" title="Direct link to Management UI and Monitoring" translate="no">​</a>
+</h4> <p>The Management UI displays:</p> <ul> <li class="">Consumer timeout status for each outgoing link (highlighted in yellow when active)</li> <li class="">Disconnected consumer state</li> <li class="">Helpful tooltips explaining the consumer timeout feature</li> </ul> <p>Warnings are logged when a consumer timeout occurs, including:</p> <ul> <li class="">Connection name</li> <li class="">Link name and handle</li> <li class="">AMQP container ID</li> <li class="">Queue name</li> </ul> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="delayed-retry">Delayed Retry<a href="#delayed-retry" class="hash-link" aria-label="Direct link to Delayed Retry" title="Direct link to Delayed Retry" translate="no">​</a>
+</h3> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>Delayed retry support for quorum queues is available as of RabbitMQ 4.3.</p></div>
+</div> <p>Quorum queues support configurable delayed retry with linear back-off for messages that are returned to the queue. When a message is rejected, nacked, or modified by a consumer, it can be held in a delayed state before becoming available for redelivery. This helps prevent rapid retry loops and implements linear back-off strategies.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="how-it-works-1">How It Works<a href="#how-it-works-1" class="hash-link" aria-label="Direct link to How It Works" title="Direct link to How It Works" translate="no">​</a>
+</h4> <p>When a message is returned and delayed retry is enabled, the message is held in a delayed queue keyed by its ready-at timestamp. The delay is calculated based on the message's delivery count:</p> <div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">delay = min(min_delay * delivery_count, max_delay)</pre></div></div> <p>For example, with <code>min_delay=1000ms</code> and <code>max_delay=30000ms</code>:</p> <ul> <li class="">First return: 1000ms delay</li> <li class="">Second return: 2000ms delay</li> <li class="">Third return: 3000ms delay</li> <li class="">Fourth return and beyond: 30000ms delay (capped at max_delay)</li> </ul> <p>NB: a message's <code>delivery-count</code> is <em>only</em> incremented for failures (session/channel crashes and using the <code>modified</code> outcome with delivery_failed=true). This means not all return types will cause the message to be delayed longer than the minimum.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="configuration-options-1">Configuration Options<a href="#configuration-options-1" class="hash-link" aria-label="Direct link to Configuration Options" title="Direct link to Configuration Options" translate="no">​</a>
+</h4> <p>Delayed retry can be configured via queue arguments (at declaration time), queue policies, or both.</p> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="queue-arguments">Queue Arguments<a href="#queue-arguments" class="hash-link" aria-label="Direct link to Queue Arguments" title="Direct link to Queue Arguments" translate="no">​</a>
+</h5> <p>Queue arguments can be set when declaring a queue using AMQP 0.9.1:</p> <ul> <li class="">
+<code>x-delayed-retry-type</code> - Retry type: <code>disabled</code>, <code>all</code>, <code>failed</code>, or <code>returned</code> (default: <code>disabled</code>)</li> <li class="">
+<code>x-delayed-retry-min</code> - Minimum delay in milliseconds (required if enabled)</li> <li class="">
+<code>x-delayed-retry-max</code> - Maximum delay in milliseconds (optional)</li> </ul> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="policy-keys">Policy Keys<a href="#policy-keys" class="hash-link" aria-label="Direct link to Policy Keys" title="Direct link to Policy Keys" translate="no">​</a>
+</h5> <p>Policies provide a way to configure delayed retry across multiple queues:</p> <ul> <li class="">
+<code>delayed-retry-type</code> - Retry type: <code>disabled</code>, <code>all</code>, <code>failed</code>, or <code>returned</code>
+</li> <li class="">
+<code>delayed-retry-min</code> - Minimum delay in milliseconds</li> <li class="">
+<code>delayed-retry-max</code> - Maximum delay in milliseconds</li> </ul> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="retry-types">Retry Types<a href="#retry-types" class="hash-link" aria-label="Direct link to Retry Types" title="Direct link to Retry Types" translate="no">​</a>
+</h5> <ul> <li class="">
+<code>disabled</code> - Delayed retry is not applied (default)</li> <li class="">
+<code>all</code> - All returned messages are delayed, regardless of whether the delivery count was incremented</li> <li class="">
+<code>failed</code> - Only messages with incremented <code>delivery-count</code> are delayed (e.g., via <code>reject</code>, AMQP 1.0 <code>modify</code> with <code>delivery_failed=true</code>, or channel termination with pending messages)</li> <li class="">
+<code>returned</code> - Only messages without incremented <code>delivery-count</code> are delayed (e.g., via <code>nack</code> or AMQP 1.0 <code>modify</code> with <code>delivery_failed=false</code>)</li> </ul> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="example-configuration">Example Configuration<a href="#example-configuration" class="hash-link" aria-label="Direct link to Example Configuration" title="Direct link to Example Configuration" translate="no">​</a>
+</h4> <div class="theme-tabs-container tabs-container tabList__CuJ">
+<ul role="tablist" aria-orientation="horizontal" class="tabs">
+<li role="tab" tabindex="0" aria-selected="true" class="tabs__item tabItem_LNqP tabs__item--active">bash</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">HTTP API</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">Management UI</li>
+</ul>
+<div class="margin-top--md">
+<div role="tabpanel" class="tabItem_Ymn6"><div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash">rabbitmqctl set_policy qq-delayed-retry \
+    "^critical\." \
+    '{"delayed-retry-type": "all", "delayed-retry-min": 1000, "delayed-retry-max": 30000}' \
+    --priority 10 \
+    --apply-to "quorum_queues"</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><div class="language-ini codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-ini codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">PUT /api/policies/%2f/qq-delayed-retry
+{"pattern": "^critical\.",
+ "definition": {
+   "delayed-retry-type": "all",
+   "delayed-retry-min": 1000,
+   "delayed-retry-max": 30000
+ },
+ "priority": 10,
+ "apply-to": "quorum_queues"}</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><ol>
+<li>Navigate to <code>Admin</code> &gt; <code>Policies</code> &gt; <code>Add / update a policy</code>
+</li>
+<li>Enter policy name, pattern, and select <code>quorum_queues</code> as the apply-to type</li>
+<li>
+<p>Add policy arguments:</p>
+<ul>
+<li>
+<code>delayed-retry-type</code> = <code>all</code>
+</li>
+<li>
+<code>delayed-retry-min</code> = <code>1000</code>
+</li>
+<li>
+<code>delayed-retry-max</code> = <code>30000</code>
+</li>
+</ul>
+</li>
+<li>Click <code>Add policy</code>
+</li>
+</ol></div>
+</div>
+</div> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="advanced-features">Advanced Features<a href="#advanced-features" class="hash-link" aria-label="Direct link to Advanced Features" title="Direct link to Advanced Features" translate="no">​</a>
+</h4> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="explicit-delivery-time">Explicit Delivery Time<a href="#explicit-delivery-time" class="hash-link" aria-label="Direct link to Explicit Delivery Time" title="Direct link to Explicit Delivery Time" translate="no">​</a>
+</h5> <p>The <code>x-opt-delivery-time</code> annotation can be set on message properties to specify an explicit future delivery time (in milliseconds since epoch). This annotation is only available when using the AMQP <code>modify</code> outcome and takes precedence over the calculated linear back-off delay.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="management-ui-and-monitoring-1">Management UI and Monitoring<a href="#management-ui-and-monitoring-1" class="hash-link" aria-label="Direct link to Management UI and Monitoring" title="Direct link to Management UI and Monitoring" translate="no">​</a>
+</h4> <p>Delayed retry configuration, deferred message counts, and retry status are displayed in the Management UI, allowing operators to:</p> <ul> <li class="">View delayed retry configuration for each queue</li> <li class="">Monitor the number of delayed messages per queue</li> <li class="">Identify queues with excessive message delays</li> </ul> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="poison-message-handling">Poison Message Handling<a href="#poison-message-handling" class="hash-link" aria-label="Direct link to Poison Message Handling" title="Direct link to Poison Message Handling" translate="no">​</a>
+</h2> <p>Quorum queue support handling of <a href="https://en.wikipedia.org/wiki/Poison_message" target="_blank" rel="noopener noreferrer" class="">poison messages</a>, that is, messages that cause a consumer to repeatedly requeue a delivery (possibly due to a consumer failure) such that the message is never consumed completely and <a class="" href="confirms.html">positively acknowledged</a> so that it can be marked for deletion by RabbitMQ.</p> <p>Quorum queues keep track of the number of unsuccessful (re)delivery attempts and expose it in the "x-delivery-count" header that is included with any redelivered message.</p> <p>Starting with RabbitMQ 4.3, the delivery limit is based on <code>delivery-count</code> rather than <code>acquired-count</code>. This means that unlimited explicit message returns (via <code>nack</code> or AMQP 1.0 <code>modify</code> with <code>delivery_failed=false</code>) are now allowed without counting towards the delivery limit. The header <code>x-acquired-count</code> has been introduced to track the number of times a message was acquired by a consumer, alongside <code>x-delivery-count</code> which tracks the actual number of failed deliveries.</p> <div class="theme-admonition theme-admonition-tip admonition_xJq3 alert alert--success">
+<div class="admonitionHeading_Gvgb">
+tip</div>
+<div class="admonitionContent_BuS1"><p><code>x-acquired-count</code> is the recommended header for tracking the number of times a message has been assigned to a consumer. It provides more accurate information about the potential number of times a message may have been seen by a consumer. Note that this counter is incremented when a message is <em>assigned</em> to a consumer. This does not mean that a consumer has actually ever seen the message.</p></div>
+</div> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1">
+<p>When a message has been redelivered more times than the limit the message will be dropped (removed) or <a class="" href="dlx.html">dead-lettered</a> (if a DLX is configured).</p>
+<p>For consumers with a <a class="" href="confirms.html#channel-qos-prefetch">prefetch</a> greater than 1, all outstanding unacknowledged deliveries can be discarded by this mechanism if they all were requeued as a group multiple times, due to, say, consumer application instance failures.</p>
+</div>
+</div> <p>It is recommended that all quorum queues have a dead letter configuration of some sort to ensure messages aren't dropped and lost unintentionally. Using a single <a class="" href="streams.html">stream</a> for a low priority dead letter policy is a good, low resource way to ensure dropped messages are retained for some time after.</p> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1">
+<p>Starting with RabbitMQ 4.0, the delivery limit for quorum queues defaults to 20.</p>
+<p>The 3.13.x era behavior where there was no limit can be restored by setting <code>x-delivery-limit=-1</code> <a class="" href="queues.html#optional-arguments">optional queue argument</a> when declaring a queue.</p>
+<p>This is <em>not</em> recommended.</p>
+</div>
+</div> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="when-is-delivery-count-incremented">When is delivery count incremented?<a href="#when-is-delivery-count-incremented" class="hash-link" aria-label="Direct link to When is delivery count incremented?" title="Direct link to When is delivery count incremented?" translate="no">​</a>
+</h3> <table>
+<thead><tr>
+<th style="text-align:left">Trigger</th>
+<th style="text-align:center">
+<code>acquired-count</code> gets incremented</th>
+<th style="text-align:center">
+<code>delivery-count</code> gets incremented (delivery attempt <em>failed</em>)</th>
+</tr></thead>
+<tbody>
+<tr>
+<td style="text-align:left">
+<strong>AMQP 1.0 <code>released</code></strong> disposition</td>
+<td style="text-align:center">✅</td>
+<td style="text-align:center">❌</td>
+</tr>
+<tr>
+<td style="text-align:left">
+<strong>AMQP 1.0 <code>rejected</code></strong> disposition</td>
+<td style="text-align:center">✅</td>
+<td style="text-align:center">✅</td>
+</tr>
+<tr>
+<td style="text-align:left">
+<strong>AMQP 1.0 <code>modified</code></strong> disposition with <code>delivery-failed=false</code>
+</td>
+<td style="text-align:center">✅</td>
+<td style="text-align:center">❌</td>
+</tr>
+<tr>
+<td style="text-align:left">
+<strong>AMQP 1.0 <code>modified</code></strong> disposition with <code>delivery-failed=true</code>
+</td>
+<td style="text-align:center">✅</td>
+<td style="text-align:center">✅</td>
+</tr>
+<tr>
+<td style="text-align:left"><strong>AMQP 0.9.1 <code>basic.nack</code></strong></td>
+<td style="text-align:center">✅</td>
+<td style="text-align:center">❌</td>
+</tr>
+<tr>
+<td style="text-align:left"><strong>AMQP 0.9.1 <code>basic.reject</code></strong></td>
+<td style="text-align:center">✅</td>
+<td style="text-align:center">✅</td>
+</tr>
+<tr>
+<td style="text-align:left"><strong>Client crash / Connection loss</strong></td>
+<td style="text-align:center">✅</td>
+<td style="text-align:center">✅</td>
+</tr>
+<tr>
+<td style="text-align:left">
+<strong>Intra-cluster network partition</strong> (consumer node suspected down)</td>
+<td style="text-align:center">✅</td>
+<td style="text-align:center">❌</td>
+</tr>
+<tr>
+<td style="text-align:left">
+<strong>Consumer timeout</strong> (consumer doesn't ack in time)</td>
+<td style="text-align:center">✅</td>
+<td style="text-align:center">❌</td>
+</tr>
+</tbody>
+</table> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="poison-message-handling-configuring-limit">Configuring the Limit<a href="#poison-message-handling-configuring-limit" class="hash-link" aria-label="Direct link to Configuring the Limit" title="Direct link to Configuring the Limit" translate="no">​</a>
+</h3> <p>It is possible to set a delivery limit for a queue using a <a class="" href="policies.html">policy</a> argument, <code>delivery-limit</code>.</p> <p>The value of <code>-1</code> disables the limit altogether. It is <em>not</em> recommended that users disable this limit as repeated requeues can threaten the stability of a queue or RabbitMQ cluster.</p> <p>Note that since 4.3 the delivery count (against which the delivery limit is evaluated) will <em>only</em> be incremented for genuine failures such as session/channel crashes or when using the modified outcome with <code>delivery-failed=true</code> or basic.reject in AMQP 0.9.1.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="overriding-the-limit">Overriding the Limit<a href="#overriding-the-limit" class="hash-link" aria-label="Direct link to Overriding the Limit" title="Direct link to Overriding the Limit" translate="no">​</a>
+</h4> <p>The following example sets the limit to 50 for queues whose names begin with <code>qq</code>.</p> <div class="theme-tabs-container tabs-container tabList__CuJ">
+<ul role="tablist" aria-orientation="horizontal" class="tabs">
+<li role="tab" tabindex="0" aria-selected="true" class="tabs__item tabItem_LNqP tabs__item--active">bash</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">PowerShell</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">HTTP API</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">Management UI</li>
+</ul>
+<div class="margin-top--md">
+<div role="tabpanel" class="tabItem_Ymn6"><div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash">rabbitmqctl set_policy qq-overrides \
+    "^qq\." '{"delivery-limit": 50}' \
+    --priority 123 \
+    --apply-to "quorum_queues"</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><div class="language-PowerShell language-powershell codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-powershell codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">rabbitmqctl.bat set_policy qq-overrides ^
+    "^qq\." "{""delivery-limit"": 50}" ^
+    --priority 123 ^
+    --apply-to "quorum_queues"</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><div class="language-ini codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-ini codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">PUT /api/policies/%2f/qq-overrides
+    {"pattern": "^qq\.",
+     "definition": {"delivery-limit": 50},
+     "priority": 1,
+    "apply-to": "quorum_queues"}</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><ol>
+<li><p>Navigate to <code>Admin</code> &gt; <code>Policies</code> &gt; <code>Add / update a     policy</code>.</p></li>
+<li><p>Enter a policy name (such as "qq-overrides") next to Name, a pattern (such as "^qq.") next to Pattern, and select what kind of entities (quorum queues in this example) the policy should apply to using the <code>Apply to</code> drop down.</p></li>
+<li><p>Enter "delivery-limit" for policy argument and 50 for its value in the first line next to <code>Policy</code>.</p></li>
+<li><p>Click <code>Add policy</code>.</p></li>
+</ol></div>
+</div>
+</div> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="disabling-the-limit">Disabling the Limit<a href="#disabling-the-limit" class="hash-link" aria-label="Direct link to Disabling the Limit" title="Direct link to Disabling the Limit" translate="no">​</a>
+</h4> <p>The following example disables the limit for queues whose names begin with <code>qq.unlimited</code>.</p> <div class="theme-tabs-container tabs-container tabList__CuJ">
+<ul role="tablist" aria-orientation="horizontal" class="tabs">
+<li role="tab" tabindex="0" aria-selected="true" class="tabs__item tabItem_LNqP tabs__item--active">bash</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">PowerShell</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">HTTP API</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">Management UI</li>
+</ul>
+<div class="margin-top--md">
+<div role="tabpanel" class="tabItem_Ymn6"><div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash">rabbitmqctl set_policy qq-overrides \
+    "^qq\.unlimited" '{"delivery-limit": -1}' \
+    --priority 123 \
+    --apply-to "quorum_queues"</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><div class="language-PowerShell language-powershell codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-powershell codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">rabbitmqctl.bat set_policy qq-overrides ^
+    "^qq\.unlimited" "{""delivery-limit"": -1}" ^
+    --priority 123 ^
+    --apply-to "quorum_queues"</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><div class="language-ini codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-ini codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">PUT /api/policies/%2f/qq-overrides
+    {"pattern": "^qq\.unlimited",
+     "definition": {"delivery-limit": -1},
+     "priority": 1,
+    "apply-to": "quorum_queues"}</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><ol>
+<li><p>Navigate to <code>Admin</code> &gt; <code>Policies</code> &gt; <code>Add / update a     policy</code>.</p></li>
+<li><p>Enter a policy name (such as "qq-overrides") next to Name, a pattern (such as "^qq.unlimited") next to Pattern, and select what kind of entities (quorum queues in this example) the policy should apply to using the <code>Apply to</code> drop down.</p></li>
+<li><p>Enter "delivery-limit" for policy argument and -1 for its value in the first line next to <code>Policy</code>.</p></li>
+<li><p>Click <code>Add policy</code>.</p></li>
+</ol></div>
+</div>
+</div> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="position-message-handling-configuring-dlx">Configuring the Limit and Setting Up Dead-Lettering<a href="#position-message-handling-configuring-dlx" class="hash-link" aria-label="Direct link to Configuring the Limit and Setting Up Dead-Lettering" title="Direct link to Configuring the Limit and Setting Up Dead-Lettering" translate="no">​</a>
+</h3> <p>Messages that are redelivered more times than the limit allows for will be either dropped (removed) or <a class="" href="dlx.html">dead-lettered</a>.</p> <p>The following example configures both the limit and an exchange to dead-letter (republish) such messages. The target exchange in this example is called "redeliveries.limit.dlx". Declaring it and setting up its topology (binding queues and/or streams to it) is not covered in this example.</p> <div class="theme-tabs-container tabs-container tabList__CuJ">
+<ul role="tablist" aria-orientation="horizontal" class="tabs">
+<li role="tab" tabindex="0" aria-selected="true" class="tabs__item tabItem_LNqP tabs__item--active">bash</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">PowerShell</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">HTTP API</li>
+<li role="tab" tabindex="-1" aria-selected="false" class="tabs__item tabItem_LNqP">Management UI</li>
+</ul>
+<div class="margin-top--md">
+<div role="tabpanel" class="tabItem_Ymn6"><div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash">rabbitmqctl set_policy qq-overrides \
+    "^qq\." '{"delivery-limit": 50, "dead-letter-exchange": "redeliveries.limit.dlx"}' \
+    --priority 123 \
+    --apply-to "quorum_queues"</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><div class="language-PowerShell language-powershell codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-powershell codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">rabbitmqctl.bat set_policy qq-overrides ^
+    "^qq\." "{""delivery-limit"": 50, ""dead-letter-exchange"": ""redeliveries.limit.dlx""}" ^
+    --priority 123 ^
+    --apply-to "quorum_queues"</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><div class="language-ini codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-ini codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">PUT /api/policies/%2f/qq-overrides
+    {"pattern": "^qq\.",
+     "definition": {"delivery-limit": 50, "dead-letter-exchange": "redeliveries.limit.dlx"},
+     "priority": 1,
+    "apply-to": "quorum_queues"}</pre></div></div></div>
+<div role="tabpanel" class="tabItem_Ymn6" hidden><ol>
+<li><p>Navigate to <code>Admin</code> &gt; <code>Policies</code> &gt; <code>Add / update a     policy</code>.</p></li>
+<li><p>Enter a policy name (such as "qq-overrides") next to Name, a pattern (such as "^qq.") next to Pattern, and select what kind of entities (quorum queues in this example) the policy should apply to using the <code>Apply to</code> drop down.</p></li>
+<li><p>Enter "delivery-limit" for policy argument and 50 for its value in the first line next to <code>Policy</code>, then "dead-letter-exchange" for the second key and "redeliveries.limit.dlx" for its value.</p></li>
+<li><p>Click <code>Add policy</code>.</p></li>
+</ol></div>
+</div>
+</div> <p>To learn more about dead-lettering, please consult its <a class="" href="dlx.html">dedicated guide</a>.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="policy-support">Policy Support<a href="#policy-support" class="hash-link" aria-label="Direct link to Policy Support" title="Direct link to Policy Support" translate="no">​</a>
+</h3> <p>Quorum queues can be configured via RabbitMQ policies. The below table summarises the policy keys they adhere to.</p> <table>
+<thead><tr>
+<th style="text-align:left">Definition Key</th>
+<th style="text-align:left">Type</th>
+</tr></thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>max-length</code></td>
+<td style="text-align:left">Number</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>max-length-bytes</code></td>
+<td style="text-align:left">Number</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>overflow</code></td>
+<td style="text-align:left">"drop-head" or "reject-publish"</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>expires</code></td>
+<td style="text-align:left">Number (milliseconds)</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>dead-letter-exchange</code></td>
+<td style="text-align:left">String</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>dead-letter-routing-key</code></td>
+<td style="text-align:left">String</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>delivery-limit</code></td>
+<td style="text-align:left">Number</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>delayed-retry-type</code></td>
+<td style="text-align:left">"disabled", "all", "failed", or "returned"</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>delayed-retry-min</code></td>
+<td style="text-align:left">Number (milliseconds)</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>delayed-retry-max</code></td>
+<td style="text-align:left">Number (milliseconds)</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>consumer-timeout</code></td>
+<td style="text-align:left">Number (milliseconds)</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>consumer-disconnected-timeout</code></td>
+<td style="text-align:left">Number (milliseconds)</td>
+</tr>
+</tbody>
+</table> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="features-that-are-not-supported">Features that are not Supported<a href="#features-that-are-not-supported" class="hash-link" aria-label="Direct link to Features that are not Supported" title="Direct link to Features that are not Supported" translate="no">​</a>
+</h2> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="transient-non-durable-queues">Transient (non-Durable) Queues<a href="#transient-non-durable-queues" class="hash-link" aria-label="Direct link to Transient (non-Durable) Queues" title="Direct link to Transient (non-Durable) Queues" translate="no">​</a>
+</h3> <p>Classic queues can be <a class="" href="queues.html">non-durable</a>. Quorum queues are always durable per their assumed <a href="#use-cases" class="">use cases</a>.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="exclusivity">Exclusivity<a href="#exclusivity" class="hash-link" aria-label="Direct link to Exclusivity" title="Direct link to Exclusivity" translate="no">​</a>
+</h3> <p><a class="" href="queues.html#exclusive-queues">Exclusive queues</a> are tied to the lifecycle of their declaring connection. Quorum queues by design are replicated and durable, therefore the exclusive property makes no sense in their context. Therefore quorum queues cannot be exclusive.</p> <p>Quorum queues are not meant to be used as <a class="" href="queues.html#temporary-queues">temporary queues</a>.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="global-qos">Global QoS<a href="#global-qos" class="hash-link" aria-label="Direct link to Global QoS" title="Direct link to Global QoS" translate="no">​</a>
+</h3> <p>Quorum queues do not support global <a class="" href="confirms.html#channel-qos-prefetch">QoS prefetch</a> where a channel sets a single prefetch limit for all consumers using that channel. If an attempt is made to consume from a quorum queue from a channel with global QoS activated a channel error will be returned.</p> <p>Use <a class="" href="consumer-prefetch.html">per-consumer QoS prefetch</a>, which is the default in several popular clients.</p> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="usage">Usage<a href="#usage" class="hash-link" aria-label="Direct link to Usage" title="Direct link to Usage" translate="no">​</a>
+</h2> <p>Quorum queues share most of the fundamentals with other <a class="" href="queues.html">queue</a> types. Any AMQP 0.9.1 client library that can specify <a class="" href="queues.html#optional-arguments">optional queue arguments</a> when declaring will be able to use quorum queues.</p> <p>First we will cover how to declare a quorum queue using AMQP 0.9.1.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="declaring">Declaring<a href="#declaring" class="hash-link" aria-label="Direct link to Declaring" title="Direct link to Declaring" translate="no">​</a>
+</h3> <p>To declare a quorum queue set the <code>x-queue-type</code> queue argument to <code>quorum</code> (the default is <code>classic</code>). This argument must be provided by a client at queue declaration time; it cannot be set or changed using a <a class="" href="policies.html">policy</a>. This is because policy definition or applicable policy can be changed dynamically but queue type cannot. It must be specified at the time of declaration.</p> <p>Declaring a queue with an <code>x-queue-type</code> argument set to <code>quorum</code> will declare a quorum queue with up to three members (default <a href="#group-size" class="">group size</a>), one per each <a class="" href="clustering.html">cluster node</a>.</p> <p>For example, a cluster of three nodes will have three members, one on each node. In a cluster of five nodes, three nodes will have one member each but two nodes won't host any members.</p> <p>After declaration a quorum queue can be bound to any exchange just as any other RabbitMQ queue.</p> <p>If declaring using <a class="" href="management.html">management UI</a>, queue type must be specified using the queue type drop down menu.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="client-operations">Client Operations<a href="#client-operations" class="hash-link" aria-label="Direct link to Client Operations" title="Direct link to Client Operations" translate="no">​</a>
+</h3> <p>The following operations work the same way for quorum queues as they do for classic queues:</p> <ul> <li class="">
+<a class="" href="consumers.html">Consumption</a> (subscription)</li> <li class="">
+<a class="" href="confirms.html">Consumer acknowledgements</a> (keep <a href="#global-qos" class="">QoS Prefetch Limitations</a> in mind)</li> <li class="">Cancellation of consumers</li> <li class="">Purging of queue messages</li> <li class="">Queue deletion</li> </ul> <p>With some queue operations there are minor differences:</p> <ul> <li class="">
+<a href="#declaring" class="">Declaration</a> (covered above)</li> <li class="">Setting <a href="#global-qos" class="">QoS prefetch</a> for consumers</li> </ul> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="replication">Group Size and Membership Management<a href="#replication" class="hash-link" aria-label="Direct link to Group Size and Membership Management" title="Direct link to Group Size and Membership Management" translate="no">​</a>
+</h2> <p>When a quorum queue is declared, an initial number of members (its "group size") must be configured. RabbitMQ defaults this to 3 which is the practical minimum number of members to provide high availability.</p> <p>The members of a quorum queue will never share a RabbitMQ node so in order to declare a new 3-member quorum queue at least 2 RabbitMQ nodes need to be online at the time of declaration.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="group-size">Controlling the Initial Group Size<a href="#group-size" class="hash-link" aria-label="Direct link to Controlling the Initial Group Size" title="Direct link to Controlling the Initial Group Size" translate="no">​</a>
+</h3> <p>For example, a cluster of three nodes will have three members, one on each node. In a cluster of seven nodes, three nodes will have one member each but four more nodes won't host any members of the newly declared queue.</p> <p>The group size (the initial number of members) can be configured for quorum queues using the <code>x-quorum-initial-group-size</code> queue argument. The group size argument provided should be an integer that is greater than zero and smaller or equal to the currently configured RabbitMQ cluster size.</p> <p>The minimum value of <code>x-quorum-initial-group-size</code> that makes practical sense is three which will support the failure of 1 RabbitMQ node.</p> <p>As for RabbitMQ cluster sizes it is highly recommended for the quorum queue group size to be an odd number.</p> <p>See the <a href="#quorum-requirements" class="">Fault Tolerance and Minimum Number of Members Online</a> section for further details on the quorum semantics.</p> <p>NB: if a RabbitMQ node is unavailable during a declaration and it is chosen to host a quorum queue member this member will be started the next time the node is started.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="member-management">Managing Members<a href="#member-management" class="hash-link" aria-label="Direct link to Managing Members" title="Direct link to Managing Members" translate="no">​</a>
+</h3> <p>Replicas of a quorum queue are explicitly managed by the operator. When a new node is added to the cluster, it will host no quorum queue members unless the operator explicitly adds a member to a quorum queue or a set of quorum queues.</p> <p>When a node has to be decommissioned (permanently removed from the cluster), the <a class="" href="cli.html"><code>forget_cluster_node</code></a> command will automatically attempt to remove all quorum queue members on the decommissioned node. Alternatively the <code>shrink</code> command below can be used ahead of node removal to move any members to a new node.</p> <p>Also see <a href="#member-reconciliation" class="">Continuous Membership Reconciliation</a> for a more automated way to grow quorum queues.</p> <p>Several <a class="" href="cli.html">CLI commands</a> are provided to perform the above operations:</p> <div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash">rabbitmq-queues add_member [-p &lt;vhost&gt;] &lt;queue-name&gt; &lt;node&gt;</pre></div></div> <div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash">rabbitmq-queues delete_member [-p &lt;vhost&gt;] &lt;queue-name&gt; &lt;node&gt;</pre></div></div> <div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash">rabbitmq-queues grow &lt;node&gt; &lt;all | even&gt; [--vhost-pattern &lt;pattern&gt;] [--queue-pattern &lt;pattern&gt;]</pre></div></div> <div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash">rabbitmq-queues shrink &lt;node&gt; [--errors-only]</pre></div></div> <p>To successfully add and remove members a quorum of members in the queue must be available because membership changes are treated as queue state changes.</p> <p>Care needs to be taken not to accidentally make a queue unavailable by losing the quorum whilst performing maintenance operations that involve membership changes.</p> <p>When replacing a cluster node, it is safer to first add a new node, grow any quorum queues that need a member on the new node and then decommission the node it replaces.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="leader-placement">Queue Leader Location<a href="#leader-placement" class="hash-link" aria-label="Direct link to Queue Leader Location" title="Direct link to Queue Leader Location" translate="no">​</a>
+</h3> <p>All operations (state changes) on a quorum queue are sent to a primary member called a <em>leader</em> which in turn replicates the operations to the remaining members, called <em>followers</em>.</p> <p>To avoid some nodes in a cluster hosting the majority of queue leader members and thus handling most of the load, it may be beneficial if queue leaders are reasonably evenly distributed across cluster nodes.</p> <p>When a new quorum queue is declared, the set of nodes that will host its members is randomly picked, but will always include the node the client that declares the queue is connected to.</p> <p>Which member becomes the initial leader can be controlled using three options:</p> <ol> <li class="">Setting the <code>queue-leader-locator</code> <a class="" href="policies.html">policy</a> key (recommended)</li> <li class="">By defining the <code>queue_leader_locator</code> key in <a class="" href="configure.html#configuration-files">the configuration file</a> (recommended)</li> <li class="">Using the <code>x-queue-leader-locator</code> <a class="" href="queues.html#optional-arguments">optional queue argument</a>
+</li> </ol> <p>Supported queue leader locator values are</p> <ul> <li class="">
+<code>client-local</code>: Pick the node the client that declares the queue is connected to. This is the default value.</li> <li class="">
+<code>balanced</code>: If there are overall less than 1000 queues (classic queues, quorum queues, and streams), pick the node hosting the minimum number of quorum queue leaders. If there are overall more than 1000 queues, pick a random node.</li> </ul> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="member-rebalancing">Rebalancing Members<a href="#member-rebalancing" class="hash-link" aria-label="Direct link to Rebalancing Members" title="Direct link to Rebalancing Members" translate="no">​</a>
+</h3> <p>Once declared or after a cluster restart, the RabbitMQ quorum queue leaders may be unevenly distributed across the RabbitMQ cluster.</p> <p>To re-balance use the <code>rabbitmq-queues rebalance</code> command.</p> <p>It is important to know that this does not change the nodes which the quorum queues span. To modify the membership instead see <a href="#member-management" class="">managing members</a>.</p> <div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash"># rebalances all quorum queues
+rabbitmq-queues rebalance quorum</pre></div></div> <p>It is possible to rebalance a subset of queues selected by name:</p> <div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash"># rebalances a subset of quorum queues
+rabbitmq-queues rebalance quorum --queue-pattern "orders.*"</pre></div></div> <p>or quorum queues in a particular set of virtual hosts:</p> <div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash"># rebalances a subset of quorum queues
+rabbitmq-queues rebalance quorum --vhost-pattern "production.*"</pre></div></div> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="member-reconciliation">Continuous Membership Reconciliation (CMR)<a href="#member-reconciliation" class="hash-link" aria-label="Direct link to Continuous Membership Reconciliation (CMR)" title="Direct link to Continuous Membership Reconciliation (CMR)" translate="no">​</a>
+</h3> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>The continuous membership reconciliation (CMR) feature exists in addition to, and not as a replacement for, <a href="#member-management" class="">explicit member management</a>. In certain cases where nodes are permanently removed from the cluster, explicitly removing quorum queue members may still be necessary.</p></div>
+</div> <p>In addition to controlling quorum queue membership by using the initial target size and <a href="#member-management" class="">explicit member management</a>, nodes can be configured to automatically try to grow the quorum queue membership to a configured target group size by enabling the continuous membership reconciliation feature.</p> <p>When activated, every quorum queue leader will periodically check its current membership group size (the number of configured members), and compare it with the target value.</p> <p>If a queue is below the target value, RabbitMQ will attempt to grow the queue onto the available nodes that do not currently host members of said queue, if any, up to the target value.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="when-is-continuous-membership-reconciliation-triggered">When is Continuous Membership Reconciliation Triggered?<a href="#when-is-continuous-membership-reconciliation-triggered" class="hash-link" aria-label="Direct link to When is Continuous Membership Reconciliation Triggered?" title="Direct link to When is Continuous Membership Reconciliation Triggered?" translate="no">​</a>
+</h4> <p>The default reconciliation interval is 60 minutes. In addition, automatic reconciliation is triggered by certain events in the cluster, such as an addition of a new node, or permanent node removal, or a quorum queue-related policy change.</p> <div class="theme-admonition theme-admonition-warning admonition_xJq3 alert alert--warning">
+<div class="admonitionHeading_Gvgb">
+warning</div>
+<div class="admonitionContent_BuS1">
+<p>Note that a node or quorum queue member failure does not trigger automatic membership reconciliation.</p>
+<p>If a node is failed in an unrecoverable way and cannot be brought back, it must be explicitly removed from the cluster or the operator must opt-in and enable the <code>quorum_queue.continuous_membership_reconciliation.auto_remove</code> setting.</p>
+<p>This also means that <a class="" href="upgrade.html">upgrades</a> do not trigger automatic membership reconciliation since nodes are expected to come back and only a minority (often just one) node is stopped for upgrading at a time.</p>
+</div>
+</div> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="cmr-configuration">CMR Configuration<a href="#cmr-configuration" class="hash-link" aria-label="Direct link to CMR Configuration" title="Direct link to CMR Configuration" translate="no">​</a>
+</h4> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="via-rabbitmqconf">Via <code>rabbitmq.conf</code><a href="#via-rabbitmqconf" class="hash-link" aria-label="Direct link to via-rabbitmqconf" title="Direct link to via-rabbitmqconf" translate="no">​</a>
+</h5> <table class="name-description">
+<caption>Continuous Membership Reconciliation (CMR) Settings</caption>
+<thead><tr>
+<th>
+<code>rabbitmq.conf</code> <a href="configure.html">configuration key</a>
+</th>
+<th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><p><code>quorum_queue.continuous_membership_reconciliation.enabled</code></p></td>
+<td>
+<p>Enables or disables continuous membership reconciliation.</p>
+<div><ul>
+<li>Data type: boolean</li>
+<li>Default: <code>false</code>
+</li>
+</ul></div>
+</td>
+</tr>
+<tr>
+<td><p><code>quorum_queue.continuous_membership_reconciliation.target_group_size</code></p></td>
+<td>
+<p>The target member count (group size) for queue members.</p>
+<div><ul>
+<li>Data type: positive integer</li>
+<li>Default: none</li>
+</ul></div>
+</td>
+</tr>
+<tr>
+<td><p><code>quorum_queue.continuous_membership_reconciliation.auto_remove</code></p></td>
+<td>
+<p>Enables or disables automatic removal of member nodes that are no longer part of the cluster, but still a member of the quorum queue.</p>
+<div><ul>
+<li>Data type: boolean</li>
+<li>Default: <code>false</code>
+</li>
+</ul></div>
+</td>
+</tr>
+<tr>
+<td><p><code>quorum_queue.continuous_membership_reconciliation.interval</code></p></td>
+<td>
+<p>The default evaluation interval in milliseconds.</p>
+<div><ul>
+<li>Data type: positive integer</li>
+<li>Default: <code>3600000</code> (60 minutes)</li>
+</ul></div>
+</td>
+</tr>
+<tr>
+<td><p><code>quorum_queue.continuous_membership_reconciliation.trigger_interval</code></p></td>
+<td>
+<p>The reconciliation delay in milliseconds, used when a trigger event occurs, for example, a node is added or removed from the cluster or an applicable policy changes. This delay will be applied only once, then the regular interval will be used again.</p>
+<div><ul>
+<li>Data type: positive integer</li>
+<li>Default: <code>10000</code> (10 seconds)</li>
+</ul></div>
+</td>
+</tr>
+</tbody>
+</table> <h5 class="anchor anchorTargetStickyNavbar_Vzrq" id="policy-keys-1">Policy Keys<a href="#policy-keys-1" class="hash-link" aria-label="Direct link to Policy Keys" title="Direct link to Policy Keys" translate="no">​</a>
+</h5> <table class="name-description">
+<caption>Policy-driven CMR Settings</caption>
+<thead><tr>
+<th><a href="https://www.rabbitmq.com/policies">Policy key</a></th>
+<th>Description</th>
+</tr></thead>
+<tbody><tr>
+<td><p><code>target-group-size</code></p></td>
+<td>
+<p>Defines the target member count (group size) for matching queues. This policy can be set by users and operators.</p>
+<div><ul>
+<li>Data type: positive integer</li>
+<li>Default: none</li>
+</ul></div>
+</td>
+</tr></tbody>
+</table> <table class="name-description">
+<caption>Optional Arguments-driven CMR Settings</caption>
+<thead><tr>
+<th><a href="queues.html#optional-arguments">Optional arguments key</a></th>
+<th>Description</th>
+</tr></thead>
+<tbody><tr>
+<td><p><code>x-quorum-target-group-size</code></p></td>
+<td>
+<p>Defines the target member count (group size) for matching queues. This key can be overridden by operator policies.</p>
+<div><ul>
+<li>Data type: positive integer</li>
+<li>Default: none</li>
+</ul></div>
+</td>
+</tr></tbody>
+</table> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="behaviour">Quorum Queue Behaviour<a href="#behaviour" class="hash-link" aria-label="Direct link to Quorum Queue Behaviour" title="Direct link to Quorum Queue Behaviour" translate="no">​</a>
+</h2> <p>A quorum queue relies on a consensus protocol called Raft to ensure data consistency and safety.</p> <p>Every quorum queue has a primary member (a <em>leader</em> in Raft parlance) and zero or more secondary members (called <em>followers</em>).</p> <p>A leader is elected when the cluster is first formed and later if the leader becomes unavailable.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="leader-election">Leader Election and Failure Handling<a href="#leader-election" class="hash-link" aria-label="Direct link to Leader Election and Failure Handling" title="Direct link to Leader Election and Failure Handling" translate="no">​</a>
+</h3> <p>A quorum queue requires a quorum of the declared nodes to be available to function. When a RabbitMQ node hosting a quorum queue's <em>leader</em> fails or is stopped another node hosting one of that quorum queue's <em>follower</em> will be elected leader and resume accepting operations.</p> <p>Failed and rejoining followers will automatically resume log replication at the point they left off which means there is no special "catch-up" process needed and there is no impact on leader availability as was the case with classic mirrored queues.</p> <p>When a new member is <a href="#member-management" class="">added</a>, the same log replication process will be performed and again there is little impact on the rest of the quorum queue cluster.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="quorum-requirements">Fault Tolerance and Minimum Number of Members Online<a href="#quorum-requirements" class="hash-link" aria-label="Direct link to Fault Tolerance and Minimum Number of Members Online" title="Direct link to Fault Tolerance and Minimum Number of Members Online" translate="no">​</a>
+</h3> <p>Consensus systems can provide certain guarantees with regard to data safety. These guarantees do mean that certain conditions need to be met before they become relevant such as requiring a minimum of three cluster nodes to provide fault tolerance and requiring more than half of members to be available to work at all.</p> <p>Failure tolerance characteristics of clusters of various size can be described in a table:</p> <table>
+<thead><tr>
+<th style="text-align:center">Cluster node count</th>
+<th style="text-align:center">Tolerated number of node failures</th>
+<th style="text-align:center">Tolerant to a network partition</th>
+</tr></thead>
+<tbody>
+<tr>
+<td style="text-align:center">1</td>
+<td style="text-align:center">0</td>
+<td style="text-align:center">not applicable</td>
+</tr>
+<tr>
+<td style="text-align:center">2</td>
+<td style="text-align:center">0</td>
+<td style="text-align:center">no</td>
+</tr>
+<tr>
+<td style="text-align:center">3</td>
+<td style="text-align:center">1</td>
+<td style="text-align:center">yes</td>
+</tr>
+<tr>
+<td style="text-align:center">4</td>
+<td style="text-align:center">1</td>
+<td style="text-align:center">yes if a majority exists on one side</td>
+</tr>
+<tr>
+<td style="text-align:center">5</td>
+<td style="text-align:center">2</td>
+<td style="text-align:center">yes</td>
+</tr>
+<tr>
+<td style="text-align:center">6</td>
+<td style="text-align:center">2</td>
+<td style="text-align:center">yes if a majority exists on one side</td>
+</tr>
+<tr>
+<td style="text-align:center">7</td>
+<td style="text-align:center">3</td>
+<td style="text-align:center">yes</td>
+</tr>
+<tr>
+<td style="text-align:center">8</td>
+<td style="text-align:center">3</td>
+<td style="text-align:center">yes if a majority exists on one side</td>
+</tr>
+<tr>
+<td style="text-align:center">9</td>
+<td style="text-align:center">4</td>
+<td style="text-align:center">yes</td>
+</tr>
+</tbody>
+</table> <p>As the table above shows RabbitMQ clusters with fewer than three nodes do not benefit fully from the quorum queue guarantees. RabbitMQ clusters with an even number of RabbitMQ nodes do not benefit from having quorum queue members spread over all nodes. For these systems the quorum queue size should be constrained to a smaller uneven number of nodes.</p> <p>Performance tails off quite a bit for quorum queue node sizes larger than 5. We do not recommend running quorum queues on more than 7 RabbitMQ nodes. The default quorum queue size is 3 and is controllable using the <code>x-quorum-initial-group-size</code> <a class="" href="queues.html#optional-arguments">queue argument</a>.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="data-safety">Data Safety<a href="#data-safety" class="hash-link" aria-label="Direct link to Data Safety" title="Direct link to Data Safety" translate="no">​</a>
+</h3> <p>Quorum queues are designed to provide data safety under network partition and failure scenarios. A message that was successfully confirmed back to the publisher using the <a class="" href="confirms.html">publisher confirms</a> feature should not be lost as long as at least a majority of RabbitMQ nodes hosting the quorum queue are not permanently made unavailable.</p> <p>Generally quorum queues favours data consistency over availability.</p> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>Quorum queues cannot provide any safety guarantees for messages that have not been <a class="" href="confirms.html">confirmed to the publisher</a>. Such messages could be lost "in flight", in an operating system buffer or otherwise fail to reach the target node or the queue leader.</p></div>
+</div> <p>Quorum queues pass a <a href="https://github.com/rabbitmq/jepsen#jepsen-tests-for-rabbitmq" target="_blank" rel="noopener noreferrer" class="">refactored and more demanding version</a> of the <a href="https://aphyr.com/posts/315-jepsen-rabbitmq#rabbit-as-a-queue" target="_blank" rel="noopener noreferrer" class="">original Jepsen test</a>. This ensures they behave as expected under network partitions and failure scenarios. The new test runs continuously to spot possible regressions and is enhanced regularly to test new features (e.g. <a href="#dead-lettering" class="">dead lettering</a>).</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="availability">Availability<a href="#availability" class="hash-link" aria-label="Direct link to Availability" title="Direct link to Availability" translate="no">​</a>
+</h3> <p>A quorum queue should be able to tolerate a minority of queue members becoming unavailable with no or little effect on availability.</p> <p>Note that depending on the <a class="" href="partitions.html">partition handling strategy</a> used RabbitMQ may restart itself during recovery and reset the node but as long as that does not happen, this availability guarantee should hold true.</p> <p>For example, a queue with three members can tolerate one node failure without losing availability. A queue with five members can tolerate two, and so on.</p> <p>If a quorum of nodes cannot be recovered (say if 2 out of 3 RabbitMQ nodes are permanently lost) the queue is permanently unavailable and will need to be force deleted and recreated.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="performance">Performance Characteristics<a href="#performance" class="hash-link" aria-label="Direct link to Performance Characteristics" title="Direct link to Performance Characteristics" translate="no">​</a>
+</h3> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>Quorum queues have been optimized further in RabbitMQ 4.1.x and now <a href="https://www.rabbitmq.com/blog/2025/04/08/4.1-performance-improvements" target="_blank" rel="noopener noreferrer" class="">feature lower memory footprints and improved consumer delivery rates</a>, parallelism under peak load.</p></div>
+</div> <p>Quorum queues are designed to trade latency for throughput and have been tested in 3, 5 and 7 node configurations with several different message sizes.</p> <p>In scenarios using both consumer acks and publisher confirms quorum queues have been observed to have superior throughput to classic mirrored queues (deprecated in 2021, removed in 2024 for RabbitMQ 4.0). For example, take a look at <a class="" href="https://www.rabbitmq.com/blog/2022/05/16/rabbitmq-3.10-performance-improvements">these benchmarks with 3.10</a> and <a class="" href="https://www.rabbitmq.com/blog/2023/05/17/rabbitmq-3.12-performance-improvements#significant-improvements-to-quorum-queues">another with 3.12</a>.</p> <p>As quorum queues persist all data to disks before doing anything it is recommended to use the fastest disks possible and certain <a href="#performance-tuning" class="">Performance Tuning</a> settings.</p> <p>Quorum queues also benefit from consumers using higher prefetch values to ensure consumers aren't starved whilst acknowledgements are flowing through the system and allowing messages to be delivered in a timely fashion.</p> <p>Due to the disk I/O-heavy nature of quorum queues, their throughput decreases as message sizes increase.</p> <p>Quorum queue throughput is also affected by the number of members. The more members a quorum queue has, the lower its throughput generally will be since more work has to be done to replicate data and achieve consensus.</p> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="migrate-from-cmqs">Migrating from RabbitMQ 3.13.x with Mirrored Classic Queues to Quorum Queues Using Blue-Green Deployment<a href="#migrate-from-cmqs" class="hash-link" aria-label="Direct link to Migrating from RabbitMQ 3.13.x with Mirrored Classic Queues to Quorum Queues Using Blue-Green Deployment" title="Direct link to Migrating from RabbitMQ 3.13.x with Mirrored Classic Queues to Quorum Queues Using Blue-Green Deployment" translate="no">​</a>
+</h2> <p><a class="" href="management-cli.html"><code>rabbitmqadmin</code> v2</a> provides commands for automating migration from 3.13.x clusters that use classic mirrored queues to quorum queues using the <a class="" href="blue-green-upgrade.html">Blue-Green Deployment strategy</a>.</p> <p>See <a class="" href="https://www.rabbitmq.com/blog/2025/07/29/latest-benefits-of-rmq-and-migrating-to-qq-along-the-way">Using Blue-Green Upgrade Strategy to Migrate from Classic Mirrored Queues to Quorum Queues</a>.</p> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="configuration">Configurable Settings<a href="#configuration" class="hash-link" aria-label="Direct link to Configurable Settings" title="Direct link to Configurable Settings" translate="no">​</a>
+</h2> <p>There are a few new configuration parameters that can be tweaked using the <a class="" href="configure.html#advanced-config-file">advanced</a> config file.</p> <p>Note that all settings related to <a href="#resource-use" class="">resource footprint</a> are documented in a separate section.</p> <p>The <code>ra</code> application (which is the Raft library that quorum queues use) has <a href="https://github.com/rabbitmq/ra#configuration" target="_blank" rel="noopener noreferrer" class="">its own set of tunable parameters</a>.</p> <p>The <code>rabbit</code> application has several quorum queue related configuration items available.</p> <table>
+<thead><tr>
+<th>
+<code>advanced.config</code> <a href="configure.html">configuration key</a>
+</th>
+<th>Description</th>
+<th>Default value</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>rabbit.quorum_cluster_size</td>
+<td><p>Sets the default quorum queue cluster size (can be over-ridden by the <code>x-quorum-initial-group-size</code> queue argument at declaration time.</p></td>
+<td>3</td>
+</tr>
+<tr>
+<td>rabbit.quorum_commands_soft_limit</td>
+<td><p>This is a flow control related parameter defining the maximum number of unconfirmed messages a channel accepts before entering flow. The current default is configured to provide good performance and stability when there are multiple publishers sending to the same quorum queue. If the applications typically only have a single publisher per queue this limit could be increased to provide somewhat better ingress rates.</p></td>
+<td>32</td>
+</tr>
+<tr>
+<td>rabbit.consumer_timeout</td>
+<td><p>Global default consumer timeout in milliseconds for all quorum queues. Can be overridden by policy or queue argument. Set to <code>undefined</code> to disable.</p></td>
+<td>undefined</td>
+</tr>
+<tr>
+<td>rabbit.consumer_disconnected_timeout</td>
+<td><p>Timeout in milliseconds for returning messages when a consumer's node becomes unreachable due to a network partition. After this timeout, the messages are returned to the queue.</p></td>
+<td>60000</td>
+</tr>
+</tbody>
+</table> <p>In <code>rabbitmq.conf</code>, these can be configured as:</p> <div class="language-ini codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-ini codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">consumer_timeout = 1800000
+consumer_disconnected_timeout = 60000</pre></div></div> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="example-of-a-quorum-queue-configuration">Example of a Quorum Queue Configuration<a href="#example-of-a-quorum-queue-configuration" class="hash-link" aria-label="Direct link to Example of a Quorum Queue Configuration" title="Direct link to Example of a Quorum Queue Configuration" translate="no">​</a>
+</h3> <p>The following <code>rabbitmq.conf</code> example shows both legacy and new configuration options:</p> <div class="language-ini codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-ini codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">quorum_queue.initial_cluster_size = 3
+
+quorum_queue.commands_soft_limit = 32
+
+consumer_timeout = 1800000
+
+consumer_disconnected_timeout = 60000</pre></div></div> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="advanced-quorum-queue-configuration">Advanced Quorum Queue Configuration<a href="#advanced-quorum-queue-configuration" class="hash-link" aria-label="Direct link to Advanced Quorum Queue Configuration" title="Direct link to Advanced Quorum Queue Configuration" translate="no">​</a>
+</h3> <p>Starting with RabbitMQ 4.3, all quorum queue Ra system parameters are explicitly configurable via <code>rabbitmq.conf</code> using the <code>quorum_queue.*</code> namespace. This allows operators to fine-tune Raft log and WAL behavior specifically for quorum queues without affecting other Raft-based features (like streams or Khepri).</p> <div class="theme-admonition theme-admonition-warning admonition_xJq3 alert alert--warning">
+<div class="admonitionHeading_Gvgb">
+warning</div>
+<div class="admonitionContent_BuS1"><p>These configuration options are for advanced use cases and should typically <strong>not</strong> be changed by users unless advised to do so by RabbitMQ core team members or support.</p></div>
+</div> <table>
+<thead><tr>
+<th>
+<code>rabbitmq.conf</code> Key</th>
+<th>Description</th>
+<th>Default Value</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>quorum_queue.segment_max_size_bytes</code></td>
+<td>Maximum size of a Raft log segment file</td>
+<td>64000000 (64 MB)</td>
+</tr>
+<tr>
+<td><code>quorum_queue.segment_max_entries</code></td>
+<td>Maximum number of entries in a Raft log segment file</td>
+<td>4096</td>
+</tr>
+<tr>
+<td><code>quorum_queue.wal_max_size_bytes</code></td>
+<td>Maximum size of the Write-Ahead Log</td>
+<td>536870912 (512 MB)</td>
+</tr>
+<tr>
+<td><code>quorum_queue.wal_max_entries</code></td>
+<td>Maximum number of entries in the Write-Ahead Log</td>
+<td>500000</td>
+</tr>
+<tr>
+<td><code>quorum_queue.wal_max_batch_size</code></td>
+<td>Maximum batch size for WAL writes</td>
+<td>4096</td>
+</tr>
+<tr>
+<td><code>quorum_queue.wal_compute_checksums</code></td>
+<td>Whether to compute checksums for WAL entries</td>
+<td>true</td>
+</tr>
+<tr>
+<td><code>quorum_queue.segment_compute_checksums</code></td>
+<td>Whether to compute checksums for segment entries</td>
+<td>true</td>
+</tr>
+<tr>
+<td><code>quorum_queue.max_append_entries_rpc_batch_size</code></td>
+<td>Maximum batch size for append entries RPCs</td>
+<td>16</td>
+</tr>
+<tr>
+<td><code>quorum_queue.compress_mem_tables</code></td>
+<td>Whether to compress memory tables</td>
+<td>true</td>
+</tr>
+<tr>
+<td><code>quorum_queue.snapshot_chunk_size</code></td>
+<td>Chunk size for snapshot transfers</td>
+<td>1000000 (1 MB)</td>
+</tr>
+</tbody>
+</table> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="relaxed-property-equivalence">Options to Relax Property Equivalence Checks<a href="#relaxed-property-equivalence" class="hash-link" aria-label="Direct link to Options to Relax Property Equivalence Checks" title="Direct link to Options to Relax Property Equivalence Checks" translate="no">​</a>
+</h2> <p>When a client redeclares a queue, RabbitMQ nodes <a class="" href="queues.html#property-equivalence">perform a property equivalence checks</a>. If some properties are not equivalent, the declaration will fail with a <a class="" href="channels.html#error-handling">channel error</a>.</p> <p>In environment where applications explicitly set the type of the queue via the <code>x-queue-type</code> argument and cannot be quickly updated and/or redeployed, the equivalence check for <code>x-queue-type</code> can be ignored with an opt-in setting:</p> <div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">quorum_queue.property_equivalence.relaxed_checks_on_redeclaration = true</pre></div></div> <p>If <code>quorum_queue.property_equivalence.relaxed_checks_on_redeclaration</code> is set to <code>true</code>, the 'x-queue-type' header will be ignored (not compared for equivalence) for queue redeclaration.</p> <p>This can simplify upgrades of applications that explicitly set 'x-queue-type' to 'classic' for historical reasons but do not set any other properties that may conflict or significantly change queue behavior and semantics, such as the <a class="" href="queues.html#exclusive-queues">'exclusive' field</a>.</p> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="resource-use">Resource Use<a href="#resource-use" class="hash-link" aria-label="Direct link to Resource Use" title="Direct link to Resource Use" translate="no">​</a>
+</h2> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>Quorum queues have been optimized further in RabbitMQ 4.1.x and now <a href="https://www.rabbitmq.com/blog/2025/04/08/4.1-performance-improvements" target="_blank" rel="noopener noreferrer" class="">feature lower memory footprints and improved consumer delivery rates</a>, parallelism under peak load.</p></div>
+</div> <p>Quorum queues are optimised for data safety and performance. Each quorum queue process maintains an in-memory index of the messages in the queue, which requires at least 32 bytes of metadata for each message (more, if the message was returned or has a TTL set). A quorum queue process will therefore use at least 1MB for every 30000 messages in the queue (message size is irrelevant). You can perform back-of-the-envelope calculations based on the number of queues and expected or maximum number of messages in them). Keeping the queues short is the best way to maintain low memory usage. <a class="" href="maxlength.html">Setting the maximum queue length</a> for all queues is a good way to limit the total memory usage if the queues become long for any reason.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="how-memory-wal-and-segments-files-interact">How Memory, WAL and Segments Files Interact<a href="#how-memory-wal-and-segments-files-interact" class="hash-link" aria-label="Direct link to How Memory, WAL and Segments Files Interact" title="Direct link to How Memory, WAL and Segments Files Interact" translate="no">​</a>
+</h3> <p>Quorum queues on a given node share a write-ahead-log (WAL) for all operations. The WAL contains a limited number of recent operations on the queue. WAL entries are stored both in memory and written to disk. When the current WAL file reaches a predefined limit, it is flushed to segment files on disk for each quorum queue member on a node and the system will begin to release the memory used by that batch of log entries.</p> <p>The segment files are then compacted over time as consumers <a class="" href="confirms.html">acknowledge deliveries</a>. Compaction is the process that reclaims disk space.</p> <p>The WAL file size limit at which it is flushed to disk can be controlled:</p> <div class="language-ini codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-ini codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language=""># Flush current WAL file to a segment file on disk once it reaches 64 MiB in size
+raft.wal_max_size_bytes = 64000000</pre></div></div> <p>The value defaults to 512 MiB. This means that during steady load, the WAL table memory footprint can reach 512 MiB.</p> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>Because memory is not guaranteed to be deallocated instantly by the <a class="" href="runtime.html">runtime</a>, we recommend that the RabbitMQ node is allocated at least 3 times the memory of the effective WAL file size limit. More will be required in high-throughput systems. 4 times is a good starting point for those.</p></div>
+</div> <p>The memory footprint pattern of quorum queues will typically look like this:</p> <figure><p><img decoding="async" loading="lazy" alt="Quorum Queues memory usage pattern" src="data:image/png;base64,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" width="1098" height="294" class="img_ev3q"></p></figure> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="log-compaction">Log Compaction<a href="#log-compaction" class="hash-link" aria-label="Direct link to Log Compaction" title="Direct link to Log Compaction" translate="no">​</a>
+</h3> <p>Quorum queues maintain a log of all operations (enqueues, acknowledgements, etc.). Over time, as consumers acknowledge messages, much of this log data becomes obsolete and can be reclaimed.</p> <p>Starting with RabbitMQ 4.3, quorum queues can now reclaim disk space even if:</p> <ul> <li class="">Messages are acknowledged out of order</li> <li class="">Some messages are retained in the queue for extended periods (e.g., by a slow consumer or held as a delayed retry)</li> <li class="">Acknowledgements arrive at different rates</li> </ul> <p>Previously, a single unacknowledged message could prevent the log from being truncated, leading to unbounded disk growth. With the new log compaction mechanism in Ra v3, the state machine tracks a list of <strong>live raft indexes</strong> (messages that are still unacknowledged or otherwise needed). When a snapshot is taken, the log undergoes compaction:</p> <ol> <li class="">
+<strong>Minor Compaction</strong>: Runs after every snapshot. It identifies and deletes entire segment files that contain zero live entries.</li> <li class="">
+<strong>Major Compaction</strong>: Runs periodically in the background. It consolidates multiple sparse segments by copying only the remaining live entries into new, smaller segments, and deleting the old ones.</li> </ol> <p>This allows the data for acknowledged messages to be omitted from the snapshot and removed from disk, reducing both snapshot size and write amplification, and safely reclaiming disk space.</p> <p>For more technical details on the compaction architecture, see the <a href="https://github.com/rabbitmq/ra/blob/main/docs/internals/COMPACTION.md" target="_blank" rel="noopener noreferrer" class="">Ra Log Compaction documentation</a>.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="snapshot-throttling">Snapshot Throttling<a href="#snapshot-throttling" class="hash-link" aria-label="Direct link to Snapshot Throttling" title="Direct link to Snapshot Throttling" translate="no">​</a>
+</h4> <p>To prevent excessive disk I/O, snapshot frequency is intelligently throttled based on the write-ahead log (WAL) fill ratio. This ensures roughly one snapshot per queue per WAL cycle, optimizing performance for both shallow, fast-flowing queues and deep queues.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="disk-space">Disk Space<a href="#disk-space" class="hash-link" aria-label="Direct link to Disk Space" title="Direct link to Disk Space" translate="no">​</a>
+</h3> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>In environments with heavy quorum queue usage and/or large messages flowing through them, it is very important to overprovision disk space, that is, have the extra spare capacity. This follows the <a class="" href="production-checklist.html#storage">general recommendation for storage</a> for modern release series.</p></div>
+</div> <p>With large messages (say, 1 MiB and higher), quorum queue disk footprint can be large. While RabbitMQ 4.3 significantly improves log compaction, the removal of obsolete data from segment files still requires background processing.</p> <p>This leads to several recommendations:</p> <ol> <li class="">In environments with heavy quorum queue usage and/or large messages flowing through them, it is very important to overprovision disk space, that is, have the extra spare capacity</li> <li class="">While quorum queues no longer strictly require consumers to acknowledge messages in a timely manner to prevent unbounded disk growth, a <a class="" href="consumers.html#acknowledgement-timeout">reasonably low delivery acknowledgement timeout</a> is still recommended to reduce the write amplification overhead of copying unacknowledged messages during major compaction</li> <li class="">Consider using <a href="#delayed-retry" class="">delayed retry</a> to manage message processing with backoff, reducing rapid redelivery loops</li> <li class="">Larger messages can be stored in a blob store as an alternative, with relevant metadata being passed around in messages flowing through quorum queues</li> </ol> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="repeated-requeues">Repeatedly Requeued Deliveries (Deliver-Requeue Loops)<a href="#repeated-requeues" class="hash-link" aria-label="Direct link to Repeatedly Requeued Deliveries (Deliver-Requeue Loops)" title="Direct link to Repeatedly Requeued Deliveries (Deliver-Requeue Loops)" translate="no">​</a>
+</h3> <p>Repeated requeues of the same message (where a consumer continuously rejects or nacks a message with the <code>requeue</code> flag set to true) can happen when a consumer encounters a transient error or is unable to process a message. RabbitMQ provides safeguards to prevent this pattern from causing issues.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="built-in-protections">Built-in Protections<a href="#built-in-protections" class="hash-link" aria-label="Direct link to Built-in Protections" title="Direct link to Built-in Protections" translate="no">​</a>
+</h4> <p>Starting with RabbitMQ 4.0, quorum queues enforce a default <code>delivery-limit</code> of 20 based on <code>delivery-count</code>. When a message's delivery count exceeds this limit, it is either dropped or <a class="" href="dlx.html">dead-lettered</a> (if a DLX is configured).</p> <p>However, it's important to note that <strong>requeue operations may not increment the delivery count</strong>. Requeues without incrementing the counter (such as returns via <code>nack</code> or AMQP 1.0 <code>modify</code> with <code>delivery_failed=false</code>) will not count toward the delivery limit, allowing unlimited requeue loops for application-level routing logic. Only actual failed redeliveries (such as via <code>reject</code>, AMQP 1.0 <code>modify</code> with <code>delivery_failed=true</code>, or when a channel/session is terminated with pending unacknowledged messages) increment the delivery count.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="recommended-approach-delayed-retry">Recommended Approach: Delayed Retry<a href="#recommended-approach-delayed-retry" class="hash-link" aria-label="Direct link to Recommended Approach: Delayed Retry" title="Direct link to Recommended Approach: Delayed Retry" translate="no">​</a>
+</h4> <p>Rather than relying on the delivery limit to catch problematic messages, use <a href="#delayed-retry" class="">delayed retry</a> to implement intelligent backoff:</p> <ul> <li class="">
+<strong>Automatic Backoff</strong>: Delay is applied linearly based on delivery count, reducing server load during transient errors</li> <li class="">
+<strong>Configurable Behavior</strong>: Choose to delay all returns, only failed deliveries, or only explicit returns</li> <li class="">
+<strong>Better Observability</strong>: Monitor delayed message counts in the Management UI to identify problematic consumers</li> <li class="">
+<strong>Flexible Recovery</strong>: Use the timeout mechanism or retry strategies to recover gracefully</li> </ul> <p>This prevents rapid requeue loops from overwhelming the queue and allows the log to be compacted efficiently.</p> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="message-return-behavior-rabbitmq-43">Message Return Behavior (RabbitMQ 4.3+)<a href="#message-return-behavior-rabbitmq-43" class="hash-link" aria-label="Direct link to Message Return Behavior (RabbitMQ 4.3+)" title="Direct link to Message Return Behavior (RabbitMQ 4.3+)" translate="no">​</a>
+</h4> <p>Starting with RabbitMQ 4.3, the delivery limit is explicitly based on <code>delivery-count</code> rather than <code>acquired-count</code>. This means:</p> <ul> <li class="">Unlimited explicit returns (via <code>nack</code> or AMQP 1.0 <code>modify</code> with <code>delivery_failed=false</code>) are allowed without counting toward the delivery limit</li> <li class="">Only actual redeliveries (via <code>reject</code>, AMQP 1.0 <code>modify</code> with <code>delivery_failed=true</code>, or channel/session termination with pending messages) increment the counter</li> <li class="">This provides flexibility for application-level message routing and processing logic</li> </ul> <h4 class="anchor anchorTargetStickyNavbar_Vzrq" id="disabling-the-delivery-limit">Disabling the Delivery Limit<a href="#disabling-the-delivery-limit" class="hash-link" aria-label="Direct link to Disabling the Delivery Limit" title="Direct link to Disabling the Delivery Limit" translate="no">​</a>
+</h4> <p>The default delivery limit can be disabled by setting <code>x-delivery-limit=-1</code> as a queue argument:</p> <div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="">x-delivery-limit = -1</pre></div></div> <p>This is only recommended for compatibility with RabbitMQ 3.13.x behavior in rare cases. Modern deployments should use <a href="#delayed-retry" class="">delayed retry</a> instead.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="atom-use">Increased Atom Use<a href="#atom-use" class="hash-link" aria-label="Direct link to Increased Atom Use" title="Direct link to Increased Atom Use" translate="no">​</a>
+</h3> <p>The internal implementation of quorum queues converts the queue name into an Erlang atom. If queues with arbitrary names are continuously created and deleted it <em>may</em> threaten the long term stability of the RabbitMQ system if the size of the atom table reaches the default limit of 5 million.</p> <p>While quorum queues were not designed to be used in high churn environments (non-mirrored classic queues are the optimal choice for those), the limit can be increased if really necessary.</p> <p>See <a class="" href="runtime.html#atom-usage">the Runtime guide</a> to learn more.</p> <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="performance-tuning">Performance Tuning<a href="#performance-tuning" class="hash-link" aria-label="Direct link to Performance Tuning" title="Direct link to Performance Tuning" translate="no">​</a>
+</h2> <div class="theme-admonition theme-admonition-important admonition_xJq3 alert alert--info">
+<div class="admonitionHeading_Gvgb">
+important</div>
+<div class="admonitionContent_BuS1"><p>Quorum queues have been optimized further in RabbitMQ 4.1.x and now <a href="https://www.rabbitmq.com/blog/2025/04/08/4.1-performance-improvements" target="_blank" rel="noopener noreferrer" class="">feature lower memory footprints and improved consumer delivery rates</a>, parallelism under peak load.</p></div>
+</div> <p>This section aims to cover a couple of tunable parameters that may increase throughput of quorum queues for <strong>some workloads</strong>. Other workloads may not see any increases, or observe decreases in throughput, with these settings.</p> <p>Use the values and recommendations here as a <strong>starting point</strong> and conduct your own benchmark (for example, <a href="https://rabbitmq.github.io/rabbitmq-perf-test/stable/htmlsingle/" target="_blank" rel="noopener noreferrer" class="">using PerfTest</a>) to conclude what combination of values works best for a particular workloads.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="segment-entry-count">Tuning: Raft Segment File Entry Count<a href="#segment-entry-count" class="hash-link" aria-label="Direct link to Tuning: Raft Segment File Entry Count" title="Direct link to Tuning: Raft Segment File Entry Count" translate="no">​</a>
+</h3> <div class="theme-admonition theme-admonition-note admonition_xJq3 alert alert--secondary">
+<div class="admonitionHeading_Gvgb">
+note</div>
+<div class="admonitionContent_BuS1"><p>This tuning parameter is <strong>no longer recommended</strong>. Segments now have a size limit (controlled by <code>quorum_queue.segment_max_size_bytes</code>, which defaults to 64000000 bytes or 64 MB) which is the primary factor in segment management. Increasing the number of entries per segment can negatively impact log compaction efficiency.</p></div>
+</div> <p>In modern RabbitMQ versions, the segment file size is the primary limiting factor for performance and compaction. Manually tuning the entry count can cause segments to become very large before being eligible for compaction, potentially slowing down the removal of obsolete data.</p> <p>If you need to control the maximum size of Raft log segment files for quorum queues, adjust the <code>quorum_queue.segment_max_size_bytes</code> configuration instead.</p> <p>If you are currently using custom <code>raft.segment_max_entries</code> settings in production, consider removing them and relying on the default values and size-based limits.</p> <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="performance-tuning-linux-readahead">Tuning: Linux Readahead<a href="#performance-tuning-linux-readahead" class="hash-link" aria-label="Direct link to Tuning: Linux Readahead" title="Direct link to Tuning: Linux Readahead" translate="no">​</a>
+</h3> <p>In addition, the aforementioned workloads with a higher rate of small messages can benefit from a higher <code>readahead</code>, a configurable block device parameter of storage devices on Linux.</p> <p>To inspect the effective <code>readahead</code> value, use <a href="https://man7.org/linux/man-pages/man8/blockdev.8.html" target="_blank" rel="noopener noreferrer" class=""><code>blockdev --getra</code></a> and specify the block device that hosts RabbitMQ node data directory:</p> <div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash"># This is JUST AN EXAMPLE.
+# The name of the block device in your environment will be different.
+#
+# Displays effective readahead value device /dev/sda.
+sudo blockdev --getra /dev/sda</pre></div></div> <p>To configure <code>readahead</code>, use <a href="https://man7.org/linux/man-pages/man8/blockdev.8.html" target="_blank" rel="noopener noreferrer" class=""><code>blockdev --setra</code></a> for the block device that hosts RabbitMQ node data directory:</p> <div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa" data-language="bash"># This is JUST AN EXAMPLE.
+# The name of the block device in your environment will be different.
+# Values between 256 and 4096 in steps of 256 are most commonly used.
+#
+# Sets readahead for device /dev/sda to 4096.
+sudo blockdev --setra 4096 /dev/sda</pre></div></div><div class="_attribution">
+  <p class="_attribution-p">
+    Copyright &copy; 2005-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.<br />Licensed under the Apache License, Version 2.0.<br>
+    <a href="https://www.rabbitmq.com/docs/quorum-queues" class="_attribution-link">https://www.rabbitmq.com/docs/quorum-queues</a>
+  </p>
+</div>

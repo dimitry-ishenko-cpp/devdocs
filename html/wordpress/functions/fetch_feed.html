@@ -3,8 +3,8 @@
 <dt>
 <code>$url</code><span class="type"><span class="string">string</span>|<span class="string[]">string[]</span></span><span class="required">required</span>
 </dt>
-<dd><div class="desc"><span class="description">URL of feed to retrieve. If an array of URLs, the feeds are merged using SimplePie’s multifeed feature.<br> See also <a href="http://simplepie.org/wiki/faq/typical_multifeed_gotchas">http://simplepie.org/wiki/faq/typical_multifeed_gotchas</a></span></div></dd>
-</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">SimplePieSimplePie|<a href="../classes/wp_error.html" rel="class">WP_Error</a></span> SimplePie object on success or <a href="../classes/wp_error.html" rel="class">WP_Error</a> object on failure.</section> <section><h2 id="more-information">More Information</h2> <p><code>fetch_feed</code> caches results for 12 hours by default. You can modify this by modifying the time interval via the filter <a title="Plugin API/Filter Reference/wp feed cache transient lifetime" href="https://codex.wordpress.org/Plugin_API/Filter_Reference/wp_feed_cache_transient_lifetime">wp_feed_cache_transient_lifetime</a>.</p> </section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="800" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">function fetch_feed( $url ) {
+<dd><div class="desc"><span class="description">URL of feed to retrieve. If an array of URLs, the feeds are merged using SimplePie’s multifeed feature.<br> See also <a href="http://simplepie.org/wiki/faq/typical_multifeed_gotchas/">http://simplepie.org/wiki/faq/typical_multifeed_gotchas</a></span></div></dd>
+</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">SimplePieSimplePie|<a href="../classes/wp_error.html" rel="class">WP_Error</a></span> SimplePie object on success or <a href="../classes/wp_error.html" rel="class">WP_Error</a> object on failure.</section> <section><h2 id="more-information">More Information</h2> <p class="wp-block-paragraph"><code>fetch_feed</code> caches results for 12 hours by default. You can modify this by modifying the time interval via the filter <a title="Plugin API/Filter Reference/wp feed cache transient lifetime" href="https://codex.wordpress.org/Plugin_API/Filter_Reference/wp_feed_cache_transient_lifetime">wp_feed_cache_transient_lifetime</a>.</p> </section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="804" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">function fetch_feed( $url ) {
 	if ( ! class_exists( 'SimplePie\SimplePie', false ) ) {
 		require_once ABSPATH . WPINC . '/class-simplepie.php';
 	}
@@ -15,7 +15,8 @@
 
 	$feed = new SimplePie\SimplePie();
 
-	$feed-&gt;set_sanitize_class( 'WP_SimplePie_Sanitize_KSES' );
+	$feed-&gt;get_registry()-&gt;register( SimplePie\Sanitize::class, 'WP_SimplePie_Sanitize_KSES', true );
+
 	/*
 	 * We must manually overwrite $feed-&gt;sanitize because SimplePie's constructor
 	 * sets it before we have a chance to set the sanitization class.
@@ -32,9 +33,8 @@
 		$feed-&gt;set_cache_class( 'WP_Feed_Cache' );
 	}
 
-	$feed-&gt;set_file_class( 'WP_SimplePie_File' );
+	$feed-&gt;get_registry()-&gt;register( SimplePie\File::class, 'WP_SimplePie_File', true );
 
-	$feed-&gt;set_feed_url( $url );
 	/** This filter is documented in wp-includes/class-wp-feed-cache-transient.php */
 	$feed-&gt;set_cache_duration( apply_filters( 'wp_feed_cache_transient_lifetime', 12 * HOUR_IN_SECONDS, $url ) );
 
@@ -48,6 +48,60 @@
 	 */
 	do_action_ref_array( 'wp_feed_options', array( &amp;$feed, $url ) );
 
+	if ( empty( $url ) ) {
+		/*
+		 * @todo: Set $url to empty string once supported by SimplePie.
+		 *
+		 * The early return without proceeding is to work around a PHP 8.5
+		 * deprecation issue resolved in https://github.com/simplepie/simplepie/pull/949
+		 *
+		 * To avoid the duplicate code, this block can be replaced with `$url = '';` once SimplePie
+		 * is upgraded to a version that includes the fix.
+		 */
+		$feed-&gt;init();
+		$feed-&gt;set_output_encoding( get_bloginfo( 'charset' ) );
+
+		if ( $feed-&gt;error() ) {
+			return new WP_Error( 'simplepie-error', $feed-&gt;error() );
+		}
+
+		return $feed;
+	} elseif ( is_array( $url ) &amp;&amp; count( $url ) === 1 ) {
+		$url = array_shift( $url );
+	} elseif ( is_array( $url ) ) {
+		$feeds            = array();
+		$simplepie_errors = array();
+		foreach ( $url as $feed_url ) {
+			$simplepie_instance = clone $feed;
+			$simplepie_instance-&gt;set_feed_url( $feed_url );
+			$simplepie_instance-&gt;init();
+			$simplepie_instance-&gt;set_output_encoding( get_bloginfo( 'charset' ) );
+
+			if ( $simplepie_instance-&gt;error() ) {
+				$simplepie_errors[] = sprintf(
+					/* translators: %1$s is the feed URL, %2$s is the error message. */
+					__( 'Error fetching feed %1$s: %2$s' ),
+					esc_url( $feed_url ),
+					$simplepie_instance-&gt;error()
+				);
+				unset( $simplepie_instance );
+				continue;
+			}
+
+			$feeds[] = $simplepie_instance;
+			unset( $simplepie_instance );
+		}
+
+		if ( ! empty( $simplepie_errors ) ) {
+			return new WP_Error( 'simplepie-error', $simplepie_errors );
+		}
+
+		$feed-&gt;init();
+		$feed-&gt;data['items'] = SimplePie\SimplePie::merge_items( $feeds );
+		return $feed;
+	}
+
+	$feed-&gt;set_feed_url( $url );
 	$feed-&gt;init();
 	$feed-&gt;set_output_encoding( get_bloginfo( 'charset' ) );
 
@@ -58,14 +112,14 @@
 	return $feed;
 }
 </code></pre>
-<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/feed.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/feed.php#L800">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/feed.php#L800-L852">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/feed.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/feed.php#L804">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/feed.php#L804-L910">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
 <dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../hooks/wp_feed_cache_transient_lifetime.html"><span class="hook-func">apply_filters</span>( ‘wp_feed_cache_transient_lifetime’, <nobr><span class="arg-type">int</span> <span class="arg-name">$lifetime</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$name</span></nobr> )</a></dt>
 <dd>
 <p>Filters the transient lifetime of the feed cache.</p> </dd>
 <dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../hooks/wp_feed_options.html"><span class="hook-func">do_action_ref_array</span>( ‘wp_feed_options’, <nobr><span class="arg-type">SimplePieSimplePie</span> <span class="arg-name">$feed</span></nobr>, <nobr><span class="arg-type">string|string[]</span> <span class="arg-name">$url</span></nobr> )</a></dt>
 <dd>
 <p>Fires just before processing the SimplePie feed object.</p> </dd>
-</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
 <thead><tr>
 <th scope="col">Version</th>
 <th scope="col">Description</th>
@@ -76,7 +130,7 @@
 </tr></tbody>
 </table></figure></section> </section><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
     <a href="https://developer.wordpress.org/reference/functions/fetch_feed" class="_attribution-link">https://developer.wordpress.org/reference/functions/fetch_feed</a>
   </p>
 </div>

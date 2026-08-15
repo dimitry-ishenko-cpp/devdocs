@@ -1,0 +1,316 @@
+<h1 class="wp-block-wporg-code-reference-title">wp_hoist_late_printed_styles()</h1> <section><p>Adds the hooks needed for CSS output to be delayed until after the content of the page has been established.</p> </section> <section><h2 id="description">Description</h2> <h3 id="see-also">See also</h3>
+<ul>
+<li><a href="wp_load_classic_theme_block_styles_on_demand.html">wp_load_classic_theme_block_styles_on_demand()</a></li> <li><a href="_wp_footer_scripts.html">_wp_footer_scripts()</a></li> </ul></section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="3737" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">function wp_hoist_late_printed_styles(): void {
+	// Skip the embed template on-demand styles aren't relevant, and there is no wp_head action.
+	if ( is_embed() ) {
+		return;
+	}
+
+	/*
+	 * Add a placeholder comment into the inline styles for wp-block-library, after which the late block styles
+	 * can be hoisted from the footer to be printed in the header by means of a filter below on the template enhancement
+	 * output buffer.
+	 *
+	 * Note that wp_maybe_inline_styles() prepends the inlined style to the extra 'after' array, which happens after
+	 * this code runs. This ensures that the placeholder appears right after any inlined wp-block-library styles,
+	 * which would be common.css.
+	 */
+	$placeholder = sprintf( '/*%s*/', uniqid( 'wp_block_styles_on_demand_placeholder:' ) );
+	$dependency  = wp_styles()-&gt;query( 'wp-block-library', 'registered' );
+	if ( $dependency ) {
+		if ( ! isset( $dependency-&gt;extra['after'] ) ) {
+			wp_add_inline_style( 'wp-block-library', $placeholder );
+		} else {
+			array_unshift( $dependency-&gt;extra['after'], $placeholder );
+		}
+	}
+
+	/*
+	 * Create a substitute for `print_late_styles()` which is aware of block styles. This substitute does not print
+	 * the styles, but it captures what would be printed for block styles and non-block styles so that they can be
+	 * later hoisted to the HEAD in the template enhancement output buffer. This will run at `wp_print_footer_scripts`
+	 * before `print_footer_scripts()` is called.
+	 */
+	$printed_core_block_styles  = '';
+	$printed_other_block_styles = '';
+	$printed_global_styles      = '';
+	$printed_late_styles        = '';
+
+	$capture_late_styles = static function () use ( &amp;$printed_core_block_styles, &amp;$printed_other_block_styles, &amp;$printed_global_styles, &amp;$printed_late_styles ) {
+		// Gather the styles related to on-demand block enqueues.
+		$all_core_block_style_handles  = array();
+		$all_other_block_style_handles = array();
+		foreach ( WP_Block_Type_Registry::get_instance()-&gt;get_all_registered() as $block_type ) {
+			if ( str_starts_with( $block_type-&gt;name, 'core/' ) ) {
+				foreach ( $block_type-&gt;style_handles as $style_handle ) {
+					$all_core_block_style_handles[] = $style_handle;
+				}
+			} else {
+				foreach ( $block_type-&gt;style_handles as $style_handle ) {
+					$all_other_block_style_handles[] = $style_handle;
+				}
+			}
+		}
+
+		/*
+		 * First print all styles related to core blocks which should be inserted right after the wp-block-library stylesheet
+		 * to preserve the CSS cascade. The logic in this `if` statement is derived from `wp_print_styles()`.
+		 */
+		$enqueued_core_block_styles = array_values( array_intersect( $all_core_block_style_handles, wp_styles()-&gt;queue ) );
+		if ( count( $enqueued_core_block_styles ) &gt; 0 ) {
+			ob_start();
+			wp_styles()-&gt;do_items( $enqueued_core_block_styles );
+			$printed_core_block_styles = (string) ob_get_clean();
+		}
+
+		// Capture non-core block styles so they can get printed at the point where wp_enqueue_registered_block_scripts_and_styles() runs.
+		$enqueued_other_block_styles = array_values( array_intersect( $all_other_block_style_handles, wp_styles()-&gt;queue ) );
+		if ( count( $enqueued_other_block_styles ) &gt; 0 ) {
+			ob_start();
+			wp_styles()-&gt;do_items( $enqueued_other_block_styles );
+			$printed_other_block_styles = (string) ob_get_clean();
+		}
+
+		// Capture the global-styles so that it can be printed at the point where wp_enqueue_global_styles() runs.
+		if ( wp_style_is( 'global-styles' ) ) {
+			ob_start();
+			wp_styles()-&gt;do_items( array( 'global-styles' ) );
+			$printed_global_styles = (string) ob_get_clean();
+		}
+
+		/*
+		 * Print all remaining styles not related to blocks. This contains a subset of the logic from
+		 * `print_late_styles()`, without admin-specific logic and the `print_late_styles` filter to control whether
+		 * late styles are printed (since they are being hoisted anyway).
+		 */
+		ob_start();
+		wp_styles()-&gt;do_footer_items();
+		$printed_late_styles = (string) ob_get_clean();
+	};
+
+	/*
+	 * If `_wp_footer_scripts()` was unhooked from the `wp_print_footer_scripts` action, or if `wp_print_footer_scripts()`
+	 * was unhooked from running at the `wp_footer` action, then only add a callback to `wp_footer` which will capture the
+	 * late-printed styles.
+	 *
+	 * Otherwise, in the normal case where `_wp_footer_scripts()` will run at the `wp_print_footer_scripts` action, then
+	 * swap out `_wp_footer_scripts()` with an alternative which captures the printed styles (for hoisting to HEAD) before
+	 * proceeding with printing the footer scripts.
+	 */
+	$wp_print_footer_scripts_priority = has_action( 'wp_print_footer_scripts', '_wp_footer_scripts' );
+	if ( false === $wp_print_footer_scripts_priority || false === has_action( 'wp_footer', 'wp_print_footer_scripts' ) ) {
+		// The normal priority for wp_print_footer_scripts() is to run at 20.
+		add_action( 'wp_footer', $capture_late_styles, 20 );
+	} else {
+		remove_action( 'wp_print_footer_scripts', '_wp_footer_scripts', $wp_print_footer_scripts_priority );
+		add_action(
+			'wp_print_footer_scripts',
+			static function () use ( $capture_late_styles ) {
+				$capture_late_styles();
+				print_footer_scripts();
+			},
+			$wp_print_footer_scripts_priority
+		);
+	}
+
+	// Replace placeholder with the captured late styles.
+	add_filter(
+		'wp_template_enhancement_output_buffer',
+		static function ( $buffer ) use ( $placeholder, &amp;$printed_core_block_styles, &amp;$printed_other_block_styles, &amp;$printed_global_styles, &amp;$printed_late_styles ) {
+
+			// Anonymous subclass of WP_HTML_Tag_Processor which exposes underlying bookmark spans.
+			$processor = new class( $buffer ) extends WP_HTML_Tag_Processor {
+				/**
+				 * Gets the span for the current token.
+				 *
+				 * @return WP_HTML_Span Current token span.
+				 */
+				private function get_span(): WP_HTML_Span {
+					// Note: This call will never fail according to the usage of this class, given it is always called after ::next_tag() is true.
+					$this-&gt;set_bookmark( 'here' );
+					return $this-&gt;bookmarks['here'];
+				}
+
+				/**
+				 * Inserts text before the current token.
+				 *
+				 * @param string $text Text to insert.
+				 */
+				public function insert_before( string $text ): void {
+					$this-&gt;lexical_updates[] = new WP_HTML_Text_Replacement( $this-&gt;get_span()-&gt;start, 0, $text );
+				}
+
+				/**
+				 * Inserts text after the current token.
+				 *
+				 * @param string $text Text to insert.
+				 */
+				public function insert_after( string $text ): void {
+					$span = $this-&gt;get_span();
+
+					$this-&gt;lexical_updates[] = new WP_HTML_Text_Replacement( $span-&gt;start + $span-&gt;length, 0, $text );
+				}
+
+				/**
+				 * Removes the current token.
+				 */
+				public function remove(): void {
+					$span = $this-&gt;get_span();
+
+					$this-&gt;lexical_updates[] = new WP_HTML_Text_Replacement( $span-&gt;start, $span-&gt;length, '' );
+				}
+
+				/**
+				 * Replaces the current token.
+				 *
+				 * @param string $text Text to replace with.
+				 */
+				public function replace( string $text ): void {
+					$span = $this-&gt;get_span();
+
+					$this-&gt;lexical_updates[] = new WP_HTML_Text_Replacement( $span-&gt;start, $span-&gt;length, $text );
+				}
+			};
+
+			// Locate the insertion points in the HEAD.
+			while ( $processor-&gt;next_tag( array( 'tag_closers' =&gt; 'visit' ) ) ) {
+				if (
+					'STYLE' === $processor-&gt;get_tag() &amp;&amp;
+					'wp-global-styles-placeholder-inline-css' === $processor-&gt;get_attribute( 'id' )
+				) {
+					/** This is added in <a href="wp_enqueue_global_styles.html">wp_enqueue_global_styles()</a> */
+					$processor-&gt;set_bookmark( 'wp_global_styles_placeholder' );
+				} elseif (
+					'STYLE' === $processor-&gt;get_tag() &amp;&amp;
+					'wp-block-styles-placeholder-inline-css' === $processor-&gt;get_attribute( 'id' )
+				) {
+					/** This is added in <a href="wp_enqueue_registered_block_scripts_and_styles.html">wp_enqueue_registered_block_scripts_and_styles()</a> */
+					$processor-&gt;set_bookmark( 'wp_block_styles_placeholder' );
+				} elseif (
+					'STYLE' === $processor-&gt;get_tag() &amp;&amp;
+					'wp-block-library-inline-css' === $processor-&gt;get_attribute( 'id' )
+				) {
+					/** This is added here in <a href="wp_hoist_late_printed_styles.html">wp_hoist_late_printed_styles()</a> */
+					$processor-&gt;set_bookmark( 'wp_block_library' );
+				} elseif ( 'HEAD' === $processor-&gt;get_tag() &amp;&amp; $processor-&gt;is_tag_closer() ) {
+					$processor-&gt;set_bookmark( 'head_end' );
+					break;
+				}
+			}
+
+			/**
+			 * Replace the placeholder for global styles enqueued during <a href="wp_enqueue_global_styles.html">wp_enqueue_global_styles()</a>. This is done
+			 * even if $printed_global_styles is empty.
+			 */
+			if ( $processor-&gt;has_bookmark( 'wp_global_styles_placeholder' ) ) {
+				$processor-&gt;seek( 'wp_global_styles_placeholder' );
+				$processor-&gt;replace( $printed_global_styles );
+				$printed_global_styles = '';
+			}
+
+			/*
+			 * Insert block styles right after wp-block-library (if it is present). The placeholder CSS comment will
+			 * always be added to the wp-block-library inline style since it gets printed at `wp_head` before the blocks
+			 * are rendered. This means that there may not actually be any block styles to hoist from the footer to
+			 * insert after this inline style. The placeholder CSS comment needs to be added so that the inline style
+			 * gets printed, but if the resulting inline style is empty after the placeholder is removed, then the
+			 * inline style is removed.
+			 */
+			if ( $processor-&gt;has_bookmark( 'wp_block_library' ) ) {
+				$processor-&gt;seek( 'wp_block_library' );
+
+				$css_text = $processor-&gt;get_modifiable_text();
+
+				/*
+				 * Split the block library inline style by the placeholder to identify the original inlined CSS, which
+				 * likely would be common.css, followed by any inline styles which had been added by the theme or
+				 * plugins via `wp_add_inline_style( 'wp-block-library', '...' )`. The separate block styles loaded on
+				 * demand will get inserted after the inlined common.css and before the extra inline styles added by the
+				 * user.
+				 */
+				$css_text_around_placeholder = explode( $placeholder, $css_text, 2 );
+				$extra_inline_styles         = '';
+				if ( count( $css_text_around_placeholder ) === 2 ) {
+					$css_text = $css_text_around_placeholder[0];
+					if ( '' !== trim( $css_text ) ) {
+						$inlined_src = wp_styles()-&gt;get_data( 'wp-block-library', 'inlined_src' );
+						if ( $inlined_src ) {
+							$css_text .= sprintf(
+								"\n/*# sourceURL=%s */\n",
+								esc_url_raw( $inlined_src )
+							);
+						}
+					}
+					$extra_inline_styles = $css_text_around_placeholder[1];
+				}
+
+				/*
+				 * The placeholder CSS comment was added to the inline style in order to force an inline STYLE tag to
+				 * be printed. Now that the inline style has been located and the placeholder comment has been removed, if
+				 * there is no CSS left in the STYLE tag after removal, then remove the STYLE tag entirely.
+				 */
+				if ( '' === trim( $css_text ) ) {
+					$processor-&gt;remove();
+				} else {
+					$processor-&gt;set_modifiable_text( $css_text );
+				}
+
+				$inserted_after            = $printed_core_block_styles;
+				$printed_core_block_styles = '';
+
+				/*
+				 * Add a new inline style for any user styles added via wp_add_inline_style( 'wp-block-library', '...' ).
+				 * This must be added here after $printed_core_block_styles to preserve the original CSS cascade when
+				 * the combined block library stylesheet was used. The pattern here is checking to see if it is not just
+				 * a sourceURL comment after the placeholder above is removed.
+				 */
+				if ( ! preg_match( ':^\s*(/\*# sourceURL=\S+? \*/\s*)?$:s', $extra_inline_styles ) ) {
+					$style_processor = new WP_HTML_Tag_Processor( '&lt;style&gt;&lt;/style&gt;' );
+					$style_processor-&gt;next_tag();
+					$style_processor-&gt;set_attribute( 'id', 'wp-block-library-inline-css-extra' );
+					$style_processor-&gt;set_modifiable_text( $extra_inline_styles );
+					$inserted_after .= "{$style_processor-&gt;get_updated_html()}\n";
+				}
+
+				if ( '' !== $inserted_after ) {
+					$processor-&gt;insert_after( "\n" . $inserted_after );
+				}
+			}
+
+			// Insert block styles at the point where wp_enqueue_registered_block_scripts_and_styles() normally enqueues styles.
+			if ( $processor-&gt;has_bookmark( 'wp_block_styles_placeholder' ) ) {
+				$processor-&gt;seek( 'wp_block_styles_placeholder' );
+				if ( '' !== $printed_other_block_styles ) {
+					$processor-&gt;replace( "\n" . $printed_other_block_styles );
+				} else {
+					$processor-&gt;remove();
+				}
+				$printed_other_block_styles = '';
+			}
+
+			// Print all remaining styles.
+			$remaining_styles = $printed_core_block_styles . $printed_other_block_styles . $printed_global_styles . $printed_late_styles;
+			if ( $remaining_styles &amp;&amp; $processor-&gt;has_bookmark( 'head_end' ) ) {
+				$processor-&gt;seek( 'head_end' );
+				$processor-&gt;insert_before( $remaining_styles . "\n" );
+			}
+			return $processor-&gt;get_updated_html();
+		}
+	);
+}
+</code></pre>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/script-loader.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/script-loader.php#L3737">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/script-loader.php#L3737-L4034">View on GitHub</a></p></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
+<thead><tr>
+<th scope="col">Version</th>
+<th scope="col">Description</th>
+</tr></thead>
+<tbody><tr class="">
+<td><a href="https://developer.wordpress.org/reference/since/6.9.0/">6.9.0</a></td>
+<td>Introduced.</td>
+</tr></tbody>
+</table></figure></section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/functions/wp_hoist_late_printed_styles" class="_attribution-link">https://developer.wordpress.org/reference/functions/wp_hoist_late_printed_styles</a>
+  </p>
+</div>

@@ -8,7 +8,7 @@
 <code>$page</code><span class="type"><span class="int">int</span></span><span class="required">required</span>
 </dt>
 <dd><div class="desc"><span class="description">Current query’s page.</span></div></dd>
-</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">array</span> Returns the constructed <a href="../classes/wp_query.html" rel="class">WP_Query</a> arguments.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="2416" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">function build_query_vars_from_query_block( $block, $page ) {
+</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">array</span> Returns the constructed <a href="../classes/wp_query.html" rel="class">WP_Query</a> arguments.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="2697" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">function build_query_vars_from_query_block( $block, $page ) {
 	$query = array(
 		'post_type'    =&gt; 'post',
 		'order'        =&gt; 'DESC',
@@ -36,8 +36,10 @@
 				 */
 				$query['post__in']            = ! empty( $sticky ) ? $sticky : array( 0 );
 				$query['ignore_sticky_posts'] = 1;
-			} else {
+			} elseif ( 'exclude' === $block-&gt;context['query']['sticky'] ) {
 				$query['post__not_in'] = array_merge( $query['post__not_in'], $sticky );
+			} elseif ( 'ignore' === $block-&gt;context['query']['sticky'] ) {
+				$query['ignore_sticky_posts'] = 1;
 			}
 		}
 		if ( ! empty( $block-&gt;context['query']['exclude'] ) ) {
@@ -81,18 +83,60 @@
 			}
 			$query['tax_query'] = array_merge( $query['tax_query'], $tax_query_back_compat );
 		}
-		if ( ! empty( $block-&gt;context['query']['taxQuery'] ) ) {
-			$tax_query = array();
-			foreach ( $block-&gt;context['query']['taxQuery'] as $taxonomy =&gt; $terms ) {
-				if ( is_taxonomy_viewable( $taxonomy ) &amp;&amp; ! empty( $terms ) ) {
-					$tax_query[] = array(
-						'taxonomy'         =&gt; $taxonomy,
-						'terms'            =&gt; array_filter( array_map( 'intval', $terms ) ),
-						'include_children' =&gt; false,
-					);
+
+		if ( ! empty( $block-&gt;context['query']['taxQuery'] ) &amp;&amp; is_array( $block-&gt;context['query']['taxQuery'] ) ) {
+			$tax_query_input = $block-&gt;context['query']['taxQuery'];
+			$tax_query       = array();
+			// If there are keys other than include/exclude, it's the old
+			// format e.g. "taxQuery":{"category":[4]}
+			if ( ! empty( array_diff( array_keys( $tax_query_input ), array( 'include', 'exclude' ) ) ) ) {
+				foreach ( $block-&gt;context['query']['taxQuery'] as $taxonomy =&gt; $terms ) {
+					if ( is_taxonomy_viewable( $taxonomy ) &amp;&amp; ! empty( $terms ) ) {
+						$tax_query[] = array(
+							'taxonomy'         =&gt; $taxonomy,
+							'terms'            =&gt; array_filter( array_map( 'intval', $terms ) ),
+							'include_children' =&gt; false,
+						);
+					}
 				}
+			} else {
+				// This is the new format e.g. "taxQuery":{"include":{"category":[4]},"exclude":{"post_tag":[5]}}
+
+				// Helper function to build tax_query conditions from taxonomy terms.
+				$build_conditions = static function ( $terms, string $operator = 'IN' ): array {
+					$terms      = (array) $terms;
+					$conditions = array();
+					foreach ( $terms as $taxonomy =&gt; $tax_terms ) {
+						if ( ! empty( $tax_terms ) &amp;&amp; is_taxonomy_viewable( $taxonomy ) ) {
+							$conditions[] = array(
+								'taxonomy'         =&gt; $taxonomy,
+								'terms'            =&gt; array_filter( array_map( 'intval', $tax_terms ) ),
+								'operator'         =&gt; $operator,
+								'include_children' =&gt; false,
+							);
+						}
+					}
+					return $conditions;
+				};
+
+				// Separate exclude from include terms.
+				$exclude_terms = isset( $tax_query_input['exclude'] ) &amp;&amp; is_array( $tax_query_input['exclude'] )
+					? $tax_query_input['exclude']
+					: array();
+				$include_terms = isset( $tax_query_input['include'] ) &amp;&amp; is_array( $tax_query_input['include'] )
+					? $tax_query_input['include']
+					: array();
+
+				$tax_query = array_merge(
+					$build_conditions( $include_terms ),
+					$build_conditions( $exclude_terms, 'NOT IN' )
+				);
 			}
-			$query['tax_query'] = array_merge( $query['tax_query'], $tax_query );
+
+			if ( ! empty( $tax_query ) ) {
+				// Merge with any existing `tax_query` conditions.
+				$query['tax_query'] = array_merge( $query['tax_query'], $tax_query );
+			}
 		}
 		if ( ! empty( $block-&gt;context['query']['format'] ) &amp;&amp; is_array( $block-&gt;context['query']['format'] ) ) {
 			$formats = $block-&gt;context['query']['format'];
@@ -185,7 +229,7 @@
 			$query['s'] = $block-&gt;context['query']['search'];
 		}
 		if ( ! empty( $block-&gt;context['query']['parents'] ) &amp;&amp; is_post_type_hierarchical( $query['post_type'] ) ) {
-			$query['post_parent__in'] = array_filter( array_map( 'intval', $block-&gt;context['query']['parents'] ) );
+			$query['post_parent__in'] = array_unique( array_map( 'intval', $block-&gt;context['query']['parents'] ) );
 		}
 	}
 
@@ -212,16 +256,20 @@
 	return apply_filters( 'query_loop_block_query_vars', $query, $block, $page );
 }
 </code></pre>
-<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/blocks.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/blocks.php#L2416">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/blocks.php#L2416-L2618">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/blocks.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/blocks.php#L2697">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/blocks.php#L2697-L2943">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
 <dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../hooks/query_loop_block_query_vars.html"><span class="hook-func">apply_filters</span>( ‘query_loop_block_query_vars’, <nobr><span class="arg-type">array</span> <span class="arg-name">$query</span></nobr>, <nobr><span class="arg-type">WP_Block</span> <span class="arg-name">$block</span></nobr>, <nobr><span class="arg-type">int</span> <span class="arg-name">$page</span></nobr> )</a></dt>
 <dd>
 <p>Filters the arguments which will be passed to <code>WP_Query</code> for the Query Loop Block.</p> </dd>
-</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
 <thead><tr>
 <th scope="col">Version</th>
 <th scope="col">Description</th>
 </tr></thead>
 <tbody>
+<tr class="">
+<td><a href="https://developer.wordpress.org/reference/since/7.0.0/">7.0.0</a></td>
+<td><span class="since-description">Updated <code>taxQuery</code> structure.</span></td>
+</tr>
 <tr class="">
 <td><a href="https://developer.wordpress.org/reference/since/6.7.0/">6.7.0</a></td>
 <td><span class="since-description">Added support for the <code>format</code> property in query.</span></td>
@@ -237,7 +285,7 @@
 </tbody>
 </table></figure></section> </section><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
     <a href="https://developer.wordpress.org/reference/functions/build_query_vars_from_query_block" class="_attribution-link">https://developer.wordpress.org/reference/functions/build_query_vars_from_query_block</a>
   </p>
 </div>

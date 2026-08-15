@@ -1,0 +1,429 @@
+<h1 class="wp-block-wporg-code-reference-title">WP_Block_Processor::next_token(): <span class="return-type">bool</span>
+</h1> <section><p>Advance to the next block delimiter or HTML span in a document, indicating if one was found.</p> </section> <section><h2 id="description">Description</h2> <p>This function steps through every syntactic chunk in a document. This includes explicit block comment delimiters, freeform non-block content, and inner HTML segments.</p> <p>Example tokens:</p> <pre class="wp-block-code" data-language="php"><code lang="php" class="language-php line-numbers">&lt;!-- wp:paragraph {"dropCap": true} --&gt;
+&lt;!-- wp:separator /--&gt;
+&lt;!-- /wp:paragraph --&gt;
+&lt;p&gt;Normal HTML content&lt;/p&gt;
+Plaintext content too!</code></pre> <p>Example:</p> <pre class="wp-block-code" data-language="php"><code lang="php" class="language-php line-numbers">// Find span containing wrapping HTML element surrounding inner blocks.
+$processor = new WP_Block_Processor( $html );
+if ( ! $processor-&gt;next_block( 'gallery' ) ) {
+    return null;
+}
+
+$containing_span = null;
+while ( $processor-&gt;next_token() &amp;&amp; $processor-&gt;is_html() ) {
+    $containing_span = $processor-&gt;get_span();
+}</code></pre> <p>This method will visit all HTML spans including those forming freeform non-block content as well as those which are part of a block’s inner HTML.</p></section> <section><h2 id="return">Return</h2> <span class="return-type">bool</span> Whether a token was matched or the end of the document was reached without finding any.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="736" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function next_token(): bool {
+	if ( $this-&gt;last_error || self::COMPLETE === $this-&gt;state || self::INCOMPLETE_INPUT === $this-&gt;state ) {
+		return false;
+	}
+
+	// Void tokens automatically pop off the stack of open blocks.
+	if ( $this-&gt;was_void ) {
+		array_pop( $this-&gt;open_blocks_at );
+		array_pop( $this-&gt;open_blocks_length );
+		$this-&gt;was_void = false;
+	}
+
+	$text = $this-&gt;source_text;
+	$end  = strlen( $text );
+
+	/*
+	 * Because HTML spans are inferred after finding the next delimiter, it means that
+	 * the parser must transition out of that HTML state and reuse the token boundaries
+	 * it found after the HTML span. If those boundaries are before the end of the
+	 * document it implies that a real delimiter was found; otherwise this must be the
+	 * terminating HTML span and the parsing is complete.
+	 */
+	if ( self::HTML_SPAN === $this-&gt;state ) {
+		if ( $this-&gt;matched_delimiter_at &gt;= $end ) {
+			$this-&gt;state = self::COMPLETE;
+			return false;
+		}
+
+		switch ( $this-&gt;next_stack_op ) {
+			case 'void':
+				$this-&gt;was_void             = true;
+				$this-&gt;open_blocks_at[]     = $this-&gt;namespace_at;
+				$this-&gt;open_blocks_length[] = $this-&gt;name_at + $this-&gt;name_length - $this-&gt;namespace_at;
+				break;
+
+			case 'push':
+				$this-&gt;open_blocks_at[]     = $this-&gt;namespace_at;
+				$this-&gt;open_blocks_length[] = $this-&gt;name_at + $this-&gt;name_length - $this-&gt;namespace_at;
+				break;
+
+			case 'pop':
+				array_pop( $this-&gt;open_blocks_at );
+				array_pop( $this-&gt;open_blocks_length );
+				break;
+		}
+
+		$this-&gt;next_stack_op = null;
+		$this-&gt;state         = self::MATCHED;
+		return true;
+	}
+
+	$this-&gt;state          = self::READY;
+	$after_prev_delimiter = $this-&gt;matched_delimiter_at + $this-&gt;matched_delimiter_length;
+	$at                   = $after_prev_delimiter;
+
+	while ( $at &lt; $end ) {
+		/*
+		 * Find the next possible start of a delimiter.
+		 *
+		 * This follows the behavior in the official block parser, which segments a post
+		 * by the block comment delimiters. It is possible for an HTML attribute to contain
+		 * what looks like a block comment delimiter but which is actually an HTML attribute
+		 * value. In such a case, the parser here will break apart the HTML and create the
+		 * block boundary inside the HTML attribute. In other words, the block parser
+		 * isolates sections of HTML from each other, even if that leads to malformed markup.
+		 *
+		 * For a more robust parse, scan through the document with the HTML API and parse
+		 * comments once they are matched to see if they are also block delimiters. In
+		 * practice, this nuance has not caused any known problems since developing blocks.
+		 *
+		 * &lt;⃨!⃨-⃨-⃨ /wp:core/paragraph {"dropCap":true} /--&gt;
+		 */
+		$comment_opening_at = strpos( $text, '&lt;!--', $at );
+
+		/*
+		 * Even if the start of a potential block delimiter is not found, the document
+		 * might end in a prefix of such, and in that case there is incomplete input.
+		 */
+		if ( false === $comment_opening_at ) {
+			if ( str_ends_with( $text, '&lt;!-' ) ) {
+				$backup = 3;
+			} elseif ( str_ends_with( $text, '&lt;!' ) ) {
+				$backup = 2;
+			} elseif ( str_ends_with( $text, '&lt;' ) ) {
+				$backup = 1;
+			} else {
+				$backup = 0;
+			}
+
+			// Whether or not there is a potential delimiter, there might be an HTML span.
+			if ( $after_prev_delimiter &lt; ( $end - $backup ) ) {
+				$this-&gt;state                    = self::HTML_SPAN;
+				$this-&gt;after_previous_delimiter = $after_prev_delimiter;
+				$this-&gt;matched_delimiter_at     = $end - $backup;
+				$this-&gt;matched_delimiter_length = $backup;
+				$this-&gt;open_blocks_at[]         = $after_prev_delimiter;
+				$this-&gt;open_blocks_length[]     = 0;
+				$this-&gt;was_void                 = true;
+				return true;
+			}
+
+			/*
+			 * In the case that there is the start of an HTML comment, it means that there
+			 * might be a block delimiter, but it’s not possible know, therefore it’s incomplete.
+			 */
+			if ( $backup &gt; 0 ) {
+				goto incomplete;
+			}
+
+			// Otherwise this is the end.
+			$this-&gt;state = self::COMPLETE;
+			return false;
+		}
+
+		// &lt;!-- ⃨/wp:core/paragraph {"dropCap":true} /--&gt;
+		$opening_whitespace_at = $comment_opening_at + 4;
+		if ( $opening_whitespace_at &gt;= $end ) {
+			goto incomplete;
+		}
+
+		$opening_whitespace_length = strspn( $text, " \t\f\r\n", $opening_whitespace_at );
+
+		/*
+		 * The `wp` prefix cannot come before this point, but it may come after it
+		 * depending on the presence of the closer. This is detected next.
+		 */
+		$wp_prefix_at = $opening_whitespace_at + $opening_whitespace_length;
+		if ( $wp_prefix_at &gt;= $end ) {
+			goto incomplete;
+		}
+
+		if ( 0 === $opening_whitespace_length ) {
+			$at = $this-&gt;find_html_comment_end( $comment_opening_at, $end );
+			continue;
+		}
+
+		// &lt;!-- /⃨wp:core/paragraph {"dropCap":true} /--&gt;
+		$has_closer = false;
+		if ( '/' === $text[ $wp_prefix_at ] ) {
+			$has_closer = true;
+			++$wp_prefix_at;
+		}
+
+		// &lt;!-- /w⃨p⃨:⃨core/paragraph {"dropCap":true} /--&gt;
+		if ( $wp_prefix_at &lt; $end &amp;&amp; 0 !== substr_compare( $text, 'wp:', $wp_prefix_at, 3 ) ) {
+			if (
+				( $wp_prefix_at + 2 &gt;= $end &amp;&amp; str_ends_with( $text, 'wp' ) ) ||
+				( $wp_prefix_at + 1 &gt;= $end &amp;&amp; str_ends_with( $text, 'w' ) )
+			) {
+				goto incomplete;
+			}
+
+			$at = $this-&gt;find_html_comment_end( $comment_opening_at, $end );
+			continue;
+		}
+
+		/*
+		 * If the block contains no namespace, this will end up masquerading with
+		 * the block name. It’s easier to first detect the span and then determine
+		 * if it’s a namespace of a name.
+		 *
+		 * &lt;!-- /wp:c⃨o⃨r⃨e⃨/paragraph {"dropCap":true} /--&gt;
+		 */
+		$namespace_at = $wp_prefix_at + 3;
+		if ( $namespace_at &gt;= $end ) {
+			goto incomplete;
+		}
+
+		$start_of_namespace = $text[ $namespace_at ];
+
+		// The namespace must start with a-z.
+		if ( 'a' &gt; $start_of_namespace || 'z' &lt; $start_of_namespace ) {
+			$at = $this-&gt;find_html_comment_end( $comment_opening_at, $end );
+			continue;
+		}
+
+		$namespace_length = 1 + strspn( $text, 'abcdefghijklmnopqrstuvwxyz0123456789-_', $namespace_at + 1 );
+		$separator_at     = $namespace_at + $namespace_length;
+		if ( $separator_at &gt;= $end ) {
+			goto incomplete;
+		}
+
+		// &lt;!-- /wp:core/⃨paragraph {"dropCap":true} /--&gt;
+		$has_separator = '/' === $text[ $separator_at ];
+		if ( $has_separator ) {
+			$name_at = $separator_at + 1;
+
+			if ( $name_at &gt;= $end ) {
+				goto incomplete;
+			}
+
+			// &lt;!-- /wp:core/p⃨a⃨r⃨a⃨g⃨r⃨a⃨p⃨h⃨ {"dropCap":true} /--&gt;
+			$start_of_name = $text[ $name_at ];
+			if ( 'a' &gt; $start_of_name || 'z' &lt; $start_of_name ) {
+				$at = $this-&gt;find_html_comment_end( $comment_opening_at, $end );
+				continue;
+			}
+
+			$name_length = 1 + strspn( $text, 'abcdefghijklmnopqrstuvwxyz0123456789-_', $name_at + 1 );
+		} else {
+			$name_at     = $namespace_at;
+			$name_length = $namespace_length;
+		}
+
+		if ( $name_at + $name_length &gt;= $end ) {
+			goto incomplete;
+		}
+
+		/*
+		 * For this next section of the delimiter, it could be the JSON attributes
+		 * or it could be the end of the comment. Assume that the JSON is there and
+		 * update if it’s not.
+		 */
+
+		// &lt;!-- /wp:core/paragraph ⃨{"dropCap":true} /--&gt;
+		$after_name_whitespace_at     = $name_at + $name_length;
+		$after_name_whitespace_length = strspn( $text, " \t\f\r\n", $after_name_whitespace_at );
+		$json_at                      = $after_name_whitespace_at + $after_name_whitespace_length;
+
+		if ( $json_at &gt;= $end ) {
+			goto incomplete;
+		}
+
+		if ( 0 === $after_name_whitespace_length ) {
+			$at = $this-&gt;find_html_comment_end( $comment_opening_at, $end );
+			continue;
+		}
+
+		// &lt;!-- /wp:core/paragraph {⃨"dropCap":true} /--&gt;
+		$has_json    = '{' === $text[ $json_at ];
+		$json_length = 0;
+
+		/*
+		 * For the final span of the delimiter it's most efficient to find the end of the
+		 * HTML comment and work backwards. This prevents complicated parsing inside the
+		 * JSON span, which is not allowed to contain the HTML comment terminator.
+		 *
+		 * This also matches the behavior in the official block parser,
+		 * even though it allows for matching invalid JSON content.
+		 *
+		 * &lt;!-- /wp:core/paragraph {"dropCap":true} /-⃨-⃨&gt;⃨
+		 */
+		$comment_closing_at = strpos( $text, '--&gt;', $json_at );
+		if ( false === $comment_closing_at ) {
+			goto incomplete;
+		}
+
+		// &lt;!-- /wp:core/paragraph {"dropCap":true} /⃨--&gt;
+		if ( '/' === $text[ $comment_closing_at - 1 ] ) {
+			$has_void_flag    = true;
+			$void_flag_length = 1;
+		} else {
+			$has_void_flag    = false;
+			$void_flag_length = 0;
+		}
+
+		/*
+		 * If there's no JSON, then the span of text after the name
+		 * until the comment closing must be completely whitespace.
+		 * Otherwise it’s a normal HTML comment.
+		 */
+		if ( ! $has_json ) {
+			if ( $after_name_whitespace_at + $after_name_whitespace_length === $comment_closing_at - $void_flag_length ) {
+				// This must be a block delimiter!
+				$this-&gt;state = self::MATCHED;
+				break;
+			}
+
+			$at = $this-&gt;find_html_comment_end( $comment_opening_at, $end );
+			continue;
+		}
+
+		/*
+		 * There's JSON, so attempt to find its boundary.
+		 *
+		 * @todo It’s likely faster to scan forward instead of in reverse.
+		 *
+		 * &lt;!-- /wp:core/paragraph {"dropCap":true}⃨ ⃨/--&gt;
+		 */
+		$after_json_whitespace_length = 0;
+		for ( $char_at = $comment_closing_at - $void_flag_length - 1; $char_at &gt; $json_at; $char_at-- ) {
+			$char = $text[ $char_at ];
+
+			switch ( $char ) {
+				case ' ':
+				case "\t":
+				case "\f":
+				case "\r":
+				case "\n":
+					++$after_json_whitespace_length;
+					continue 2;
+
+				case '}':
+					$json_length = $char_at - $json_at + 1;
+					break 2;
+
+				default:
+					++$at;
+					continue 3;
+			}
+		}
+
+		/*
+		 * This covers cases where there is no terminating “}” or where
+		 * mandatory whitespace is missing.
+		 */
+		if ( 0 === $json_length || 0 === $after_json_whitespace_length ) {
+			$at = $this-&gt;find_html_comment_end( $comment_opening_at, $end );
+			continue;
+		}
+
+		// This must be a block delimiter!
+		$this-&gt;state = self::MATCHED;
+		break;
+	}
+
+	// The end of the document was reached without a match.
+	if ( self::MATCHED !== $this-&gt;state ) {
+		$this-&gt;state = self::COMPLETE;
+		return false;
+	}
+
+	/*
+	 * From this point forward, a delimiter has been matched. There
+	 * might also be an HTML span that appears before the delimiter.
+	 */
+
+	$this-&gt;after_previous_delimiter = $after_prev_delimiter;
+
+	$this-&gt;matched_delimiter_at     = $comment_opening_at;
+	$this-&gt;matched_delimiter_length = $comment_closing_at + 3 - $comment_opening_at;
+
+	$this-&gt;namespace_at = $namespace_at;
+	$this-&gt;name_at      = $name_at;
+	$this-&gt;name_length  = $name_length;
+
+	$this-&gt;json_at     = $json_at;
+	$this-&gt;json_length = $json_length;
+
+	/*
+	 * When delimiters contain both the void flag and the closing flag
+	 * they shall be interpreted as void blocks, per the spec parser.
+	 */
+	if ( $has_void_flag ) {
+		$this-&gt;type          = self::VOID;
+		$this-&gt;next_stack_op = 'void';
+	} elseif ( $has_closer ) {
+		$this-&gt;type          = self::CLOSER;
+		$this-&gt;next_stack_op = 'pop';
+
+		/*
+		 * @todo Check if the name matches and bail according to the spec parser.
+		 *       The default parser doesn’t examine the names.
+		 */
+	} else {
+		$this-&gt;type          = self::OPENER;
+		$this-&gt;next_stack_op = 'push';
+	}
+
+	$this-&gt;has_closing_flag = $has_closer;
+
+	// HTML spans are visited before the delimiter that follows them.
+	if ( $comment_opening_at &gt; $after_prev_delimiter ) {
+		$this-&gt;state                = self::HTML_SPAN;
+		$this-&gt;open_blocks_at[]     = $after_prev_delimiter;
+		$this-&gt;open_blocks_length[] = 0;
+		$this-&gt;was_void             = true;
+
+		return true;
+	}
+
+	// If there were no HTML spans then flush the enqueued stack operations immediately.
+	switch ( $this-&gt;next_stack_op ) {
+		case 'void':
+			$this-&gt;was_void             = true;
+			$this-&gt;open_blocks_at[]     = $namespace_at;
+			$this-&gt;open_blocks_length[] = $name_at + $name_length - $namespace_at;
+			break;
+
+		case 'push':
+			$this-&gt;open_blocks_at[]     = $namespace_at;
+			$this-&gt;open_blocks_length[] = $name_at + $name_length - $namespace_at;
+			break;
+
+		case 'pop':
+			array_pop( $this-&gt;open_blocks_at );
+			array_pop( $this-&gt;open_blocks_length );
+			break;
+	}
+
+	$this-&gt;next_stack_op = null;
+
+	return true;
+
+	incomplete:
+	$this-&gt;state      = self::COMPLETE;
+	$this-&gt;last_error = self::INCOMPLETE_INPUT;
+	return false;
+}
+</code></pre>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-block-processor.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/class-wp-block-processor.php#L736">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/class-wp-block-processor.php#L736-L1134">View on GitHub</a></p></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
+<thead><tr>
+<th scope="col">Version</th>
+<th scope="col">Description</th>
+</tr></thead>
+<tbody><tr class="">
+<td><a href="https://developer.wordpress.org/reference/since/6.9.0/">6.9.0</a></td>
+<td>Introduced.</td>
+</tr></tbody>
+</table></figure></section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_block_processor/next_token" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_block_processor/next_token</a>
+  </p>
+</div>

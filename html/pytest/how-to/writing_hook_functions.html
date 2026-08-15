@@ -1,0 +1,126 @@
+<h1 id="writinghooks">Writing hook functions</h1> <section id="hook-function-validation-and-execution"> <h2 id="validation">hook function validation and execution</h2> <p>pytest calls hook functions from registered plugins for any given hook specification. Let’s look at a typical hook function for the <code>pytest_collection_modifyitems(session, config,
+items)</code> hook which pytest calls after collection of all test items is completed.</p> <p>When we implement a <code>pytest_collection_modifyitems</code> function in our plugin pytest will during registration verify that you use argument names which match the specification and bail out if not.</p> <p>Let’s look at a possible implementation:</p> <pre data-language="python">def pytest_collection_modifyitems(config, items):
+    # called after collection is completed
+    # you can modify the ``items`` list
+    ...
+</pre> <p>Here, <code>pytest</code> will pass in <code>config</code> (the pytest config object) and <code>items</code> (the list of collected test items) but will not pass in the <code>session</code> argument because we didn’t list it in the function signature. This dynamic “pruning” of arguments allows <code>pytest</code> to be “future-compatible”: we can introduce new hook named parameters without breaking the signatures of existing hook implementations. It is one of the reasons for the general long-lived compatibility of pytest plugins.</p> <p>Note that hook functions other than <code>pytest_runtest_*</code> are not allowed to raise exceptions. Doing so will break the pytest run.</p> </section> <section id="firstresult-stop-at-first-non-none-result"> <h2 id="firstresult">firstresult: stop at first non-None result</h2> <p>Most calls to <code>pytest</code> hooks result in a <strong>list of results</strong> which contains all non-None results of the called hook functions.</p> <p>Some hook specifications use the <code>firstresult=True</code> option so that the hook call only executes until the first of N registered functions returns a non-None result which is then taken as result of the overall hook call. The remaining hook functions will not be called in this case.</p> </section> <section id="hook-wrappers-executing-around-other-hooks"> <h2 id="hookwrapper">hook wrappers: executing around other hooks</h2> <p>pytest plugins can implement hook wrappers which wrap the execution of other hook implementations. A hook wrapper is a generator function which yields exactly once. When pytest invokes hooks it first executes hook wrappers and passes the same arguments as to the regular hooks.</p> <p>At the yield point of the hook wrapper pytest will execute the next hook implementations and return their result to the yield point, or will propagate an exception if they raised.</p> <p>Here is an example definition of a hook wrapper:</p> <pre data-language="python">import pytest
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_pyfunc_call(pyfuncitem):
+    do_something_before_next_hook_executes()
+
+    # If the outcome is an exception, will raise the exception.
+    res = yield
+
+    new_res = post_process_result(res)
+
+    # Override the return value to the plugin system.
+    return new_res
+</pre> <p>The hook wrapper needs to return a result for the hook, or raise an exception.</p> <p>In many cases, the wrapper only needs to perform tracing or other side effects around the actual hook implementations, in which case it can return the result value of the <code>yield</code>. The simplest (though useless) hook wrapper is <code>return (yield)</code>.</p> <p>In other cases, the wrapper wants to adjust or adapt the result, in which case it can return a new value. If the result of the underlying hook is a mutable object, the wrapper may modify that result, but it’s probably better to avoid it.</p> <p>If the hook implementation failed with an exception, the wrapper can handle that exception using a <code>try-catch-finally</code> around the <code>yield</code>, by propagating it, suppressing it, or raising a different exception entirely.</p> <p>For more information, consult the <a class="reference external" href="https://pluggy.readthedocs.io/en/stable/index.html#hookwrappers" title="(in pluggy v0.1)"><span class="xref std std-ref">pluggy documentation about hook wrappers</span></a>.</p> </section> <section id="hook-function-ordering-call-example"> <h2 id="plugin-hookorder">Hook function ordering / call example</h2> <p>For any given hook specification there may be more than one implementation and we thus generally view <code>hook</code> execution as a <code>1:N</code> function call where <code>N</code> is the number of registered functions. There are ways to influence if a hook implementation comes before or after others, i.e. the position in the <code>N</code>-sized list of functions:</p> <pre data-language="python"># Plugin 1
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    # will execute as early as possible
+    ...
+
+
+# Plugin 2
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(items):
+    # will execute as late as possible
+    ...
+
+
+# Plugin 3
+@pytest.hookimpl(wrapper=True)
+def pytest_collection_modifyitems(items):
+    # will execute even before the tryfirst one above!
+    try:
+        return (yield)
+    finally:
+        # will execute after all non-wrappers executed
+        ...
+</pre> <p>Here is the order of execution:</p> <ol class="arabic simple"> <li>Plugin3’s pytest_collection_modifyitems called until the yield point because it is a hook wrapper.</li> <li>Plugin1’s pytest_collection_modifyitems is called because it is marked with <code>tryfirst=True</code>.</li> <li>Plugin2’s pytest_collection_modifyitems is called because it is marked with <code>trylast=True</code> (but even without this mark it would come after Plugin1).</li> <li>Plugin3’s pytest_collection_modifyitems then executing the code after the yield point. The yield receives the result from calling the non-wrappers, or raises an exception if the non-wrappers raised.</li> </ol> <p>It’s possible to use <code>tryfirst</code> and <code>trylast</code> also on hook wrappers in which case it will influence the ordering of hook wrappers among each other.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>pytest only searches for hook implementations whose names start with <code>pytest_</code>. The <code>specname</code> argument to <code>@pytest.hookimpl</code> can be used to give an implementation a different suffix, for example <code>pytest_collection_modifyitems_tryfirst</code>, but the function name still needs to start with <code>pytest_</code>. A hook implementation named <code>my_collection_modifyitems</code> is ignored even if it is decorated with <code>@pytest.hookimpl(specname="pytest_collection_modifyitems")</code>.</p> </div> </section> <section id="declaring-new-hooks"> <h2 id="declaringhooks">Declaring new hooks</h2> <div class="admonition note"> <p class="admonition-title">Note</p> <p>This is a quick overview on how to add new hooks and how they work in general, but a more complete overview can be found in <a class="reference external" href="https://pluggy.readthedocs.io/en/latest/">the pluggy documentation</a>.</p> </div> <p>Plugins and <code>conftest.py</code> files may declare new hooks that can then be implemented by other plugins in order to alter behaviour or interact with the new plugin:</p> <dl class="py function"> <dt class="sig sig-object py"> <span class="sig-name descname">pytest_addhooks</span><span class="sig-paren">(</span><em class="sig-param"><span class="n">pluginmanager</span></em><span class="sig-paren">)</span>
+</dt> <dd>
+<p>Called at plugin registration time to allow adding new hooks via a call to <a class="reference internal" href="../reference/reference.html#pytest.PytestPluginManager.add_hookspecs" title="pytest.PytestPluginManager.add_hookspecs"><code>pluginmanager.add_hookspecs(module_or_class, prefix)</code></a>.</p> <dl class="field-list simple"> <dt class="field-odd">Parameters<span class="colon">:</span>
+</dt> <dd class="field-odd">
+<p><strong>pluginmanager</strong> – The pytest plugin manager.</p> </dd> </dl> <div class="admonition note"> <p class="admonition-title">Note</p> <p>This hook is incompatible with hook wrappers.</p> </div> <section id="use-in-conftest-plugins"> <h3>Use in conftest plugins</h3> <p>If a conftest plugin implements this hook, it will be called immediately when the conftest is registered.</p> </section> </dd>
+</dl> <p>Hooks are usually declared as do-nothing functions that contain only documentation describing when the hook will be called and what return values are expected. The names of the functions must start with <code>pytest_</code> otherwise pytest won’t recognize them.</p> <p>Here’s an example. Let’s assume this code is in the <code>sample_hook.py</code> module.</p> <pre data-language="python">def pytest_my_hook(config):
+    """
+    Receives the pytest config and does things with it
+    """
+</pre> <p>To register the hooks with pytest they need to be structured in their own module or class. This class or module can then be passed to the <code>pluginmanager</code> using the <code>pytest_addhooks</code> function (which itself is a hook exposed by pytest).</p> <pre data-language="python">def pytest_addhooks(pluginmanager):
+    """This example assumes the hooks are grouped in the 'sample_hook' module."""
+    from my_app.tests import sample_hook
+
+    pluginmanager.add_hookspecs(sample_hook)
+</pre> <p>For a real world example, see <a class="reference external" href="https://github.com/pytest-dev/pytest-xdist/blob/v3.8.0/src/xdist/newhooks.py">newhooks.py</a> from <a class="reference external" href="https://github.com/pytest-dev/pytest-xdist">xdist</a>.</p> <p>Hooks may be called both from fixtures or from other hooks. In both cases, hooks are called through the <code>hook</code> object, available in the <code>config</code> object. Most hooks receive a <code>config</code> object directly, while fixtures may use the <code>pytestconfig</code> fixture which provides the same object.</p> <pre data-language="python">@pytest.fixture()
+def my_fixture(pytestconfig):
+    # call the hook called "pytest_my_hook"
+    # 'result' will be a list of return values from all registered functions.
+    result = pytestconfig.hook.pytest_my_hook(config=pytestconfig)
+</pre> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Hooks receive parameters using only keyword arguments.</p> </div> <p>Now your hook is ready to be used. To register a function at the hook, other plugins or users must now simply define the function <code>pytest_my_hook</code> with the correct signature in their <code>conftest.py</code>.</p> <p>Example:</p> <pre data-language="python">def pytest_my_hook(config):
+    """
+    Print all active hooks to the screen.
+    """
+    print(config.hook)
+</pre> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Unlike other hooks, the <a class="reference internal" href="../reference/reference.html#std-hook-pytest_generate_tests"><code>pytest_generate_tests</code></a> hook is also discovered when defined inside a test module or test class. Other hooks must live in <a class="reference internal" href="writing_plugins.html#localplugin"><span class="std std-ref">conftest.py plugins</span></a> or external plugins. See <a class="reference internal" href="parametrize.html#parametrize-basics"><span class="std std-ref">How to parametrize fixtures and test functions</span></a> and the <a class="reference internal" href="../reference/reference.html#hook-reference"><span class="std std-ref">Hooks</span></a>.</p> </div> </section> <section id="using-hooks-in-pytest-addoption"> <h2 id="addoptionhooks">Using hooks in pytest_addoption</h2> <p>Occasionally, it is necessary to change the way in which command line options are defined by one plugin based on hooks in another plugin. For example, a plugin may expose a command line option for which another plugin needs to define the default value. The pluginmanager can be used to install and use hooks to accomplish this. The plugin would define and add the hooks and use pytest_addoption as follows:</p> <pre data-language="python"># contents of hooks.py
+
+
+# Use firstresult=True because we only want one plugin to define this
+# default value
+@hookspec(firstresult=True)
+def pytest_config_file_default_value():
+    """Return the default value for the config file command line option."""
+
+
+# contents of myplugin.py
+
+
+def pytest_addhooks(pluginmanager):
+    """This example assumes the hooks are grouped in the 'hooks' module."""
+    from . import hooks
+
+    pluginmanager.add_hookspecs(hooks)
+
+
+def pytest_addoption(parser, pluginmanager):
+    default_value = pluginmanager.hook.pytest_config_file_default_value()
+    parser.addoption(
+        "--config-file",
+        help="Config file to use, defaults to %(default)s",
+        default=default_value,
+    )
+</pre> <p>Another plugin (installed via setuptools entry points, or via the <code>-p</code> command-line option) could then define the hook implementation to provide the default value:</p> <pre data-language="python"># contents of third_party_plugin.py
+
+
+def pytest_config_file_default_value():
+    return "config.yaml"
+</pre> <div class="admonition note"> <p class="admonition-title">Note</p> <p><strong>Hook implementations in conftest.py files are not available to other plugins during</strong> <strong>their</strong> <code>pytest_addoption()</code> <strong>execution</strong>. This is because conftest.py files are discovered and loaded <em>after</em> builtin plugins, third-party plugins, and command-line plugins have already been initialized (including the execution of their <code>pytest_addoption()</code> hooks).</p> <p>However, <a class="reference internal" href="writing_plugins.html#pluginorder"><span class="std std-ref">initial conftest files</span></a> themselves <em>can</em> implement <code>pytest_addoption()</code> to add their own command-line options. When an initial conftest is loaded, its <code>pytest_addoption()</code> hook will be called immediately.</p> <p>During a plugin’s <code>pytest_addoption()</code> execution, only hook implementations from plugins that were loaded earlier will be available. These include:</p> <ul class="simple"> <li>builtin plugins</li> <li>plugins explicitly loaded with <code>-p</code> on the command line</li> <li>installed third-party plugins (via setuptools entry points)</li> <li>plugins specified via the <code>PYTEST_PLUGINS</code> environment variable</li> </ul> <p>See <a class="reference internal" href="writing_plugins.html#pluginorder"><span class="std std-ref">Plugin discovery order at tool startup</span></a> for the complete plugin discovery order.</p> </div> </section> <section id="optionally-using-hooks-from-3rd-party-plugins"> <h2>Optionally using hooks from 3rd party plugins</h2> <p>Using new hooks from plugins as explained above might be a little tricky because of the standard <a class="reference internal" href="#validation"><span class="std std-ref">validation mechanism</span></a>: if you depend on a plugin that is not installed, validation will fail and the error message will not make much sense to your users.</p> <p>One approach is to defer the hook implementation to a new plugin instead of declaring the hook functions directly in your plugin module, for example:</p> <pre data-language="python"># contents of myplugin.py
+
+
+class DeferPlugin:
+    """Simple plugin to defer pytest-xdist hook functions."""
+
+    def pytest_testnodedown(self, node, error):
+        """standard xdist hook function."""
+
+
+def pytest_configure(config):
+    if config.pluginmanager.hasplugin("xdist"):
+        config.pluginmanager.register(DeferPlugin())
+</pre> <p>This has the added benefit of allowing you to conditionally install hooks depending on which plugins are installed.</p> </section> <section id="storing-data-on-items-across-hook-functions"> <h2 id="plugin-stash">Storing data on items across hook functions</h2> <p>Plugins often need to store data on <a class="reference internal" href="../reference/reference.html#pytest.Item" title="pytest.Item"><code>Item</code></a>s in one hook implementation, and access it in another. One common solution is to just assign some private attribute directly on the item, but type-checkers like mypy frown upon this, and it may also cause conflicts with other plugins. So pytest offers a better way to do this, <a class="reference internal" href="../reference/reference.html#pytest.nodes.Node.stash" title="_pytest.nodes.Node.stash"><code>item.stash</code></a>.</p> <p>To use the “stash” in your plugins, first create “stash keys” somewhere at the top level of your plugin:</p> <pre data-language="python">been_there_key = pytest.StashKey[bool]()
+done_that_key = pytest.StashKey[str]()
+</pre> <p>then use the keys to stash your data at some point:</p> <pre data-language="python">def pytest_runtest_setup(item: pytest.Item) -&gt; None:
+    item.stash[been_there_key] = True
+    item.stash[done_that_key] = "no"
+</pre> <p>and retrieve them at another point:</p> <pre data-language="python">def pytest_runtest_teardown(item: pytest.Item) -&gt; None:
+    if not item.stash[been_there_key]:
+        print("Oh?")
+    item.stash[done_that_key] = "yes!"
+</pre> <p>Stashes are available on all node types (like <a class="reference internal" href="../reference/reference.html#pytest.Class" title="pytest.Class"><code>Class</code></a>, <a class="reference internal" href="../reference/reference.html#pytest.Session" title="pytest.Session"><code>Session</code></a>) and also on <a class="reference internal" href="../reference/reference.html#pytest.Config" title="pytest.Config"><code>Config</code></a>, if needed.</p> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2015&ndash;2026 Holger Krekel and pytest-dev team<br>Licensed under the MIT License.<br>
+    <a href="https://docs.pytest.org/en/stable/how-to/writing_hook_functions.html" class="_attribution-link">https://docs.pytest.org/en/stable/how-to/writing_hook_functions.html</a>
+  </p>
+</div>

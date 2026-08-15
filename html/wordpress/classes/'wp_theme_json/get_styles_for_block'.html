@@ -1,0 +1,303 @@
+<h1 class="wp-block-wporg-code-reference-title">WP_Theme_JSON::get_styles_for_block( <span class="arg-type">array</span> <span class="arg-name">$block_metadata</span> ): <span class="return-type">string</span>
+</h1> <section><p>Gets the CSS rules for a particular block from theme.json.</p> </section> <section><h2 id="parameters">Parameters</h2> <dl>
+<dt>
+<code>$block_metadata</code><span class="type"><span class="array">array</span></span><span class="required">required</span>
+</dt>
+<dd><div class="desc"><span class="description">Metadata about the block to get styles for.</span></div></dd>
+</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">string</span> Styles for the block.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="2949" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function get_styles_for_block( $block_metadata ) {
+	$node                 = _wp_array_get( $this-&gt;theme_json, $block_metadata['path'], array() );
+	$use_root_padding     = isset( $this-&gt;theme_json['settings']['useRootPaddingAwareAlignments'] ) &amp;&amp; true === $this-&gt;theme_json['settings']['useRootPaddingAwareAlignments'];
+	$selector             = $block_metadata['selector'];
+	$settings             = $this-&gt;theme_json['settings'] ?? array();
+	$feature_declarations = static::get_feature_declarations_for_node( $block_metadata, $node );
+	$is_root_selector     = static::ROOT_BLOCK_SELECTOR === $selector;
+
+	// Update text indent selector for paragraph blocks based on the textIndent setting.
+	$block_name           = $block_metadata['name'] ?? null;
+	$feature_declarations = static::update_paragraph_text_indent_selector( $feature_declarations, $settings, $block_name );
+
+	// If there are style variations, generate the declarations for them, including any feature selectors the block may have.
+	$style_variation_declarations    = array();
+	$style_variation_custom_css      = array();
+	$style_variation_layout_metadata = array();
+	if ( ! empty( $block_metadata['variations'] ) ) {
+		foreach ( $block_metadata['variations'] as $style_variation ) {
+			$style_variation_node           = _wp_array_get( $this-&gt;theme_json, $style_variation['path'], array() );
+			$clean_style_variation_selector = trim( $style_variation['selector'] );
+
+			// Generate any feature/subfeature style declarations for the current style variation.
+			$variation_declarations = static::get_feature_declarations_for_node( $block_metadata, $style_variation_node );
+
+			// Update text indent selector for paragraph blocks based on the textIndent setting.
+			$variation_declarations = static::update_paragraph_text_indent_selector( $variation_declarations, $settings, $block_name );
+
+			// Combine selectors with style variation's selector and add to overall style variation declarations.
+			foreach ( $variation_declarations as $current_selector =&gt; $new_declarations ) {
+				/*
+				 * Clean up any whitespace between comma separated selectors.
+				 * This prevents these spaces breaking compound selectors such as:
+				 * - `.wp-block-list:not(.wp-block-list .wp-block-list)`
+				 * - `.wp-block-image img, .wp-block-image.my-class img`
+				 */
+				$clean_current_selector = preg_replace( '/,\s+/', ',', $current_selector );
+				$shortened_selector     = str_replace( $block_metadata['selector'], '', $clean_current_selector );
+
+				// Prepend the variation selector to the current selector.
+				$split_selectors    = explode( ',', $shortened_selector );
+				$updated_selectors  = array_map(
+					static function ( $split_selector ) use ( $clean_style_variation_selector ) {
+						return $clean_style_variation_selector . $split_selector;
+					},
+					$split_selectors
+				);
+				$combined_selectors = implode( ',', $updated_selectors );
+
+				// Add the new declarations to the overall results under the modified selector.
+				$style_variation_declarations[ $combined_selectors ] = $new_declarations;
+			}
+
+			// Compute declarations for remaining styles not covered by feature level selectors.
+			$style_variation_declarations[ $style_variation['selector'] ] = static::compute_style_properties( $style_variation_node, $settings, null, $this-&gt;theme_json );
+
+			// Process pseudo-selectors for this variation (e.g., :hover, :focus)
+			if ( isset( $block_metadata['name'] ) ) {
+				$block_name = $block_metadata['name'];
+			} elseif ( in_array( 'blocks', $block_metadata['path'], true ) &amp;&amp; count( $block_metadata['path'] ) &gt;= 3 ) {
+				$block_name = $block_metadata['path'][2];
+			} else {
+				$block_name = null;
+			}
+			$variation_pseudo_declarations = static::process_pseudo_selectors( $style_variation_node, $style_variation['selector'], $settings, $block_name );
+			$style_variation_declarations  = array_merge( $style_variation_declarations, $variation_pseudo_declarations );
+
+			// Store custom CSS for the style variation.
+			if ( isset( $style_variation_node['css'] ) ) {
+				$style_variation_custom_css[ $style_variation['selector'] ] = $this-&gt;process_blocks_custom_css( $style_variation_node['css'], $style_variation['selector'] );
+			}
+
+			// Store variation metadata and node for layout styles generation.
+			// Only store if the variation has blockGap defined.
+			if ( isset( $style_variation_node['spacing']['blockGap'] ) ) {
+				// Append block selector to the variation selector for proper targeting.
+				$variation_metadata_with_selector                                = $style_variation;
+				$variation_metadata_with_selector['selector']                    = $style_variation['selector'] . $block_metadata['css'];
+				$style_variation_layout_metadata[ $style_variation['selector'] ] = array(
+					'metadata' =&gt; $variation_metadata_with_selector,
+					'node'     =&gt; $style_variation_node,
+				);
+			}
+		}
+	}
+	/*
+	 * Get a reference to element name from path.
+	 * $block_metadata['path'] = array( 'styles','elements','link' );
+	 * Make sure that $block_metadata['path'] describes an element node, like [ 'styles', 'element', 'link' ].
+	 * Skip non-element paths like just ['styles'].
+	 */
+	$is_processing_element = in_array( 'elements', $block_metadata['path'], true );
+
+	$current_element = $is_processing_element ? $block_metadata['path'][ count( $block_metadata['path'] ) - 1 ] : null;
+
+	$element_pseudo_allowed = array();
+
+	if ( isset( $current_element, static::VALID_ELEMENT_PSEUDO_SELECTORS[ $current_element ] ) ) {
+		$element_pseudo_allowed = static::VALID_ELEMENT_PSEUDO_SELECTORS[ $current_element ];
+	}
+
+	/*
+	 * Check if we're processing a block pseudo-selector.
+	 * $block_metadata['path'] = array( 'styles', 'blocks', 'core/button', ':hover' );
+	 */
+	$is_processing_block_pseudo = false;
+	$block_pseudo_selector      = null;
+	if ( in_array( 'blocks', $block_metadata['path'], true ) &amp;&amp; count( $block_metadata['path'] ) &gt;= 4 ) {
+		$block_name        = $block_metadata['path'][2]; // 'core/button'
+		$last_path_element = $block_metadata['path'][ count( $block_metadata['path'] ) - 1 ]; // ':hover'
+
+		if ( isset( static::VALID_BLOCK_PSEUDO_SELECTORS[ $block_name ] ) &amp;&amp;
+			in_array( $last_path_element, static::VALID_BLOCK_PSEUDO_SELECTORS[ $block_name ], true ) ) {
+			$is_processing_block_pseudo = true;
+			$block_pseudo_selector      = $last_path_element;
+		}
+	}
+
+	/*
+	 * Check for allowed pseudo classes (e.g. ":hover") from the $selector ("a:hover").
+	 * This also resets the array keys.
+	 */
+	$pseudo_matches = array_values(
+		array_filter(
+			$element_pseudo_allowed,
+			static function ( $pseudo_selector ) use ( $selector ) {
+				/*
+				 * Check if the pseudo selector is in the current selector,
+				 * ensuring it is not followed by a dash (e.g., :focus should not match :focus-visible).
+				 */
+				return preg_match( '/' . preg_quote( $pseudo_selector, '/' ) . '(?!-)/', $selector ) === 1;
+			}
+		)
+	);
+
+	$pseudo_selector = $pseudo_matches[0] ?? null;
+
+	/*
+	 * If the current selector is a pseudo selector that's defined in the allow list for the current
+	 * element then compute the style properties for it.
+	 * Otherwise just compute the styles for the default selector as normal.
+	 */
+	if ( $pseudo_selector &amp;&amp; isset( $node[ $pseudo_selector ] ) &amp;&amp;
+		isset( static::VALID_ELEMENT_PSEUDO_SELECTORS[ $current_element ] )
+		&amp;&amp; in_array( $pseudo_selector, static::VALID_ELEMENT_PSEUDO_SELECTORS[ $current_element ], true )
+	) {
+		$declarations = static::compute_style_properties( $node[ $pseudo_selector ], $settings, null, $this-&gt;theme_json, $selector, $use_root_padding );
+	} elseif ( $is_processing_block_pseudo ) {
+		// Process block pseudo-selector styles
+		// For block pseudo-selectors, we need to get the block data first, then access the pseudo-selector
+		$block_name  = $block_metadata['path'][2]; // 'core/button'
+		$block_data  = _wp_array_get( $this-&gt;theme_json, array( 'styles', 'blocks', $block_name ), array() );
+		$pseudo_data = $block_data[ $block_pseudo_selector ] ?? array();
+
+		$declarations = static::compute_style_properties( $pseudo_data, $settings, null, $this-&gt;theme_json, $selector, $use_root_padding );
+	} else {
+		$declarations = static::compute_style_properties( $node, $settings, null, $this-&gt;theme_json, $selector, $use_root_padding );
+	}
+
+	$block_rules = '';
+
+	/*
+	 * 1. Bespoke declaration modifiers:
+	 * - 'filter': Separate the declarations that use the general selector
+	 * from the ones using the duotone selector.
+	 * - 'background|background-image': set the html min-height to 100%
+	 * to ensure the background covers the entire viewport.
+	 */
+	$declarations_duotone       = array();
+	$should_set_root_min_height = false;
+
+	foreach ( $declarations as $index =&gt; $declaration ) {
+		if ( 'filter' === $declaration['name'] ) {
+			/*
+			 * 'unset' filters happen when a filter is unset
+			 * in the site-editor UI. Because the 'unset' value
+			 * in the user origin overrides the value in the
+			 * theme origin, we can skip rendering anything
+			 * here as no filter needs to be applied anymore.
+			 * So only add declarations to with values other
+			 * than 'unset'.
+			 */
+			if ( 'unset' !== $declaration['value'] ) {
+				$declarations_duotone[] = $declaration;
+			}
+			unset( $declarations[ $index ] );
+		}
+
+		if ( $is_root_selector &amp;&amp; ( 'background-image' === $declaration['name'] || 'background' === $declaration['name'] ) ) {
+			$should_set_root_min_height = true;
+		}
+	}
+
+	/*
+	 * If root styles has a background-image or a background (gradient) set,
+	 * set the min-height to '100%'. Minus `--wp-admin--admin-bar--height` for logged-in view.
+	 * Setting the CSS rule on the HTML tag ensures background gradients and images behave similarly,
+	 * and matches the behavior of the site editor.
+	 */
+	if ( $should_set_root_min_height ) {
+		$block_rules .= static::to_ruleset(
+			'html',
+			array(
+				array(
+					'name'  =&gt; 'min-height',
+					'value' =&gt; 'calc(100% - var(--wp-admin--admin-bar--height, 0px))',
+				),
+			)
+		);
+	}
+
+	// Update declarations if there are separators with only background color defined.
+	if ( '.wp-block-separator' === $selector ) {
+		$declarations = static::update_separator_declarations( $declarations );
+	}
+
+	/*
+	 * Root selector (body) styles should not be wrapped in `:root where()` to keep
+	 * specificity at (0,0,1) and maintain backwards compatibility.
+	 *
+	 * Top-level element styles using element-only specificity selectors should
+	 * not get wrapped in `:root :where()` to maintain backwards compatibility.
+	 *
+	 * Pseudo classes, e.g. :hover, :focus etc., are a class-level selector so
+	 * still need to be wrapped in `:root :where` to cap specificity for nested
+	 * variations etc. Pseudo selectors won't match the ELEMENTS selector exactly.
+	 */
+	$element_only_selector = $is_root_selector || (
+		$current_element &amp;&amp;
+		isset( static::ELEMENTS[ $current_element ] ) &amp;&amp;
+		// buttons, captions etc. still need `:root :where()` as they are class based selectors.
+		! isset( static::__EXPERIMENTAL_ELEMENT_CLASS_NAMES[ $current_element ] ) &amp;&amp;
+		static::ELEMENTS[ $current_element ] === $selector
+	);
+
+	// 2. Generate and append the rules that use the general selector.
+	$general_selector = $element_only_selector ? $selector : ":root :where($selector)";
+	$block_rules     .= static::to_ruleset( $general_selector, $declarations );
+
+	// 3. Generate and append the rules that use the duotone selector.
+	if ( isset( $block_metadata['duotone'] ) &amp;&amp; ! empty( $declarations_duotone ) ) {
+		$block_rules .= static::to_ruleset( $block_metadata['duotone'], $declarations_duotone );
+	}
+
+	// 4. Generate Layout block gap styles.
+	if (
+		! $is_root_selector &amp;&amp;
+		! empty( $block_metadata['name'] )
+	) {
+		$block_rules .= $this-&gt;get_layout_styles( $block_metadata );
+	}
+
+	// 5. Generate and append the feature level rulesets.
+	foreach ( $feature_declarations as $feature_selector =&gt; $individual_feature_declarations ) {
+		$block_rules .= static::to_ruleset( ":root :where($feature_selector)", $individual_feature_declarations );
+	}
+
+	// 6. Generate and append the style variation rulesets.
+	foreach ( $style_variation_declarations as $style_variation_selector =&gt; $individual_style_variation_declarations ) {
+		$block_rules .= static::to_ruleset( ":root :where($style_variation_selector)", $individual_style_variation_declarations );
+		if ( isset( $style_variation_layout_metadata[ $style_variation_selector ] ) ) {
+			$variation_data = $style_variation_layout_metadata[ $style_variation_selector ];
+			$block_rules   .= $this-&gt;get_layout_styles( $variation_data['metadata'], array( 'node' =&gt; $variation_data['node'] ) );
+		}
+		if ( isset( $style_variation_custom_css[ $style_variation_selector ] ) ) {
+			$block_rules .= $style_variation_custom_css[ $style_variation_selector ];
+		}
+	}
+
+	// 7. Generate and append any custom CSS rules.
+	if ( isset( $node['css'] ) &amp;&amp; ! $is_root_selector ) {
+		$block_rules .= $this-&gt;process_blocks_custom_css( $node['css'], $selector );
+	}
+
+	return $block_rules;
+}
+</code></pre>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-theme-json.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/class-wp-theme-json.php#L2949">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/class-wp-theme-json.php#L2949-L3223">View on GitHub</a></p></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
+<thead><tr>
+<th scope="col">Version</th>
+<th scope="col">Description</th>
+</tr></thead>
+<tbody>
+<tr class="">
+<td><a href="https://developer.wordpress.org/reference/since/6.6.0/">6.6.0</a></td>
+<td><span class="since-description">Setting a min-height of HTML when root styles have a background gradient or image.<br> Updated general global styles specificity to 0-1-0.<br> Fixed custom CSS output in block style variations.</span></td>
+</tr>
+<tr class="">
+<td><a href="https://developer.wordpress.org/reference/since/6.1.0/">6.1.0</a></td>
+<td>Introduced.</td>
+</tr>
+</tbody>
+</table></figure></section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/'WP_Theme_JSON/get_styles_for_block'" class="_attribution-link">https://developer.wordpress.org/reference/classes/'WP_Theme_JSON/get_styles_for_block'</a>
+  </p>
+</div>

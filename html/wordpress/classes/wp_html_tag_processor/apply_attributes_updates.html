@@ -4,96 +4,96 @@
 <code>$shift_this_point</code><span class="type"><span class="int">int</span></span><span class="required">required</span>
 </dt>
 <dd><div class="desc"><span class="description">Accumulate and return shift for this position.</span></div></dd>
-</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">int</span> How many bytes the given pointer moved in response to the updates.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="2268" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers"> * @see WP_HTML_Tag_Processor::$lexical_updates
- * @see WP_HTML_Tag_Processor::$classname_updates
+</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">int</span> How many bytes the given pointer moved in response to the updates.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="2497" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">
+/**
+ * Applies attribute updates to HTML document.
+ *
+ * @since 6.2.0
+ * @since 6.2.1 Accumulates shift for internal cursor and passed pointer.
+ * @since 6.3.0 Invalidate any bookmarks whose targets are overwritten.
+ * @ignore
+ *
+ * @param int $shift_this_point Accumulate and return shift for this position.
+ * @return int How many bytes the given pointer moved in response to the updates.
  */
-private function class_name_updates_to_attributes_updates(): void {
-	if ( count( $this-&gt;classname_updates ) === 0 ) {
-		return;
+private function apply_attributes_updates( int $shift_this_point ): int {
+	if ( ! count( $this-&gt;lexical_updates ) ) {
+		return 0;
 	}
 
-	$existing_class = $this-&gt;get_enqueued_attribute_value( 'class' );
-	if ( null === $existing_class || true === $existing_class ) {
-		$existing_class = '';
-	}
+	$accumulated_shift_for_given_point = 0;
 
-	if ( false === $existing_class &amp;&amp; isset( $this-&gt;attributes['class'] ) ) {
-		$existing_class = substr(
-			$this-&gt;html,
-			$this-&gt;attributes['class']-&gt;value_starts_at,
-			$this-&gt;attributes['class']-&gt;value_length
-		);
-	}
-
-	if ( false === $existing_class ) {
-		$existing_class = '';
-	}
-
-	/**
-	 * Updated "class" attribute value.
+	/*
+	 * Attribute updates can be enqueued in any order but updates
+	 * to the document must occur in lexical order; that is, each
+	 * replacement must be made before all others which follow it
+	 * at later string indices in the input document.
 	 *
-	 * This is incrementally built while scanning through the existing class
-	 * attribute, skipping removed classes on the way, and then appending
-	 * added classes at the end. Only when finished processing will the
-	 * value contain the final new value.
-
-	 * @var string $class
+	 * Sorting avoid making out-of-order replacements which
+	 * can lead to mangled output, partially-duplicated
+	 * attributes, and overwritten attributes.
 	 */
-	$class = '';
+	usort( $this-&gt;lexical_updates, array( self::class, 'sort_start_ascending' ) );
 
-	/**
-	 * Tracks the cursor position in the existing
-	 * class attribute value while parsing.
-	 *
-	 * @var int $at
-	 */
-	$at = 0;
+	$bytes_already_copied = 0;
+	$output_buffer        = '';
+	foreach ( $this-&gt;lexical_updates as $diff ) {
+		$shift = strlen( $diff-&gt;text ) - $diff-&gt;length;
 
-	/**
-	 * Indicates if there's any need to modify the existing class attribute.
-	 *
-	 * If a call to `add_class()` and `remove_class()` wouldn't impact
-	 * the `class` attribute value then there's no need to rebuild it.
-	 * For example, when adding a class that's already present or
-	 * removing one that isn't.
-	 *
-	 * This flag enables a performance optimization when none of the enqueued
-	 * class updates would impact the `class` attribute; namely, that the
-	 * processor can continue without modifying the input document, as if
-	 * none of the `add_class()` or `remove_class()` calls had been made.
-	 *
-	 * This flag is set upon the first change that requires a string update.
-	 *
-	 * @var bool $modified
-	 */
-	$modified = false;
-
-	$seen      = array();
-	$to_remove = array();
-	$is_quirks = self::QUIRKS_MODE === $this-&gt;compat_mode;
-	if ( $is_quirks ) {
-		foreach ( $this-&gt;classname_updates as $updated_name =&gt; $action ) {
-			if ( self::REMOVE_CLASS === $action ) {
-				$to_remove[] = strtolower( $updated_name );
-			}
+		// Adjust the cursor position by however much an update affects it.
+		if ( $diff-&gt;start &lt; $this-&gt;bytes_already_parsed ) {
+			$this-&gt;bytes_already_parsed += $shift;
 		}
-	} else {
-		foreach ( $this-&gt;classname_updates as $updated_name =&gt; $action ) {
-			if ( self::REMOVE_CLASS === $action ) {
-				$to_remove[] = $updated_name;
-			}
+
+		// Accumulate shift of the given pointer within this function call.
+		if ( $diff-&gt;start &lt; $shift_this_point ) {
+			$accumulated_shift_for_given_point += $shift;
 		}
+
+		$output_buffer       .= substr( $this-&gt;html, $bytes_already_copied, $diff-&gt;start - $bytes_already_copied );
+		$output_buffer       .= $diff-&gt;text;
+		$bytes_already_copied = $diff-&gt;start + $diff-&gt;length;
 	}
 
-	// Remove unwanted classes by only copying the new ones.
-	$existing_class_length = strlen( $existing_class );
-	while ( $at &lt; $existing_class_length ) {
-		// Skip to the first non-whitespace character.
-		$ws_at     = $at;
-		$ws_length = strspn( $existing_class, " \t\f\r\n", $ws_at );
-		$at       += $ws_length;
+	$this-&gt;html = $output_buffer . substr( $this-&gt;html, $bytes_already_copied );
+
+	/*
+	 * Adjust bookmark locations to account for how the text
+	 * replacements adjust offsets in the input document.
+	 */
+	foreach ( $this-&gt;bookmarks as $bookmark_name =&gt; $bookmark ) {
+		$bookmark_end = $bookmark-&gt;start + $bookmark-&gt;length;
+
+		/*
+		 * Each lexical update which appears before the bookmark's endpoints
+		 * might shift the offsets for those endpoints. Loop through each change
+		 * and accumulate the total shift for each bookmark, then apply that
+		 * shift after tallying the full delta.
+		 */
+		$head_delta = 0;
+		$tail_delta = 0;
+
+		foreach ( $this-&gt;lexical_updates as $diff ) {
+			$diff_end = $diff-&gt;start + $diff-&gt;length;
+
+			if ( $bookmark-&gt;start &lt; $diff-&gt;start &amp;&amp; $bookmark_end &lt; $diff-&gt;start ) {
+				break;
+			}
+
+			if ( $bookmark-&gt;start &gt;= $diff-&gt;start &amp;&amp; $bookmark_end &lt; $diff_end ) {
+				$this-&gt;release_bookmark( $bookmark_name );
+				continue 2;
+			}
+
+			$delta = strlen( $diff-&gt;text ) - $diff-&gt;length;
+
+			if ( $bookmark-&gt;start &gt;= $diff-&gt;start ) {
+				$head_delta += $delta;
+			}
+
+			if ( $bookmark_end &gt;= $diff_end ) {
 </code></pre>
-<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/html-api/class-wp-html-tag-processor.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/html-api/class-wp-html-tag-processor.php#L2268">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/html-api/class-wp-html-tag-processor.php#L2268-L2355">View on GitHub</a></p></section> <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/html-api/class-wp-html-tag-processor.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/html-api/class-wp-html-tag-processor.php#L2497">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/html-api/class-wp-html-tag-processor.php#L2497-L2584">View on GitHub</a></p></section> <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
 <thead><tr>
 <th scope="col">Version</th>
 <th scope="col">Description</th>
@@ -114,7 +114,7 @@ private function class_name_updates_to_attributes_updates(): void {
 </tbody>
 </table></figure></section> </section><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
     <a href="https://developer.wordpress.org/reference/classes/wp_html_tag_processor/apply_attributes_updates" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_html_tag_processor/apply_attributes_updates</a>
   </p>
 </div>

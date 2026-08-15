@@ -39,6 +39,7 @@
 		'author_exclude' =&gt; 'author__not_in',
 		'exclude'        =&gt; 'post__not_in',
 		'include'        =&gt; 'post__in',
+		'ignore_sticky'  =&gt; 'ignore_sticky_posts',
 		'menu_order'     =&gt; 'menu_order',
 		'offset'         =&gt; 'offset',
 		'order'          =&gt; 'order',
@@ -129,6 +130,14 @@
 		}
 	}
 
+	/*
+	 * Honor the original REST API `post__in` behavior. Don't prepend sticky posts
+	 * when `post__in` has been specified.
+	 */
+	if ( ! empty( $args['post__in'] ) ) {
+		unset( $args['ignore_sticky_posts'] );
+	}
+
 	if (
 		isset( $registered['search_semantics'], $request['search_semantics'] )
 		&amp;&amp; 'exact' === $request['search_semantics']
@@ -138,7 +147,7 @@
 
 	$args = $this-&gt;prepare_tax_query( $args, $request );
 
-	if ( ! empty( $request['format'] ) ) {
+	if ( isset( $registered['format'], $request['format'] ) ) {
 		$formats = $request['format'];
 		/*
 		 * The relation needs to be set to `OR` since the request can contain
@@ -194,6 +203,15 @@
 	// Force the post_type argument, since it's not a user input variable.
 	$args['post_type'] = $this-&gt;post_type;
 
+	$is_head_request = $request-&gt;is_method( 'HEAD' );
+	if ( $is_head_request ) {
+		// Force the 'fields' argument. For HEAD requests, only post IDs are required to calculate pagination.
+		$args['fields'] = 'ids';
+		// Disable priming post meta for HEAD requests to improve performance.
+		$args['update_post_term_cache'] = false;
+		$args['update_post_meta_cache'] = false;
+	}
+
 	/**
 	 * Filters WP_Query arguments when querying posts via the REST API.
 	 *
@@ -215,7 +233,10 @@
 	 * @param array           $args    Array of arguments for WP_Query.
 	 * @param WP_REST_Request $request The REST API request.
 	 */
-	$args       = apply_filters( "rest_{$this-&gt;post_type}_query", $args, $request );
+	$args = apply_filters( "rest_{$this-&gt;post_type}_query", $args, $request );
+	if ( ! is_array( $args ) ) {
+		$args = array();
+	}
 	$query_args = $this-&gt;prepare_items_query( $args, $request );
 
 	$posts_query  = new WP_Query();
@@ -226,22 +247,30 @@
 		add_filter( 'post_password_required', array( $this, 'check_password_required' ), 10, 2 );
 	}
 
-	$posts = array();
+	if ( ! $is_head_request ) {
+		$posts = array();
 
-	update_post_author_caches( $query_result );
-	update_post_parent_caches( $query_result );
+		update_post_author_caches( $query_result );
+		update_post_parent_caches( $query_result );
 
-	if ( post_type_supports( $this-&gt;post_type, 'thumbnail' ) ) {
-		update_post_thumbnail_cache( $posts_query );
-	}
-
-	foreach ( $query_result as $post ) {
-		if ( ! $this-&gt;check_read_permission( $post ) ) {
-			continue;
+		if ( post_type_supports( $this-&gt;post_type, 'thumbnail' ) ) {
+			update_post_thumbnail_cache( $posts_query );
 		}
 
-		$data    = $this-&gt;prepare_item_for_response( $post, $request );
-		$posts[] = $this-&gt;prepare_response_for_collection( $data );
+		foreach ( $query_result as $post ) {
+			if ( 'edit' === $request['context'] ) {
+				$permission = $this-&gt;check_update_permission( $post );
+			} else {
+				$permission = $this-&gt;check_read_permission( $post );
+			}
+
+			if ( ! $permission ) {
+				continue;
+			}
+
+			$data    = $this-&gt;prepare_item_for_response( $post, $request );
+			$posts[] = $this-&gt;prepare_response_for_collection( $data );
+		}
 	}
 
 	// Reset filter.
@@ -249,14 +278,19 @@
 		remove_filter( 'post_password_required', array( $this, 'check_password_required' ) );
 	}
 
-	$page        = (int) $query_args['paged'];
+	$page        = (int) ( $query_args['paged'] ?? 0 );
 	$total_posts = $posts_query-&gt;found_posts;
 
 	if ( $total_posts &lt; 1 &amp;&amp; $page &gt; 1 ) {
-		// Out-of-bounds, run the query again without LIMIT for total count.
+		// Out-of-bounds, run the query without pagination/offset to get the total count.
 		unset( $query_args['paged'] );
 
-		$count_query = new WP_Query();
+		$count_query                          = new WP_Query();
+		$query_args['fields']                 = 'ids';
+		$query_args['posts_per_page']         = 1;
+		$query_args['update_post_meta_cache'] = false;
+		$query_args['update_post_term_cache'] = false;
+
 		$count_query-&gt;query( $query_args );
 		$total_posts = $count_query-&gt;found_posts;
 	}
@@ -271,7 +305,7 @@
 		);
 	}
 
-	$response = rest_ensure_response( $posts );
+	$response = $is_head_request ? new WP_REST_Response( array() ) : rest_ensure_response( $posts );
 
 	$response-&gt;header( 'X-WP-Total', (int) $total_posts );
 	$response-&gt;header( 'X-WP-TotalPages', (int) $max_pages );
@@ -300,11 +334,11 @@
 	return $response;
 }
 </code></pre>
-<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/rest-api/endpoints/class-wp-rest-posts-controller.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/rest-api/endpoints/class-wp-rest-posts-controller.php#L215">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/rest-api/endpoints/class-wp-rest-posts-controller.php#L215-L509">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/rest-api/endpoints/class-wp-rest-posts-controller.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/rest-api/endpoints/class-wp-rest-posts-controller.php#L215">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/rest-api/endpoints/class-wp-rest-posts-controller.php#L215-L543">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
 <dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../../hooks/rest_this-post_type_query.html"><span class="hook-func">apply_filters</span>( “rest_{$this-&gt;post_type}_query”, <nobr><span class="arg-type">array</span> <span class="arg-name">$args</span></nobr>, <nobr><span class="arg-type">WP_REST_Request</span> <span class="arg-name">$request</span></nobr> )</a></dt>
 <dd>
 <p>Filters <a href="../wp_query.html" rel="class">WP_Query</a> arguments when querying posts via the REST API.</p> </dd>
-</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
 <thead><tr>
 <th scope="col">Version</th>
 <th scope="col">Description</th>
@@ -315,7 +349,7 @@
 </tr></tbody>
 </table></figure></section> </section><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
     <a href="https://developer.wordpress.org/reference/classes/wp_rest_posts_controller/get_items" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_rest_posts_controller/get_items</a>
   </p>
 </div>

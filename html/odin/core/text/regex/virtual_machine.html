@@ -1,0 +1,212 @@
+<article class="col-lg-8 p-4 documentation odin-article">  <h1>package core:text/regex/virtual_machine</h1>    <div id="pkg-top"> <h2>Overview</h2> <div id="pkg-overview"> <p>A threaded virtual machine for interpreting regular expressions. Based on the designs described by Russ Cox and attributed to both Ken Thompson and Rob Pike.</p> <p>The virtual machine executes all threads in lock step, i.e. the string pointer does not advance until all threads have finished processing the current rune. The algorithm does not look backwards.</p> <p>Threads merge when splitting or jumping to positions already visited by another thread, based on the observation that each thread having visited one PC (Program Counter) state will execute identically to the previous thread.</p> <p>Each thread keeps a save state of its capture groups, and thread priority is used to allow higher precedence operations to complete first with correct save states, such as greedy versus non-greedy repetition.</p> <p>For more information, see: https://swtch.com/~rsc/regexp/regexp2.html</p> <p><b>Implementation Details:</b></p> <p><span class="doc-list">Each opcode is 8 bits in size, and most instructions have no operands.</span></p> <p><span class="doc-list">All operands larger than <code>u8</code> are read in system endian order.</span></p> <p><span class="doc-list">Jump and Split instructions operate on absolute positions in <code>u16</code> operands.</span></p> <p><span class="doc-list">Classes such as <code>[0-9]</code> are stored in a RegEx-specific slice of structs which</span> are then dereferenced by a <code>u8</code> index from the <code>Rune_Class</code> instructions.</p> <p><span class="doc-list">Each Byte and Rune opcode have their operands stored inline after the opcode,</span> sized <code>u8</code> and <code>i32</code> respectively.</p> <p><span class="doc-list">A bitmap is used to determine which PC positions are occupied by a thread to</span> perform merging. The bitmap is cleared with every new frame.</p> <p><span class="doc-list">The VM supports two modes: ASCII and Unicode, decided by a compile-time</span> boolean constant argument provided to <code>run</code>. The procedure differs only in string decoding. This was done for the sake of performance.</p> <p><span class="doc-list">No allocations are ever freed; the VM expects an arena or temporary allocator</span> to be used in the context preceding it.</p> <p><b>Opcode Reference:</b></p> <pre>(0x00) Match
+
+The terminal opcode which ends a thread. This always comes at the end of
+the program.
+
+(0x01) Match_And_Exit
+
+A modified version of Match which stops the virtual machine entirely. It is
+only compiled for `No_Capture` expressions, as those expressions do not
+need to determine which thread may have saved the most appropriate capture
+groups.
+
+(0x02) Byte
+
+Consumes one byte from the text using its operand, which is also a byte.
+
+(0x03) Rune
+
+Consumes one Unicode codepoint from the text using its operand, which is
+four bytes long in a system-dependent endian order.
+
+(0x04) Rune_Class
+
+Consumes one character (which may be an ASCII byte or Unicode codepoint,
+wholly dependent on which mode the virtual machine is running in) from the
+text.
+
+The actual data storing what runes and ranges of runes apply to the class
+are stored alongside the program in the Regular_Expression structure and
+the operand for this opcode is a single byte which indexes into a
+collection of these data structures.
+
+(0x05) Rune_Class_Negated
+
+A modified version of Rune_Class that functions the same, save for how it
+returns the opposite of what Rune_Class matches.
+
+(0x06) Wildcard
+
+Consumes one byte or one Unicode codepoint, depending on the VM mode.
+
+(0x07) Jump
+
+Sets the Program Counter of a VM thread to the operand, which is a u16.
+This opcode is used to implement Alternation (coming at the end of the left
+choice) and Repeat_Zero (to cause the thread to loop backwards).
+
+(0x08) Split
+
+Spawns a new thread for the X operand and causes the current thread to jump
+to the Y operand. This opcode is used to implement Alternation, all the
+Repeat variations, and the Optional nodes.
+
+Splitting threads is how the virtual machine is able to execute optional
+control flow paths, letting it evaluate different possible ways to match
+text.
+
+(0x09) Save
+
+Saves the current string index to a slot on the thread dictated by the
+operand. These values will be used later to reconstruct capture groups.
+
+(0x0A) Assert_Start
+
+Asserts that the thread is at the beginning of the string.
+
+(0x0B) Assert_Start_Multiline
+
+This opcode is compiled in only when the `Multiline` flag is present as a
+replacement for the `^` text anchor.
+
+Asserts that the thread is at the beginning of the string or previously
+parsed either a "\n" or "\r".
+
+(0x0C) Assert_End
+
+Asserts that the thread is at the end of the string.
+
+(0x0D) Assert_Word_Boundary
+
+Asserts that the thread is on a word boundary, which can be the start or
+end of the text. This examines both the current rune and the next rune.
+
+(0x0E) Assert_Non_Word_Boundary
+
+A modified version of Assert_Word_Boundary that returns the opposite value.
+
+(0x0F) Multiline_Open
+
+This opcode is compiled in only when the `Multiline` flag is present as a
+replacement for the `$` text anchor.
+
+It asserts that either the current thread is at the end of the string,
+or it consumes a `\n` or `\r` character.
+
+If a `\r` character is consumed, the PC will be advanced to the sibling
+`Multiline_Close` opcode to optionally consume a `\n` character on the next
+frame.
+
+(0x10) Multiline_Close
+
+This opcode is always present after `Multiline_Open`.
+
+It handles consuming the second half of a complete newline, if necessary.
+For example, Windows newlines are represented by the characters `\r\n`,
+whereas UNIX newlines are `\n` and Macintosh newlines are `\r`.
+
+(0x11) Wait_For_Byte
+(0x12) Wait_For_Rune
+(0x13) Wait_For_Rune_Class
+(0x14) Wait_For_Rune_Class_Negated
+
+These opcodes are an optimization around restarting threads on failed
+matches when the beginning to a pattern is predictable and the Global flag
+is set.
+
+They will cause the VM to wait for the next rune to match before splitting,
+as would happen in the un-optimized version.
+
+(0x15) Match_All_And_Escape
+
+This opcode is an optimized version of `.*$` or `.+$` that causes the
+active thread to immediately work on escaping the program by following all
+Jumps out to the end.
+
+While running through the rest of the program, the thread will trigger on
+every Save instruction it passes to store the length of the string.
+
+This way, any time a program hits one of these `.*$` constructs, the
+virtual machine can exit early, vastly improving processing times.
+
+Be aware, this opcode is not compiled in if the `Multiline` flag is on, as
+the meaning of `$` changes with that flag.
+</pre> </div> <div id="pkg-index"> <h2>Index</h2> <div> <details class="doc-index" id="doc-index-Types" aria-labelledby="#doc-index-Types-header"> <summary id="#doc-index-Types-header"> Types (14)</summary> <ul> <li><a href="#Jump">Jump</a></li> <li><a href="#Machine">Machine</a></li> <li><a href="#Opcode">Opcode</a></li> <li><a href="#Opcode_Iterator">Opcode_Iterator</a></li> <li><a href="#Program">Program</a></li> <li><a href="#Rune_Class_Data">Rune_Class_Data</a></li> <li><a href="#Rune_Class_Range">Rune_Class_Range</a></li> <li><a href="#Save">Save</a></li> <li><a href="#Split">Split</a></li> <li><a href="#Thread">Thread</a></li> <li><a href="#Wait_For_Byte">Wait_For_Byte</a></li> <li><a href="#Wait_For_Rune">Wait_For_Rune</a></li> <li><a href="#Wait_For_Rune_Class">Wait_For_Rune_Class</a></li> <li><a href="#Wait_For_Rune_Class_Negated">Wait_For_Rune_Class_Negated</a></li> </ul> </details> </div> <div> <details class="doc-index" id="doc-index-Constants" aria-labelledby="#doc-index-Constants-header"> <summary id="#doc-index-Constants-header"> Constants (0)</summary> <p class="pkg-empty-section">This section is empty.</p> </details> </div> <div> <details class="doc-index" id="doc-index-Variables" aria-labelledby="#doc-index-Variables-header"> <summary id="#doc-index-Variables-header"> Variables (0)</summary> <p class="pkg-empty-section">This section is empty.</p> </details> </div> <div> <details class="doc-index" id="doc-index-Procedures" aria-labelledby="#doc-index-Procedures-header"> <summary id="#doc-index-Procedures-header"> Procedures (10)</summary> <ul> <li><a href="#add_thread">add_thread</a></li> <li><a href="#check_busy_map">check_busy_map</a></li> <li><a href="#create">create</a></li> <li><a href="#destroy">destroy</a></li> <li><a href="#is_word_class">is_word_class</a></li> <li><a href="#iterate_opcodes">iterate_opcodes</a></li> <li><a href="#opcode_count">opcode_count</a></li> <li><a href="#opcode_to_name">opcode_to_name</a></li> <li><a href="#run">run</a></li> <li><a href="#set_busy_map">set_busy_map</a></li> </ul> </details> </div> <div> <details class="doc-index" id="doc-index-Procedure Groups" aria-labelledby="#doc-index-Procedure Groups-header"> <summary id="#doc-index-Procedure Groups-header"> Procedure Groups (0)</summary> <p class="pkg-empty-section">This section is empty.</p> </details> </div> </div> </div> <section class="documentation"> <h2 id="pkg-Types" class="pkg-header">Types</h2> <div class="pkg-entity"> <h3 id="Jump"><span><a class="doc-id-link" href="#Jump">Jump</a></span></h3> <div> <pre class="doc-code">Jump :: <span class="keyword-type">struct</span> <span class="directive">#packed</span> {
+	opcode: <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+	target: <a href="../../../base/builtin.html#i16"><span class="doc-builtin">i16</span></a>,
+}</pre> </div> </div> <div class="pkg-entity"> <h3 id="Machine"><span><a class="doc-id-link" href="#Machine">Machine</a></span></h3> <div> <pre class="doc-code">Machine :: <span class="keyword-type">struct</span> {
+	<span class="comment">// Program state</span>
+	memory:            <a href="../../../base/builtin.html#string"><span class="doc-builtin">string</span></a>,
+	class_data:        []<a class="code-typename" href="virtual_machine.html#Rune_Class_Data">Rune_Class_Data</a>,
+	code:              []<a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+	<span class="comment">// Thread state</span>
+	top_thread:        <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>,
+	threads:           [^]<a class="code-typename" href="virtual_machine.html#Thread">Thread</a>,
+	next_threads:      [^]<a class="code-typename" href="virtual_machine.html#Thread">Thread</a>,
+	<span class="comment">// The busy map is used to merge threads based on their program counters.</span>
+	busy_map:          []<a href="../../../base/builtin.html#u64"><span class="doc-builtin">u64</span></a>,
+	<span class="comment">// Global state</span>
+	string_pointer:    <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>,
+	current_rune:      <a href="../../../base/builtin.html#rune"><span class="doc-builtin">rune</span></a>,
+	current_rune_size: <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>,
+	next_rune:         <a href="../../../base/builtin.html#rune"><span class="doc-builtin">rune</span></a>,
+	next_rune_size:    <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>,
+	last_rune:         <a href="../../../base/builtin.html#rune"><span class="doc-builtin">rune</span></a>,
+}</pre> </div> <details class="odin-doc-toggle" open> <summary class="hideme"> <h5 style="display:inline-block">Related Procedures With Parameters</h5> </summary> <ul> <li><a href="virtual_machine.html#add_thread">add_thread</a></li> <li><a href="virtual_machine.html#check_busy_map">check_busy_map</a></li> <li><a href="virtual_machine.html#destroy">destroy</a></li> <li><a href="virtual_machine.html#run">run</a></li> <li><a href="virtual_machine.html#set_busy_map">set_busy_map</a></li> </ul> </details> <details class="odin-doc-toggle" open> <summary class="hideme"> <h5 style="display:inline-block">Related Procedures With Returns</h5> </summary> <ul> <li><a href="virtual_machine.html#create">create</a></li> </ul> </details> </div> <div class="pkg-entity"> <h3 id="Opcode"><span><a class="doc-id-link" href="#Opcode">Opcode</a></span></h3> <div> <pre class="doc-code">Opcode :: <span class="keyword-type">enum</span> <a href="../../../base/builtin.html#u8"><span class="doc-builtin">u8</span></a> {
+	<span class="comment">// | [ operands ]</span>
+	Match                       = 0,  <span class="comment">// |</span>
+	Match_And_Exit              = 1,  <span class="comment">// |</span>
+	Byte                        = 2,  <span class="comment">// | u8</span>
+	Rune                        = 3,  <span class="comment">// | i32</span>
+	Rune_Class                  = 4,  <span class="comment">// | u8</span>
+	Rune_Class_Negated          = 5,  <span class="comment">// | u8</span>
+	Wildcard                    = 6,  <span class="comment">// |</span>
+	Jump                        = 7,  <span class="comment">// | u16</span>
+	Split                       = 8,  <span class="comment">// | u16, u16</span>
+	Save                        = 9,  <span class="comment">// | u8</span>
+	Assert_Start                = 10, <span class="comment">// |</span>
+	Assert_Start_Multiline      = 11, <span class="comment">// |</span>
+	Assert_End                  = 12, <span class="comment">// |</span>
+	Assert_Word_Boundary        = 13, <span class="comment">// |</span>
+	Assert_Non_Word_Boundary    = 14, <span class="comment">// |</span>
+	Multiline_Open              = 15, <span class="comment">// |</span>
+	Multiline_Close             = 16, <span class="comment">// |</span>
+	Wait_For_Byte               = 17, <span class="comment">// | u8</span>
+	Wait_For_Rune               = 18, <span class="comment">// | i32</span>
+	Wait_For_Rune_Class         = 19, <span class="comment">// | u8</span>
+	Wait_For_Rune_Class_Negated = 20, <span class="comment">// | u8</span>
+	Match_All_And_Escape        = 21, <span class="comment">// |</span>
+}</pre> </div> <details class="odin-doc-toggle" open> <summary class="hideme"> <h5 style="display:inline-block">Related Procedures With Parameters</h5> </summary> <ul> <li><a href="virtual_machine.html#opcode_to_name">opcode_to_name</a></li> </ul> </details> <details class="odin-doc-toggle" open> <summary class="hideme"> <h5 style="display:inline-block">Related Procedures With Returns</h5> </summary> <ul> <li><a href="virtual_machine.html#iterate_opcodes">iterate_opcodes</a></li> </ul> </details> </div> <div class="pkg-entity"> <h3 id="Opcode_Iterator"><span><a class="doc-id-link" href="#Opcode_Iterator">Opcode_Iterator</a></span></h3> <div> <pre class="doc-code">Opcode_Iterator :: <span class="keyword-type">struct</span> {
+	code: []<a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+	pc:   <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>,
+}</pre> </div> <details class="odin-doc-toggle" open> <summary class="hideme"> <h5 style="display:inline-block">Related Procedures With Parameters</h5> </summary> <ul> <li><a href="virtual_machine.html#iterate_opcodes">iterate_opcodes</a></li> </ul> </details> </div> <div class="pkg-entity"> <h3 id="Program"><span><a class="doc-id-link" href="#Program">Program</a></span></h3> <div> <pre class="doc-code">Program :: []<a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a></pre> </div> <details class="odin-doc-toggle" open> <summary class="hideme"> <h5 style="display:inline-block">Related Procedures With Parameters</h5> </summary> <ul> <li><a href="virtual_machine.html#create">create</a></li> <li><a href="virtual_machine.html#opcode_count">opcode_count</a></li> </ul> </details> </div> <div class="pkg-entity"> <h3 id="Rune_Class_Data"><span><a class="doc-id-link" href="#Rune_Class_Data">Rune_Class_Data</a></span></h3> <div> <pre class="doc-code">Rune_Class_Data :: <span class="keyword-type">struct</span> {
+	runes:  []<a href="../../../base/builtin.html#rune"><span class="doc-builtin">rune</span></a>,
+	ranges: []regex_parser.<a class="code-typename" href="parser.html#Rune_Class_Range">Rune_Class_Range</a>,
+}</pre> </div> <details class="odin-doc-toggle" open>  <p>NOTE: This structure differs intentionally from the one in <code>regex/parser</code>, as this data doesn't need to be a dynamic array once it hits the VM.</p> </details> </div> <div class="pkg-entity"> <h3 id="Rune_Class_Range"><span><a class="doc-id-link" href="#Rune_Class_Range">Rune_Class_Range</a></span></h3> <div> <pre class="doc-code">Rune_Class_Range :: regex_parser.<a class="code-typename" href="parser.html#Rune_Class_Range">Rune_Class_Range</a></pre> </div> </div> <div class="pkg-entity"> <h3 id="Save"><span><a class="doc-id-link" href="#Save">Save</a></span></h3> <div> <pre class="doc-code">Save :: <span class="keyword-type">struct</span> <span class="directive">#packed</span> {
+	opcode:  <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+	operand: <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+}</pre> </div> </div> <div class="pkg-entity"> <h3 id="Split"><span><a class="doc-id-link" href="#Split">Split</a></span></h3> <div> <pre class="doc-code">Split :: <span class="keyword-type">struct</span> <span class="directive">#packed</span> {
+	opcode: <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+	left:   <a href="../../../base/builtin.html#i16"><span class="doc-builtin">i16</span></a>,
+	right:  <a href="../../../base/builtin.html#i16"><span class="doc-builtin">i16</span></a>,
+}</pre> </div> </div> <div class="pkg-entity"> <h3 id="Thread"><span><a class="doc-id-link" href="#Thread">Thread</a></span></h3> <div> <pre class="doc-code">Thread :: <span class="keyword-type">struct</span> {
+	pc:    <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>,
+	saved: ^[<span class="number">20</span>]<a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>,
+}</pre> </div> </div> <div class="pkg-entity"> <h3 id="Wait_For_Byte"><span><a class="doc-id-link" href="#Wait_For_Byte">Wait_For_Byte</a></span></h3> <div> <pre class="doc-code">Wait_For_Byte :: <span class="keyword-type">struct</span> <span class="directive">#packed</span> {
+	opcode:  <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+	operand: <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+}</pre> </div> </div> <div class="pkg-entity"> <h3 id="Wait_For_Rune"><span><a class="doc-id-link" href="#Wait_For_Rune">Wait_For_Rune</a></span></h3> <div> <pre class="doc-code">Wait_For_Rune :: <span class="keyword-type">struct</span> <span class="directive">#packed</span> {
+	opcode:  <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+	operand: <a href="../../../base/builtin.html#rune"><span class="doc-builtin">rune</span></a>,
+}</pre> </div> </div> <div class="pkg-entity"> <h3 id="Wait_For_Rune_Class"><span><a class="doc-id-link" href="#Wait_For_Rune_Class">Wait_For_Rune_Class</a></span></h3> <div> <pre class="doc-code">Wait_For_Rune_Class :: <span class="keyword-type">struct</span> <span class="directive">#packed</span> {
+	opcode:  <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+	operand: <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+}</pre> </div> </div> <div class="pkg-entity"> <h3 id="Wait_For_Rune_Class_Negated"><span><a class="doc-id-link" href="#Wait_For_Rune_Class_Negated">Wait_For_Rune_Class_Negated</a></span></h3> <div> <pre class="doc-code">Wait_For_Rune_Class_Negated :: <span class="keyword-type">struct</span> <span class="directive">#packed</span> {
+	opcode:  <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+	operand: <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>,
+}</pre> </div> </div> <h2 id="pkg-Constants" class="pkg-header">Constants</h2> <p class="pkg-empty-section">This section is empty.</p> <h2 id="pkg-Variables" class="pkg-header">Variables</h2> <p class="pkg-empty-section">This section is empty.</p> <h2 id="pkg-Procedures" class="pkg-header">Procedures</h2> <div class="pkg-entity"> <h3 id="add_thread"><span><a class="doc-id-link" href="#add_thread">add_thread</a></span></h3> <div> <pre class="doc-code">add_thread :: <span class="keyword-type">proc</span>(vm: ^<a class="code-typename" href="virtual_machine.html#Machine">Machine</a>, saved: ^[<span class="number">20</span>]<a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>, pc: <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>) {…}</pre> </div> </div> <div class="pkg-entity"> <h3 id="check_busy_map"><span><a class="doc-id-link" href="#check_busy_map">check_busy_map</a></span></h3> <div> <pre class="doc-code">check_busy_map :: <span class="keyword-type">proc</span> <span class="string">"contextless"</span> (vm: ^<a class="code-typename" href="virtual_machine.html#Machine">Machine</a>, pc: <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>) -&gt; <a href="../../../base/builtin.html#bool"><span class="doc-builtin">bool</span></a> {…}</pre> </div> </div> <div class="pkg-entity"> <h3 id="create"><span><a class="doc-id-link" href="#create">create</a></span></h3> <div> <pre class="doc-code">create :: <span class="keyword-type">proc</span>(code: []<a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>, str: <a href="../../../base/builtin.html#string"><span class="doc-builtin">string</span></a>, allocator := <a href="../../../base/runtime.html#Context">context.allocator</a>) -&gt; (vm: <a class="code-typename" href="virtual_machine.html#Machine">Machine</a>) {…}</pre> </div> </div> <div class="pkg-entity"> <h3 id="destroy"><span><a class="doc-id-link" href="#destroy">destroy</a></span></h3> <div> <pre class="doc-code">destroy :: <span class="keyword-type">proc</span>(vm: <a class="code-typename" href="virtual_machine.html#Machine">Machine</a>, allocator := <a href="../../../base/runtime.html#Context">context.allocator</a>) {…}</pre> </div> </div> <div class="pkg-entity"> <h3 id="is_word_class"><span><a class="doc-id-link" href="#is_word_class">is_word_class</a></span></h3> <div> <pre class="doc-code">is_word_class :: <span class="keyword-type">proc</span> <span class="string">"contextless"</span> (r: <a href="../../../base/builtin.html#rune"><span class="doc-builtin">rune</span></a>) -&gt; <a href="../../../base/builtin.html#bool"><span class="doc-builtin">bool</span></a> {…}</pre> </div> <details class="odin-doc-toggle" open>  <p>@MetaCharacter NOTE: This must be kept in sync with the compiler &amp; tokenizer.</p> </details> </div> <div class="pkg-entity"> <h3 id="iterate_opcodes"><span><a class="doc-id-link" href="#iterate_opcodes">iterate_opcodes</a></span></h3> <div> <pre class="doc-code">iterate_opcodes :: <span class="keyword-type">proc</span>(iter: ^<a class="code-typename" href="virtual_machine.html#Opcode_Iterator">Opcode_Iterator</a>) -&gt; (opcode: <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>, pc: <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>, ok: <a href="../../../base/builtin.html#bool"><span class="doc-builtin">bool</span></a>) {…}</pre> </div> </div> <div class="pkg-entity"> <h3 id="opcode_count"><span><a class="doc-id-link" href="#opcode_count">opcode_count</a></span></h3> <div> <pre class="doc-code">opcode_count :: <span class="keyword-type">proc</span>(code: []<a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>) -&gt; (opcodes: <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>) {…}</pre> </div> </div> <div class="pkg-entity"> <h3 id="opcode_to_name"><span><a class="doc-id-link" href="#opcode_to_name">opcode_to_name</a></span></h3> <div> <pre class="doc-code">opcode_to_name :: <span class="keyword-type">proc</span>(opcode: <a class="code-typename" href="virtual_machine.html#Opcode">Opcode</a>) -&gt; (str: <a href="../../../base/builtin.html#string"><span class="doc-builtin">string</span></a>) {…}</pre> </div> </div> <div class="pkg-entity"> <h3 id="run"><span><a class="doc-id-link" href="#run">run</a></span></h3> <div> <pre class="doc-code">run :: <span class="keyword-type">proc</span>(vm: ^<a class="code-typename" href="virtual_machine.html#Machine">Machine</a>, $UNICODE_MODE: <a href="../../../base/builtin.html#bool"><span class="doc-builtin">bool</span></a>) -&gt; (saved: ^[<span class="number">20</span>]<a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>, ok: <a href="../../../base/builtin.html#bool"><span class="doc-builtin">bool</span></a>) {…}</pre> </div> </div> <div class="pkg-entity"> <h3 id="set_busy_map"><span><a class="doc-id-link" href="#set_busy_map">set_busy_map</a></span></h3> <div> <pre class="doc-code">set_busy_map :: <span class="keyword-type">proc</span> <span class="string">"contextless"</span> (vm: ^<a class="code-typename" href="virtual_machine.html#Machine">Machine</a>, pc: <a href="../../../base/builtin.html#int"><span class="doc-builtin">int</span></a>) -&gt; <a href="../../../base/builtin.html#bool"><span class="doc-builtin">bool</span></a> {…}</pre> </div> </div> <h2 id="pkg-Procedure Groups" class="pkg-header">Procedure Groups</h2> <p class="pkg-empty-section">This section is empty.</p> </section> <h2 id="pkg-source-files">Source Files</h2> <ul> <li><a href="https://github.com/odin-lang/Odin/tree/master/core/text/regex/virtual_machine/doc.odin">doc.odin</a></li> <li><a href="https://github.com/odin-lang/Odin/tree/master/core/text/regex/virtual_machine/util.odin">util.odin</a></li> <li><a href="https://github.com/odin-lang/Odin/tree/master/core/text/regex/virtual_machine/virtual_machine.odin">virtual_machine.odin</a></li> </ul> <h2 id="pkg-generation-information">Generation Information</h2> <p>Generated with <code>odin version dev-2026-07 (vendor "odin") Windows_amd64 @ 2026-07-07 22:05:25.159205100 +0000 UTC</code></p> </article> <div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2016-2026 Ginger Bill<br>Licensed under the zlib License.<br>
+    <a href="https://pkg.odin-lang.org/core/text/regex/virtual_machine" class="_attribution-link">https://pkg.odin-lang.org/core/text/regex/virtual_machine</a>
+  </p>
+</div>

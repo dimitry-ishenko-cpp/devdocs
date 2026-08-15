@@ -1,0 +1,141 @@
+<section id="testing-with-celery"> <h1>Testing with Celery</h1> <p>Testing with Celery is divided into two parts:</p> <ul class="simple"> <li><p>Unit &amp; Integration: Using <code class="docutils literal notranslate"><span class="pre">celery.contrib.pytest</span></code>.</p></li> <li><p>Smoke / Production: Using <a class="extlink-pypi reference external" href="https://pypi.org/project/pytest-celery/">pytest-celery</a> &gt;= 1.0.0</p></li> </ul> <p>Installing the pytest-celery plugin will install the <code class="docutils literal notranslate"><span class="pre">celery.contrib.pytest</span></code> infrastructure as well, alongside the pytest plugin infrastructure. The difference is how you use it.</p> <div class="admonition warning"> <p class="admonition-title">Warning</p> <p>Both APIs are NOT compatible with each other. The pytest-celery plugin is Docker based and the <code class="docutils literal notranslate"><span class="pre">celery.contrib.pytest</span></code> is mock based.</p> </div> <p>To use the <code class="docutils literal notranslate"><span class="pre">celery.contrib.pytest</span></code> infrastructure, follow the instructions below.</p> <p>The pytest-celery plugin has its <a class="reference external" href="https://pytest-celery.readthedocs.io/">own documentation</a>.</p> <section id="tasks-and-unit-tests"> <h2>Tasks and unit tests</h2> <p>To test task behavior in unit tests the preferred method is mocking.</p> <div class="admonition-eager-mode admonition"> <p class="admonition-title">Eager mode</p> <p>The eager mode enabled by the <a class="reference internal" href="configuration.html#std-setting-task_always_eager"><code class="xref std std-setting docutils literal notranslate"><span class="pre">task_always_eager</span></code></a> setting is by definition not suitable for unit tests.</p> <p>When testing with eager mode you are only testing an emulation of what happens in a worker, and there are many discrepancies between the emulation and what happens in reality.</p> <p>Note that eagerly executed tasks don’t write results to backend by default. If you want to enable this functionality, have a look at <a class="reference internal" href="configuration.html#std-setting-task_store_eager_result"><code class="xref std std-setting docutils literal notranslate"><span class="pre">task_store_eager_result</span></code></a>.</p> </div> <p>A Celery task is much like a web view, in that it should only define how to perform the action in the context of being called as a task.</p> <p>This means optimally tasks only handle things like serialization, message headers, retries, and so on, with the actual logic implemented elsewhere.</p> <p>Say we had a task like this:</p> <pre data-language="python">from .models import Product
+
+
+@app.task(bind=True)
+def send_order(self, product_pk, quantity, price):
+    price = Decimal(price)  # json serializes this to string.
+
+    # models are passed by id, not serialized.
+    product = Product.objects.get(product_pk)
+
+    try:
+        product.order(quantity, price)
+    except OperationalError as exc:
+        raise self.retry(exc=exc)
+</pre> <p><code class="docutils literal notranslate"><span class="pre">Note</span></code>: A task being <a class="reference external" href="https://docs.celeryq.dev/en/latest/userguide/tasks.html#bound-tasks">bound</a> means the first argument to the task will always be the task instance (self). which means you do get a self argument as the first argument and can use the Task class methods and attributes.</p> <p>You could write unit tests for this task, using mocking like in this example:</p> <pre data-language="python">from pytest import raises
+
+from celery.exceptions import Retry
+
+# for python 2: use mock.patch from `pip install mock`.
+from unittest.mock import patch
+
+from proj.models import Product
+from proj.tasks import send_order
+
+class test_send_order:
+
+    @patch('proj.tasks.Product.order')  # &lt; patching Product in module above
+    def test_success(self, product_order):
+        product = Product.objects.create(
+            name='Foo',
+        )
+        send_order(product.pk, 3, Decimal(30.3))
+        product_order.assert_called_with(3, Decimal(30.3))
+
+    @patch('proj.tasks.Product.order')
+    @patch('proj.tasks.send_order.retry')
+    def test_failure(self, send_order_retry, product_order):
+        product = Product.objects.create(
+            name='Foo',
+        )
+
+        # Set a side effect on the patched methods
+        # so that they raise the errors we want.
+        send_order_retry.side_effect = Retry()
+        product_order.side_effect = OperationalError()
+
+        with raises(Retry):
+            send_order(product.pk, 3, Decimal(30.6))
+</pre> </section> <section id="pytest"> <h2>pytest</h2> <div class="versionadded"> <p><span class="versionmodified added">Added in version 4.0.</span></p> </div> <p>Celery also makes a <a class="extlink-pypi reference external" href="https://pypi.org/project/pytest/">https://pypi.org/project/pytest/</a> plugin available that adds fixtures that you can use in your integration (or unit) test suites.</p> <section id="enabling"> <h3>Enabling</h3> <p>Celery initially ships the plugin in a disabled state. To enable it, you can either:</p> <ul class="simple"> <li><p><code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">celery[pytest]</span></code></p></li> <li><p>or add an environment variable <code class="docutils literal notranslate"><span class="pre">PYTEST_PLUGINS=celery.contrib.pytest</span></code></p></li> <li><p>or add <code class="docutils literal notranslate"><span class="pre">pytest_plugins</span> <span class="pre">=</span> <span class="pre">("celery.contrib.pytest",</span> <span class="pre">)</span></code> to your root conftest.py</p></li> </ul> </section> <section id="marks"> <h3>Marks</h3> <section id="celery-set-test-app-configuration"> <h4>celery - Set test app configuration.</h4> <p>The <code class="docutils literal notranslate"><span class="pre">celery</span></code> mark enables you to override the configuration used for a single test case:</p> <pre data-language="python">@pytest.mark.celery(result_backend='redis://')
+def test_something():
+    ...
+</pre> <p>or for all the test cases in a class:</p> <pre data-language="python">@pytest.mark.celery(result_backend='redis://')
+class test_something:
+
+    def test_one(self):
+        ...
+
+    def test_two(self):
+        ...
+</pre> </section> </section> <section id="fixtures"> <h3>Fixtures</h3> <section id="function-scope"> <h4>Function scope</h4> <section id="celery-app-celery-app-used-for-testing"> <h5>celery_app - Celery app used for testing.</h5> <p>This fixture returns a Celery app you can use for testing.</p> <p>Example:</p> <pre data-language="python">def test_create_task(celery_app, celery_worker):
+    @celery_app.task
+    def mul(x, y):
+        return x * y
+
+    celery_worker.reload()
+    assert mul.delay(4, 4).get(timeout=10) == 16
+</pre> </section> <section id="celery-worker-embed-live-worker"> <h5>celery_worker - Embed live worker.</h5> <p>This fixture starts a Celery worker instance that you can use for integration tests. The worker will be started in a <em>separate thread</em> and will be shutdown as soon as the test returns.</p> <p>By default the fixture will wait up to 10 seconds for the worker to complete outstanding tasks and will raise an exception if the time limit is exceeded. The timeout can be customized by setting the <code class="docutils literal notranslate"><span class="pre">shutdown_timeout</span></code> key in the dictionary returned by the <code class="xref py py-func docutils literal notranslate"><span class="pre">celery_worker_parameters()</span></code> fixture.</p> <p>Example:</p> <pre data-language="python"># Put this in your conftest.py
+@pytest.fixture(scope='session')
+def celery_config():
+    return {
+        'broker_url': 'amqp://',
+        'result_backend': 'redis://'
+    }
+
+def test_add(celery_worker):
+    mytask.delay()
+
+
+# If you wish to override some setting in one test cases
+# only - you can use the ``celery`` mark:
+@pytest.mark.celery(result_backend='rpc')
+def test_other(celery_worker):
+    ...
+</pre> <p>Heartbeats are disabled by default which means that the test worker doesn’t send events for <code class="docutils literal notranslate"><span class="pre">worker-online</span></code>, <code class="docutils literal notranslate"><span class="pre">worker-offline</span></code> and <code class="docutils literal notranslate"><span class="pre">worker-heartbeat</span></code>. To enable heartbeats modify the <code class="xref py py-func docutils literal notranslate"><span class="pre">celery_worker_parameters()</span></code> fixture:</p> <pre data-language="python"># Put this in your conftest.py
+@pytest.fixture(scope="session")
+def celery_worker_parameters():
+    return {"without_heartbeat": False}
+    ...
+</pre> </section> </section> <section id="session-scope"> <h4>Session scope</h4> <section id="celery-config-override-to-setup-celery-test-app-configuration"> <h5>celery_config - Override to setup Celery test app configuration.</h5> <p>You can redefine this fixture to configure the test Celery app.</p> <p>The config returned by your fixture will then be used to configure the <code class="xref py py-func docutils literal notranslate"><span class="pre">celery_app()</span></code>, and <code class="xref py py-func docutils literal notranslate"><span class="pre">celery_session_app()</span></code> fixtures.</p> <p>Example:</p> <pre data-language="python">@pytest.fixture(scope='session')
+def celery_config():
+    return {
+        'broker_url': 'amqp://',
+        'result_backend': 'rpc',
+    }
+</pre> </section> <section id="celery-parameters-override-to-setup-celery-test-app-parameters"> <h5>celery_parameters - Override to setup Celery test app parameters.</h5> <p>You can redefine this fixture to change the <code class="docutils literal notranslate"><span class="pre">__init__</span></code> parameters of test Celery app. In contrast to <code class="xref py py-func docutils literal notranslate"><span class="pre">celery_config()</span></code>, these are directly passed to when instantiating <a class="reference internal" href="../reference/celery.html#celery.Celery" title="celery.Celery"><code class="xref py py-class docutils literal notranslate"><span class="pre">Celery</span></code></a>.</p> <p>The config returned by your fixture will then be used to configure the <code class="xref py py-func docutils literal notranslate"><span class="pre">celery_app()</span></code>, and <code class="xref py py-func docutils literal notranslate"><span class="pre">celery_session_app()</span></code> fixtures.</p> <p>Example:</p> <pre data-language="python">@pytest.fixture(scope='session')
+def celery_parameters():
+    return {
+        'task_cls':  my.package.MyCustomTaskClass,
+        'strict_typing': False,
+    }
+</pre> </section> <section id="celery-worker-parameters-override-to-setup-celery-worker-parameters"> <h5>celery_worker_parameters - Override to setup Celery worker parameters.</h5> <p>You can redefine this fixture to change the <code class="docutils literal notranslate"><span class="pre">__init__</span></code> parameters of test Celery workers. These are directly passed to <a class="reference internal" href="../reference/celery.worker.html#celery.worker.WorkController" title="celery.worker.WorkController"><code class="xref py py-class docutils literal notranslate"><span class="pre">WorkController</span></code></a> when it is instantiated.</p> <p>The config returned by your fixture will then be used to configure the <code class="xref py py-func docutils literal notranslate"><span class="pre">celery_worker()</span></code>, and <code class="xref py py-func docutils literal notranslate"><span class="pre">celery_session_worker()</span></code> fixtures.</p> <p>Example:</p> <pre data-language="python">@pytest.fixture(scope='session')
+def celery_worker_parameters():
+    return {
+        'queues':  ('high-prio', 'low-prio'),
+        'exclude_queues': ('celery'),
+    }
+</pre> </section> <section id="celery-enable-logging-override-to-enable-logging-in-embedded-workers"> <h5>celery_enable_logging - Override to enable logging in embedded workers.</h5> <p>This is a fixture you can override to enable logging in embedded workers.</p> <p>Example:</p> <pre data-language="python">@pytest.fixture(scope='session')
+def celery_enable_logging():
+    return True
+</pre> </section> <section id="celery-includes-add-additional-imports-for-embedded-workers"> <h5>celery_includes - Add additional imports for embedded workers.</h5> <p>You can override fixture to include modules when an embedded worker starts.</p> <p>You can have this return a list of module names to import, which can be task modules, modules registering signals, and so on.</p> <p>Example:</p> <pre data-language="python">@pytest.fixture(scope='session')
+def celery_includes():
+    return [
+        'proj.tests.tasks',
+        'proj.tests.celery_signal_handlers',
+    ]
+</pre> </section> <section id="celery-worker-pool-override-the-pool-used-for-embedded-workers"> <h5>celery_worker_pool - Override the pool used for embedded workers.</h5> <p>You can override fixture to configure the execution pool used for embedded workers.</p> <p>Example:</p> <pre data-language="python">@pytest.fixture(scope='session')
+def celery_worker_pool():
+    return 'prefork'
+</pre> <div class="admonition warning"> <p class="admonition-title">Warning</p> <p>You cannot use the gevent/eventlet pools, that is unless your whole test suite is running with the monkeypatches enabled.</p> </div> </section> <section id="celery-session-worker-embedded-worker-that-lives-throughout-the-session"> <h5>celery_session_worker - Embedded worker that lives throughout the session.</h5> <p>This fixture starts a worker that lives throughout the testing session (it won’t be started/stopped for every test).</p> <p>Example:</p> <pre data-language="python"># Add this to your conftest.py
+@pytest.fixture(scope='session')
+def celery_config():
+    return {
+        'broker_url': 'amqp://',
+        'result_backend': 'rpc',
+    }
+
+# Do this in your tests.
+def test_add_task(celery_session_worker):
+    assert add.delay(2, 2).get() == 4
+</pre> <div class="admonition warning"> <p class="admonition-title">Warning</p> <p>It’s probably a bad idea to mix session and ephemeral workers…</p> </div> </section> <section id="celery-session-app-celery-app-used-for-testing-session-scope"> <h5>celery_session_app - Celery app used for testing (session scope).</h5> <p>This can be used by other session scoped fixtures when they need to refer to a Celery app instance.</p> </section> <section id="use-celery-app-trap-raise-exception-on-falling-back-to-default-app"> <h5>use_celery_app_trap - Raise exception on falling back to default app.</h5> <p>This is a fixture you can override in your <code class="docutils literal notranslate"><span class="pre">conftest.py</span></code>, to enable the “app trap”: if something tries to access the default or current_app, an exception is raised.</p> <p>Example:</p> <pre data-language="python">@pytest.fixture(scope='session')
+def use_celery_app_trap():
+    return True
+</pre> <p>If a test wants to access the default app, you would have to mark it using the <code class="docutils literal notranslate"><span class="pre">depends_on_current_app</span></code> fixture:</p> <pre data-language="python">@pytest.mark.usefixtures('depends_on_current_app')
+def test_something():
+    something()
+</pre> </section> </section> </section> </section> </section> <div class="_attribution">
+  <p class="_attribution-p">
+    Copyright &copy; 2017-2026 Asif Saif Uddin, core team & contributors. All rights reserved.<br />Celery is licensed under The BSD License (3 Clause, also known as the new BSD license).  The license is an OSI approved Open Source license and is GPL-compatible.<br>
+    <a href="https://docs.celeryq.dev/en/stable/userguide/testing.html" class="_attribution-link">https://docs.celeryq.dev/en/stable/userguide/testing.html</a>
+  </p>
+</div>

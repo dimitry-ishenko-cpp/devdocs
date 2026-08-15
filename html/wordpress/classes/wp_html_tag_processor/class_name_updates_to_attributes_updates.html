@@ -1,139 +1,159 @@
 <h1 class="wp-block-wporg-code-reference-title">WP_HTML_Tag_Processor::class_name_updates_to_attributes_updates()</h1> <section><p>Converts class name updates into tag attributes updates (they are accumulated in different data formats for performance).</p> </section> <section><h2 id="description">Description</h2> <h3 id="see-also">See also</h3>
 <ul>
-<li>WP_HTML_Tag_Processor::$lexical_updates</li> <li>WP_HTML_Tag_Processor::$classname_updates</li> </ul></section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="2125" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">				$attribute_end              = $end_quote_at + 1;
-				$this-&gt;bytes_already_parsed = $attribute_end;
-				break;
+<li>WP_HTML_Tag_Processor::$lexical_updates</li> <li>WP_HTML_Tag_Processor::$classname_updates</li> </ul></section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="2334" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">
+/**
+ * Converts class name updates into tag attributes updates
+ * (they are accumulated in different data formats for performance).
+ *
+ * @since 6.2.0
+ * @ignore
+ *
+ * @see WP_HTML_Tag_Processor::$lexical_updates
+ * @see WP_HTML_Tag_Processor::$classname_updates
+ */
+private function class_name_updates_to_attributes_updates(): void {
+	if ( count( $this-&gt;classname_updates ) === 0 ) {
+		return;
+	}
 
-			default:
-				$value_start                = $this-&gt;bytes_already_parsed;
-				$value_length               = strcspn( $this-&gt;html, "&gt; \t\f\r\n", $value_start );
-				$attribute_end              = $value_start + $value_length;
-				$this-&gt;bytes_already_parsed = $attribute_end;
+	$existing_class = $this-&gt;get_enqueued_attribute_value( 'class' );
+	if ( null === $existing_class || true === $existing_class ) {
+		$existing_class = '';
+	}
+
+	if ( false === $existing_class &amp;&amp; isset( $this-&gt;attributes['class'] ) ) {
+		$existing_class = WP_HTML_Decoder::decode_attribute(
+			substr(
+				$this-&gt;html,
+				$this-&gt;attributes['class']-&gt;value_starts_at,
+				$this-&gt;attributes['class']-&gt;value_length
+			)
+		);
+	}
+
+	if ( false === $existing_class ) {
+		$existing_class = '';
+	}
+
+	/**
+	 * Updated "class" attribute value.
+	 *
+	 * This is incrementally built while scanning through the existing class
+	 * attribute, skipping removed classes on the way, and then appending
+	 * added classes at the end. Only when finished processing will the
+	 * value contain the final new value.
+
+	 * @var string $class
+	 */
+	$class = '';
+
+	/**
+	 * Tracks the cursor position in the existing
+	 * class attribute value while parsing.
+	 *
+	 * @var int $at
+	 */
+	$at = 0;
+
+	/**
+	 * Indicates if there's any need to modify the existing class attribute.
+	 *
+	 * If a call to `add_class()` and `remove_class()` wouldn't impact
+	 * the `class` attribute value then there's no need to rebuild it.
+	 * For example, when adding a class that's already present or
+	 * removing one that isn't.
+	 *
+	 * This flag enables a performance optimization when none of the enqueued
+	 * class updates would impact the `class` attribute; namely, that the
+	 * processor can continue without modifying the input document, as if
+	 * none of the `add_class()` or `remove_class()` calls had been made.
+	 *
+	 * This flag is set upon the first change that requires a string update.
+	 *
+	 * @var bool $modified
+	 */
+	$modified = false;
+
+	$seen      = array();
+	$to_remove = array();
+	$is_quirks = self::QUIRKS_MODE === $this-&gt;compat_mode;
+	if ( $is_quirks ) {
+		foreach ( $this-&gt;classname_updates as $updated_name =&gt; $action ) {
+			if ( self::REMOVE_CLASS === $action ) {
+				$to_remove[] = strtolower( $updated_name );
+			}
 		}
 	} else {
-		$value_start   = $this-&gt;bytes_already_parsed;
-		$value_length  = 0;
-		$attribute_end = $attribute_start + $name_length;
+		foreach ( $this-&gt;classname_updates as $updated_name =&gt; $action ) {
+			if ( self::REMOVE_CLASS === $action ) {
+				$to_remove[] = $updated_name;
+			}
+		}
 	}
 
-	if ( $attribute_end &gt;= $doc_length ) {
-		$this-&gt;parser_state = self::STATE_INCOMPLETE_INPUT;
+	// Remove unwanted classes by only copying the new ones.
+	$existing_class_length = strlen( $existing_class );
+	while ( $at &lt; $existing_class_length ) {
+		// Skip to the first non-whitespace character.
+		$ws_at     = $at;
+		$ws_length = strspn( $existing_class, " \t\f\r\n", $ws_at );
+		$at       += $ws_length;
 
-		return false;
-	}
-
-	if ( $this-&gt;is_closing_tag ) {
-		return true;
-	}
-
-	/*
-	 * &gt; There must never be two or more attributes on
-	 * &gt; the same start tag whose names are an ASCII
-	 * &gt; case-insensitive match for each other.
-	 *     - HTML 5 spec
-	 *
-	 * @see https://html.spec.whatwg.org/multipage/syntax.html#attributes-2:ascii-case-insensitive
-	 */
-	$comparable_name = strtolower( $attribute_name );
-
-	// If an attribute is listed many times, only use the first declaration and ignore the rest.
-	if ( ! isset( $this-&gt;attributes[ $comparable_name ] ) ) {
-		$this-&gt;attributes[ $comparable_name ] = new WP_HTML_Attribute_Token(
-			$attribute_name,
-			$value_start,
-			$value_length,
-			$attribute_start,
-			$attribute_end - $attribute_start,
-			! $has_value
-		);
-
-		return true;
-	}
-
-	/*
-	 * Track the duplicate attributes so if we remove it, all disappear together.
-	 *
-	 * While `$this-&gt;duplicated_attributes` could always be stored as an `array()`,
-	 * which would simplify the logic here, storing a `null` and only allocating
-	 * an array when encountering duplicates avoids needless allocations in the
-	 * normative case of parsing tags with no duplicate attributes.
-	 */
-	$duplicate_span = new WP_HTML_Span( $attribute_start, $attribute_end - $attribute_start );
-	if ( null === $this-&gt;duplicate_attributes ) {
-		$this-&gt;duplicate_attributes = array( $comparable_name =&gt; array( $duplicate_span ) );
-	} elseif ( ! isset( $this-&gt;duplicate_attributes[ $comparable_name ] ) ) {
-		$this-&gt;duplicate_attributes[ $comparable_name ] = array( $duplicate_span );
-	} else {
-		$this-&gt;duplicate_attributes[ $comparable_name ][] = $duplicate_span;
-	}
-
-	return true;
-}
-
-/**
- * Move the internal cursor past any immediate successive whitespace.
- *
- * @since 6.2.0
- */
-private function skip_whitespace(): void {
-	$this-&gt;bytes_already_parsed += strspn( $this-&gt;html, " \t\f\r\n", $this-&gt;bytes_already_parsed );
-}
-
-/**
- * Applies attribute updates and cleans up once a tag is fully parsed.
- *
- * @since 6.2.0
- */
-private function after_tag(): void {
-	/*
-	 * There could be lexical updates enqueued for an attribute that
-	 * also exists on the next tag. In order to avoid conflating the
-	 * attributes across the two tags, lexical updates with names
-	 * need to be flushed to raw lexical updates.
-	 */
-	$this-&gt;class_name_updates_to_attributes_updates();
-
-	/*
-	 * Purge updates if there are too many. The actual count isn't
-	 * scientific, but a few values from 100 to a few thousand were
-	 * tests to find a practically-useful limit.
-	 *
-	 * If the update queue grows too big, then the Tag Processor
-	 * will spend more time iterating through them and lose the
-	 * efficiency gains of deferring applying them.
-	 */
-	if ( 1000 &lt; count( $this-&gt;lexical_updates ) ) {
-		$this-&gt;get_updated_html();
-	}
-
-	foreach ( $this-&gt;lexical_updates as $name =&gt; $update ) {
-		/*
-		 * Any updates appearing after the cursor should be applied
-		 * before proceeding, otherwise they may be overlooked.
-		 */
-		if ( $update-&gt;start &gt;= $this-&gt;bytes_already_parsed ) {
-			$this-&gt;get_updated_html();
+		// Capture the class name – it's everything until the next whitespace.
+		$name_length = strcspn( $existing_class, " \t\f\r\n", $at );
+		if ( 0 === $name_length ) {
+			// If no more class names are found then that's the end.
 			break;
 		}
 
-		if ( is_int( $name ) ) {
+		$name                  = substr( $existing_class, $at, $name_length );
+		$comparable_class_name = $is_quirks ? strtolower( $name ) : $name;
+		$at                   += $name_length;
+
+		// If this class is marked for removal, remove it and move on to the next one.
+		if ( in_array( $comparable_class_name, $to_remove, true ) ) {
+			$modified = true;
 			continue;
 		}
 
-		$this-&gt;lexical_updates[] = $update;
-		unset( $this-&gt;lexical_updates[ $name ] );
+		// If a class has already been seen then skip it; it should not be added twice.
+		if ( in_array( $comparable_class_name, $seen, true ) ) {
+			continue;
+		}
+
+		$seen[] = $comparable_class_name;
+
+		/*
+		 * Otherwise, append it to the new "class" attribute value.
+		 *
+		 * There are options for handling whitespace between tags.
+		 * Preserving the existing whitespace produces fewer changes
+		 * to the HTML content and should clarify the before/after
+		 * content when debugging the modified output.
+		 *
+		 * This approach contrasts normalizing the inter-class
+		 * whitespace to a single space, which might appear cleaner
+		 * in the output HTML but produce a noisier change.
+		 */
+		if ( '' !== $class ) {
+			$class .= substr( $existing_class, $ws_at, $ws_length );
+		}
+		$class .= $name;
 	}
 
-	$this-&gt;token_starts_at          = null;
-	$this-&gt;token_length             = null;
-	$this-&gt;tag_name_starts_at       = null;
-	$this-&gt;tag_name_length          = null;
-	$this-&gt;text_starts_at           = 0;
-	$this-&gt;text_length              = 0;
-	$this-&gt;is_closing_tag           = null;
-	$this-&gt;attributes               = array();
+	// Add new classes by appending those which haven't already been seen.
+	foreach ( $this-&gt;classname_updates as $name =&gt; $operation ) {
+		$comparable_name = $is_quirks ? strtolower( $name ) : $name;
+		if ( self::ADD_CLASS === $operation &amp;&amp; ! in_array( $comparable_name, $seen, true ) ) {
+			$modified = true;
+
+			$class .= strlen( $class ) &gt; 0 ? ' ' : '';
+			$class .= $name;
+		}
+	}
+
 </code></pre>
-<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/html-api/class-wp-html-tag-processor.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/html-api/class-wp-html-tag-processor.php#L2125">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/html-api/class-wp-html-tag-processor.php#L2125-L2256">View on GitHub</a></p></section> <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/html-api/class-wp-html-tag-processor.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/html-api/class-wp-html-tag-processor.php#L2334">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/html-api/class-wp-html-tag-processor.php#L2334-L2485">View on GitHub</a></p></section> <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
 <thead><tr>
 <th scope="col">Version</th>
 <th scope="col">Description</th>
@@ -144,7 +164,7 @@ private function after_tag(): void {
 </tr></tbody>
 </table></figure></section> </section><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
     <a href="https://developer.wordpress.org/reference/classes/wp_html_tag_processor/class_name_updates_to_attributes_updates" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_html_tag_processor/class_name_updates_to_attributes_updates</a>
   </p>
 </div>

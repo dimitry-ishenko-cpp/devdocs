@@ -4,93 +4,138 @@
 <code>$bookmark_name</code><span class="type"><span class="string">string</span></span><span class="required">required</span>
 </dt>
 <dd><div class="desc"><span class="description">Jump to the place in the document identified by this bookmark name.</span></div></dd>
-</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">bool</span> Whether the internal cursor was successfully moved to the bookmark’s location.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="1835" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers"> *
- * @since 6.7.0 Stub implementation.
- *
- * @throws WP_HTML_Unsupported_Exception When encountering unsupported HTML input.
- *
- * @see https://html.spec.whatwg.org/#the-after-head-insertion-mode
- * @see WP_HTML_Processor::step
- *
- * @return bool Whether an element was found.
- */
-private function step_after_head(): bool {
-	$token_name = $this-&gt;get_token_name();
-	$token_type = $this-&gt;get_token_type();
-	$is_closer  = parent::is_tag_closer();
-	$op_sigil   = '#tag' === $token_type ? ( $is_closer ? '-' : '+' ) : '';
-	$op         = "{$op_sigil}{$token_name}";
+</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">bool</span> Whether the internal cursor was successfully moved to the bookmark’s location.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="5576" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function seek( $bookmark_name ): bool {
+	// Flush any pending updates to the document before beginning.
+	$this-&gt;get_updated_html();
 
-	switch ( $op ) {
+	$actual_bookmark_name = "_{$bookmark_name}";
+	$processor_started_at = $this-&gt;state-&gt;current_token
+		? $this-&gt;bookmarks[ $this-&gt;state-&gt;current_token-&gt;bookmark_name ]-&gt;start
+		: 0;
+	$bookmark_starts_at   = $this-&gt;bookmarks[ $actual_bookmark_name ]-&gt;start;
+	$direction            = $bookmark_starts_at &gt; $processor_started_at ? 'forward' : 'backward';
+
+	/*
+	 * If seeking backwards, it's possible that the sought-after bookmark exists within an element
+	 * which has been closed before the current cursor; in other words, it has already been removed
+	 * from the stack of open elements. This means that it's insufficient to simply pop off elements
+	 * from the stack of open elements which appear after the bookmarked location and then jump to
+	 * that location, as the elements which were open before won't be re-opened.
+	 *
+	 * In order to maintain consistency, the HTML Processor rewinds to the start of the document
+	 * and reparses everything until it finds the sought-after bookmark.
+	 *
+	 * There are potentially better ways to do this: cache the parser state for each bookmark and
+	 * restore it when seeking; store an immutable and idempotent register of where elements open
+	 * and close.
+	 *
+	 * If caching the parser state it will be essential to properly maintain the cached stack of
+	 * open elements and active formatting elements when modifying the document. This could be a
+	 * tedious and time-consuming process as well, and so for now will not be performed.
+	 *
+	 * It may be possible to track bookmarks for where elements open and close, and in doing so
+	 * be able to quickly recalculate breadcrumbs for any element in the document. It may even
+	 * be possible to remove the stack of open elements and compute it on the fly this way.
+	 * If doing this, the parser would need to track the opening and closing locations for all
+	 * tokens in the breadcrumb path for any and all bookmarks. By utilizing bookmarks themselves
+	 * this list could be automatically maintained while modifying the document. Finding the
+	 * breadcrumbs would then amount to traversing that list from the start until the token
+	 * being inspected. Once an element closes, if there are no bookmarks pointing to locations
+	 * within that element, then all of these locations may be forgotten to save on memory use
+	 * and computation time.
+	 */
+	if ( 'backward' === $direction ) {
+
 		/*
-		 * &gt; A character token that is one of U+0009 CHARACTER TABULATION,
-		 * &gt; U+000A LINE FEED (LF), U+000C FORM FEED (FF),
-		 * &gt; U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+		 * When moving backward, stateful stacks should be cleared.
 		 */
-		case '#text':
-			if ( parent::TEXT_IS_WHITESPACE === $this-&gt;text_node_classification ) {
-				// Insert the character.
-				$this-&gt;insert_html_element( $this-&gt;state-&gt;current_token );
-				return true;
+		foreach ( $this-&gt;state-&gt;stack_of_open_elements-&gt;walk_up() as $item ) {
+			$this-&gt;state-&gt;stack_of_open_elements-&gt;remove_node( $item );
+		}
+
+		foreach ( $this-&gt;state-&gt;active_formatting_elements-&gt;walk_up() as $item ) {
+			$this-&gt;state-&gt;active_formatting_elements-&gt;remove_node( $item );
+		}
+
+		/*
+		 * **After** clearing stacks, more processor state can be reset.
+		 * This must be done after clearing the stack because those stacks generate events that
+		 * would appear on a subsequent call to `next_token()`.
+		 */
+		$this-&gt;state-&gt;frameset_ok                       = true;
+		$this-&gt;state-&gt;stack_of_template_insertion_modes = array();
+		$this-&gt;state-&gt;head_element                      = null;
+		$this-&gt;state-&gt;form_element                      = null;
+		$this-&gt;state-&gt;current_token                     = null;
+		$this-&gt;current_element                          = null;
+		$this-&gt;element_queue                            = array();
+
+		/*
+		 * The absence of a context node indicates a full parse.
+		 * The presence of a context node indicates a fragment parser.
+		 */
+		if ( null === $this-&gt;context_node ) {
+			$this-&gt;change_parsing_namespace( 'html' );
+			$this-&gt;state-&gt;insertion_mode = WP_HTML_Processor_State::INSERTION_MODE_INITIAL;
+			$this-&gt;breadcrumbs           = array();
+
+			$this-&gt;bookmarks['initial'] = new WP_HTML_Span( 0, 0 );
+			parent::seek( 'initial' );
+			unset( $this-&gt;bookmarks['initial'] );
+		} else {
+
+			/*
+			 * Push the root-node (HTML) back onto the stack of open elements.
+			 *
+			 * Fragment parsers require this extra bit of setup.
+			 * It's handled in full parsers by advancing the processor state.
+			 */
+			$this-&gt;state-&gt;stack_of_open_elements-&gt;push(
+				new WP_HTML_Token(
+					'root-node',
+					'HTML',
+					false
+				)
+			);
+
+			$this-&gt;change_parsing_namespace(
+				$this-&gt;context_node-&gt;integration_node_type
+					? 'html'
+					: $this-&gt;context_node-&gt;namespace
+			);
+
+			if ( 'TEMPLATE' === $this-&gt;context_node-&gt;node_name ) {
+				$this-&gt;state-&gt;stack_of_template_insertion_modes[] = WP_HTML_Processor_State::INSERTION_MODE_IN_TEMPLATE;
 			}
-			goto after_head_anything_else;
-			break;
 
+			$this-&gt;reset_insertion_mode_appropriately();
+			$this-&gt;breadcrumbs = array_slice( $this-&gt;breadcrumbs, 0, 2 );
+			parent::seek( $this-&gt;context_node-&gt;bookmark_name );
+		}
+	}
+
+	/*
+	 * Here, the processor moves forward through the document until it matches the bookmark.
+	 * do-while is used here because the processor is expected to already be stopped on
+	 * a token than may match the bookmarked location.
+	 */
+	do {
 		/*
-		 * &gt; A comment token
+		 * The processor will stop on virtual tokens, but bookmarks may not be set on them.
+		 * They should not be matched when seeking a bookmark, skip them.
 		 */
-		case '#comment':
-		case '#funky-comment':
-		case '#presumptuous-tag':
-			$this-&gt;insert_html_element( $this-&gt;state-&gt;current_token );
+		if ( $this-&gt;is_virtual() ) {
+			continue;
+		}
+		if ( $bookmark_starts_at === $this-&gt;bookmarks[ $this-&gt;state-&gt;current_token-&gt;bookmark_name ]-&gt;start ) {
 			return true;
+		}
+	} while ( $this-&gt;next_token() );
 
-		/*
-		 * &gt; A DOCTYPE token
-		 */
-		case 'html':
-			// Parse error: ignore the token.
-			return $this-&gt;step();
-
-		/*
-		 * &gt; A start tag whose tag name is "html"
-		 */
-		case '+HTML':
-			return $this-&gt;step_in_body();
-
-		/*
-		 * &gt; A start tag whose tag name is "body"
-		 */
-		case '+BODY':
-			$this-&gt;insert_html_element( $this-&gt;state-&gt;current_token );
-			$this-&gt;state-&gt;frameset_ok    = false;
-			$this-&gt;state-&gt;insertion_mode = WP_HTML_Processor_State::INSERTION_MODE_IN_BODY;
-			return true;
-
-		/*
-		 * &gt; A start tag whose tag name is "frameset"
-		 */
-		case '+FRAMESET':
-			$this-&gt;insert_html_element( $this-&gt;state-&gt;current_token );
-			$this-&gt;state-&gt;insertion_mode = WP_HTML_Processor_State::INSERTION_MODE_IN_FRAMESET;
-			return true;
-
-		/*
-		 * &gt; A start tag whose tag name is one of: "base", "basefont", "bgsound",
-		 * &gt; "link", "meta", "noframes", "script", "style", "template", "title"
-		 *
-		 * Anything here is a parse error.
-		 */
-		case '+BASE':
-		case '+BASEFONT':
-		case '+BGSOUND':
-		case '+LINK':
-		case '+META':
-		case '+NOFRAMES':
-		case '+SCRIPT':
-		case '+STYLE':
+	return false;
+}
 </code></pre>
-<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/html-api/class-wp-html-processor.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/html-api/class-wp-html-processor.php#L1835">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/html-api/class-wp-html-processor.php#L1835-L1919">View on GitHub</a></p></section> <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/html-api/class-wp-html-processor.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/html-api/class-wp-html-processor.php#L5576">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/html-api/class-wp-html-processor.php#L5576-L5705">View on GitHub</a></p></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
 <thead><tr>
 <th scope="col">Version</th>
 <th scope="col">Description</th>
@@ -101,7 +146,7 @@ private function step_after_head(): bool {
 </tr></tbody>
 </table></figure></section> </section><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
     <a href="https://developer.wordpress.org/reference/classes/wp_html_processor/seek" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_html_processor/seek</a>
   </p>
 </div>

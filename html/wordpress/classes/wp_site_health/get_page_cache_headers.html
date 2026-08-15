@@ -1,11 +1,12 @@
-<h1 class="wp-block-wporg-code-reference-title">WP_Site_Health::get_page_cache_headers(): <span class="return-type">array</span>
-</h1> <section><p>Returns a list of headers and its verification callback to verify if page cache is enabled or not.</p> </section> <section><h2 id="description">Description</h2> <p>Note: key is header name and value could be callable function to verify header value.<br>Empty value mean existence of header detect page cache is enabled.</p> </section> <section><h2 id="return">Return</h2> <span class="return-type">array</span> List of client caching headers and their (optional) verification callbacks.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="3318" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function get_page_cache_headers() {
+<h1 class="wp-block-wporg-code-reference-title">WP_Site_Health::get_page_cache_headers(): <span class="return-type">array&lt;string,</span>
+</h1> <section><p>Returns a mapping from response headers to an optional callback to verify if page cache is enabled or not.</p> </section> <section><h2 id="return">Return</h2> <span class="return-type">array&lt;string,</span> ?callable&gt; Mapping of page caching headers and their (optional) verification callbacks.<br> A null value means a simple existence check is used for the header.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="3478" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function get_page_cache_headers(): array {
 
 	$cache_hit_callback = static function ( $header_value ) {
-		return str_contains( strtolower( $header_value ), 'hit' );
+		return 1 === preg_match( '/(^| |,)HIT(,| |$)/i', $header_value );
 	};
 
 	$cache_headers = array(
+		// Standard HTTP caching headers.
 		'cache-control'          =&gt; static function ( $header_value ) {
 			return (bool) preg_match( '/max-age=[1-9]/', $header_value );
 		},
@@ -15,33 +16,114 @@
 		'age'                    =&gt; static function ( $header_value ) {
 			return is_numeric( $header_value ) &amp;&amp; $header_value &gt; 0;
 		},
-		'last-modified'          =&gt; '',
-		'etag'                   =&gt; '',
+		'last-modified'          =&gt; null,
+		'etag'                   =&gt; null,
+		'via'                    =&gt; null,
+
+		/**
+		 * Custom caching headers.
+		 *
+		 * These do not seem to be actually used by any caching layers. There were first introduced in a Site Health
+		 * test in the AMP plugin. They were copied into the Performance Lab plugin's Site Health test before they
+		 * were merged into core.
+		 *
+		 * @link https://github.com/ampproject/amp-wp/pull/6849
+		 * @link https://github.com/WordPress/performance/pull/263
+		 * @link https://core.trac.wordpress.org/changeset/54043
+		 */
 		'x-cache-enabled'        =&gt; static function ( $header_value ) {
-			return 'true' === strtolower( $header_value );
+			return ( 'true' === strtolower( $header_value ) );
 		},
 		'x-cache-disabled'       =&gt; static function ( $header_value ) {
 			return ( 'on' !== strtolower( $header_value ) );
 		},
-		'x-srcache-store-status' =&gt; $cache_hit_callback,
+
+		/**
+		 * CloudFlare.
+		 *
+		 * @link https://developers.cloudflare.com/cache/concepts/cache-responses/
+		 */
+		'cf-cache-status'        =&gt; $cache_hit_callback,
+
+		/**
+		 * Fastly.
+		 *
+		 * @link https://www.fastly.com/documentation/reference/http/http-headers/X-Cache/
+		 */
+		'x-cache'                =&gt; $cache_hit_callback,
+
+		/**
+		 * LightSpeed.
+		 *
+		 * @link https://docs.litespeedtech.com/lscache/devguide/controls/#x-litespeed-cache
+		 */
+		'x-litespeed-cache'      =&gt; $cache_hit_callback,
+
+		/**
+		 * OpenResty srcache-nginx-module.
+		 *
+		 * The `x-srcache-store-status` header indicates if the response was stored in the cache.
+		 * Valid values include `STORE` and `BYPASS`.
+		 *
+		 * The `x-srcache-fetch-status` header indicates if the response was fetched from the cache.
+		 * Valid values include `HIT`, `MISS`, and `BYPASS`.
+		 *
+		 * @link https://github.com/openresty/srcache-nginx-module
+		 */
+		'x-srcache-store-status' =&gt; static function ( $header_value ) {
+			return 'store' === strtolower( $header_value );
+		},
 		'x-srcache-fetch-status' =&gt; $cache_hit_callback,
+
+		/**
+		 * Nginx.
+		 *
+		 * @link https://blog.nginx.org/blog/nginx-caching-guide
+		 * @link https://www.inmotionhosting.com/support/website/nginx-cache-management/
+		 */
+		'x-cache-status'         =&gt; $cache_hit_callback,
+		'x-proxy-cache'          =&gt; $cache_hit_callback,
+
+		/**
+		 * Varnish Cache.
+		 *
+		 * A header with a single number indicates it was not cached. If there are two numbers (or more), then this
+		 * indicates the response was cached.
+		 *
+		 * @link https://vinyl-cache.org/docs/2.1/faq/http.html
+		 * @link https://www.fastly.com/documentation/reference/http/http-headers/X-Varnish/
+		 * @link https://www.linuxjournal.com/content/speed-your-web-site-varnish
+		 */
+		'x-varnish'              =&gt; static function ( $header_value ) {
+			return 1 === preg_match( '/^\d+ \d+/', $header_value );
+		},
 	);
 
 	/**
 	 * Filters the list of cache headers supported by core.
 	 *
+	 * This list indicates how each of the specified headers will be checked to indicate if a page cache is enabled
+	 * or not. WordPress checks for each of the headers in the returned array. If the callback is provided, it will
+	 * be passed the value for the corresponding header and return a boolean value indicating if the header suggests
+	 * that a cache is active. If the value is `null` for the header, then WordPress will assume that a cache is
+	 * active if the header is present, regardless of its value.
+	 *
 	 * @since 6.1.0
 	 *
-	 * @param array $cache_headers Array of supported cache headers.
+	 * @param array&lt;string, ?callable&gt; $cache_headers Mapping from cache-related HTTP headers to whether they
+	 *                                                indicate if a page cache is enabled for the site. `null`
+	 *                                                indicates caching in the presence of the header; a callback is
+	 *                                                provided the header’s value and should return `true` if it
+	 *                                                implies that a cache is active.
 	 */
-	return apply_filters( 'site_status_page_cache_supported_cache_headers', $cache_headers );
+	return (array) apply_filters( 'site_status_page_cache_supported_cache_headers', $cache_headers );
 }
 </code></pre>
-<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-admin/includes/class-wp-site-health.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-admin/includes/class-wp-site-health.php#L3318">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-admin/includes/class-wp-site-health.php#L3318-L3354">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
-<dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../../hooks/site_status_page_cache_supported_cache_headers.html"><span class="hook-func">apply_filters</span>( ‘site_status_page_cache_supported_cache_headers’, <nobr><span class="arg-type">array</span> <span class="arg-name">$cache_headers</span></nobr> )</a></dt>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-admin/includes/class-wp-site-health.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-admin/includes/class-wp-site-health.php#L3478">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-admin/includes/class-wp-site-health.php#L3478-L3596">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
+<dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../../hooks/site_status_page_cache_supported_cache_headers.html"><span class="hook-func">apply_filters</span>( ‘site_status_page_cache_supported_cache_headers’, <nobr><span class="arg-type">array&lt;string,</span> </nobr> )</a></dt>
 <dd>
 <p>Filters the list of cache headers supported by core.</p> </dd>
-</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
 <thead><tr>
 <th scope="col">Version</th>
 <th scope="col">Description</th>
@@ -52,7 +134,7 @@
 </tr></tbody>
 </table></figure></section> </section><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
     <a href="https://developer.wordpress.org/reference/classes/wp_site_health/get_page_cache_headers" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_site_health/get_page_cache_headers</a>
   </p>
 </div>

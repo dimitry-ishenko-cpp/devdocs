@@ -1,0 +1,179 @@
+<h1 class="wp-block-wporg-code-reference-title">WP_Interactivity_API::_process_directives( <span class="arg-type">string</span> <span class="arg-name">$html</span> ): <span class="return-type">string|null</span>
+</h1> <section><p>Processes the interactivity directives contained within the HTML content and updates the markup accordingly.</p> </section> <section><h2 id="description">Description</h2> <p>It uses the <a href="../wp_interactivity_api.html" rel="class">WP_Interactivity_API</a> instance’s context and namespace stacks, which are shared between all calls.</p> <p>This method returns null if the HTML contains unbalanced tags.</p> </section> <section><h2 id="parameters">Parameters</h2> <dl>
+<dt>
+<code>$html</code><span class="type"><span class="string">string</span></span><span class="required">required</span>
+</dt>
+<dd><div class="desc"><span class="description">The HTML content to process.</span></div></dd>
+</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">string|null</span> The processed HTML content. It returns null when the HTML contains unbalanced tags.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="473" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">private function _process_directives( string $html ) {
+	$p          = new WP_Interactivity_API_Directives_Processor( $html );
+	$tag_stack  = array();
+	$unbalanced = false;
+
+	$directive_processor_prefixes          = array_keys( self::$directive_processors );
+	$directive_processor_prefixes_reversed = array_reverse( $directive_processor_prefixes );
+
+	/*
+	 * Save the current size for each stack to restore them in case
+	 * the processing finds unbalanced tags.
+	 */
+	$namespace_stack_size = count( $this-&gt;namespace_stack );
+	$context_stack_size   = count( $this-&gt;context_stack );
+
+	while ( $p-&gt;next_tag( array( 'tag_closers' =&gt; 'visit' ) ) ) {
+		$tag_name = $p-&gt;get_tag();
+
+		/*
+		 * Directives inside SVG and MATH tags are not processed,
+		 * as they are not compatible with the Tag Processor yet.
+		 * We still process the rest of the HTML.
+		 */
+		if ( 'SVG' === $tag_name || 'MATH' === $tag_name ) {
+			if ( $p-&gt;get_attribute_names_with_prefix( 'data-wp-' ) ) {
+				/* translators: 1: SVG or MATH HTML tag, 2: Namespace of the interactive block. */
+				$message = sprintf( __( 'Interactivity directives were detected on an incompatible %1$s tag when processing "%2$s". These directives will be ignored in the server side render.' ), $tag_name, end( $this-&gt;namespace_stack ) );
+				_doing_it_wrong( __METHOD__, $message, '6.6.0' );
+			}
+			$p-&gt;skip_to_tag_closer();
+			continue;
+		}
+
+		if ( $p-&gt;is_tag_closer() ) {
+			list( $opening_tag_name, $directives_prefixes ) = ! empty( $tag_stack ) ? end( $tag_stack ) : array( null, null );
+
+			if ( 0 === count( $tag_stack ) || $opening_tag_name !== $tag_name ) {
+
+				/*
+				 * If the tag stack is empty or the matching opening tag is not the
+				 * same than the closing tag, it means the HTML is unbalanced and it
+				 * stops processing it.
+				 */
+				$unbalanced = true;
+				break;
+			} else {
+				// Remove the last tag from the stack.
+				array_pop( $tag_stack );
+			}
+		} else {
+			$each_child_attrs = $p-&gt;get_attribute_names_with_prefix( 'data-wp-each-child' );
+			if ( null === $each_child_attrs ) {
+				continue;
+			}
+
+			if ( 0 !== count( $each_child_attrs ) ) {
+				/*
+				 * If the tag has a `data-wp-each-child` directive, jump to its closer
+				 * tag because those tags have already been processed.
+				 */
+				$p-&gt;next_balanced_tag_closer_tag();
+				continue;
+			} else {
+				$directives_prefixes = array();
+
+				// Checks if there is a server directive processor registered for each directive.
+				foreach ( $p-&gt;get_attribute_names_with_prefix( 'data-wp-' ) as $attribute_name ) {
+					$parsed_directive = $this-&gt;parse_directive_name( $attribute_name );
+					if ( empty( $parsed_directive ) ) {
+						continue;
+					}
+					$directive_prefix = 'data-wp-' . $parsed_directive['prefix'];
+					if ( array_key_exists( $directive_prefix, self::$directive_processors ) ) {
+						$directives_prefixes[] = $directive_prefix;
+					}
+				}
+
+				/*
+				 * If this tag will visit its closer tag, it adds it to the tag stack
+				 * so it can process its closing tag and check for unbalanced tags.
+				 */
+				if ( $p-&gt;has_and_visits_its_closer_tag() ) {
+					$tag_stack[] = array( $tag_name, $directives_prefixes );
+				}
+			}
+		}
+		/*
+		 * If the matching opener tag didn't have any directives, it can skip the
+		 * processing.
+		 */
+		if ( 0 === count( $directives_prefixes ) ) {
+			continue;
+		}
+
+		// Directive processing might be different depending on if it is entering the tag or exiting it.
+		$modes = array(
+			'enter' =&gt; ! $p-&gt;is_tag_closer(),
+			'exit'  =&gt; $p-&gt;is_tag_closer() || ! $p-&gt;has_and_visits_its_closer_tag(),
+		);
+
+		// Get the element attributes to include them in the element representation.
+		$element_attrs = array();
+		$attr_names    = $p-&gt;get_attribute_names_with_prefix( '' ) ?? array();
+
+		foreach ( $attr_names as $name ) {
+			$element_attrs[ $name ] = $p-&gt;get_attribute( $name );
+		}
+
+		// Assign the current element right before running its directive processors.
+		$this-&gt;current_element = array(
+			'attributes' =&gt; $element_attrs,
+		);
+
+		foreach ( $modes as $mode =&gt; $should_run ) {
+			if ( ! $should_run ) {
+				continue;
+			}
+
+			/*
+			 * Sorts the attributes by the order of the `directives_processor` array
+			 * and checks what directives are present in this element.
+			 */
+			$existing_directives_prefixes = array_intersect(
+				'enter' === $mode ? $directive_processor_prefixes : $directive_processor_prefixes_reversed,
+				$directives_prefixes
+			);
+			foreach ( $existing_directives_prefixes as $directive_prefix ) {
+				$func = is_array( self::$directive_processors[ $directive_prefix ] )
+					? self::$directive_processors[ $directive_prefix ]
+					: array( $this, self::$directive_processors[ $directive_prefix ] );
+
+				call_user_func_array( $func, array( $p, $mode, &amp;$tag_stack ) );
+			}
+		}
+
+		// Clear the current element.
+		$this-&gt;current_element = null;
+	}
+
+	if ( $unbalanced ) {
+		// Reset the namespace and context stacks to their previous values.
+		array_splice( $this-&gt;namespace_stack, $namespace_stack_size );
+		array_splice( $this-&gt;context_stack, $context_stack_size );
+	}
+
+	/*
+	 * It returns null if the HTML is unbalanced because unbalanced HTML is
+	 * not safe to process. In that case, the Interactivity API runtime will
+	 * update the HTML on the client side during the hydration. It will display
+	 * a notice to the developer in the console to inform them about the issue.
+	 */
+	if ( $unbalanced || 0 &lt; count( $tag_stack ) ) {
+		return null;
+	}
+
+	return $p-&gt;get_updated_html();
+}
+</code></pre>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/interactivity-api/class-wp-interactivity-api.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/interactivity-api/class-wp-interactivity-api.php#L473">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/interactivity-api/class-wp-interactivity-api.php#L473-L629">View on GitHub</a></p></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
+<thead><tr>
+<th scope="col">Version</th>
+<th scope="col">Description</th>
+</tr></thead>
+<tbody><tr class="">
+<td><a href="https://developer.wordpress.org/reference/since/6.6.0/">6.6.0</a></td>
+<td>Introduced.</td>
+</tr></tbody>
+</table></figure></section> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    <a href="https://developer.wordpress.org/reference/classes/wp_interactivity_api/_process_directives" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_interactivity_api/_process_directives</a>
+  </p>
+</div>

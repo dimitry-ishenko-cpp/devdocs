@@ -10,8 +10,15 @@
 </li> </ul> </span></div>
 <p class="default">Default:<code>array()</code></p>
 </dd>
-</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">string</span> Rendered block output.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="451" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function render( $options = array() ) {
+</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">string</span> Rendered block output.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="492" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function render( $options = array() ) {
 	global $post;
+
+	$before_wp_enqueue_scripts_count = did_action( 'wp_enqueue_scripts' );
+
+	// Capture the current assets queues.
+	$before_styles_queue         = wp_styles()-&gt;queue;
+	$before_scripts_queue        = wp_scripts()-&gt;queue;
+	$before_script_modules_queue = wp_script_modules()-&gt;get_queue();
 
 	/*
 	 * There can be only one root interactive block at a time because the rendered HTML of that block contains
@@ -68,13 +75,24 @@
 				if ( ! is_null( $pre_render ) ) {
 					$block_content .= $pre_render;
 				} else {
-					$source_block = $inner_block-&gt;parsed_block;
+					$source_block        = $inner_block-&gt;parsed_block;
+					$inner_block_context = $inner_block-&gt;context;
 
 					/** This filter is documented in wp-includes/blocks.php */
 					$inner_block-&gt;parsed_block = apply_filters( 'render_block_data', $inner_block-&gt;parsed_block, $source_block, $parent_block );
 
 					/** This filter is documented in wp-includes/blocks.php */
 					$inner_block-&gt;context = apply_filters( 'render_block_context', $inner_block-&gt;context, $inner_block-&gt;parsed_block, $parent_block );
+
+					/*
+					 * The `refresh_context_dependents()` method already calls `refresh_parsed_block_dependents()`.
+					 * Therefore the second condition is irrelevant if the first one is satisfied.
+					 */
+					if ( $inner_block-&gt;context !== $inner_block_context ) {
+						$inner_block-&gt;refresh_context_dependents();
+					} elseif ( $inner_block-&gt;parsed_block !== $source_block ) {
+						$inner_block-&gt;refresh_parsed_block_dependents();
+					}
 
 					$block_content .= $inner_block-&gt;render();
 				}
@@ -121,6 +139,11 @@
 		}
 	}
 
+	/*
+	 * For Core blocks, these styles are only enqueued if `wp_should_load_separate_core_block_assets()` returns
+	 * true. Otherwise these `wp_enqueue_style()` calls will not have any effect, as the Core blocks are relying on
+	 * the combined 'wp-block-library' stylesheet instead, which is unconditionally enqueued.
+	 */
 	if ( ( ! empty( $this-&gt;block_type-&gt;style_handles ) ) ) {
 		foreach ( $this-&gt;block_type-&gt;style_handles as $style_handle ) {
 			wp_enqueue_style( $style_handle );
@@ -166,10 +189,57 @@
 		$root_interactive_block = null;
 	}
 
+	// Capture the new assets enqueued during rendering, and restore the queues the state prior to rendering.
+	$after_styles_queue         = wp_styles()-&gt;queue;
+	$after_scripts_queue        = wp_scripts()-&gt;queue;
+	$after_script_modules_queue = wp_script_modules()-&gt;get_queue();
+
+	/*
+	 * As a very special case, a dynamic block may in fact include a call to wp_head() (and thus wp_enqueue_scripts()),
+	 * in which all of its enqueued assets are targeting wp_footer. In this case, nothing would be printed, but this
+	 * shouldn't indicate that the just-enqueued assets should be dequeued due to it being an empty block.
+	 */
+	$just_did_wp_enqueue_scripts = ( did_action( 'wp_enqueue_scripts' ) !== $before_wp_enqueue_scripts_count );
+
+	$has_new_styles         = ( $before_styles_queue !== $after_styles_queue );
+	$has_new_scripts        = ( $before_scripts_queue !== $after_scripts_queue );
+	$has_new_script_modules = ( $before_script_modules_queue !== $after_script_modules_queue );
+
+	// Dequeue the newly enqueued assets with the existing assets if the rendered block was empty &amp; wp_enqueue_scripts did not fire.
+	if (
+		! $just_did_wp_enqueue_scripts &amp;&amp;
+		( $has_new_styles || $has_new_scripts || $has_new_script_modules ) &amp;&amp;
+		(
+			trim( $block_content ) === '' &amp;&amp;
+			/**
+			 * Filters whether to enqueue assets for a block which has no rendered content.
+			 *
+			 * @since 6.9.0
+			 *
+			 * @param bool   $enqueue    Whether to enqueue assets.
+			 * @param string $block_name Block name.
+			 */
+			! (bool) apply_filters( 'enqueue_empty_block_content_assets', false, $this-&gt;name )
+		)
+	) {
+		foreach ( array_diff( $after_styles_queue, $before_styles_queue ) as $handle ) {
+			wp_dequeue_style( $handle );
+		}
+		foreach ( array_diff( $after_scripts_queue, $before_scripts_queue ) as $handle ) {
+			wp_dequeue_script( $handle );
+		}
+		foreach ( array_diff( $after_script_modules_queue, $before_script_modules_queue ) as $handle ) {
+			wp_dequeue_script_module( $handle );
+		}
+	}
+
 	return $block_content;
 }
 </code></pre>
-<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-block.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/class-wp-block.php#L451">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/class-wp-block.php#L451-L608">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes/class-wp-block.php/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/class-wp-block.php#L492">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/class-wp-block.php#L492-L716">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
+<dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../../hooks/enqueue_empty_block_content_assets.html"><span class="hook-func">apply_filters</span>( ‘enqueue_empty_block_content_assets’, <nobr><span class="arg-type">bool</span> <span class="arg-name">$enqueue</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$block_name</span></nobr> )</a></dt>
+<dd>
+<p>Filters whether to enqueue assets for a block which has no rendered content.</p> </dd>
 <dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../../hooks/interactivity_process_directives.html"><span class="hook-func">apply_filters</span>( ‘interactivity_process_directives’, <nobr><span class="arg-type">bool</span> <span class="arg-name">$enabled</span></nobr> )</a></dt>
 <dd>
 <p>Filters whether Interactivity API should process directives.</p> </dd>
@@ -188,7 +258,7 @@
 <dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../../hooks/render_block_this-name.html"><span class="hook-func">apply_filters</span>( “render_block_{$this-&gt;name}”, <nobr><span class="arg-type">string</span> <span class="arg-name">$block_content</span></nobr>, <nobr><span class="arg-type">array</span> <span class="arg-name">$block</span></nobr>, <nobr><span class="arg-type">WP_Block</span> <span class="arg-name">$instance</span></nobr> )</a></dt>
 <dd>
 <p>Filters the content of a single block.</p> </dd>
-</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
 <thead><tr>
 <th scope="col">Version</th>
 <th scope="col">Description</th>
@@ -205,7 +275,7 @@
 </tbody>
 </table></figure></section> </section><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
     <a href="https://developer.wordpress.org/reference/classes/wp_block/render" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_block/render</a>
   </p>
 </div>

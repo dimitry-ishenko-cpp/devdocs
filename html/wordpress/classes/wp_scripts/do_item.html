@@ -13,7 +13,7 @@
 <div class="desc"><span class="description">Group level: level (int), no groups (false).<br> </span></div>
 <p class="default">Default:<code>false</code></p>
 </dd>
-</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">bool</span> True on success, false on failure.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="266" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function do_item( $handle, $group = false ) {
+</dl></section> <section><h2 id="return">Return</h2> <span class="return-type">bool</span> True on success, false on failure.</section> <section><h2 id="source">Source</h2> <pre class="wp-block-code" data-start="284" aria-label="Function source code" data-language="php"><code id="wporg-source-code" lang="php" class="language-php line-numbers">public function do_item( $handle, $group = false ) {
 	if ( ! parent::do_item( $handle ) ) {
 		return false;
 	}
@@ -28,6 +28,9 @@
 	}
 
 	$obj = $this-&gt;registered[ $handle ];
+	if ( $obj-&gt;extra['conditional'] ?? false ) {
+		return false;
+	}
 
 	if ( null === $obj-&gt;ver ) {
 		$ver = '';
@@ -39,12 +42,9 @@
 		$ver = $ver ? $ver . '&amp;amp;' . $this-&gt;args[ $handle ] : $this-&gt;args[ $handle ];
 	}
 
-	$src                   = $obj-&gt;src;
-	$strategy              = $this-&gt;get_eligible_loading_strategy( $handle );
-	$intended_strategy     = (string) $this-&gt;get_data( $handle, 'strategy' );
-	$ie_conditional_prefix = '';
-	$ie_conditional_suffix = '';
-	$conditional           = isset( $obj-&gt;extra['conditional'] ) ? $obj-&gt;extra['conditional'] : '';
+	$src               = $obj-&gt;src;
+	$strategy          = $this-&gt;get_eligible_loading_strategy( $handle );
+	$intended_strategy = (string) $this-&gt;get_data( $handle, 'strategy' );
 
 	if ( ! $this-&gt;is_delayed_strategy( $intended_strategy ) ) {
 		$intended_strategy = '';
@@ -69,16 +69,11 @@
 		return false;
 	}
 
-	if ( $conditional ) {
-		$ie_conditional_prefix = "&lt;!--[if {$conditional}]&gt;\n";
-		$ie_conditional_suffix = "&lt;![endif]--&gt;\n";
-	}
-
 	$before_script = $this-&gt;get_inline_script_tag( $handle, 'before' );
 	$after_script  = $this-&gt;get_inline_script_tag( $handle, 'after' );
 
 	if ( $before_script || $after_script ) {
-		$inline_script_tag = $ie_conditional_prefix . $before_script . $after_script . $ie_conditional_suffix;
+		$inline_script_tag = $before_script . $after_script;
 	} else {
 		$inline_script_tag = '';
 	}
@@ -91,7 +86,16 @@
 
 	$translations = $this-&gt;print_translations( $handle, false );
 	if ( $translations ) {
-		$translations = wp_get_inline_script_tag( $translations, array( 'id' =&gt; "{$handle}-js-translations" ) );
+		/*
+		 * The sourceURL comment is not included by WP_Scripts::print_translations()
+		 * when `$display` is `false` to prevent issues where the script tag contents are used
+		 * by extenders for other purposes, for example concatenated with other script content.
+		 *
+		 * Include the sourceURL comment here as it would be when printed directly.
+		 */
+		$source_url    = rawurlencode( "{$handle}-js-translations" );
+		$translations .= "\n//# sourceURL={$source_url}";
+		$translations  = wp_get_inline_script_tag( $translations, array( 'id' =&gt; "{$handle}-js-translations" ) );
 	}
 
 	if ( $this-&gt;do_concat ) {
@@ -106,7 +110,8 @@
 		$filtered_src = apply_filters( 'script_loader_src', $src, $handle );
 
 		if (
-			$this-&gt;in_default_dir( $filtered_src )
+			is_string( $filtered_src )
+			&amp;&amp; $this-&gt;in_default_dir( $filtered_src )
 			&amp;&amp; ( $before_script || $after_script || $translations_stop_concat || $this-&gt;is_delayed_strategy( $strategy ) )
 		) {
 			$this-&gt;do_concat = false;
@@ -114,7 +119,7 @@
 			// Have to print the so-far concatenated scripts right away to maintain the right order.
 			_print_scripts();
 			$this-&gt;reset();
-		} elseif ( $this-&gt;in_default_dir( $filtered_src ) &amp;&amp; ! $conditional ) {
+		} elseif ( $this-&gt;in_default_dir( $filtered_src ) ) {
 			$this-&gt;print_code     .= $this-&gt;print_extra_script( $handle, false );
 			$this-&gt;concat         .= "$handle,";
 			$this-&gt;concat_version .= "$handle$ver";
@@ -125,17 +130,7 @@
 		}
 	}
 
-	$has_conditional_data = $conditional &amp;&amp; $this-&gt;get_data( $handle, 'data' );
-
-	if ( $has_conditional_data ) {
-		echo $ie_conditional_prefix;
-	}
-
 	$this-&gt;print_extra_script( $handle );
-
-	if ( $has_conditional_data ) {
-		echo $ie_conditional_suffix;
-	}
 
 	// A single item may alias a set of items, by having dependencies, but no source.
 	if ( ! $src ) {
@@ -154,8 +149,31 @@
 		$src = $this-&gt;base_url . $src;
 	}
 
-	if ( ! empty( $ver ) ) {
-		$src = add_query_arg( 'ver', $ver, $src );
+	$ver_to_add = '';
+	if ( empty( $obj-&gt;ver ) &amp;&amp; null !== $obj-&gt;ver &amp;&amp; is_string( $this-&gt;default_version ) ) {
+		$ver_to_add = $this-&gt;default_version;
+	} elseif ( is_scalar( $obj-&gt;ver ) ) {
+		$ver_to_add = (string) $obj-&gt;ver;
+	}
+
+	$added_args = (string) ( $this-&gt;args[ $handle ] ?? '' );
+
+	if ( '' !== $ver_to_add || '' !== $added_args ) {
+		$fragment = strstr( $src, '#' );
+		if ( false !== $fragment ) {
+			$src = substr( $src, 0, -strlen( $fragment ) );
+		}
+
+		if ( '' !== $ver_to_add ) {
+			$src .= ( str_contains( $src, '?' ) ? '&amp;' : '?' ) . 'ver=' . rawurlencode( $ver_to_add );
+		}
+		if ( '' !== $added_args ) {
+			$src .= ( str_contains( $src, '?' ) ? '&amp;' : '?' ) . $added_args;
+		}
+
+		if ( false !== $fragment ) {
+			$src .= $fragment;
+		}
 	}
 
 	/** This filter is documented in wp-includes/class-wp-scripts.php */
@@ -175,9 +193,28 @@
 	if ( $intended_strategy ) {
 		$attr['data-wp-strategy'] = $intended_strategy;
 	}
-	$tag  = $translations . $ie_conditional_prefix . $before_script;
+
+	// Determine fetchpriority.
+	$original_fetchpriority = $obj-&gt;extra['fetchpriority'] ?? null;
+	if ( null === $original_fetchpriority || ! $this-&gt;is_valid_fetchpriority( $original_fetchpriority ) ) {
+		$original_fetchpriority = 'auto';
+	}
+	$actual_fetchpriority = $this-&gt;get_highest_fetchpriority_with_dependents( $handle );
+	if ( null === $actual_fetchpriority ) {
+		// If null, it's likely this script was not explicitly enqueued, so in this case use the original priority.
+		$actual_fetchpriority = $original_fetchpriority;
+	}
+	if ( is_string( $actual_fetchpriority ) &amp;&amp; 'auto' !== $actual_fetchpriority ) {
+		$attr['fetchpriority'] = $actual_fetchpriority;
+	}
+
+	if ( $original_fetchpriority !== $actual_fetchpriority ) {
+		$attr['data-wp-fetchpriority'] = $original_fetchpriority;
+	}
+
+	$tag  = $translations . $before_script;
 	$tag .= wp_get_script_tag( $attr );
-	$tag .= $after_script . $ie_conditional_suffix;
+	$tag .= $after_script;
 
 	/**
 	 * Filters the HTML script tag of an enqueued script.
@@ -199,14 +236,14 @@
 	return true;
 }
 </code></pre>
-<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes_class-wp-scripts-php-2/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/6.7/src/wp-includes/class-wp-scripts.php#L266">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/6.7/src/wp-includes/class-wp-scripts.php#L266-L450">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
+<p class="wporg-dot-link-list"><a href="https://developer.wordpress.org/reference/files/wp-includes_class-wp-scripts-php-2/">View all references</a> <a href="https://core.trac.wordpress.org/browser/tags/7.0/src/wp-includes/class-wp-scripts.php#L284">View on Trac</a> <a href="https://github.com/WordPress/wordpress-develop/blob/7.0/src/wp-includes/class-wp-scripts.php#L284-L505">View on GitHub</a></p></section> <section><h2 id="hooks">Hooks</h2> <dl>
 <dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../../hooks/script_loader_src.html"><span class="hook-func">apply_filters</span>( ‘script_loader_src’, <nobr><span class="arg-type">string</span> <span class="arg-name">$src</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$handle</span></nobr> )</a></dt>
 <dd>
 <p>Filters the script loader source.</p> </dd>
 <dt class="wp-block-wporg-code-reference-title has-normal-font-size"><a href="../../hooks/script_loader_tag.html"><span class="hook-func">apply_filters</span>( ‘script_loader_tag’, <nobr><span class="arg-type">string</span> <span class="arg-name">$tag</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$handle</span></nobr>, <nobr><span class="arg-type">string</span> <span class="arg-name">$src</span></nobr> )</a></dt>
 <dd>
 <p>Filters the HTML script tag of an enqueued script.</p> </dd>
-</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20);"><figure class="wp-block-table "><table>
+</dl></section>  <section><h2 id="changelog">Changelog</h2> <section style="margin-top:var(--wp--preset--spacing--20)"><figure class="wp-block-table "><table>
 <thead><tr>
 <th scope="col">Version</th>
 <th scope="col">Description</th>
@@ -223,7 +260,7 @@
 </tbody>
 </table></figure></section> </section><div class="_attribution">
   <p class="_attribution-p">
-    &copy; 2003&ndash;2024 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
+    &copy; 2003&ndash;2026 WordPress Foundation<br>Licensed under the GNU GPLv2+ License.<br>
     <a href="https://developer.wordpress.org/reference/classes/wp_scripts/do_item" class="_attribution-link">https://developer.wordpress.org/reference/classes/wp_scripts/do_item</a>
   </p>
 </div>
