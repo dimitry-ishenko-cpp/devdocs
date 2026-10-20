@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22) # jammy
-project(devdocs VERSION 1.5 LANGUAGES NONE)
+project(devdocs VERSION 1.6 LANGUAGES NONE)
 
 option(SYSTEM_INSTALL "" OFF)
 
