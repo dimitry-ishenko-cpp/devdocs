@@ -71,7 +71,7 @@ You can use the _--preview_ option with both **devgrep** and **devopen**:
 Binary packages for Debian, Ubuntu, RaspberryPi and other Debian-based
 distributions can be installed from the [CCCP Linux Package
 Archive](https://github.com/cccp-linux/archive). Follow their instructions to
-set up the archive and be sure to add the _dev_ component. After that:
+set up the archive and be sure to add the _dev_ component. Then, run:
 
 ```shell
 # install the devdocs package
