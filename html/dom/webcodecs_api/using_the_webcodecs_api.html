@@ -1,0 +1,187 @@
+<h1>Using the WebCodecs API</h1>  <p>This guide covers the basic usage patterns of the WebCodecs API, including how to encode and decode video and audio, as well as how to use <a href="../videoframe.html"><code>VideoFrame</code></a> and <a href="../audiodata.html"><code>AudioData</code></a>.</p> <h2 id="encoding_video">Encoding video</h2> <p>The basic usage pattern for <a href="../videoencoder.html"><code>VideoEncoder</code></a> starts with instantiation, where you define the <code>output</code> and <code>error</code> callback functions. The <code>output</code> callback receives an <code>EncodedVideoChunk</code> and a <code>metadata</code> parameter — an <code>EncodedVideoChunkMetadata</code> dictionary which contains an optional <a href="../videoencoder/videoencoder.html#decoderconfig">decoderConfig</a> property. This metadata is needed by muxing libraries when muxing to a video file.</p> <pre data-language="js">const encoder = new VideoEncoder({
+  output(chunk, meta) {
+    // Do something with chunk, typically send to muxing library
+  },
+  error(e) {
+    // Handle the error
+  },
+});
+</pre> <p>You then need to configure the encoder with the codec parameter and various other encoding parameters such as width, height, bitrate and framerate. See the <a href="codec_selection.html">Codec selection</a> guide for guidance on choosing a codec.</p> <pre data-language="js">encoder.configure({
+  codec: "vp09.00.40.08.00", // See codec selection guide
+  width: 1280,
+  height: 720,
+  bitrate: 1_000_000, // 1 Mbps
+  framerate: 30,
+});
+</pre> <p>You would then start encoding <code>VideoFrame</code> objects, where you would not only specify the <code>VideoFrame</code> to be encoded, but also the <code>keyFrame</code> parameter indicating whether or not the frame should be encoded as a key frame.</p> <pre data-language="js">for (let i = 0; i &lt; 60; i++) {
+  const timestamp = (i * 1e6) / 30; // 30 fps, in microseconds
+  const frame = new VideoFrame(canvas, { timestamp });
+  encoder.encode(frame, { keyFrame: i % 60 === 0 });
+  frame.close();
+}
+</pre> <p>The first frame encoded should be a key frame — while <code>VideoEncoder</code> will automatically force the first frame to be a key frame even if not explicitly flagged, it is good practice to set it explicitly. Typical key frame intervals are once every 30 or 60 frames. Using more key frames increases video file size, while using fewer key frames can result in unstable video playback by some video players.</p> <p>It is important to close <code>VideoFrame</code> objects as soon as they are sent for encoding to avoid memory leaks. <code>VideoFrame</code> objects are large enough that applications can crash with fewer than 100 active frames in memory.</p> <p>Note that <code>VideoEncoder</code> also has a queue of frames to encode called the <code>encodeQueue</code>. If you are rendering an animation at 30 fps, run <code>encoder.encode(frame)</code> on each render, but the encoder is only able to encode at 10 fps, the encoder queue will eventually grow until it runs out of video memory and the process crashes.</p> <p>You therefore need to manage how and when you send frames to the encoder, checking <a href="../videoencoder/encodequeuesize.html"><code>VideoEncoder.encodeQueueSize</code></a> within your render loop, and ensuring that it does not grow unbounded.</p> <p>It is possible to use the <code>dequeue</code> event to detect when the encode queue is reduced, to avoid the need to poll <code>encodeQueueSize</code>.</p> <pre data-language="js">encoder.addEventListener("dequeue", (event) =&gt; {
+  // Queue up more encoding work
+});
+</pre> <p>Once you are done sending all frames for encoding, you should call the <code>flush()</code> method.</p> <pre data-language="js">await encoder.flush();
+</pre> <p>Depending on the device/browser, the encoder may not return the last few <code>EncodedVideoChunk</code> objects until <code>flush()</code> is called. Once you are done using the <code>VideoEncoder</code> completely, you should call the <code>close()</code> method to free up system resources.</p> <pre data-language="js">encoder.close();
+</pre> <p>A <code>VideoEncoder</code> may throw an error during the process of encoding for a number of different reasons, such as if the user switches tabs and the browser reclaims the resources. When an error occurs, the encoder transitions permanently to the <code>"closed"</code> state. It is not possible to reconfigure a closed encoder — a new <code>VideoEncoder</code> instance must be created. The first frame encoded by the new encoder must be a key frame.</p> <pre data-language="js">if (encoder.state === "closed") {
+  // Close the old encoder, instantiate and configure a new encoder
+}
+
+encoder.encode(frame, { keyFrame: true });
+</pre> <h2 id="decoding_video">Decoding video</h2> <p>Likewise, for decoding video, you start by instantiating the <a href="../videodecoder.html"><code>VideoDecoder</code></a> with the <code>output</code> and <code>error</code> callback functions, where the <code>output</code> callback receives <code>VideoFrame</code> objects returned by the decoder.</p> <pre data-language="js">const decoder = new VideoDecoder({
+  output(frame) {
+    // Do something with the VideoFrame
+  },
+  error(e) {
+    /** Handle the error */
+  },
+});
+</pre> <p>You then need to configure the decoder. If you are decoding a video file, a demuxing library can provide the correct decoder config (see <a href="../webcodecs_api.html#muxing_and_demuxing">Muxing and Demuxing</a>). If streaming video between a WebCodecs sender and receiver, the decoder config would be identical to the meta returned by the <code>VideoEncoder</code> which generated the encoded chunks.</p> <pre data-language="js">decoder.configure(/* config */);
+</pre> <p>If you are decoding a video file, you will need a demuxing library to extract video chunks. You can then submit the chunks for decoding. Keep in mind that you should not send just one chunk for decoding and wait for the frame to be output before feeding the next chunk. Depending on the browser/device and video itself, you may need to send multiple chunks before the decoder begins returning frames, and the minimum number of chunks will depend on the device.</p> <pre data-language="js">let chunkIndex = 0;
+// Process chunks in batches, not one at a time nor all at once
+for (let i = 0; i &lt; BATCH_LENGTH; i++) {
+  decoder.decode(chunks[chunkIndex]);
+  chunkIndex++;
+}
+</pre> <p>Similar to <code>VideoEncoder</code>, <code>VideoDecoder</code> maintains a decode queue which needs to be managed. If you send thousands of chunks to the <code>VideoDecoder</code> at once, the decoder might close or fail, so your application will need to ensure that <a href="../videodecoder/decodequeuesize.html"><code>VideoDecoder.decodeQueueSize</code></a> does not grow unbounded. Like with the encoder, you can also listen for the <code>dequeue</code> event to aid in managing the decode queue.</p> <pre data-language="js">decoder.addEventListener("dequeue", (event) =&gt; {
+  // Queue up more decoding work
+});
+</pre> <p>Once you are finished sending all frames for decoding, you can run <code>flush</code>.</p> <pre data-language="js">await decoder.flush();
+</pre> <p>Depending on the device/browser, the decoder may not return the last few <code>VideoFrame</code> objects until <code>flush()</code> is called. Once you are done using the <code>VideoDecoder</code> completely, you should call the <code>close()</code> method to free up system resources.</p> <pre data-language="js">decoder.close();
+</pre> <p>A <code>VideoDecoder</code> may throw an error decoding for a variety of reasons, such as corrupted or missing data in a source <code>EncodedVideoChunk</code>. When a decoder fails, it transitions permanently to the <code>"closed"</code> state and a new <code>VideoDecoder</code> instance must be created. The first chunk decoded by the new decoder must be a key frame, so it is necessary to seek forward from the current position to the next key frame before resuming.</p> <pre data-language="js">let chunkIndex = 0;
+
+for (let i = 0; i &lt; BATCH_LENGTH; i++) {
+  // Check if decoder failed
+  if (decoder.state === "closed") {
+    // Seek forward to the next key frame from the current position
+    for (let j = chunkIndex; j &lt; chunks.length; j++) {
+      if (chunks[j].type === "key") {
+        chunkIndex = j;
+        break;
+      }
+    }
+    // Close the old decoder, instantiate and configure a new decoder
+  }
+  decoder.decode(chunks[chunkIndex]);
+  chunkIndex++;
+}
+</pre> <h2 id="videoframe">VideoFrame</h2> <p>A <a href="../videoframe.html"><code>VideoFrame</code></a> represents a single uncompressed video frame, including its pixel data and metadata such as its timestamp. It is both returned by the <code>VideoDecoder</code> when decoding encoded video, and generated from a variety of source images.</p> <h3 id="creating_video_frames">Creating video frames</h3> <p>A <code>VideoFrame</code> can be constructed from any image source. Keep in mind that timestamps are in microseconds.</p> <pre data-language="js">const bitmapFrame = new VideoFrame(imgBitmap, { timestamp: 0 });
+const imageFrame = new VideoFrame(htmlImageEl, { timestamp: 0 });
+const videoFrame = new VideoFrame(htmlVideoEl, { timestamp: 0 });
+const canvasFrame = new VideoFrame(canvasEl, { timestamp: 0 });
+</pre> <p>Constructing a <code>VideoFrame</code> from a <code>Canvas</code> is typically how you would encode video in a video editing application, where source video and images are used within a canvas context, applying effects and transformations, and the <code>Canvas</code> can both be previewed by the user and used as the image source for a <code>VideoFrame</code> to be encoded.</p> <p>You can also directly create a <code>VideoFrame</code> from binary data, such as an <code>ArrayBuffer</code>; however, you will need to specify the <code>format</code> and metadata and ensure that the data being used to construct the frame follows the specified <a href="../videoframe/format.html">format</a>.</p> <pre data-language="js">const rgbaFrame = new VideoFrame(rgbaData, {
+  timestamp: 0,
+  format: "RGBA",
+  codedWidth: 1920,
+  codedHeight: 1080,
+});
+</pre> <p><code>VideoFrame</code> objects are tied to data on graphics memory. When creating a <code>VideoFrame</code> from a <code>Canvas</code>, <code>Bitmap</code>, <code>Video</code> or <code>Image</code>, data is copied from graphics memory to graphics memory, which is relatively more efficient.</p> <p>A <code>VideoFrame</code> constructed from binary data (e.g., <code>ArrayBuffer</code> or <code>Uint8ClampedArray</code>) will incur a CPU→graphics memory copy operation, which can be a performance penalty if done repeatedly.</p> <p>Finally, <code>VideoFrame</code> objects can also be generated by decoding <code>EncodedVideoChunk</code> objects via a <code>VideoDecoder</code>, as shown in the <a href="#decoding_video">Decoding video</a> section above.</p> <h3 id="consuming_video_frames">Consuming video frames</h3> <p>Decoded video can also be played back in the browser by rendering <code>VideoFrame</code> objects to a <code>Canvas</code> via any of the Canvas rendering methods. Different rendering methods have different performance characteristics, which may be relevant when running compute-intensive video processing operations.</p> <h4 id="canvas2d">Canvas2D</h4> <p>Frames can be drawn to a <a href="../canvasrenderingcontext2d.html"><code>CanvasRenderingContext2D</code></a> using the <code>drawImage</code> method:</p> <pre data-language="js">const canvas = new OffscreenCanvas(width, height);
+const ctx = canvas.getContext("2d");
+ctx.drawImage(frame, 0, 0);
+</pre> <p>While the 2D canvas context has a simple yet flexible API, browsers use different implementations under the hood, resulting in inconsistent and generally worse performance across browsers.</p> <h4 id="bitmaprenderer">BitmapRenderer</h4> <p>Frames can also be rendered to a canvas via the <a href="../imagebitmaprenderingcontext.html"><code>ImageBitmapRenderingContext</code></a> by creating an <a href="../imagebitmap.html"><code>ImageBitmap</code></a> from the frame, and rendering it to the canvas via the <code>transferFromImageBitmap</code> method.</p> <pre data-language="js">const canvas = new OffscreenCanvas(width, height);
+const ctx = canvas.getContext("bitmaprenderer");
+
+const bitmap = await createImageBitmap(frame);
+ctx.transferFromImageBitmap(bitmap);
+frame.close();
+</pre> <p>This method involves making a single copy of the frame in graphics memory, resulting in more consistent and generally better performance across browsers than the Canvas2D API while also being relatively simple.</p> <h4 id="webgpu">WebGPU</h4> <p>The most efficient way to render a <code>VideoFrame</code> to a canvas is via the <a href="../gpudevice/importexternaltexture.html">importExternalTexture</a> method in WebGPU.</p> <pre data-language="js">const externalTexture = device.importExternalTexture({ source: frame });
+</pre> <p><code>importExternalTexture</code> is efficient as it incurs a zero-copy operation, using the exact same <code>VideoFrame</code> object in memory within a WebGPU pipeline. It is the most performant method for rendering a <code>VideoFrame</code>, but also the most complex to set up.</p> <h3 id="memory">Memory</h3> <p>Because <code>VideoFrame</code> objects can consume significant GPU memory, and video processing involves manipulating many frames per second, extra care should be taken to manage memory and avoid memory leaks in order to avoid application crashes.</p> <p>First and foremost, frames must be explicitly released when no longer needed.</p> <pre data-language="js">frame.close();
+</pre> <p>When encoding, you can close the frame as soon as you send it for encoding.</p> <pre data-language="js">encoder.encode(frame, { keyFrame: true });
+frame.close();
+</pre> <p>You should also close the frames right after rendering.</p> <pre data-language="js">ctx.drawImage(frame, 0, 0);
+frame.close();
+</pre> <p>When transferring a <code>VideoFrame</code> between threads (e.g., a worker), it should be transferred as a <a href="../web_workers_api/transferable_objects.html">transferable object</a>.</p> <pre data-language="js">worker.postMessage(frame, [frame]);
+</pre> <h2 id="audio">Audio</h2> <p>WebCodecs supports encoding and decoding audio via <a href="../audioencoder.html"><code>AudioEncoder</code></a> and <a href="../audiodecoder.html"><code>AudioDecoder</code></a>, using the Opus and AAC codecs. Before working with audio, there are a few important caveats to be aware of:</p> <ul> <li>
+<strong>Pass-through</strong>: If you are transcoding video and do not need to modify the audio, you do not need to decode and re-encode the audio at all. <code>EncodedAudioChunk</code> objects can be passed directly from a demuxing library to a muxing library, which is significantly more efficient.</li> <li>
+<strong>Playback</strong>: The WebCodecs API has no built-in audio playback. For playback, use the <a href="../web_audio_api.html">Web Audio API</a>.</li> <li>
+<strong>Format support</strong>: WebCodecs only supports encoding Opus and AAC. For MP3 or other formats, a third-party library is required.</li> </ul> <h3 id="playback">Playback</h3> <p>There is no direct bridge between WebCodecs and the Web Audio API. <a href="../audiodata.html"><code>AudioData</code></a> objects cannot be passed directly to the Web Audio API, which uses <a href="../audiobuffer.html"><code>AudioBuffer</code></a> to represent raw audio.</p> <p>The recommended approach for playback is to mux <code>EncodedAudioChunk</code> objects into an in-memory buffer using a muxing library, then decode that buffer via <a href="../baseaudiocontext/decodeaudiodata.html"><code>AudioContext.decodeAudioData()</code></a>:</p> <pre data-language="js">// mux encoded chunks to an ArrayBuffer using a muxing library
+const buffer = await muxAudioToBuffer(encodedChunks);
+const audioBuffer = await audioContext.decodeAudioData(buffer);
+const source = audioContext.createBufferSource();
+source.buffer = audioBuffer;
+source.connect(audioContext.destination);
+source.start();
+</pre> <p>Alternatively, you can extract raw samples from <code>AudioData</code> via <code>copyTo()</code> and construct an <code>AudioBuffer</code> manually, but this requires a CPU-side data copy for each chunk and is slower.</p> <h3 id="encoding">Encoding</h3> <p>Audio encoding is simpler than video encoding — there are no key frames, no hardware acceleration concerns, and each <code>AudioData</code> produces exactly one <code>EncodedAudioChunk</code>. The encoder can be treated as a straightforward async pipeline.</p> <pre data-language="js">const encoder = new AudioEncoder({
+  output(chunk) {
+    // send to muxer
+  },
+  error(e) {
+    console.error(e);
+  },
+});
+
+encoder.configure({
+  codec: "opus",
+  sampleRate: 48000,
+  numberOfChannels: 2,
+});
+
+for (const audioData of rawAudio) {
+  encoder.encode(audioData);
+  audioData.close();
+}
+
+await encoder.flush();
+</pre> <p>See the <a href="codec_selection.html#audio_codecs">Codec selection</a> guide for guidance on choosing between Opus and AAC.</p> <h3 id="decoding">Decoding</h3> <p>Audio decoding follows the same pattern as encoding. The decoder configuration is typically provided by the demuxing library rather than chosen by the developer.</p> <pre data-language="js">const decoder = new AudioDecoder({
+  output(audioData) {
+    // process AudioData
+    audioData.close();
+  },
+  error(e) {
+    console.error(e);
+  },
+});
+
+// config comes from demuxer library
+decoder.configure(decoderConfig);
+
+for (const chunk of encodedChunks) {
+  decoder.decode(chunk);
+}
+
+await decoder.flush();
+</pre> <h3 id="audiodata">AudioData</h3> <p>An <a href="../audiodata.html"><code>AudioData</code></a> object represents a segment of raw audio, typically covering 0.2–0.5 seconds. Raw samples are extracted as <code>Float32Array</code> data using the <a href="../audiodata/copyto.html"><code>AudioData.copyTo()</code></a> method. The extraction pattern depends on the <code>format</code> property of the <code>AudioData</code> object.</p> <p>The most common format is <code>f32-planar</code>, where each channel is stored in a separate plane. Use <code>planeIndex</code> to copy each channel independently:</p> <pre data-language="js">// f32-planar: each channel stored separately
+const leftChannel = new Float32Array(audioData.numberOfFrames);
+audioData.copyTo(leftChannel, { planeIndex: 0 });
+
+const rightChannel = new Float32Array(audioData.numberOfFrames);
+audioData.copyTo(rightChannel, { planeIndex: 1 });
+</pre> <p>The less common <code>f32</code> format stores all channels interleaved in a single array (<code>[L, R, L, R, ...]</code>). In this case, copy the full interleaved buffer and de-interleave manually:</p> <pre data-language="js">// f32: channels interleaved in a single array
+const interleaved = new Float32Array(
+  audioData.numberOfFrames * audioData.numberOfChannels,
+);
+audioData.copyTo(interleaved, { planeIndex: 0 });
+
+const leftChannel = new Float32Array(audioData.numberOfFrames);
+const rightChannel = new Float32Array(audioData.numberOfFrames);
+
+for (let i = 0; i &lt; audioData.numberOfFrames; i++) {
+  leftChannel[i] = interleaved[i * 2];
+  rightChannel[i] = interleaved[i * 2 + 1];
+}
+</pre> <p>To handle both formats:</p> <pre data-language="js">if (audioData.format.includes("planar")) {
+  // f32-planar: copy each channel by planeIndex
+} else {
+  // f32: copy interleaved, then de-interleave
+}
+</pre> <p>To construct an <code>AudioData</code> from raw samples, the data for all channels must be concatenated into a single <code>Float32Array</code> with each channel's samples placed sequentially (matching <code>f32-planar</code> layout), and the <code>numberOfFrames</code> set to the number of samples per channel:</p> <pre data-language="js">const framesPerChunk = 1024;
+const data = new Float32Array(framesPerChunk * 2); // 2 channels
+data.set(leftChannel, 0);
+data.set(rightChannel, framesPerChunk);
+
+const audioData = new AudioData({
+  format: "f32-planar",
+  sampleRate: 48000,
+  numberOfFrames: framesPerChunk,
+  numberOfChannels: 2,
+  timestamp: sourceAudioData.timestamp,
+  data,
+});
+</pre> <p>Note that certain AAC codec strings (<code>mp4a.40.5</code>, <code>mp4a.40.05</code> and <code>mp4a.40.29</code>) correspond to configurations that use a technique called Spectral Band Replication (SBR), which causes the decoder to output audio at double the sample rate specified in the decoder configuration. Always read <code>audioData.sampleRate</code> directly rather than assuming it matches the configured value.</p> <p>Like <code>VideoFrame</code>, <code>AudioData</code> objects must be explicitly closed to free memory:</p> <pre data-language="js">audioData.close();
+</pre> <p>While <code>AudioData</code> requires much less memory than a <code>VideoFrame</code>, raw audio still has a significant memory footprint — an hour of stereo audio at 48kHz is approximately 1.4 GB. For large files, audio should be decoded and processed in batches rather than all at once.</p> <h2 id="see_also">See also</h2> <ul> <li><a href="video_processing_concepts.html">Video processing concepts</a></li> <li><a href="codec_selection.html">Codec selection</a></li> <li><a href="../videoencoder.html"><code>VideoEncoder</code></a></li> <li><a href="../videodecoder.html"><code>VideoDecoder</code></a></li> <li><a href="../audioencoder.html"><code>AudioEncoder</code></a></li> <li><a href="../audiodecoder.html"><code>AudioDecoder</code></a></li> <li><a href="../videoframe.html"><code>VideoFrame</code></a></li> <li><a href="../audiodata.html"><code>AudioData</code></a></li> <li><a href="../encodedvideochunk.html"><code>EncodedVideoChunk</code></a></li> <li><a href="../encodedaudiochunk.html"><code>EncodedAudioChunk</code></a></li> </ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2005&ndash;2025 MDN contributors.<br>Licensed under the Creative Commons Attribution-ShareAlike License v2.5 or later.<br>
+    <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API/Using_the_WebCodecs_API" class="_attribution-link">https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API/Using_the_WebCodecs_API</a>
+  </p>
+</div>

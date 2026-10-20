@@ -1,0 +1,430 @@
+<h1> <span>gen_tcp</span>  </h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L23" title="View Source" class="source" rel="help nofollow">Source</a>   <p>Interface to TCP/IP sockets.</p>
+<p>This module provides functions for communicating over TCP/IP protocol sockets.</p>
+<p>The following code fragment is a simple example of a client connecting to a server at port 5678, transferring a binary, and closing the connection:</p>
+<pre data-language="erlang">client() -&gt;
+    SomeHostInNet = "localhost", % to make it runnable on one machine
+    {ok, Sock} = gen_tcp:connect(SomeHostInNet, 5678,
+                                 [binary, {packet, 0}]),
+    ok = gen_tcp:send(Sock, "Some Data"),
+    ok = gen_tcp:close(Sock).</pre>
+<p>At the other end, a server is listening on port 5678, accepts the connection, and receives the binary:</p>
+<pre data-language="erlang">server() -&gt;
+    {ok, LSock} = gen_tcp:listen(5678, [binary, {packet, 0},
+                                        {active, false}]),
+    {ok, Sock} = gen_tcp:accept(LSock),
+    {ok, Bin} = do_recv(Sock, []),
+    ok = gen_tcp:close(Sock),
+    ok = gen_tcp:close(LSock),
+    Bin.
+
+do_recv(Sock, Bs) -&gt;
+    case gen_tcp:recv(Sock, 0) of
+        {ok, B} -&gt;
+            do_recv(Sock, [Bs, B]);
+        {error, closed} -&gt;
+            {ok, list_to_binary(Bs)}
+    end.</pre>
+<p>For more examples, see section <a href="#module-examples">Examples</a>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>Functions that create sockets can take an optional option; <code>{inet_backend, Backend}</code> that, if specified, has to be the first option. This selects the implementation backend towards the platform's socket API.</p>
+<p>This is a <em>temporary</em> option that will be ignored in a future release.</p>
+<p>The default is <code>Backend = inet</code> that selects the traditional <code>inet_drv.c</code> driver. The other choice is <code>Backend = socket</code> that selects the new <a href="socket.html"><code>socket</code></a> module and its NIF implementation.</p>
+<p>The system default can be changed when the node is started with the application <code>kernel</code>'s configuration variable <code>inet_backend</code>.</p>
+<p>For <code>gen_tcp</code> with <code>inet_backend = socket</code> we have tried to be as "compatible" as possible which has sometimes been impossible. Here is a list of cases when the behaviour of inet-backend <code>inet</code> (default) and <code>socket</code> are different:</p>
+<ul>
+<li>
+<p><a href="#non_blocking_send">Non-blocking send</a></p>
+<p>If a user calling <a href="#send/2"><code>gen_tcp:send/2</code></a> with <code>inet_backend = inet</code>, tries to send more data than there is room for in the OS buffers, the "rest data" is buffered by the inet driver (and later sent in the background). The effect for the user is that the call is non-blocking.</p>
+<p>This is <em>not</em> the effect when <code>inet_backend = socket</code>, since there is no buffering. Instead the user hangs either until all data has been sent or the <code>send_timeout</code> timeout has been reached.</p>
+</li>
+<li>
+<p><a href="#shutdown/2"><code>shutdown/2</code></a> may hide errors</p>
+<p>The call does not involve the receive process state, and is done right on the underlying socket. On for example Linux, it is a known misbehaviour that it skips some checks so doing shutdown on a listen socket returns <code>ok</code> while the logical result should have been <code>{error, enotconn}</code>. The <code>inet_drv.c</code> driver did an extra check and simulated the correct error, but with <code>Backend = socket</code> it would introduce overhead to involve the receive process.</p>
+</li>
+<li>
+<p>The option <a href="inet.html#option-nodelay">nodelay</a> is a TCP specific option that is <em>not</em> compatible with <code>domain = local</code>.</p>
+<p>When using <code>inet_backend = socket</code>, trying to create a socket (via listen or connect) with <code>domain = local</code> (for example with option {ifaddr, {local,"/tmp/test"}}) <em>will fail</em> with <code>{error, enotsup}</code>.</p>
+<p>This does not actually work for <code>inet_backend = inet</code> either, but in that case the error is simply <em>ignored</em>, which is a <em>bad</em> idea. We have chosen to <em>not</em> ignore this error for <code>inet_backend = socket</code>.</p>
+</li>
+<li>
+<p><a href="#async_shutdown_write">Async shutdown write</a></p>
+<p>Calling <a href="#shutdown/2">gen_tcp:shutdown(Socket, write | read_write)</a> on a socket created with <code>inet_backend = socket</code> will take <em>immediate</em> effect, unlike for a socket created with <code>inet_backend = inet</code>.</p>
+<p>See <a href="#async_shutdown_write">async shutdown write</a> for more info.</p>
+</li>
+<li>
+<p>Windows require sockets (domain = <code>inet | inet6</code>) to be bound.</p>
+<p><em>Currently</em> all sockets created on Windows with <code>inet_backend = socket</code> will be bound. If the user does not provide an address, gen_tcp will try to 'figure out' an address itself.</p>
+</li>
+</ul>
+</div>
+<h2 id="module-examples">Examples</h2>
+<p>The following example illustrates use of option <code>{active,once}</code> and multiple accepts by implementing a server as a number of worker processes doing accept on a single listening socket. Function <code>start/2</code> takes the number of worker processes and the port number on which to listen for incoming connections. If <code>LPort</code> is specified as <code>0</code>, an ephemeral port number is used, which is why the start function returns the actual port number allocated:</p>
+<pre data-language="erlang">start(Num,LPort) -&gt;
+    case gen_tcp:listen(LPort,[{active, false},{packet,2}]) of
+        {ok, ListenSock} -&gt;
+            start_servers(Num,ListenSock),
+            {ok, Port} = inet:port(ListenSock),
+            Port;
+        {error,Reason} -&gt;
+            {error,Reason}
+    end.
+
+start_servers(0,_) -&gt;
+    ok;
+start_servers(Num,LS) -&gt;
+    spawn(?MODULE,server,[LS]),
+    start_servers(Num-1,LS).
+
+server(LS) -&gt;
+    case gen_tcp:accept(LS) of
+        {ok,S} -&gt;
+            loop(S),
+            server(LS);
+        Other -&gt;
+            io:format("accept returned ~w - goodbye!~n",[Other]),
+            ok
+    end.
+
+loop(S) -&gt;
+    inet:setopts(S,[{active,once}]),
+    receive
+        {tcp,S,Data} -&gt;
+            Answer = process(Data), % Not implemented in this example
+            gen_tcp:send(S,Answer),
+            loop(S);
+        {tcp_closed,S} -&gt;
+            io:format("Socket ~w closed [~w]~n",[S,self()]),
+            ok
+    end.</pre>
+<p>Example of a simple client:</p>
+<pre data-language="erlang">client(PortNo,Message) -&gt;
+    {ok,Sock} = gen_tcp:connect("localhost",PortNo,[{active,false},
+                                                    {packet,2}]),
+    gen_tcp:send(Sock,Message),
+    A = gen_tcp:recv(Sock,0),
+    gen_tcp:close(Sock),
+    A.</pre>
+<p>The <code>send</code> call does not accept a time-out option because time-outs on send is handled through socket option <code>send_timeout</code>. The behavior of a send operation with no receiver is mainly defined by the underlying TCP stack and the network infrastructure. To write code that handles a hanging receiver that can eventually cause the sender to hang on a <code>send</code> do like the following.</p>
+<p>Consider a process that receives data from a client process to be forwarded to a server on the network. The process is connected to the server through TCP/IP and does not get any acknowledge for each message it sends, but has to rely on the send time-out option to detect that the other end is unresponsive. Option <code>send_timeout</code> can be used when connecting:</p>
+<pre data-language="erlang">...
+{ok,Sock} = gen_tcp:connect(HostAddress, Port,
+                            [{active,false},
+                             {send_timeout, 5000},
+                             {packet,2}]),
+                loop(Sock), % See below
+...</pre>
+<p>In the loop where requests are handled, send time-outs can now be detected:</p>
+<pre data-language="erlang">loop(Sock) -&gt;
+    receive
+        {Client, send_data, Binary} -&gt;
+            case gen_tcp:send(Sock,[Binary]) of
+                {error, timeout} -&gt;
+                    io:format("Send timeout, closing!~n",
+                              []),
+                    handle_send_timeout(), % Not implemented here
+                    Client ! {self(),{error_sending, timeout}},
+                    %% Usually, it's a good idea to give up in case of a
+                    %% send timeout, as you never know how much actually
+                    %% reached the server, maybe only a packet header?!
+                    gen_tcp:close(Sock);
+                {error, OtherSendError} -&gt;
+                    io:format("Some other error on socket (~p), closing",
+                              [OtherSendError]),
+                    Client ! {self(),{error_sending, OtherSendError}},
+                    gen_tcp:close(Sock);
+                ok -&gt;
+                    Client ! {self(), data_sent},
+                    loop(Sock)
+            end
+    end.</pre>
+<p>Usually it suffices to detect time-outs on receive, as most protocols include some sort of acknowledgment from the server, but if the protocol is strictly one way, option <code>send_timeout</code> comes in handy.</p>   <section id="summary" class="details-list"> <h2>Summary</h2> <h3>Types</h3>
+<dl class="summary-types summary">   <dt> <a href="#t:connect_option/0">connect_option()</a> </dt>   <dt> <a href="#t:listen_option/0">listen_option()</a> </dt>   <dt> <a href="#t:option/0">option()</a> </dt>   <dt> <a href="#t:option_name/0">option_name()</a> </dt>   <dt> <a href="#t:pktoptions_value/0">pktoptions_value()</a> </dt> <dd><p>Value from socket option <a href="#t:option_name/0"><code>pktoptions</code></a>.</p></dd>   <dt> <a href="#t:socket/0">socket()</a> </dt> <dd><p>As returned by <a href="#accept/1"><code>accept/1,2</code></a> and <a href="#connect/3"><code>connect/3,4</code></a>.</p></dd>  </dl> <h3>Functions</h3>
+<dl class="summary-functions summary">   <dt> <a href="#accept/1">accept(ListenSocket)</a> </dt> <dd><p>Equivalent to <a href="#accept/2"><code>accept(ListenSocket, infinity)</code></a>.</p></dd>   <dt> <a href="#accept/2">accept(ListenSocket, Timeout)</a> </dt> <dd><p>Accept an incoming connection request on a listen socket.</p></dd>   <dt> <a href="#close/1">close(Socket)</a> </dt> <dd><p>Close a TCP socket.</p></dd>   <dt> <a href="#connect/2">connect(SockAddr, Opts)</a> </dt> <dd><p>Equivalent to <a href="#connect/3"><code>connect(SockAddr, Opts, infinity)</code></a>.</p></dd>   <dt> <a href="#connect/3">connect/3</a> </dt> <dd><p>Create a socket connected to the specified address.</p></dd>   <dt> <a href="#connect/4">connect(Address, Port, Opts, Timeout)</a> </dt> <dd><p>Create a socket connected to the specified address.</p></dd>   <dt> <a href="#controlling_process/2">controlling_process(Socket, Pid)</a> </dt> <dd><p>Change the controlling process (owner) of a socket.</p></dd>   <dt> <a href="#listen/2">listen(Port, Options)</a> </dt> <dd><p>Create a listen socket.</p></dd>   <dt> <a href="#recv/2">recv(Socket, Length)</a> </dt> <dd><p>Equivalent to <a href="#recv/3"><code>recv(Socket, Length, infinity)</code></a>.</p></dd>   <dt> <a href="#recv/3">recv(Socket, Length, Timeout)</a> </dt> <dd><p>Receive a packet, from a socket in <em>passive mode</em>.</p></dd>   <dt> <a href="#send/2">send(Socket, Packet)</a> </dt> <dd><p>Send a packet on a socket.</p></dd>   <dt> <a href="#shutdown/2">shutdown(Socket, How)</a> </dt> <dd><p>Close the socket in one or both directions.</p></dd>  </dl> </section> <section id="types" class="details-list"> <h2>Types</h2> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:connect_option/0">connect_option()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L377" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> connect_option() ::
+          {fd, Fd :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          <a href="inet.html#t:address_family/0">inet:address_family</a>() |
+          {ifaddr, <a href="socket.html#t:sockaddr_in/0">socket:sockaddr_in</a>() | <a href="socket.html#t:sockaddr_in6/0">socket:sockaddr_in6</a>() | <a href="inet.html#t:socket_address/0">inet:socket_address</a>()} |
+          {ip, <a href="inet.html#t:socket_address/0">inet:socket_address</a>()} |
+          {port, <a href="inet.html#t:port_number/0">inet:port_number</a>()} |
+          {tcp_module, <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>()} |
+          {netns, <a href="file.html#t:filename_all/0">file:filename_all</a>()} |
+          {bind_to_device, <a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0">binary</a>()} |
+          <a href="#t:option/0">option</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:listen_option/0">listen_option()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L388" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> listen_option() ::
+          {fd, Fd :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          <a href="inet.html#t:address_family/0">inet:address_family</a>() |
+          {ifaddr, <a href="socket.html#t:sockaddr_in/0">socket:sockaddr_in</a>() | <a href="socket.html#t:sockaddr_in6/0">socket:sockaddr_in6</a>() | <a href="inet.html#t:socket_address/0">inet:socket_address</a>()} |
+          {ip, <a href="inet.html#t:socket_address/0">inet:socket_address</a>()} |
+          {port, <a href="inet.html#t:port_number/0">inet:port_number</a>()} |
+          {backlog, B :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {tcp_module, <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>()} |
+          {netns, <a href="file.html#t:filename_all/0">file:filename_all</a>()} |
+          {bind_to_device, <a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0">binary</a>()} |
+          <a href="#t:option/0">option</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:option/0">option()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L264" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> option() ::
+          {active, true | false | once | -32768..32767} |
+          {buffer, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {debug, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {delay_send, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {deliver, port | term} |
+          {dontroute, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {exit_on_close, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {exclusiveaddruse, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {header, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {high_msgq_watermark, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>()} |
+          {high_watermark, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {keepalive, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {keepcnt, <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0">integer</a>()} |
+          {keepidle, <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0">integer</a>()} |
+          {keepintvl, <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0">integer</a>()} |
+          {linger, {<a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()}} |
+          {low_msgq_watermark, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>()} |
+          {low_watermark, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {mode, list | binary} |
+          list | binary |
+          {nodelay, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {packet,
+           0 | 1 | 2 | 4 | raw | sunrm | asn1 | cdr | fcgi | line | tpkt | http | httph | http_bin |
+           httph_bin} |
+          {packet_size, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {priority, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {raw, Protocol :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), OptionNum :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), ValueBin :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0">binary</a>()} |
+          {recbuf, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {reuseaddr, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {reuseport, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {reuseport_lb, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {send_timeout, <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>()} |
+          {send_timeout_close, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {show_econnreset, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {sndbuf, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {tos, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {tclass, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {ttl, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {recvtos, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {recvtclass, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {recvttl, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {user_timeout, <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          {ipv6_v6only, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:option_name/0">option_name()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L331" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> option_name() ::
+          active | buffer | debug | delay_send | deliver | dontroute | exit_on_close |
+          exclusiveaddruse | header | high_msgq_watermark | high_watermark | keepalive | keepcnt |
+          keepidle | keepintvl | linger | low_msgq_watermark | low_watermark | mode | nodelay | packet |
+          packet_size | priority |
+          {raw,
+           Protocol :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+           OptionNum :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+           ValueSpec :: (ValueSize :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()) | (ValueBin :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0">binary</a>())} |
+          recbuf | reuseaddr | reuseport | reuseport_lb | send_timeout | send_timeout_close |
+          show_econnreset | sndbuf | tos | tclass | ttl | recvtos | recvtclass | recvttl | pktoptions |
+          user_timeout | ipv6_v6only.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:pktoptions_value/0">pktoptions_value()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L328" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> pktoptions_value() :: {pktoptions, <a href="inet.html#t:ancillary_data/0">inet:ancillary_data</a>()}.</pre>  <p>Value from socket option <a href="#t:option_name/0"><code>pktoptions</code></a>.</p>
+<p>If the platform implements the IPv4 option <code>IP_PKTOPTIONS</code>, or the IPv6 option <code>IPV6_PKTOPTIONS</code> or <code>IPV6_2292PKTOPTIONS</code> for the socket; this value is returned from <a href="inet.html#getopts/2"><code>inet:getopts/2</code></a> when called with the option name <a href="#t:option_name/0"><code>pktoptions</code></a>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>This option appears to be VERY Linux specific, and its existence in future Linux kernel versions is also worrying since the option is part of RFC 2292 which is since long (2003) obsoleted by RFC 3542 that <em>explicitly</em> removes this possibility to get packet information from a stream socket. For comparison: it has existed in FreeBSD but is now removed, at least since FreeBSD 10.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:socket/0">socket()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L403" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> socket() :: <a href="inet.html#t:socket/0">inet:socket</a>().</pre>  <p>As returned by <a href="#accept/1"><code>accept/1,2</code></a> and <a href="#connect/3"><code>connect/3,4</code></a>.</p> </section> </section> </div> </section> <section id="functions" class="details-list"> <h2>Functions</h2> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="accept/1">accept(ListenSocket)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L731" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> accept(ListenSocket) -&gt; {ok, Socket} | {error, Reason}
+                when
+                    ListenSocket :: <a href="#t:socket/0">socket</a>(),
+                    Socket :: <a href="#t:socket/0">socket</a>(),
+                    Reason :: closed | system_limit | <a href="inet.html#t:posix/0">inet:posix</a>().</pre>  <p>Equivalent to <a href="#accept/2"><code>accept(ListenSocket, infinity)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="accept/2">accept(ListenSocket, Timeout)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L778" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> accept(ListenSocket, Timeout) -&gt; {ok, Socket} | {error, Reason}
+                when
+                    ListenSocket :: <a href="#t:socket/0">socket</a>(),
+                    Timeout :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>(),
+                    Socket :: <a href="#t:socket/0">socket</a>(),
+                    Reason :: closed | timeout | system_limit | <a href="inet.html#t:posix/0">inet:posix</a>().</pre>  <p>Accept an incoming connection request on a listen socket.</p>
+<p><code>ListenSocket</code> must be a socket returned from <a href="#listen/2"><code>listen/2</code></a>. <code>Timeout</code> specifies a time-out value in milliseconds. Defaults to <code>infinity</code>.</p>
+<p>Returns:</p>
+<ul>
+<li>
+<code>{ok, Socket}</code> if a connection is established</li>
+<li>
+<code>{error, closed}</code> if <code>ListenSocket</code> is closed</li>
+<li>
+<code>{error, timeout}</code> if no connection is established within <code>Timeout</code>
+</li>
+<li>
+<code>{error, system_limit}</code> if all available ports in the Erlang emulator are in use</li>
+<li>A POSIX error value if something else goes wrong, see <a href="inet.html"><code>inet</code></a> about possible values</li>
+</ul>
+<p>To send packets (outbound) on the returned <code>Socket</code>, use <a href="#send/2"><code>send/2</code></a>. Packets sent from the peer (inbound) are delivered as messages to the socket owner; the process that created the socket. Unless <code>{active, false}</code> is specified in the option list when creating the <a href="#listen/2">listening socket</a>.</p>
+<p>See <a href="#connect/4"><code>connect/4</code></a> about <em>active mode</em> socket messages and <em>passive mode</em>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>The <code>accept</code> call <em>doesn't have to be</em> issued from the socket owner process. Using version 5.5.3 and higher of the emulator, multiple simultaneous accept calls can be issued from different processes, which allows for a pool of acceptor processes handling incoming connections.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="close/1">close(Socket)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L867" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> close(Socket) -&gt; ok when Socket :: <a href="#t:socket/0">socket</a>().</pre>  <p>Close a TCP socket.</p>
+<p>Note that in most implementations of TCP, doing a <code>close</code> does not guarantee that the data sent is delivered to the recipient. It is guaranteed that the recepient will see all sent data before getting the close, but the sender gets no indication of that.</p>
+<p>If the sender needs to know that the recepient has received all data there are two common ways to achieve this:</p>
+<ol>
+<li>Use <a href="#shutdown/2"><code>gen_tcp:shutdown(Sock, write)</code></a> to signal that no more data is to be sent and wait for the other side to acknowledge seeing its read side being closed, by closing its write side, which shows as a socket close on this side.</li>
+<li>Implement an acknowledgement in the protocol on top of TCP that both connection ends adhere to, indicating that all data has been seen. The socket option <a href="inet.html#option-packet"><code>{packet, N}</code></a> may be useful.</li>
+</ol> </section> </section> <section class="detail"> <h3 class="detail-header" id="connect/2">connect(SockAddr, Opts) <span class="since">(since OTP 24.3)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L424" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> connect(SockAddr, Opts) -&gt; {ok, Socket} | {error, Reason}
+                 when
+                     SockAddr :: <a href="socket.html#t:sockaddr_in/0">socket:sockaddr_in</a>() | <a href="socket.html#t:sockaddr_in6/0">socket:sockaddr_in6</a>(),
+                     Opts :: [<a href="inet.html#t:inet_backend/0">inet:inet_backend</a>() | <a href="#t:connect_option/0">connect_option</a>()],
+                     Socket :: <a href="#t:socket/0">socket</a>(),
+                     Reason :: <a href="inet.html#t:posix/0">inet:posix</a>().</pre>  <p>Equivalent to <a href="#connect/3"><code>connect(SockAddr, Opts, infinity)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="connect/3">connect/3<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L458" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> connect(Address, Port, Opts) -&gt; {ok, Socket} | {error, Reason}
+                 when
+                     Address :: <a href="inet.html#t:socket_address/0">inet:socket_address</a>() | <a href="inet.html#t:hostname/0">inet:hostname</a>(),
+                     Port :: <a href="inet.html#t:port_number/0">inet:port_number</a>(),
+                     Opts :: [<a href="inet.html#t:inet_backend/0">inet:inet_backend</a>() | <a href="#t:connect_option/0">connect_option</a>()],
+                     Socket :: <a href="#t:socket/0">socket</a>(),
+                     Reason :: <a href="inet.html#t:posix/0">inet:posix</a>();
+             (SockAddr, Opts, Timeout) -&gt; {ok, Socket} | {error, Reason}
+                 when
+                     SockAddr :: <a href="socket.html#t:sockaddr_in/0">socket:sockaddr_in</a>() | <a href="socket.html#t:sockaddr_in6/0">socket:sockaddr_in6</a>(),
+                     Opts :: [<a href="inet.html#t:inet_backend/0">inet:inet_backend</a>() | <a href="#t:connect_option/0">connect_option</a>()],
+                     Timeout :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>(),
+                     Socket :: <a href="#t:socket/0">socket</a>(),
+                     Reason :: timeout | <a href="inet.html#t:posix/0">inet:posix</a>().</pre>  <p>Create a socket connected to the specified address.</p>
+<h5 id="connect/3-with-arguments-address-and-port">With arguments Address and Port</h5>
+<p>Equivalent to <a href="#connect/4"><code>connect(Address, Port, Opts, infinity)</code></a>.</p>
+<h5 id="connect/3-with-argument-sockaddr-since-otp-24-3">With argument SockAddr (since OTP 24.3)</h5>
+<p>Connects to a remote listen socket specified by <code>SockAddr</code> where <a href="socket.html#t:sockaddr_in6/0"><code>socket:sockaddr_in6/0</code></a> for example allows specifying the <code>scope_id</code> for link local IPv6 addresses.</p>
+<p><a href="socket.html#t:sockaddr_in/0">IPv4 addresses</a> on the same <a href="../../../../erts-17.1/doc/html/erlang.html#t:map/0"><code>map/0</code></a> format is also allowed.</p>
+<p>Equivalent to <a href="#connect/4"><code>connect/4</code></a>, besides the format of the destination address.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="connect/4">connect(Address, Port, Opts, Timeout)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L587" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> connect(Address, Port, Opts, Timeout) -&gt; {ok, Socket} | {error, Reason}
+                 when
+                     Address :: <a href="inet.html#t:socket_address/0">inet:socket_address</a>() | <a href="inet.html#t:hostname/0">inet:hostname</a>(),
+                     Port :: <a href="inet.html#t:port_number/0">inet:port_number</a>(),
+                     Opts :: [<a href="inet.html#t:inet_backend/0">inet:inet_backend</a>() | <a href="#t:connect_option/0">connect_option</a>()],
+                     Timeout :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>(),
+                     Socket :: <a href="#t:socket/0">socket</a>(),
+                     Reason :: timeout | <a href="inet.html#t:posix/0">inet:posix</a>().</pre>  <p>Create a socket connected to the specified address.</p>
+<p>Creates a socket and connects it to a server on TCP port <code>Port</code> on the host with IP address <code>Address</code>, that may also be a hostname.</p>
+<h5 id="connect/4-opts-connect-options">Opts (connect options)</h5>
+<ul>
+<li><p><strong><code>{ip, Address}</code></strong> - If the local host has many IP addresses, this option specifies which one to use.</p></li>
+<li>
+<p><strong><code>{ifaddr, Address}</code></strong> - Same as <code>{ip, Address}</code>.</p>
+<p>However, if <code>Address</code> instead is a <a href="socket.html#t:sockaddr_in/0"><code>socket:sockaddr_in/0</code></a> or <a href="socket.html#t:sockaddr_in6/0"><code>socket:sockaddr_in6/0</code></a> this takes precedence over any value previously set with the <code>ip</code> and <code>port</code> options. If these options (<code>ip</code> or/and <code>port</code>) however comes <em>after</em> this option, they may be used to <em>update</em> the corresponding fields of this option (for <code>ip</code>, the <code>addr</code> field, and for <code>port</code>, the <code>port</code> field).</p>
+</li>
+<li><p><strong><code>{fd, integer() &gt;= 0}</code></strong> - If a socket has somehow been connected without using <code>gen_tcp</code>, use this option to pass the file descriptor for it. If <code>{ip, Address}</code> and/or <code>{port, port_number()}</code> is combined with this option, the <code>fd</code> is bound to the specified interface and port before connecting. If these options are not specified, it is assumed that the <code>fd</code> is already bound appropriately.</p></li>
+<li><p><strong><code>inet</code></strong> - Sets up the socket for IPv4.</p></li>
+<li><p><strong><code>inet6</code></strong> - Sets up the socket for IPv6.</p></li>
+<li><p><strong><code>local</code></strong> - Sets up a Unix Domain Socket. See <a href="inet.html#t:local_address/0"><code>inet:local_address/0</code></a></p></li>
+<li><p><strong><code>{port, Port}</code></strong> - Specifies which local port number to use.</p></li>
+<li><p><strong><code>{tcp_module, module()}</code></strong> - Overrides which callback module is used. Defaults to <code>inet_tcp</code> for IPv4 and <code>inet6_tcp</code> for IPv6.</p></li>
+<li><p><strong><code>{protocol, tcp|mptcp}</code></strong> - With <code>mptcp</code> creates the socket with protocol IPPROTO_MPTCP, if that is defined on the system. Other than that the socket is regarded as a <code>tcp</code> socket. If IPPROTO_MPTCP is not defined, <code>{error, eprotonosupport}</code> is returned. <code>tcp</code> is the default value.</p></li>
+<li><p><strong><a href="#t:option/0"><code>option/0</code></a></strong> - See <a href="inet.html#setopts/2"><code>inet:setopts/2</code></a>.</p></li>
+</ul>
+<h5 id="connect/4-socket-data">Socket Data</h5>
+<p>Packets can be sent to the peer (outbound) with <a href="#send/2"><code>send(Socket, Packet)</code></a>. Packets sent from the peer (inbound) are delivered as messages to the socket owner; the process that created the socket, unless <code>{active, false}</code> is specified in the <code>Options</code> list.</p>
+<h4>Active mode socket messages</h4>
+<ul>
+<li><p><strong><code>{tcp, Socket, Data}</code></strong> - Inbound data from the socket.</p></li>
+<li><p><strong><code>{tcp_passive, Socket}</code></strong> - The socket was in <code>{active, N}</code> mode (see <a href="inet.html#setopts/2"><code>inet:setopts/2</code></a> for details) and its message counter reached <code>0</code>, indicating that the socket has transitioned to passive (<code>{active, false}</code>) mode.</p></li>
+<li><p><strong><code>{tcp_closed, Socket}</code></strong> - The socket was closed.</p></li>
+<li><p><strong><code>{tcp_error, Socket, Reason}</code></strong> A socket error occurred.</p></li>
+</ul>
+<h4>Passive mode</h4>
+<p>If <code>{active, false}</code> is specified in the option list for the socket, packets and errors are retrieved by calling <a href="#recv/3"><code>recv/2,3</code></a> (<a href="#send/2"><code>send/2</code></a> may also return errors).</p>
+<h4>Timeout</h4>
+<p>The optional <code>Timeout</code> parameter specifies a connect time-out in milliseconds. Defaults to <code>infinity</code>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>Keep in mind that if the underlying OS <code>connect()</code> call returns a timeout, <code>gen_tcp:connect</code> will also return a timeout (i.e. <code>{error, etimedout}</code>), even if a larger <code>Timeout</code> was specified (for example <code>infinity</code>).</p>
+</div>
+<div class="note">
+<p class="label">Note</p>
+<p>The default values for options specified to <code>connect</code> can be affected by the Kernel configuration parameter <code>inet_default_connect_options</code>. For details, see <a href="inet.html"><code>inet</code></a>.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="controlling_process/2">controlling_process(Socket, Pid)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L1028" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> controlling_process(Socket, Pid) -&gt; ok | {error, Reason}
+                             when
+                                 Socket :: <a href="#t:socket/0">socket</a>(),
+                                 Pid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                                 Reason :: closed | not_owner | badarg | <a href="inet.html#t:posix/0">inet:posix</a>().</pre>  <p>Change the controlling process (owner) of a socket.</p>
+<p>Assigns a new controlling process <code>Pid</code> to <code>Socket</code>. The controlling process is the process that the socket sends messages to. If this function is called from any other process than the current controlling process, <code>{error, not_owner}</code> is returned.</p>
+<p>If the process identified by <code>Pid</code> is not an existing local <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a>, <code>{error, badarg}</code> is returned. <code>{error, badarg}</code> may also be returned in some cases when <code>Socket</code> is closed during the execution of this function.</p>
+<p>If the socket is in <em>active mode</em>, this function will transfer any messages from the socket in the mailbox of the caller to the new controlling process.</p>
+<p>If any other process is interacting with the socket during the transfer, it may not work correctly and messages may remain in the caller's mailbox. For instance, changing the sockets active mode during the transfer could cause this.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="listen/2">listen(Port, Options)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L701" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> listen(Port, Options) -&gt; {ok, ListenSocket} | {error, Reason}
+                when
+                    Port :: <a href="inet.html#t:port_number/0">inet:port_number</a>(),
+                    Options :: [<a href="inet.html#t:inet_backend/0">inet:inet_backend</a>() | <a href="#t:listen_option/0">listen_option</a>()],
+                    ListenSocket :: <a href="#t:socket/0">socket</a>(),
+                    Reason :: system_limit | <a href="inet.html#t:posix/0">inet:posix</a>().</pre>  <p>Create a listen socket.</p>
+<p>Creates a socket and sets it to listen on port <code>Port</code> on the local host.</p>
+<p>If <code>Port == 0</code>, the underlying OS assigns an available (ephemeral) port number, use <a href="inet.html#port/1"><code>inet:port/1</code></a> to retrieve it.</p>
+<p>The following options are available:</p>
+<ul>
+<li><p><strong><code>list</code></strong> - Received <code>Packet</code>s are delivered as lists of bytes, <code>[</code><a href="../../../../erts-17.1/doc/html/erlang.html#t:byte/0"><code>byte/0</code></a><code>]</code>.</p></li>
+<li><p><strong><code>binary</code></strong> - Received <code>Packet</code>s are delivered as <a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0"><code>binary/0</code></a>s.</p></li>
+<li><p><strong><code>{backlog, B}</code></strong> - <code>B ::</code> <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0"><code>non_neg_integer/0</code></a>. The backlog value defines the maximum length that the queue of pending connections can grow to. Defaults to <code>5</code>.</p></li>
+<li><p><strong><code>inet6</code></strong> - Sets up the socket for IPv6.</p></li>
+<li><p><strong><code>inet</code></strong> - Sets up the socket for IPv4.</p></li>
+<li><p><strong><code>{fd, Fd}</code></strong> - If a socket has somehow been created without using <code>gen_tcp</code>, use this option to pass the file descriptor for it.</p></li>
+<li><p><strong><code>{ip, Address}</code></strong> - If the host has many IP addresses, this option specifies which one to listen on.</p></li>
+<li><p><strong><code>{port, Port}</code></strong> - Specifies which local port number to use.</p></li>
+<li>
+<p><strong><code>{ifaddr, Address}</code></strong> - Same as <code>{ip, Address}</code>.</p>
+<p>However, if this instead is an <a href="socket.html#t:sockaddr_in/0"><code>socket:sockaddr_in/0</code></a> or <a href="socket.html#t:sockaddr_in6/0"><code>socket:sockaddr_in6/0</code></a> this takes precedence over any value previously set with the <code>ip</code> and <code>port</code> options. If these options (<code>ip</code> or/and <code>port</code>) however comes <em>after</em> this option, they may be used to <em>update</em> their corresponding fields of this option (for <code>ip</code>, the <code>addr</code> field, and for <code>port</code>, the <code>port</code> field).</p>
+</li>
+<li><p><strong><code>{tcp_module, module()}</code></strong> - Overrides which callback module is used. Defaults to <code>inet_tcp</code> for IPv4 and <code>inet6_tcp</code> for IPv6.</p></li>
+<li><p><strong><code>{protocol, tcp|mptcp}</code></strong> - With <code>mptcp</code> creates the socket with protocol IPPROTO_MPTCP, if that is defined on the system. Other than that the socket is regarded as a <code>tcp</code> socket. If IPPROTO_MPTCP is not defined, <code>{error, eprotonosupport}</code> is returned. <code>tcp</code> is the default value.</p></li>
+<li><p><strong><a href="#t:option/0"><code>option/0</code></a></strong> - See <a href="inet.html#setopts/2"><code>inet:setopts/2</code></a>.</p></li>
+</ul>
+<p>The returned socket <code>ListenSocket</code> should be used when calling <a href="#accept/1"><code>accept/1,2</code></a> to accept an incoming connection request.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>The default values for options specified to <code>listen</code> can be affected by the Kernel configuration parameter <code>inet_default_listen_options</code>. For details, see <a href="inet.html"><code>inet</code></a>.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="recv/2">recv(Socket, Length)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L938" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> recv(Socket, Length) -&gt; {ok, Packet} | {error, Reason}
+              when
+                  Socket :: <a href="#t:socket/0">socket</a>(),
+                  Length :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                  Packet :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0">binary</a>() | HttpPacket,
+                  Reason :: closed | <a href="inet.html#t:posix/0">inet:posix</a>(),
+                  HttpPacket :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Equivalent to <a href="#recv/3"><code>recv(Socket, Length, infinity)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="recv/3">recv(Socket, Length, Timeout)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L978" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> recv(Socket, Length, Timeout) -&gt; {ok, Packet} | {error, Reason}
+              when
+                  Socket :: <a href="#t:socket/0">socket</a>(),
+                  Length :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+                  Timeout :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>(),
+                  Packet :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0">binary</a>() | HttpPacket,
+                  Reason :: closed | timeout | <a href="inet.html#t:posix/0">inet:posix</a>(),
+                  HttpPacket :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Receive a packet, from a socket in <em>passive mode</em>.</p>
+<p>A closed socket is indicated by the return value <code>{error, closed}</code>. If the socket is not in passive mode, the return value is <code>{error, einval}</code>.</p>
+<p>Argument <code>Length</code> is only meaningful when the socket is in <code>raw</code> mode and denotes the number of bytes to read. If <code>Length</code> is <code>0</code>, all available bytes are returned. If <code>Length &gt; 0</code>, exactly <code>Length</code> bytes are returned, or an error; except if the socket is closed from the other side, then the last read before the one returning <code>{error, closed}</code> may return less than <code>Length</code> bytes of data.</p>
+<p>The optional <code>Timeout</code> parameter specifies a time-out in milliseconds. Defaults to <code>infinity</code>.</p>
+<p>Any process can receive data from a passive socket, even if that process is not the controlling process of the socket. However, only one process can call this function on a socket at any given time. Using simultaneous calls to <code>recv</code> is not recommended as the behavior depends on the socket implementation, and could return errors such as <code>{error, ealready}</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="send/2">send(Socket, Packet)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L916" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> send(Socket, Packet) -&gt; ok | {error, Reason}
+              when
+                  Socket :: <a href="#t:socket/0">socket</a>(),
+                  Packet :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:iodata/0">iodata</a>(),
+                  Reason :: closed | {timeout, RestData} | <a href="inet.html#t:posix/0">inet:posix</a>(),
+                  RestData :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0">binary</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:iovec/0">erlang:iovec</a>().</pre>  <p>Send a packet on a socket.</p>
+<p>There is no <a href="#send/2"><code>send/2</code></a> call with a time-out option; use socket option <code>send_timeout</code> if time-outs are desired. See section <a href="#module-examples">Examples</a>.</p>
+<p>The return value <code>{error, {timeout, RestData}}</code> can only be returned when <code>inet_backend = socket</code>.</p>
+
+<div class="note">
+<p class="label">Note</p>
+<h4>Non-blocking send.</h4>
+<p>If the user tries to send more data than there is room for in the OS send buffers, the 'rest data' is stored in (inet driver) internal buffers and later sent in the background. The function immediately returns ok (<em>not</em> informing the caller that some date isn'nt sent yet). Any issue while sending the 'rest data' may be returned later.</p>
+<p>When using <code>inet_backend = socket</code>, the behaviour is different. There is <em>no</em> buffering, instead the caller will "hang" until all of the data has been sent or the send timeout (as specified by the <code>send_timeout</code> option) expires (the function can "hang" even when using the <code>inet</code> backend if the internal buffers are full).</p>
+<p>If this happens when using <code>packet =/= raw</code>, a partial packet has been written. A new packet therefore <em>mustn't</em> be written at this point, as there is no way for the peer to distinguish this from data in the current packet. Instead, set the <code>packet</code> option to <code>raw</code>, send the rest data (as raw data) and then set <code>packet</code> back to the correct type.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="shutdown/2">shutdown(Socket, How)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/gen_tcp.erl#L830" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> shutdown(Socket, How) -&gt; ok | {error, Reason}
+                  when Socket :: <a href="#t:socket/0">socket</a>(), How :: read | write | read_write, Reason :: <a href="inet.html#t:posix/0">inet:posix</a>().</pre>  <p>Close the socket in one or both directions.</p>
+<p><code>How == write</code> means closing the socket for writing, reading from it is still possible.</p>
+<p>If <code>How == read</code> or there is no outgoing data buffered in the <code>Socket</code> port, the shutdown is performed immediately and any error encountered is returned in <code>Reason</code>.</p>
+<p>If there is data buffered in the socket port, shutdown isn't performed on the socket until that buffered data has been written to the OS protocol stack. If any errors are encountered, the socket is closed and <code>{error, closed}</code> is returned by the next <a href="#recv/2"><code>recv/2</code></a> or <a href="#send/2"><code>send/2</code></a> call.</p>
+<p>Option <code>{exit_on_close, false}</code> is useful if the peer performs a shutdown of its write side. Then the socket stays open for writing after receive has indicated that the socket was closed.</p>
+
+<div class="note">
+<p class="label">Note</p>
+<p>Async shutdown write (<code>How :: write | read_write</code>).</p>
+<p>If the shutdown attempt is made while the inet driver is sending buffered data in the background, the shutdown is postponed until all buffered data has been sent. This function immediately returns <code>ok</code>, and the caller <em>isn't</em> informed (that the shutdown has been postponed).</p>
+<p>When using <code>inet_backend = socket</code>, the behaviour is different. A shutdown with <code>How :: write | read_write</code> will always be performed <em>immediately</em>.</p>
+</div> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

@@ -1,4 +1,4 @@
-<div style="display:none;" hidden="true" aria-hidden="true">Are you an LLM? You can read better optimized documentation at /api/browser/commands.md for this page in Markdown format</div>
+<div style="display:none;" hidden data-nosnippet>Are you an LLM? You can read better optimized documentation at /api/browser/commands.md for this page in Markdown format</div>
 <h1 id="commands" tabindex="-1">Commands </h1>
 <p>Command is a function that invokes another function on the server and passes down the result back to the browser. Vitest exposes several built-in commands you can use in your browser tests.</p>
 <h2 id="built-in-commands" tabindex="-1">Built-in Commands </h2>
@@ -6,8 +6,8 @@
 <p>You can use the <code>readFile</code>, <code>writeFile</code>, and <code>removeFile</code> APIs to handle files in your browser tests. Since Vitest 3.2, all paths are resolved relative to the <a href="../../guide/projects.html">project</a> root (which is <code>process.cwd()</code>, unless overridden manually). Previously, paths were resolved relative to the test file.</p>
 <p>By default, Vitest uses <code>utf-8</code> encoding but you can override it with options.</p>
 <div class="tip custom-block">
-<strong class="custom-block-title custom-block-title-default">TIP</strong><p>This API follows <a href="https://vitejs.dev/config/server-options.html#server-fs-allow" target="_blank" rel="noreferrer"><code>server.fs</code></a> limitations for security reasons.</p>
-<p>If <a href="../../config/browser/api.html"><code>browser.api.allowWrite</code></a> or <a href="../../config/api.html#api-allowwrite"><code>api.allowWrite</code></a> are disabled, <code>writeFile</code> and <code>removeFile</code> functions won't do anything.</p>
+<strong class="custom-block-title custom-block-title-default">TIP</strong><p>The built-in file commands follow Vite's <a href="https://vitejs.dev/config/server-options.html#server-fs-allow" target="_blank" rel="noreferrer"><code>server.fs</code></a> restrictions for security reasons.</p>
+<p><code>writeFile</code> and <code>removeFile</code> also require write access through <a href="../../config/api.html#api-allowwrite"><code>api.allowWrite</code></a>.</p>
 </div>
 <div class="language-ts">
 <pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">import { server } from 'vitest/browser'
@@ -43,6 +43,7 @@ expect(input).toHaveValue('a')</pre>
 </div>
 <div class="warning custom-block">
 <strong class="custom-block-title custom-block-title-default">WARNING</strong><p>CDP session works only with <code>playwright</code> provider and only when using <code>chromium</code> browser. You can read more about it in playwright's <a href="https://playwright.dev/docs/api/class-cdpsession" target="_blank" rel="noreferrer"><code>CDPSession</code></a> documentation.</p>
+<p>CDP is a privileged debugging API. It is available only when browser API write and exec operations are enabled through <a href="../../config/api.html#api-allowwrite"><code>api.allowWrite</code></a>, and <a href="../../config/api.html#api-allowexec"><code>api.allowExec</code></a>.</p>
 </div>
 <h2 id="custom-commands" tabindex="-1">Custom Commands </h2>
 <p>You can also add your own commands via <a href="../../config/browser/commands.html"><code>browser.commands</code></a> config option. If you develop a library, you can provide them via a <code>config</code> hook inside a plugin:</p>
@@ -101,6 +102,63 @@ declare module 'vitest/browser' {
 <div class="warning custom-block">
 <strong class="custom-block-title custom-block-title-default">WARNING</strong><p>Custom functions will override built-in ones if they have the same name.</p>
 </div>
+<div class="warning custom-block">
+<strong class="custom-block-title">Security</strong><p>Custom commands run in the Vitest Node process and are callable from browser test code through Vitest's browser RPC connection. They can access local files, environment variables, network services, databases, shell commands, and other Node APIs.</p>
+<p>Vitest's built-in file commands validate paths against Vite's <a href="https://vite.dev/config/server-options#server-fs-allow" target="_blank" rel="noreferrer"><code>server.fs</code></a> restrictions and separately check whether writes are allowed. Custom commands do not automatically inherit these protections. If a custom command accepts browser-provided input and uses it to read, write, delete, execute, or expose local resources, validate that input before using it.</p>
+<p>For file reads or fixture loading, use <code>isFileLoadingAllowed</code> from <code>vitest/node</code> or an explicit allowlist. For writes and deletes, also require an explicit mutation policy, such as <a href="../../config/api.html#api-allowwrite"><code>api.allowWrite</code></a>, and a command-specific allowed directory. For commands that execute code, shell commands, or project scripts, also check <a href="../../config/api.html#api-allowexec"><code>api.allowExec</code></a>.</p>
+<p>For example, if you create your own file-writing command instead of using Vitest's built-in <code>writeFile</code>, apply the same checks:</p>
+<div class="language-ts">
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">import { mkdir, writeFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
+import { normalizePath } from 'vite'
+import { isFileLoadingAllowed } from 'vitest/node'
+import type { BrowserCommand } from 'vitest/node'
+
+function assertFileAccess(path: string, project: any) {
+  if (
+    !isFileLoadingAllowed(project.vite.config, path)
+    &amp;&amp; !isFileLoadingAllowed(project.vitest.vite.config, path)
+  ) {
+    throw new Error(`Access denied to "${path}".`)
+  }
+}
+
+function assertWrite(project: any) {
+  if (!project.config.browser.api.allowWrite || !project.vitest.config.api.allowWrite) {
+    throw new Error('Writing files is disabled.')
+  }
+}
+
+export const myWriteFileCommand: BrowserCommand&lt;[path: string, content: string]&gt; = async (
+  { project },
+  path,
+  content,
+) =&gt; {
+  assertWrite(project)
+
+  const file = resolve(project.config.root, path)
+  assertFileAccess(normalizePath(file), project)
+
+  await mkdir(dirname(file), { recursive: true })
+  await writeFile(file, content)
+}</pre>
+</div>
+</div>
+<h3 id="recording-trace-markers" tabindex="-1">Recording trace markers </h3>
+<p>Custom commands can record <a href="context.html#mark">trace markers</a> for the test that triggered them through <code>context.mark</code>. This is the server-side equivalent of <code>page.mark</code> and helps annotate the <a href="../../guide/browser/trace-view.html">trace view</a> with custom actions performed inside a command.</p>
+<div class="language-ts">
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">import type { BrowserCommand } from 'vitest/node'
+
+export const uploadFixture: BrowserCommand&lt;[name: string]&gt; = async (
+  context,
+  name,
+) =&gt; {
+  await context.mark(`upload start: ${name}`, { kind: 'action' })
+  // ... do server-side work
+  await context.mark(`upload done: ${name}`, { kind: 'action' })
+}</pre>
+</div>
+<p><code>context.mark</code> is a no-op when browser tracing is not enabled or no test is currently running in the session. Unlike <code>page.mark</code>, it does not accept a callback form.</p>
 <h3 id="custom-playwright-commands" tabindex="-1">Custom <code>playwright</code> commands </h3>
 <p>Vitest exposes several <code>playwright</code> specific properties on the command context.</p>
 <ul>

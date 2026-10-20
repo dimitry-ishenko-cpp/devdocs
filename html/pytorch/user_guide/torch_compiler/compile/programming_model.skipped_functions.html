@@ -1,0 +1,100 @@
+<div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList"> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="User Guide"> <meta itemprop="position" content="1"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compiler"> <meta itemprop="position" content="2"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Core Concepts"> <meta itemprop="position" content="3"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compile Programming Model"> <meta itemprop="position" content="4"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Working with Graph Breaks"> <meta itemprop="position" content="5"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Working with &lt;code class=" docutils literal notranslate>fullgraph=False"&gt; <meta itemprop="position" content="6"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem"> <meta itemprop="name" content="Skipped Functions"> <meta itemprop="position" content="7"> </div> </div>  <article class="bd-article"> <section id="skipped-functions"> <h1>Skipped Functions</h1> <p class="date-info-last-verified" style="color: #6c6c6d; font-size: small;">Created On: Jul 28, 2025 | Last Updated On: Dec 03, 2025</p> <p><strong>Summary:</strong></p> <ul class="simple"> <li>Sometimes, <code>torch.compile</code> completely gives up compiling a function and runs it eagerly instead, resulting in potentially lost optimization opportunities.</li> <li>There are ways to work around skipped functions in order to re-enable tracing around the problematic code.</li> </ul> <p>Sometimes, <code>torch.compile</code> with <code>fullgraph=False</code> is unable to resume tracing when encountering a graph break or other compiler error. In many of these cases, <code>torch.compile</code> will skip compiling the function entirely and run it eagerly.</p> <p>Note that the skip is only applied to the current function and NOT any nested function calls. <code>torch.compile</code> will still attempt to compile nested calls.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">def inner1(x):
+    return x + 1
+def inner2(x):
+    return x + 2
+@torch.compile
+def fn(x):
+    x = inner1(x)
+    torch._dynamo.skip_frame()
+    x = inner2(x)
+fn(torch.randn(3))
+</pre> </div> </div> <p>In the above example, <code>torch.compile</code> will trace <code>fn</code> (including <code>inner1</code>) up until the <code>skip_frame</code>. Then <code>fn</code> is skipped and run eagerly - <code>inner1</code> and <code>inner2</code> are compiled when they are called.</p> <p>Skipping functions may result in lost optimization opportunities, so it is important to check if code you want compiled is being skipped, and if so, to work around the skip.</p> <section id="graph-break-in-a-loop"> <h2>Graph Break in a Loop</h2> <p><code>torch.compile</code> cannot resume tracing if a graph break occurs in a loop:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">@torch.compile
+def fn(x):
+    for i in range(5):
+        x = x + 1
+        if i == 3:
+            torch._dynamo.graph_break()
+    return x
+fn(torch.randn(3))
+</pre> </div> </div> <p>In this example, we can avoid skipping by unrolling the loop:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">@torch.compile
+def fn(x):
+    def inner(i):
+        nonlocal x
+        x = x + 1
+        if i == 3:
+            torch._dynamo.graph_break()
+    inner(0)
+    inner(1)
+    inner(2)
+    inner(3)
+    inner(4)
+    return x
+fn(torch.randn(3))
+</pre> </div> </div> <p>In general, resolving the graph break causing the skip will also resolve the skip.</p> </section> <section id="graph-break-in-a-context-manager"> <h2>Graph Break in a Context Manager</h2> <p>Another common example of an unresumable graph break is a graph break in most context managers:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">class CustomCtxManager:
+    def __enter__(self):
+        pass
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+@torch.compile
+def fn(x):
+    with CustomCtxManager():
+        x = x + 1
+        torch._dynamo.graph_break()
+        return x + 1
+fn(torch.randn(3))
+</pre> </div> </div> <p>We can avoid skipping by moving the graph break outside of the context manager:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">@torch.compile
+def fn(x):
+    with CustomCtxManager():
+        x = x + 1
+    torch._dynamo.graph_break()
+    with CustomCtxManager():
+        return x + 1
+fn(torch.randn(3))
+</pre> </div> </div> <p>There are some context managers where Dynamo can resume after a graph break. Some of these can be found in <code>supported_ctx_manager_classes</code> in <code>torch/_dynamo/variables/torch.py</code>. In general, any context manager represented by a <code>ContextWrappingVariable</code> subclass in <code>torch/_dynamo/variables/ctx_manager.py</code> support resuming after a graph break. For example:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">import contextlib
+@torch.compile
+def fn(x):
+    with contextlib.nullcontext():
+        with torch.no_grad():
+            x = x + 1
+            torch._dynamo.graph_break()
+            return x + 1
+fn(torch.randn(3))
+</pre> </div> </div> </section> <section id="graph-break-in-a-try-block"> <h2>Graph Break in a Try Block</h2> <p>A graph break in a try block cannot be resumed:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">@torch.compile
+def fn(x):
+    try:
+        x = x + 1
+        torch._dynamo.graph_break()
+        return x + 1
+    except Exception as e:
+        pass
+fn(torch.randn(3))
+</pre> </div> </div> <p>We can avoid skipping by moving the graph break outside of the try block:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">@torch.compile
+def fn(x):
+    try:
+        x = x + 1
+    except Exception as e:
+        pass
+    torch._dynamo.graph_break()
+    try:
+        return x + 1
+    except Exception as e:
+        pass
+fn(torch.randn(3))
+</pre> </div> </div> </section> <section id="hitting-a-recompilation-limit"> <h2>Hitting a Recompilation Limit</h2> <p>See <a class="reference internal" href="programming_model.recompilation.html#programming-model-recompilation-changing-cache-size-limit"><span class="std std-ref">Changing the Cache Size Limit.</span></a></p> </section> <section id="compiler-errors"> <h2>Compiler Errors</h2> <p>Some compiler errors will result in skipped functions. Other compiler errors will result in a hard error rather than a skipped function.</p> </section> <section id="dealing-with-skipped-functions"> <h2>Dealing with Skipped Functions</h2> <p>In general, you can resolve a skipped function by fixing the underlying graph break or error that is causing the function to be skipped.</p> <p>If the graph break/error causing the skipped function is difficult to fix, then consider isolating the graph break/error in its own function so that minimal things are skipped.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">def inner1(x):
+    return x + 1
+def inner2(x):
+    return x + 2
+@torch.compile
+def fn(x):
+    x = inner1(x)
+    def problematic_code():
+        torch._dynamo.skip_frame()
+    problematic_code()
+    x = inner2(x)
+fn(torch.randn(3))
+</pre> </div> </div> </section> </section> </article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2026, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/compile/programming_model.skipped_functions.html" class="_attribution-link">https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/compile/programming_model.skipped_functions.html</a>
+  </p>
+</div>

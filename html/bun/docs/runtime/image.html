@@ -1,0 +1,222 @@
+<header><h1>Image</h1>
+<p>Decode, transform, and encode images with a fast native pipeline</p></header><div>
+<p><code>Bun.Image</code> is a chainable image pipeline for decoding, resizing, rotating, and re-encoding JPEG, PNG, WebP, HEIC, and AVIF. It is built on libjpeg-turbo, spng, libwebp, and SIMD geometry kernels, with zero npm dependencies and no native addon build step.</p>
+<div data-lang="ts"><div><div><div><div data-h="0"><pre data-language="typescript">await Bun.file("photo.jpg").image().resize(400, 400, { fit: "inside" }).webp({ quality: 80 }).write("thumb.webp");</pre></div></div></div></div></div>
+<p>The API is shaped after <a href="https://sharp.pixelplumbing.com/" target="_blank" rel="noopener noreferrer">Sharp</a>: construct from an input, chain transforms, pick an output format, then <code>await</code> a terminal method. Nothing runs until you await the terminal, and the work executes off the JavaScript thread.</p>
+<h2 id="input">Input</h2>
+<p>The constructor accepts a path, bytes, or a <code>Blob</code> — including <code>Bun.file()</code> and <code>Bun.s3.file()</code>. <code>Blob#image()</code> is shorthand for <code>new Bun.Image(blob)</code>:</p>
+<div data-lang="ts"><div><div><div><div data-h="1"><pre data-language="typescript">new Bun.Image("./photo.jpg"); // file path
+new Bun.Image(buffer); // Buffer / ArrayBuffer / TypedArray
+new Bun.Image(Bun.file("photo.jpg")); // BunFile (read lazily, off-thread)
+Bun.file("photo.jpg").image(); // same as above
+Bun.s3.file("bucket/photo.jpg").image(); // S3File</pre></div></div></div></div></div>
+<p>Bun sniffs the format from the bytes and ignores extensions and <code>Content-Type</code>.</p>
+<p><strong>Path strings are filesystem paths.</strong> Don't pass user-controlled strings directly to the constructor — that's an arbitrary-file-read primitive. Read untrusted input into a <code>Buffer</code> (with <code>fetch</code> or <code>Bun.file</code> and your own validation) and pass the bytes.</p>
+<p>When passing a <code>TypedArray</code>/<code>ArrayBuffer</code>, don't mutate it while a terminal is pending — decode runs off-thread and borrows the bytes. Bun refuses <code>SharedArrayBuffer</code> and resizable buffers; use <code>buf.slice()</code> to pass a fixed view.</p>
+<p>A second <code>options</code> argument guards against decompression bombs and controls EXIF handling:</p>
+<div data-lang="ts"><div><div><div><div data-h="2"><pre data-language="typescript">new Bun.Image(input, {
+  // Reject if width*height &gt; this. Checked after reading the header,
+  // before allocating the pixel buffer. Default matches Sharp (~268 MP).
+  maxPixels: 4096 * 4096,
+  // Apply JPEG EXIF Orientation before any other op. Default: true.
+  autoOrient: true,
+});</pre></div></div></div></div></div>
+<h2 id="metadata">Metadata</h2>
+<p>Read <code>width</code>, <code>height</code>, and <code>format</code> without decoding pixel data:</p>
+<div data-lang="ts"><div><div><div><div data-h="3"><pre data-language="typescript">const { width, height, format } = await new Bun.Image(input).metadata();
+// =&gt; { width: 1920, height: 1080, format: "jpeg" }</pre></div></div></div></div></div>
+<h2 id="resize">Resize</h2>
+<div data-lang="ts"><div><div><div><div data-h="4"><pre data-language="typescript">img.resize(800); // width 800, keep aspect ratio
+img.resize(800, 600); // exactly 800×600 (stretch)
+img.resize(800, 600, { fit: "inside" }); // fit within 800×600
+img.resize(800, 600, { withoutEnlargement: true }); // never upscale
+img.resize(800, 600, { filter: "mitchell" });</pre></div></div></div></div></div>
+<div><table>
+<thead><tr>
+<th><code>fit</code></th>
+<th>Behavior</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>
+<code>"fill"</code> (default)</td>
+<td>Stretch to exactly <code>width × height</code>
+</td>
+</tr>
+<tr>
+<td><code>"inside"</code></td>
+<td>Preserve aspect ratio; result fits <em>within</em> the box</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>filter</code> selects the resampling kernel. The default <code>"lanczos3"</code> is the right choice for photographs.</p>
+<div><table>
+<thead><tr>
+<th>Filter</th>
+<th>Use when</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>
+<code>"lanczos3"</code> <em>(default)</em>
+</td>
+<td>General-purpose, sharpest for photos</td>
+</tr>
+<tr>
+<td><code>"lanczos2"</code></td>
+<td>Slightly softer, fewer ringing artifacts</td>
+</tr>
+<tr>
+<td><code>"mitchell"</code></td>
+<td>Smooth gradients; the classic bicubic compromise</td>
+</tr>
+<tr>
+<td><code>"cubic"</code></td>
+<td>Catmull-Rom — sharper than Mitchell, can ring</td>
+</tr>
+<tr>
+<td>
+<code>"mks2013"</code> / <code>"mks2021"</code>
+</td>
+<td>"Magic Kernel Sharp"; used by Facebook/Instagram</td>
+</tr>
+<tr>
+<td>
+<code>"bilinear"</code> / <code>"linear"</code>
+</td>
+<td>Fast, soft</td>
+</tr>
+<tr>
+<td><code>"box"</code></td>
+<td>Area-average; good for large integer downscales</td>
+</tr>
+<tr>
+<td><code>"nearest"</code></td>
+<td>Pixel art / hard edges</td>
+</tr>
+</tbody>
+</table></div>
+<p>When the source is a JPEG and the target is at most half the source size, decode skips straight to the nearest M/8 IDCT scale. As a result, generating a thumbnail from a 24 MP photo never materializes the full-resolution buffer.</p>
+<h2 id="rotate-flip">Rotate · flip</h2>
+<div data-lang="ts"><div><div><div><div data-h="5"><pre data-language="typescript">img.rotate(90); // 90° clockwise (multiples of 90 only)
+img.flip(); // mirror vertically (about the x-axis)
+img.flop(); // mirror horizontally (about the y-axis)</pre></div></div></div></div></div>
+<h2 id="modulate">Modulate</h2>
+<div data-lang="ts"><div><div><div><div data-h="6"><pre data-language="typescript">img.modulate({
+  brightness: 1.2, // 1 = unchanged
+  saturation: 0, // 0 = greyscale, 1 = unchanged, &gt;1 = boost
+});</pre></div></div></div></div></div>
+<h2 id="output-formats">Output formats</h2>
+<p>Calling a format method sets the encode target; without one, Bun reuses the source format.</p>
+<div data-lang="ts"><div><div><div><div data-h="7"><pre data-language="typescript">img.jpeg({ quality: 85 }); // 1–100, default 80
+img.png({ compressionLevel: 6 }); // zlib level 0–9
+img.png({ palette: true, colors: 64, dither: true }); // indexed PNG
+img.webp({ quality: 80 });
+img.webp({ lossless: true });
+img.heic({ quality: 80 }); // macOS / Windows only
+img.avif({ quality: 60 }); // macOS / Windows only</pre></div></div></div></div></div>
+<p><code>palette: true</code> quantizes to a ≤256-color palette and emits an indexed (color-type 3) PNG, optionally with Floyd–Steinberg <code>dither</code>. The indexed PNG is typically 3–5× smaller than truecolor for screenshots and UI assets.</p>
+<h2 id="terminals">Terminals</h2>
+<p>A pipeline does no work until you await one of these:</p>
+<div data-lang="ts"><div><div><div><div data-h="8"><pre data-language="typescript">await img.bytes(); // Uint8Array
+await img.buffer(); // Buffer
+await img.blob(); // Blob with .type set to the output MIME
+await img.toBase64(); // string
+await img.dataurl(); // "data:image/png;base64,…"
+await img.write("out.webp"); // number (bytes written)
+await img.write(Bun.s3.file("bucket/out.webp"));</pre></div></div></div></div></div>
+<p><code>.write()</code> accepts the same destinations as <code>Bun.write</code> — a path string, <code>Bun.file()</code>, <code>Bun.s3.file()</code>, or an fd. If you didn't chain a format method and the destination is a path string, the extension picks one (<code>.jpg</code>/<code>.png</code>/<code>.webp</code>/<code>.heic</code>/<code>.avif</code>).</p>
+<h2 id="placeholders">Placeholders</h2>
+<p><code>.placeholder()</code> returns a low-quality placeholder to inline in HTML before the real image loads. The placeholder is a <a href="https://evanw.github.io/thumbhash/" target="_blank" rel="noopener noreferrer">ThumbHash</a>-rendered ≤32px blur as a <code>data:</code> URL. It is ~400–700 bytes and needs no client-side decoder:</p>
+<div data-lang="ts"><div><div><div><div data-h="9"><pre data-language="typescript">const lqip = await Bun.file("hero.jpg").image().placeholder();
+// &lt;img src={lqip} … /&gt; — then swap to the real URL on load.</pre></div></div></div></div></div>
+<p>For coarse-to-fine rendering of the image <em>itself</em>, encode a progressive JPEG:</p>
+<div data-lang="ts"><div><div><div><div data-h="10"><pre data-language="typescript">img.jpeg({ progressive: true });</pre></div></div></div></div></div>
+<p>After the first terminal resolves, <code>img.width</code> and <code>img.height</code> reflect the <em>output</em> dimensions (they're <code>-1</code> before).</p>
+<h2 id="bun-serve-integration">
+<code>Bun.serve</code> integration</h2>
+<p>A <code>Bun.Image</code> pipeline is a valid <code>Response</code> body and sets <code>Content-Type</code> automatically. To keep the encode off the JS thread in a server handler, await a terminal first:</p>
+<div data-lang="ts"><div><div><div><div data-h="11"><pre data-language="typescript">Bun.serve({
+  routes: {
+    "/avatar/:id": async req =&gt; {
+      // Validate before touching the filesystem (see the Input note above).
+      if (!/^[a-z0-9]+$/.test(req.params.id)) return new Response(null, { status: 400 });
+      const out = await Bun.file(`avatars/${req.params.id}.png`).image().resize(128, 128).webp().blob();
+      return new Response(out);
+    },
+  },
+});</pre></div></div></div></div></div>
+<p>Passing the pipeline directly (<code>new Response(img)</code>) also works, but runs the encode synchronously during body init.</p>
+<h2 id="clipboard">Clipboard</h2>
+<div data-lang="ts"><div><div><div><div data-h="12"><pre data-language="typescript">const img = Bun.Image.fromClipboard();
+if (img) {
+  const png = await img.resize(800, 800, { fit: "inside" }).png().bytes();
+}</pre></div></div></div></div></div>
+<p><code>fromClipboard()</code> reads PNG, TIFF, HEIC, JPEG, WebP, GIF, or BMP from the system pasteboard on macOS and Windows; the regular decode pipeline takes it from there. Returns <code>null</code> if there's no image, and always <code>null</code> on Linux — call <code>wl-paste</code>/<code>xclip</code> yourself and pass the bytes to the constructor.</p>
+<p>For a passive "image in clipboard, press ⌘V" hint, poll <code>clipboardChangeCount()</code> (a single integer read) and call <code>hasClipboardImage()</code> only when it moves. Polling is the documented pattern because macOS has no clipboard-change notification.</p>
+<h2 id="platform-backends">Platform backends</h2>
+<div><table>
+<thead><tr>
+<th></th>
+<th>Linux</th>
+<th>macOS</th>
+<th>Windows</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>JPEG / PNG / WebP</td>
+<td>libjpeg-turbo · spng · libwebp</td>
+<td>same</td>
+<td>same</td>
+</tr>
+<tr>
+<td>BMP / GIF (decode)</td>
+<td>built-in</td>
+<td>ImageIO</td>
+<td>WIC</td>
+</tr>
+<tr>
+<td>TIFF (decode)</td>
+<td>❌</td>
+<td>ImageIO</td>
+<td>WIC</td>
+</tr>
+<tr>
+<td>Resize / rotate / flip</td>
+<td>Highway SIMD</td>
+<td>Accelerate vImage ³</td>
+<td>Highway SIMD</td>
+</tr>
+<tr>
+<td>HEIC / AVIF</td>
+<td>❌ <code>ERR_IMAGE_FORMAT_UNSUPPORTED</code>
+</td>
+<td>ImageIO ²</td>
+<td>WIC ¹</td>
+</tr>
+<tr>
+<td>Clipboard</td>
+<td>❌ returns <code>null</code>
+</td>
+<td>NSPasteboard</td>
+<td>Win32</td>
+</tr>
+</tbody>
+</table></div>
+<p>¹ Windows requires the <strong>HEIF Image Extensions</strong> / <strong>AV1 Video Extension</strong> from the Microsoft Store. ² AVIF <em>encode</em> needs an OS AV1 encoder — Apple Silicon M3+ only. Intel Mac and M1/M2 reject with <code>ERR_IMAGE_FORMAT_UNSUPPORTED</code>; AVIF <em>decode</em> works everywhere ImageIO does (macOS 13+). ³ Resize uses vImage only with the default <code>lanczos3</code> filter; every other <code>filter</code> uses Highway SIMD on macOS too.</p>
+<p>When a system-backend format isn't available on the current machine, the terminal rejects with <code>error.code === "ERR_IMAGE_FORMAT_UNSUPPORTED"</code>. Branch on that error code to fall back to a portable format:</p>
+<div data-lang="ts"><div><div><div><div data-h="13"><pre data-language="typescript">const out = await img
+  .avif({ quality: 50 })
+  .bytes()
+  .catch(e =&gt; {
+    if (e.code === "ERR_IMAGE_FORMAT_UNSUPPORTED") return img.webp({ quality: 80 }).bytes();
+    throw e;
+  });</pre></div></div></div></div></div>
+<p>Formats handled by the system backend (TIFF, HEIC, AVIF, clipboard) inherit the <strong>OS's</strong> patch level, so keep macOS / Windows updated. JPEG, PNG, and WebP go through the same statically-linked codecs on every platform, so encoded output is byte-identical across Linux, macOS, and Windows. To force the portable Highway path for geometry too (e.g. for golden-image tests), set the process-global backend:</p>
+<div data-lang="ts"><div><div><div><div data-h="14"><pre data-language="typescript">Bun.Image.backend = "bun"; // default is "system" on macOS/Windows</pre></div></div></div></div></div>
+</div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; bun.com, oven-sh, Jarred Sumner<br>Licensed under the MIT License.<br>
+    <a href="https://bun.com/docs/runtime/image" class="_attribution-link">https://bun.com/docs/runtime/image</a>
+  </p>
+</div>

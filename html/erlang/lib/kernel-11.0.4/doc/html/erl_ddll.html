@@ -1,0 +1,367 @@
+<h1> <span>erl_ddll</span>  </h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L27" title="View Source" class="source" rel="help nofollow">Source</a>   <p>Dynamic driver loader and linker.</p>
+<p>This module provides an interface for loading and unloading <em>Erlang linked-in drivers</em> in runtime.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>This is a large reference document. For casual use of this module, and for most real world applications, the descriptions of functions <a href="#load/2"><code>load/2</code></a> and <a href="#unload/1"><code>unload/1</code></a> are enough to getting started.</p>
+</div>
+<p>The driver is to be provided as a dynamically linked library in an object code format specific for the platform in use, that is, <code>.so</code> files on most Unix systems and <code>.ddl</code> files on Windows. An Erlang linked-in driver must provide specific interfaces to the emulator, so this module is not designed for loading arbitrary dynamic libraries. For more information about Erlang drivers, see <a href="../../../../erts-17.1/doc/html/erl_driver.html"><code>erl_driver</code></a> .</p>
+
+<p>When describing a set of functions (that is, a module, a part of a module, or an application), executing in a process and wanting to use a ddll-driver, we use the term <em>user</em>. A process can have many users (different modules needing the same driver) and many processes running the same code, making up many <em>users</em> of a driver.</p>
+<p>In the basic scenario, each user loads the driver before starting to use it and unloads the driver when done. The reference counting keeps track of processes and the number of loads by each process. This way the driver is only unloaded when no one wants it (it has no user). The driver also keeps track of ports that are opened to it. This enables delay of unloading until all ports are closed, or killing of all ports that use the driver when it is unloaded.</p>
+
+<p>The interface supports two basic scenarios of loading and unloading. Each scenario can also have the option of either killing ports when the driver is unloading, or waiting for the ports to close themselves. The scenarios are as follows:</p>
+<ul>
+<li>
+<p><strong><em>Load and Unload on a "When Needed Basis"</em></strong> - This (most common) scenario simply supports that each <a href="erl_ddll.html#users">user</a> of the driver loads it when needed and unloads it when no longer needed. The driver is always reference counted and as long as a process keeping the driver loaded is still alive, the driver is present in the system.</p>
+<p>Each <a href="erl_ddll.html#users">user</a> of the driver use <em>literally</em> the same pathname for the driver when demanding load, but the <a href="erl_ddll.html#users">users</a> are not concerned with if the driver is already loaded from the file system or if the object code must be loaded from file system.</p>
+<p>The following two pairs of functions support this scenario:</p>
+<ul>
+<li>
+<p><strong><em>load/2 and unload/1</em></strong> - When using the <code>load/unload</code> interfaces, the driver is not unloaded until the <em>last port</em> using the driver is closed. Function <a href="#unload/1"><code>unload/1</code></a> can return immediately, as the <a href="erl_ddll.html#users">users</a> have no interest in when the unloading occurs. The driver is unloaded when no one needs it any longer.</p>
+<p>If a process having the driver loaded dies, it has the same effect as if unloading is done.</p>
+<p>When loading, function <a href="#load/2"><code>load/2</code></a> returns <code>ok</code> when any instance of the driver is present. Thus, if a driver is waiting to get unloaded (because of open ports), it simply changes state to no longer need unloading.</p>
+</li>
+<li>
+<p><strong><em>load_driver/2 and unload_driver/1</em></strong> - These interfaces are intended to be used when it is considered an error that ports are open to a driver that no <a href="erl_ddll.html#users">user</a> has loaded. The ports that are still open when the last <a href="erl_ddll.html#users">user</a> calls <a href="#unload_driver/1"><code>unload_driver/1</code></a> or when the last process having the driver loaded dies, are killed with reason <code>driver_unloaded</code>.</p>
+<p>The function names <code>load_driver</code> and <code>unload_driver</code> are kept for backward compatibility.</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong><em>Loading and Reloading for Code Replacement</em></strong> - This scenario can occur if the driver code needs replacement during operation of the Erlang emulator. Implementing driver code replacement is a little more tedious than Beam code replacement, as one driver cannot be loaded as both "old" and "new" code. All <a href="erl_ddll.html#users">users</a> of a driver must have it closed (no open ports) before the old code can be unloaded and the new code can be loaded.</p>
+<p>The unloading/loading is done as one atomic operation, blocking all processes in the system from using the driver in question while in progress.</p>
+<p>The preferred way to do driver code replacement is to let <em>one single process</em> keep track of the driver. When the process starts, the driver is loaded. When replacement is required, the driver is reloaded. Unload is probably never done, or done when the process exits. If more than one <a href="erl_ddll.html#users">user</a> has a driver loaded when code replacement is demanded, the replacement cannot occur until the last "other" <a href="erl_ddll.html#users">user</a> has unloaded the driver.</p>
+<p>Demanding reload when a reload is already in progress is always an error. Using the high-level functions, it is also an error to demand reloading when more than one <a href="erl_ddll.html#users">user</a> has the driver loaded.</p>
+<p>To simplify driver replacement, avoid designing your system so that more than one <a href="erl_ddll.html#users">user</a> has the driver loaded.</p>
+<p>The two functions for reloading drivers are to be used together with corresponding load functions to support the two different behaviors concerning open ports:</p>
+<ul>
+<li>
+<p><strong><em>load/2 and reload/2</em></strong> - This pair of functions is used when reloading is to be done after the last open port to the driver is closed.</p>
+<p>As <a href="#reload/2"><code>reload/2</code></a> waits for the reloading to occur, a misbehaving process keeping open ports to the driver (or keeping the driver loaded) can cause infinite waiting for reload. Time-outs must be provided outside of the process demanding the reload or by using the low-level interface <a href="#try_load/3"><code>try_load/3</code></a> in combination with driver monitors.</p>
+</li>
+<li>
+<p><strong><em>load_driver/2 and reload_driver/2</em></strong> - This pair of functions are used when open ports to the driver are to be killed with reason <code>driver_unloaded</code> to allow for new driver code to get loaded.</p>
+<p>However, if another process has the driver loaded, calling <code>reload_driver</code> returns error code <code>pending_process</code>. As stated earlier, the recommended design is to not allow other <a href="erl_ddll.html#users">users</a> than the "driver reloader" to demand loading of the driver in question.</p>
+</li>
+</ul>
+</li>
+</ul>
+<h3 id="module-see-also">See Also</h3>
+<p><a href="../../../../erts-17.1/doc/html/erl_driver.html"><code>erl_driver(4)</code></a>, <a href="../../../../erts-17.1/doc/html/driver_entry.html"><code>driver_entry(4)</code></a></p>   <section id="summary" class="details-list"> <h2>Summary</h2> <h3>Types</h3>
+<dl class="summary-types summary">   <dt> <a href="#t:driver/0">driver()</a> </dt>   <dt> <a href="#t:path/0">path()</a> </dt>  </dl> <h3>Functions</h3>
+<dl class="summary-functions summary">   <dt> <a href="#demonitor/1">demonitor(MonitorRef)</a> </dt> <dd><p>Removes a driver monitor in much the same way as <a href="../../../../erts-17.1/doc/html/erlang.html#demonitor/1"><code>erlang:demonitor/1</code></a> in ERTS does with process monitors.</p></dd>   <dt> <a href="#format_error/1">format_error(ErrorDesc)</a> </dt> <dd><p>Takes an <code>ErrorDesc</code> returned by load, unload, or reload functions and returns a string that describes the error or warning.</p></dd>   <dt> <a href="#info/0">info()</a> </dt> <dd><p>Returns a list of tuples <code>{DriverName, InfoList}</code>, where <code>InfoList</code> is the result of calling <a href="#info/1"><code>info/1</code></a> for that <code>DriverName</code>. Only dynamically linked-in drivers are included in the list.</p></dd>   <dt> <a href="#info/1">info(Name)</a> </dt> <dd><p>Returns a list of tuples <code>{Tag, Value}</code>, where <code>Tag</code> is the information item and <code>Value</code> is the result of calling <a href="#info/2"><code>info/2</code></a> with this driver name and this tag. The result is a tuple list containing all information available about a driver.</p></dd>   <dt> <a href="#info/2">info(Name, Tag)</a> </dt> <dd><p>Returns specific information about one aspect of a driver. Parameter <code>Tag</code> specifies which aspect to get information about. The return <code>Value</code> differs between different tags</p></dd>   <dt> <a href="#load/2">load(Path, Name)</a> </dt> <dd><p>Loads and links the dynamic driver <code>Name</code>. <code>Path</code> is a file path to the directory containing the driver. <code>Name</code> must be a shareable object/dynamic library. Two drivers with different <code>Path</code> parameters cannot be loaded under the same name. <code>Name</code> is a string or atom containing at least one character.</p></dd>   <dt> <a href="#load_driver/2">load_driver(Path, Name)</a> </dt> <dd><p>Works essentially as <a href="#load/2"><code>load/2</code></a>, but loads the driver with other options. All ports using the driver are killed with reason <code>driver_unloaded</code> when the driver is to be unloaded.</p></dd>   <dt> <a href="#loaded_drivers/0">loaded_drivers()</a> </dt> <dd><p>Returns a list of all the available drivers, both (statically) linked-in and dynamically loaded ones.</p></dd>   <dt> <a href="#monitor/2">monitor(Tag, Item)</a> </dt> <dd><p>Creates a driver monitor and works in many ways as <a href="../../../../erts-17.1/doc/html/erlang.html#monitor/2"><code>erlang:monitor/2</code></a> in ERTS, does for processes. When a driver changes state, the monitor results in a monitor message that is sent to the calling process. <code>MonitorRef</code> returned by this function is included in the message sent.</p></dd>   <dt> <a href="#reload/2">reload(Path, Name)</a> </dt> <dd><p>Reloads the driver named <code>Name</code> from a possibly different <code>Path</code> than previously used. This function is used in the code change <a href="erl_ddll.html#scenarios"><code>scenario</code></a> described in the introduction.</p></dd>   <dt> <a href="#reload_driver/2">reload_driver(Path, Name)</a> </dt> <dd><p>Works exactly as <a href="#reload/2"><code>reload/2</code></a>, but for drivers loaded with the <a href="#load_driver/2"><code>load_driver/2</code></a> interface.</p></dd>   <dt> <a href="#try_load/3">try_load(Path, Name, OptionList)</a> </dt> <dd><p>Provides more control than the <a href="#load/2"><code>load/2</code></a>/<a href="#reload/2"><code>reload/2</code></a> and <a href="#load_driver/2"><code>load_driver/2</code></a>/<a href="#reload_driver/2"><code>reload_driver/2</code></a> interfaces. It never waits for completion of other operations related to the driver, but immediately returns the status of the driver as one of the following</p></dd>   <dt> <a href="#try_unload/2">try_unload(Name, OptionList)</a> </dt> <dd><p>This is the low-level function to unload (or decrement reference counts of) a driver. It can be used to force port killing, in much the same way as the driver option <code>kill_ports</code> implicitly does. Also, it can trigger a monitor either because other <a href="erl_ddll.html#users">users</a> still have the driver loaded or because open ports use the driver.</p></dd>   <dt> <a href="#unload/1">unload(Name)</a> </dt> <dd><p>Unloads, or at least dereferences the driver named <code>Name</code>. If the caller is the last <a href="erl_ddll.html#users">user</a> of the driver, and no more open ports use the driver, the driver gets unloaded. Otherwise, unloading is delayed until all ports are closed and no <a href="erl_ddll.html#users">users</a> remain.</p></dd>   <dt> <a href="#unload_driver/1">unload_driver(Name)</a> </dt> <dd><p>Unloads, or at least dereferences the driver named <code>Name</code>. If the caller is the last <a href="erl_ddll.html#users">user</a> of the driver, all remaining open ports using the driver are killed with reason <code>driver_unloaded</code> and the driver eventually gets unloaded.</p></dd>  </dl> </section> <section id="types" class="details-list"> <h2>Types</h2> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:driver/0">driver() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L168" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> driver() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:iolist/0">iolist</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:path/0">path() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L167" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> path() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>().</pre>  </section> </section> </div> </section> <section id="functions" class="details-list"> <h2>Functions</h2> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="demonitor/1">demonitor(MonitorRef)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L189" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> demonitor(MonitorRef) -&gt; ok when MonitorRef :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:reference/0">reference</a>().</pre>  <p>Removes a driver monitor in much the same way as <a href="../../../../erts-17.1/doc/html/erlang.html#demonitor/1"><code>erlang:demonitor/1</code></a> in ERTS does with process monitors.</p>
+<p>For details about how to create driver monitors, see <a href="#monitor/2"><code>monitor/2</code></a>, <a href="#try_load/3"><code>try_load/3</code></a>, and <a href="#try_unload/2"><code>try_unload/2</code></a>.</p>
+<p>The function throws a <code>badarg</code> exception if the parameter is not a <a href="../../../../erts-17.1/doc/html/erlang.html#t:reference/0"><code>reference/0</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="format_error/1">format_error(ErrorDesc)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L1004" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> format_error(ErrorDesc) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>() when ErrorDesc :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Takes an <code>ErrorDesc</code> returned by load, unload, or reload functions and returns a string that describes the error or warning.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>Because of peculiarities in the dynamic loading interfaces on different platforms, the returned string is only guaranteed to describe the correct error <em>if format_error/1 is called in the same instance of the Erlang virtual machine as the error appeared in</em> (meaning the same operating system process).</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="info/0">info()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L1060" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> info() -&gt; AllInfoList
+              when
+                  AllInfoList :: [DriverInfo],
+                  DriverInfo :: {DriverName, InfoList},
+                  DriverName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>(),
+                  InfoList :: [InfoItem],
+                  InfoItem :: {Tag :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Value :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>Returns a list of tuples <code>{DriverName, InfoList}</code>, where <code>InfoList</code> is the result of calling <a href="#info/1"><code>info/1</code></a> for that <code>DriverName</code>. Only dynamically linked-in drivers are included in the list.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="info/1">info(Name)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L1039" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> info(Name) -&gt; InfoList
+              when
+                  Name :: <a href="#t:driver/0">driver</a>(),
+                  InfoList :: [InfoItem, ...],
+                  InfoItem :: {Tag :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Value :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>Returns a list of tuples <code>{Tag, Value}</code>, where <code>Tag</code> is the information item and <code>Value</code> is the result of calling <a href="#info/2"><code>info/2</code></a> with this driver name and this tag. The result is a tuple list containing all information available about a driver.</p>
+<p>The following tags appears in the list:</p>
+<ul>
+<li><code>processes</code></li>
+<li><code>driver_options</code></li>
+<li><code>port_count</code></li>
+<li><code>linked_in_driver</code></li>
+<li><code>permanent</code></li>
+<li><code>awaiting_load</code></li>
+<li><code>awaiting_unload</code></li>
+</ul>
+<p>For a detailed description of each value, see <a href="#info/2"><code>info/2</code></a>.</p>
+<p>The function throws a <code>badarg</code> exception if the driver is not present in the system.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="info/2">info(Name, Tag)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L235" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> info(Name, Tag) -&gt; Value
+              when
+                  Name :: <a href="#t:driver/0">driver</a>(),
+                  Tag ::
+                      processes | driver_options | port_count | linked_in_driver | permanent |
+                      awaiting_load | awaiting_unload,
+                  Value :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Returns specific information about one aspect of a driver. Parameter <code>Tag</code> specifies which aspect to get information about. The return <code>Value</code> differs between different tags:</p>
+<ul>
+<li><p><strong><code>processes</code></strong> - Returns all processes containing <a href="erl_ddll.html#users">users</a> of the specific drivers as a list of tuples <code>{pid(),integer() &gt;= 0}</code>, where <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0"><code>integer/0</code></a> denotes the number of users in process <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a>.</p></li>
+<li><p><strong><code>driver_options</code></strong> - Returns a list of the driver options provided when loading, and any options set by the driver during initialization. The only valid option is <code>kill_ports</code>.</p></li>
+<li><p><strong><code>port_count</code></strong> - Returns the number of ports (an <code>integer() &gt;= 0</code>) using the driver.</p></li>
+<li><p><strong><code>linked_in_driver</code></strong> - Returns a <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0"><code>boolean/0</code></a>, which is <code>true</code> if the driver is a statically linked-in one, otherwise <code>false</code>.</p></li>
+<li><p><strong><code>permanent</code></strong> - Returns a <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0"><code>boolean/0</code></a>, which is <code>true</code> if the driver has made itself permanent (and is <em>not</em> a statically linked-in driver), otherwise <code>false</code>.</p></li>
+<li><p><strong><code>awaiting_load</code></strong> - Returns a list of all processes having monitors for <code>loading</code> active. Each process is returned as <code>{pid(),integer() &gt;= 0}</code>, where <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0"><code>integer/0</code></a> is the number of monitors held by process <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a>.</p></li>
+<li><p><strong><code>awaiting_unload</code></strong> - Returns a list of all processes having monitors for <code>unloading</code> active. Each process is returned as <code>{pid(),integer() &gt;= 0}</code>, where <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0"><code>integer/0</code></a> is the number of monitors held by process <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a>.</p></li>
+</ul>
+<p>If option <code>linked_in_driver</code> or <code>permanent</code> returns <code>true</code>, all other options return <code>linked_in_driver</code> or <code>permanent</code>, respectively.</p>
+<p>The function throws a <code>badarg</code> exception if the driver is not present in the system or if the tag is not supported.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="load/2">load(Path, Name)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L832" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> load(Path, Name) -&gt; ok | {error, ErrorDesc}
+              when Path :: <a href="#t:path/0">path</a>(), Name :: <a href="#t:driver/0">driver</a>(), ErrorDesc :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Loads and links the dynamic driver <code>Name</code>. <code>Path</code> is a file path to the directory containing the driver. <code>Name</code> must be a shareable object/dynamic library. Two drivers with different <code>Path</code> parameters cannot be loaded under the same name. <code>Name</code> is a string or atom containing at least one character.</p>
+<p>The <code>Name</code> specified is to correspond to the filename of the dynamically loadable object file residing in the directory specified as <code>Path</code>, but <em>without</em> the extension (that is, <code>.so</code>). The driver name provided in the driver initialization routine must correspond with the filename, in much the same way as Erlang module names correspond to the names of the <code>.beam</code> files.</p>
+<p>If the driver was previously unloaded, but is still present because of open ports to it, a call to <a href="#load/2"><code>load/2</code></a> stops the unloading and keeps the driver (as long as <code>Path</code> is the same), and <code>ok</code> is returned. If you really want the object code to be reloaded, use <a href="#reload/2"><code>reload/2</code></a> or the low-level interface <a href="#try_load/3"><code>try_load/3</code></a> instead. See also the description of <a href="erl_ddll.html#scenarios"><code>different scenarios</code></a> for loading/unloading in the introduction.</p>
+<p>If more than one process tries to load an already loaded driver with the same <code>Path</code>, or if the same process tries to load it many times, the function returns <code>ok</code>. The emulator keeps track of the <a href="#load/2"><code>load/2</code></a> calls, so that a corresponding number of <code>unload/2</code> calls must be done from the same process before the driver gets unloaded. It is therefore safe for an application to load a driver that is shared between processes or applications when needed. It can safely be unloaded without causing trouble for other parts of the system.</p>
+<p>It is not allowed to load multiple drivers with the same name but with different <code>Path</code> parameters.</p>
+<div class="note">
+<p class="label">Note</p>
+<p><code>Path</code> is interpreted literally, so that all loaders of the same driver must specify the same <em>literal</em> <code>Path</code> string, although different paths can point out the same directory in the file system (because of use of relative paths and links).</p>
+</div>
+<p>On success, the function returns <code>ok</code>. On failure, the return value is <code>{error,ErrorDesc}</code>, where <code>ErrorDesc</code> is an opaque term to be translated into human readable form by function <a href="#format_error/1"><code>format_error/1</code></a>.</p>
+<p>For more control over the error handling, use the <a href="#try_load/3"><code>try_load/3</code></a> interface instead.</p>
+<p>The function throws a <code>badarg</code> exception if the parameters are not specified as described here.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="load_driver/2">load_driver(Path, Name)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L776" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> load_driver(Path, Name) -&gt; ok | {error, ErrorDesc}
+                     when Path :: <a href="#t:path/0">path</a>(), Name :: <a href="#t:driver/0">driver</a>(), ErrorDesc :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Works essentially as <a href="#load/2"><code>load/2</code></a>, but loads the driver with other options. All ports using the driver are killed with reason <code>driver_unloaded</code> when the driver is to be unloaded.</p>
+<p>The number of loads and unloads by different <a href="erl_ddll.html#users">users</a> influences the loading and unloading of a driver file. The port killing therefore only occurs when the <em>last</em> <a href="erl_ddll.html#users">user</a> unloads the driver, or when the last process having loaded the driver exits.</p>
+<p>This interface (or at least the name of the functions) is kept for backward compatibility. Using <a href="#try_load/3"><code>try_load/3</code></a> with <code>{driver_options,[kill_ports]}</code> in the option list gives the same effect regarding the port killing.</p>
+<p>The function throws a <code>badarg</code> exception if the parameters are not specified as described here.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="loaded_drivers/0">loaded_drivers()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L736" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> loaded_drivers() -&gt; {ok, Drivers} when Drivers :: [Driver], Driver :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>().</pre>  <p>Returns a list of all the available drivers, both (statically) linked-in and dynamically loaded ones.</p>
+<p>The driver names are returned as a list of strings rather than a list of atoms for historical reasons.</p>
+<p>For more information about drivers, see <a href="#info/0"><code>info</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="monitor/2">monitor(Tag, Item)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L354" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> monitor(Tag, Item) -&gt; MonitorRef
+                 when
+                     Tag :: driver,
+                     Item :: {Name, When},
+                     Name :: <a href="#t:driver/0">driver</a>(),
+                     When :: loaded | unloaded | unloaded_only,
+                     MonitorRef :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:reference/0">reference</a>().</pre>  <p>Creates a driver monitor and works in many ways as <a href="../../../../erts-17.1/doc/html/erlang.html#monitor/2"><code>erlang:monitor/2</code></a> in ERTS, does for processes. When a driver changes state, the monitor results in a monitor message that is sent to the calling process. <code>MonitorRef</code> returned by this function is included in the message sent.</p>
+<p>As with process monitors, each driver monitor set only generates <em>one single message</em>. The monitor is "destroyed" after the message is sent, so it is then not needed to call <a href="#demonitor/1"><code>demonitor/1</code></a>.</p>
+<p><code>MonitorRef</code> can also be used in subsequent calls to <a href="#demonitor/1"><code>demonitor/1</code></a> to remove a monitor.</p>
+<p>The function accepts the following parameters:</p>
+<ul>
+<li><p><strong><code>Tag</code></strong> - The monitor tag is always <code>driver</code>, as this function can only be used to create driver monitors. In the future, driver monitors will be integrated with process monitors, why this parameter has to be specified for consistence.</p></li>
+<li>
+<p><strong><code>Item</code></strong> - Parameter <code>Item</code> specifies which driver to monitor (the driver name) and which state change to monitor. The parameter is a tuple of arity two whose first element is the driver name and second element is one of the following:</p>
+<ul>
+<li>
+<p><strong><code>loaded</code></strong> - Notifies when the driver is reloaded (or loaded if loading is underway). It only makes sense to monitor drivers that are in the process of being loaded or reloaded. A future driver name for loading cannot be monitored. That only results in a <code>DOWN</code> message sent immediately. Monitoring for loading is therefore most useful when triggered by function <a href="#try_load/3"><code>try_load/3</code></a>, where the monitor is created <em>because</em> the driver is in such a pending state.</p>
+<p>Setting a driver monitor for <code>loading</code> eventually leads to one of the following messages being sent:</p>
+<ul>
+<li>
+<p><strong><code>{'UP', reference(), driver, Name, loaded}</code></strong> - This message is sent either immediately if the driver is already loaded and no reloading is pending, or when reloading is executed if reloading is pending.</p>
+<p>The <a href="erl_ddll.html#users">user</a> is expected to know if reloading is demanded before creating a monitor for loading.</p>
+</li>
+<li><p><strong><code>{'UP', reference(), driver, Name, permanent}</code></strong> - This message is sent if reloading was expected, but the (old) driver made itself permanent before reloading. It is also sent if the driver was permanent or statically linked-in when trying to create the monitor.</p></li>
+<li><p><strong><code>{'DOWN', reference(), driver, Name, load_cancelled}</code></strong> - This message arrives if reloading was underway, but the requesting <a href="erl_ddll.html#users">user</a> cancelled it by dying or calling <a href="#try_unload/2"><code>try_unload/2</code></a> (or <a href="#unload/1"><code>unload/1</code></a>/<a href="#unload_driver/1"><code>unload_driver/1</code></a>) again before it was reloaded.</p></li>
+<li><p><strong><code>{'DOWN', reference(), driver, Name, {load_failure, Failure}}</code></strong> - This message arrives if reloading was underway but the loading for some reason failed. The <code>Failure</code> term is one of the errors that can be returned from <a href="#try_load/3"><code>try_load/3</code></a>. The error term can be passed to <a href="#format_error/1"><code>format_error/1</code></a> for translation into human readable form. Notice that the translation must be done in the same running Erlang virtual machine as the error was detected in.</p></li>
+</ul>
+</li>
+<li>
+<p><strong><code>unloaded</code></strong> - Monitors when a driver gets unloaded. If one monitors a driver that is not present in the system, one immediately gets notified that the driver got unloaded. There is no guarantee that the driver was ever loaded.</p>
+<p>A driver monitor for unload eventually results in one of the following messages being sent:</p>
+<ul>
+<li><p><strong><code>{'DOWN', reference(), driver, Name, unloaded}</code></strong> - The monitored driver instance is now unloaded. As the unload can be a result of a <a href="#reload/2"><code>reload/2</code></a> request, the driver can once again have been loaded when this message arrives.</p></li>
+<li>
+<p><strong><code>{'UP', reference(), driver, Name, unload_cancelled}</code></strong> - This message is sent if unloading was expected, but while the driver was waiting for all ports to get closed, a new <a href="erl_ddll.html#users">user</a> of the driver appeared, and the unloading was cancelled.</p>
+<p>This message appears if <code>{ok, pending_driver}</code> was returned from <a href="#try_unload/2"><code>try_unload/2</code></a> for the last <a href="erl_ddll.html#users">user</a> of the driver, and then <code>{ok, already_loaded}</code> is returned from a call to <a href="#try_load/3"><code>try_load/3</code></a>.</p>
+<p>If one <em>really</em> wants to monitor when the driver gets unloaded, this message distorts the picture, because no unloading was done. Option <code>unloaded_only</code> creates a monitor similar to an <code>unloaded</code> monitor, but never results in this message.</p>
+</li>
+<li><p><strong><code>{'UP', reference(), driver, Name, permanent}</code></strong> - This message is sent if unloading was expected, but the driver made itself permanent before unloading. It is also sent if trying to monitor a permanent or statically linked-in driver.</p></li>
+</ul>
+</li>
+<li><p><strong><code>unloaded_only</code></strong> - A monitor created as <code>unloaded_only</code> behaves exactly as one created as <code>unloaded</code> except that the <code>{'UP', reference(), driver, Name, unload_cancelled}</code> message is never sent, but the monitor instead persists until the driver <em>really</em> gets unloaded.</p></li>
+</ul>
+</li>
+</ul>
+<p>The function throws a <code>badarg</code> exception if the parameters are not specified as described here.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="reload/2">reload(Path, Name)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L964" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> reload(Path, Name) -&gt; ok | {error, ErrorDesc}
+                when
+                    Path :: <a href="#t:path/0">path</a>(),
+                    Name :: <a href="#t:driver/0">driver</a>(),
+                    ErrorDesc :: pending_process | OpaqueError,
+                    OpaqueError :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Reloads the driver named <code>Name</code> from a possibly different <code>Path</code> than previously used. This function is used in the code change <a href="erl_ddll.html#scenarios"><code>scenario</code></a> described in the introduction.</p>
+<p>If there are other <a href="erl_ddll.html#users">users</a> of this driver, the function returns <code>{error, pending_process}</code>, but if there are no other users, the function call hangs until all open ports are closed.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>Avoid mixing multiple <a href="erl_ddll.html#users">users</a> with driver reload requests.</p>
+</div>
+<p>To avoid hanging on open ports, use function <a href="#try_load/3"><code>try_load/3</code></a> instead.</p>
+<p>The <code>Name</code> and <code>Path</code> parameters have exactly the same meaning as when calling the plain function <a href="#load/2"><code>load/2</code></a>.</p>
+<p>On success, the function returns <code>ok</code>. On failure, the function returns an opaque error, except the <code>pending_process</code> error described earlier. The opaque errors are to be translated into human readable form by function <a href="#format_error/1"><code>format_error/1</code></a>.</p>
+<p>For more control over the error handling, use the <a href="#try_load/3"><code>try_load/3</code></a> interface instead.</p>
+<p>The function throws a <code>badarg</code> exception if the parameters are not specified as described here.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="reload_driver/2">reload_driver(Path, Name)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L986" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> reload_driver(Path, Name) -&gt; ok | {error, ErrorDesc}
+                       when
+                           Path :: <a href="#t:path/0">path</a>(),
+                           Name :: <a href="#t:driver/0">driver</a>(),
+                           ErrorDesc :: pending_process | OpaqueError,
+                           OpaqueError :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Works exactly as <a href="#reload/2"><code>reload/2</code></a>, but for drivers loaded with the <a href="#load_driver/2"><code>load_driver/2</code></a> interface.</p>
+<p>As this interface implies that ports are killed when the last user disappears, the function does not hang waiting for ports to get closed.</p>
+<p>For more details, see <a href="erl_ddll.html#scenarios"><code>scenarios</code></a> in this module description and the function description for <a href="#reload/2"><code>reload/2</code></a>.</p>
+<p>The function throws a <code>badarg</code> exception if the parameters are not specified as described here.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="try_load/3">try_load(Path, Name, OptionList)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L573" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> try_load(Path, Name, OptionList) -&gt; {ok, Status} | {ok, PendingStatus, Ref} | {error, ErrorDesc}
+                  when
+                      Path :: <a href="#t:path/0">path</a>(),
+                      Name :: <a href="#t:driver/0">driver</a>(),
+                      OptionList :: [Option],
+                      Option ::
+                          {driver_options, DriverOptionList} |
+                          {monitor, MonitorOption} |
+                          {reload, ReloadOption},
+                      DriverOptionList :: [DriverOption],
+                      DriverOption :: kill_ports,
+                      MonitorOption :: pending_driver | pending,
+                      ReloadOption :: pending_driver | pending,
+                      Status :: loaded | already_loaded | PendingStatus,
+                      PendingStatus :: pending_driver | pending_process,
+                      Ref :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:reference/0">reference</a>(),
+                      ErrorDesc :: ErrorAtom | OpaqueError,
+                      ErrorAtom ::
+                          linked_in_driver | inconsistent | permanent | not_loaded_by_this_process |
+                          not_loaded | pending_reload | pending_process,
+                      OpaqueError :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Provides more control than the <a href="#load/2"><code>load/2</code></a>/<a href="#reload/2"><code>reload/2</code></a> and <a href="#load_driver/2"><code>load_driver/2</code></a>/<a href="#reload_driver/2"><code>reload_driver/2</code></a> interfaces. It never waits for completion of other operations related to the driver, but immediately returns the status of the driver as one of the following:</p>
+<ul>
+<li><p><strong><code>{ok, loaded}</code></strong> - The driver was loaded and is immediately usable.</p></li>
+<li><p><strong><code>{ok, already_loaded}</code></strong> - The driver was already loaded by another process or is in use by a living port, or both. The load by you is registered and a corresponding <code>try_unload</code> is expected sometime in the future.</p></li>
+<li><p><strong><code>{ok, pending_driver}</code>or <code>{ok, pending_driver, reference()}</code></strong> - The load request is registered, but the loading is delayed because an earlier instance of the driver is still waiting to get unloaded (open ports use it). Still, unload is expected when you are done with the driver. This return value <em>mostly</em> occurs when options <code>{reload,pending_driver}</code> or <code>{reload,pending}</code> are used, but <em>can</em> occur when another <a href="erl_ddll.html#users">user</a> is unloading a driver in parallel and driver option <code>kill_ports</code> is set. In other words, this return value always needs to be handled.</p></li>
+<li><p><strong><code>{ok, pending_process}</code>or <code>{ok, pending_process, reference()}</code></strong> - The load request is registered, but the loading is delayed because an earlier instance of the driver is still waiting to get unloaded by another <a href="erl_ddll.html#users">user</a> (not only by a port, in which case <code>{ok,pending_driver}</code> would have been returned). Still, unload is expected when you are done with the driver. This return value <em>only</em> occurs when option <code>{reload,pending}</code> is used.</p></li>
+</ul>
+<p>When the function returns <code>{ok, pending_driver}</code> or <code>{ok, pending_process}</code>, one can get information about when the driver is <em>actually</em> loaded by using option <code>{monitor, MonitorOption}</code>.</p>
+<p>When monitoring is requested, and a corresponding <code>{ok, pending_driver}</code> or <code>{ok, pending_process}</code> would be returned, the function instead returns a tuple <code>{ok, PendingStatus, reference()}</code> and the process then gets a monitor message later, when the driver gets loaded. The monitor message to expect is described in the function description of <a href="#monitor/2"><code>monitor/2</code></a>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>In case of loading, monitoring can <em>not</em> only get triggered by using option <code>{reload, ReloadOption}</code>, but also in special cases where the load error is transient. Thus, <code>{monitor, pending_driver}</code> is to be used under basically <em>all</em> real world circumstances.</p>
+</div>
+<p>The function accepts the following parameters:</p>
+<ul>
+<li>
+<p><strong><code>Path</code></strong> - The file system path to the directory where the driver object file is located. The filename of the object file (minus extension) must correspond to the driver name (used in parameter <code>Name</code>) and the driver must identify itself with the same name. <code>Path</code> can be provided as an <em>iolist()</em>, meaning it can be a list of other <a href="../../../../erts-17.1/doc/html/erlang.html#t:iolist/0"><code>iolist/0</code></a>s, characters (8-bit integers), or binaries, all to be flattened into a sequence of characters.</p>
+<p>The (possibly flattened) <code>Path</code> parameter must be consistent throughout the system. A driver is to, by all <a href="erl_ddll.html#users">users</a>, be loaded using the same <em>literal</em> <code>Path</code>. The exception is when <em>reloading</em> is requested, in which case <code>Path</code> can be specified differently. Notice that all <a href="erl_ddll.html#users">users</a> trying to load the driver later need to use the <em>new</em> <code>Path</code> if <code>Path</code> is changed using a <code>reload</code> option. This is yet another reason to have <em>only one loader</em> of a driver one wants to upgrade in a running system.</p>
+</li>
+<li><p><strong><code>Name</code></strong> - This parameter is the name of the driver to be used in subsequent calls to function <a href="../../../../erts-17.1/doc/html/erlang.html#open_port/2"><code>erlang:open_port</code></a> in ERTS. The name can be specified as an <a href="../../../../erts-17.1/doc/html/erlang.html#t:iolist/0"><code>iolist/0</code></a> or an <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0"><code>atom/0</code></a>. The name specified when loading is used to find the object file (with the help of <code>Path</code> and the system-implied extension suffix, that is, <code>.so</code>). The name by which the driver identifies itself must also be consistent with this <code>Name</code> parameter, much as the module name of a Beam file much corresponds to its filename.</p></li>
+<li>
+<p><strong><code>OptionList</code></strong> - Some options can be specified to control the loading operation. The options are specified as a list of two-tuples. The tuples have the following values and meanings:</p>
+<ul>
+<li>
+<p><strong><code>{driver_options, DriverOptionList}</code></strong> - This is to provide options that changes its general behavior and "sticks" to the driver throughout its lifespan.</p>
+<p>The driver options for a specified driver name need always to be consistent, <em>even when the driver is reloaded</em>, meaning that they are as much a part of the driver as the name.</p>
+<p>The only allowed driver option is <code>kill_ports</code>, which means that all ports opened to the driver are killed with exit reason <code>driver_unloaded</code> when no process any longer has the driver loaded. This situation arises either when the last <a href="erl_ddll.html#users">user</a> calls <a href="#try_unload/2"><code>try_unload/2</code></a>, or when the last process having loaded the driver exits.</p>
+</li>
+<li>
+<p><strong><code>{monitor, MonitorOption}</code></strong> - A <code>MonitorOption</code> tells <a href="#try_load/3"><code>try_load/3</code></a> to trigger a driver monitor under certain conditions. When the monitor is triggered, the function returns a three-tuple <code>{ok, PendingStatus, reference()}</code>, where <a href="../../../../erts-17.1/doc/html/erlang.html#t:reference/0"><code>reference/0</code></a> is the monitor reference for the driver monitor.</p>
+<p>Only one <code>MonitorOption</code> can be specified. It is one of the following:</p>
+<ul>
+<li>The atom <code>pending</code>, which means that a monitor is to be created whenever a load operation is delayed,</li>
+<li>The atom <code>pending_driver</code>, in which a monitor is created whenever the operation is delayed because of open ports to an otherwise unused driver.</li>
+</ul>
+<p>Option <code>pending_driver</code> is of little use, but is present for completeness, as it is well defined which reload options that can give rise to which delays. However, it can be a good idea to use the same <code>MonitorOption</code> as the <code>ReloadOption</code>, if present.</p>
+<p>If reloading is not requested, it can still be useful to specify option <code>monitor</code>, as forced unloads (driver option <code>kill_ports</code> or option <code>kill_ports</code> to <a href="#try_unload/2"><code>try_unload/2</code></a>) trigger a transient state where driver loading cannot be performed until all closing ports are closed. Thus, as <code>try_unload</code> can, in almost all situations, return <code>{ok, pending_driver}</code>, always specify at least <code>{monitor, pending_driver}</code> in production code (see the monitor discussion earlier).</p>
+</li>
+<li>
+<p><strong><code>{reload, ReloadOption}</code></strong> - This option is used to <em>reload</em> a driver from disk, most often in a code upgrade scenario. Having a <code>reload</code> option also implies that parameter <code>Path</code> does <em>not</em> need to be consistent with earlier loads of the driver.</p>
+<p>To reload a driver, the process must have loaded the driver before, that is, there must be an active <a href="erl_ddll.html#users">user</a> of the driver in the process.</p>
+<p>The <code>reload</code> option can be either of the following:</p>
+<ul>
+<li>
+<p><strong><code>pending</code></strong> - With the atom <code>pending</code>, reloading is requested for any driver and is effectuated when <em>all</em> ports opened to the driver are closed. The driver replacement in this case takes place regardless if there are still pending <a href="erl_ddll.html#users">users</a> having the driver loaded.</p>
+<p>The option also triggers port-killing (if driver option <code>kill_ports</code> is used) although there are pending users, making it usable for forced driver replacement, but laying much responsibility on the driver <a href="erl_ddll.html#users">users</a>. The pending option is seldom used as one does not want other <a href="erl_ddll.html#users">users</a> to have loaded the driver when code change is underway.</p>
+</li>
+<li><p><strong><code>pending_driver</code></strong> - This option is more useful. Here, reloading is queued if the driver is <em>not</em> loaded by any other <a href="erl_ddll.html#users">users</a>, but the driver has opened ports, in which case <code>{ok, pending_driver}</code> is returned (a <code>monitor</code> option is recommended).</p></li>
+</ul>
+<p>If the driver is unloaded (not present in the system), error code <code>not_loaded</code> is returned. Option <code>reload</code> is intended for when the user has already loaded the driver in advance.</p>
+</li>
+</ul>
+</li>
+</ul>
+<p>The function can return numerous errors, some can only be returned given a certain combination of options.</p>
+<p>Some errors are opaque and can only be interpreted by passing them to function <a href="#format_error/1"><code>format_error/1</code></a>, but some can be interpreted directly:</p>
+<ul>
+<li><p><strong><code>{error,linked_in_driver}</code></strong> - The driver with the specified name is an Erlang statically linked-in driver, which cannot be manipulated with this API.</p></li>
+<li>
+<p><strong><code>{error,inconsistent}</code></strong> - The driver is already loaded with other <code>DriverOptionList</code> or a different <em>literal</em> <code>Path</code> argument.</p>
+<p>This can occur even if a <code>reload</code> option is specified, if <code>DriverOptionList</code> differs from the current.</p>
+</li>
+<li><p><strong><code>{error, permanent}</code></strong> - The driver has requested itself to be permanent, making it behave like an Erlang linked-in driver and can no longer be manipulated with this API.</p></li>
+<li><p><strong><code>{error, pending_process}</code></strong> - The driver is loaded by other <a href="erl_ddll.html#users">users</a> when option <code>{reload, pending_driver}</code> was specified.</p></li>
+<li><p><strong><code>{error, pending_reload}</code></strong> - Driver reload is already requested by another <a href="erl_ddll.html#users">user</a> when option <code>{reload, ReloadOption}</code> was specified.</p></li>
+<li><p><strong><code>{error, not_loaded_by_this_process}</code></strong> - Appears when option <code>reload</code> is specified. The driver <code>Name</code> is present in the system, but there is no <a href="erl_ddll.html#users">user</a> of it in this process.</p></li>
+<li><p><strong><code>{error, not_loaded}</code></strong> - Appears when option <code>reload</code> is specified. The driver <code>Name</code> is not in the system. Only drivers loaded by this process can be reloaded.</p></li>
+</ul>
+<p>All other error codes are to be translated by function <a href="#format_error/1"><code>format_error/1</code></a>. Notice that calls to <code>format_error</code> are to be performed from the same running instance of the Erlang virtual machine as the error is detected in, because of system-dependent behavior concerning error values.</p>
+<p>If the arguments or options are malformed, the function throws a <code>badarg</code> exception.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="try_unload/2">try_unload(Name, OptionList)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L720" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> try_unload(Name, OptionList) -&gt; {ok, Status} | {ok, PendingStatus, Ref} | {error, ErrorAtom}
+                    when
+                        Name :: <a href="#t:driver/0">driver</a>(),
+                        OptionList :: [Option],
+                        Option :: {monitor, MonitorOption} | kill_ports,
+                        MonitorOption :: pending_driver | pending,
+                        Status :: unloaded | PendingStatus,
+                        PendingStatus :: pending_driver | pending_process,
+                        Ref :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:reference/0">reference</a>(),
+                        ErrorAtom ::
+                            linked_in_driver | not_loaded | not_loaded_by_this_process | permanent.</pre>  <p>This is the low-level function to unload (or decrement reference counts of) a driver. It can be used to force port killing, in much the same way as the driver option <code>kill_ports</code> implicitly does. Also, it can trigger a monitor either because other <a href="erl_ddll.html#users">users</a> still have the driver loaded or because open ports use the driver.</p>
+<p>Unloading can be described as the process of telling the emulator that this particular part of the code in this particular process (that is, this <a href="erl_ddll.html#users">user</a>) no longer needs the driver. That can, if there are no other users, trigger unloading of the driver, in which case the driver name disappears from the system and (if possible) the memory occupied by the driver executable code is reclaimed.</p>
+<p>If the driver has option <code>kill_ports</code> set, or if <code>kill_ports</code> is specified as an option to this function, all pending ports using this driver are killed when unloading is done by the last <a href="erl_ddll.html#users">user</a>. If no port-killing is involved and there are open ports, the unloading is delayed until no more open ports use the driver. If, in this case, another <a href="erl_ddll.html#users">user</a> (or even this user) loads the driver again before the driver is unloaded, the unloading never takes place.</p>
+<p>To allow the <a href="erl_ddll.html#users">user</a> to <em>request unloading</em> to wait for <em>actual unloading</em>, <code>monitor</code> triggers can be specified in much the same way as when loading. However, as <a href="erl_ddll.html#users">users</a> of this function seldom are interested in more than decrementing the reference counts, monitoring is seldom needed.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>If option <code>kill_ports</code> is used, monitor trigging is crucial, as the ports are not guaranteed to be killed until the driver is unloaded. Thus, a monitor must be triggered for at least the <code>pending_driver</code> case.</p>
+</div>
+<p>The possible monitor messages to expect are the same as when using option <code>unloaded</code> to function <a href="#monitor/2"><code>monitor/2</code></a>.</p>
+<p>The function returns one of the following statuses upon success:</p>
+<ul>
+<li>
+<p><strong><code>{ok, unloaded}</code></strong> - The driver was immediately unloaded, meaning that the driver name is now free to use by other drivers and, if the underlying OS permits it, the memory occupied by the driver object code is now reclaimed.</p>
+<p>The driver can only be unloaded when there are no open ports using it and no more <a href="erl_ddll.html#users">users</a> require it to be loaded.</p>
+</li>
+<li>
+<p><strong><code>{ok, pending_driver}</code>or <code>{ok, pending_driver, reference()}</code></strong> - Indicates that this call removed the last <a href="erl_ddll.html#users">user</a> from the driver, but there are still open ports using it. When all ports are closed and no new <a href="erl_ddll.html#users">users</a> have arrived, the driver is reloaded and the name and memory reclaimed.</p>
+<p>This return value is valid even if option <code>kill_ports</code> was used, as killing ports can be a process that does not complete immediately. However, the condition is in that case transient. Monitors are always useful to detect when the driver is really unloaded.</p>
+</li>
+<li>
+<p><strong><code>{ok, pending_process}</code>or <code>{ok, pending_process, reference()}</code></strong> - The unload request is registered, but other <a href="erl_ddll.html#users">users</a> still hold the driver. Notice that the term <code>pending_process</code> can refer to the running process; there can be more than one <a href="erl_ddll.html#users">user</a> in the same process.</p>
+<p>This is a normal, healthy, return value if the call was just placed to inform the emulator that you have no further use of the driver. It is the most common return value in the most common <a href="erl_ddll.html#scenarios"><code>scenario</code></a> described in the introduction.</p>
+</li>
+</ul>
+<p>The function accepts the following parameters:</p>
+<ul>
+<li><p><strong><code>Name</code></strong> - <code>Name</code> is the name of the driver to be unloaded. The name can be specified as an <a href="../../../../erts-17.1/doc/html/erlang.html#t:iolist/0"><code>iolist/0</code></a> or as an <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0"><code>atom/0</code></a>.</p></li>
+<li>
+<p><strong><code>OptionList</code></strong> - Argument <code>OptionList</code> can be used to specify certain behavior regarding ports and triggering monitors under certain conditions:</p>
+<ul>
+<li>
+<p><strong><code>kill_ports</code></strong> - Forces killing of all ports opened using this driver, with exit reason <code>driver_unloaded</code>, if you are the <em>last</em> <a href="erl_ddll.html#users">user</a> of the driver.</p>
+<p>If other <a href="erl_ddll.html#users">users</a> have the driver loaded, this option has no effect.</p>
+<p>To get the consistent behavior of killing ports when the last <a href="erl_ddll.html#users">user</a> unloads, use driver option <code>kill_ports</code> when loading the driver instead.</p>
+</li>
+<li>
+<p><strong><code>{monitor, MonitorOption}</code></strong> - Creates a driver monitor if the condition specified in <code>MonitorOption</code> is true. The valid options are:</p>
+<ul>
+<li><p><strong><code>pending_driver</code></strong> - Creates a driver monitor if the return value is to be <code>{ok, pending_driver}</code>.</p></li>
+<li><p><strong><code>pending</code></strong> - Creates a monitor if the return value is <code>{ok, pending_driver}</code> or <code>{ok, pending_process}</code>.</p></li>
+</ul>
+<p>The <code>pending_driver</code> <code>MonitorOption</code> is by far the most useful. It must be used to ensure that the driver really is unloaded and the ports closed whenever option <code>kill_ports</code> is used, or the driver can have been loaded with driver option <code>kill_ports</code>.</p>
+<p>Using the monitor triggers in the call to <code>try_unload</code> ensures that the monitor is added before the unloading is executed, meaning that the monitor is always properly triggered, which is not the case if <a href="#monitor/2"><code>monitor/2</code></a> is called separately.</p>
+</li>
+</ul>
+</li>
+</ul>
+<p>The function can return the following error conditions, all well specified (no opaque values):</p>
+<ul>
+<li><p><strong><code>{error, linked_in_driver}</code></strong> - You were trying to unload an Erlang statically linked-in driver, which cannot be manipulated with this interface (and cannot be unloaded at all).</p></li>
+<li><p><strong><code>{error, not_loaded}</code></strong> - The driver <code>Name</code> is not present in the system.</p></li>
+<li>
+<p><strong><code>{error, not_loaded_by_this_process}</code></strong> - The driver <code>Name</code> is present in the system, but there is no <a href="erl_ddll.html#users">user</a> of it in this process.</p>
+<p>As a special case, drivers can be unloaded from processes that have done no corresponding call to <a href="#try_load/3"><code>try_load/3</code></a> if, and only if, there are <em>no users of the driver at all</em>, which can occur if the process containing the last user dies.</p>
+</li>
+<li><p><strong><code>{error, permanent}</code></strong> - The driver has made itself permanent, in which case it can no longer be manipulated by this interface (much like a statically linked-in driver).</p></li>
+</ul>
+<p>The function throws a <code>badarg</code> exception if the parameters are not specified as described here.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="unload/1">unload(Name)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L926" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> unload(Name) -&gt; ok | {error, ErrorDesc} when Name :: <a href="#t:driver/0">driver</a>(), ErrorDesc :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Unloads, or at least dereferences the driver named <code>Name</code>. If the caller is the last <a href="erl_ddll.html#users">user</a> of the driver, and no more open ports use the driver, the driver gets unloaded. Otherwise, unloading is delayed until all ports are closed and no <a href="erl_ddll.html#users">users</a> remain.</p>
+<p>If there are other <a href="erl_ddll.html#users">users</a> of the driver, the reference counts of the driver is merely decreased, so that the caller is no longer considered a <a href="erl_ddll.html#users">user</a> of the driver. For use scenarios, see the <a href="erl_ddll.html#scenarios"><code>description</code></a> in the beginning of this module.</p>
+<p>The <code>ErrorDesc</code> returned is an opaque value to be passed further on to function <a href="#format_error/1"><code>format_error/1</code></a>. For more control over the operation, use the <a href="#try_unload/2"><code>try_unload/2</code></a> interface.</p>
+<p>The function throws a <code>badarg</code> exception if the parameters are not specified as described here.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="unload_driver/1">unload_driver(Name)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/kernel/src/erl_ddll.erl#L901" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> unload_driver(Name) -&gt; ok | {error, ErrorDesc} when Name :: <a href="#t:driver/0">driver</a>(), ErrorDesc :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Unloads, or at least dereferences the driver named <code>Name</code>. If the caller is the last <a href="erl_ddll.html#users">user</a> of the driver, all remaining open ports using the driver are killed with reason <code>driver_unloaded</code> and the driver eventually gets unloaded.</p>
+<p>If there are other <a href="erl_ddll.html#users">users</a> of the driver, the reference counts of the driver is merely decreased, so that the caller is no longer considered a <a href="erl_ddll.html#users">user</a>. For use scenarios, see the <a href="erl_ddll.html#scenarios"><code>description</code></a> in the beginning of this module.</p>
+<p>The <code>ErrorDesc</code> returned is an opaque value to be passed further on to function <a href="#format_error/1"><code>format_error/1</code></a>. For more control over the operation, use the <a href="#try_unload/2"><code>try_unload/2</code></a> interface.</p>
+<p>The function throws a <code>badarg</code> exception if the parameters are not specified as described here.</p> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

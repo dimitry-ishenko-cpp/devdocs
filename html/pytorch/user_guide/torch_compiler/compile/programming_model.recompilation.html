@@ -1,0 +1,91 @@
+<div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList"> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="User Guide"> <meta itemprop="position" content="1"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compiler"> <meta itemprop="position" content="2"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Core Concepts"> <meta itemprop="position" content="3"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.compile Programming Model"> <meta itemprop="position" content="4"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem"> <meta itemprop="name" content="Dealing with Recompilations"> <meta itemprop="position" content="5"> </div> </div>  <article class="bd-article"> <section id="dealing-with-recompilations"> <h1>Dealing with Recompilations</h1> <p class="date-info-last-verified" style="color: #6c6c6d; font-size: small;">Created On: Jul 29, 2025 | Last Updated On: Jul 28, 2026</p> <p>Recompilations are necessary for <code>torch.compile</code> soundness, but can result in significantly increased compile time. Thus, minimizing recompilations while preserving soundness is essential for reducing compile time.</p> <p>You can view recompilations and their reasons using tlparse or <code>TORCH_LOGS=recompiles</code>.</p> <section id="is-dynamic-shapes-enabled"> <h2>Is Dynamic Shapes Enabled?</h2> <p>In the below example, we recompile due to mismatched shapes:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">@torch.compile
+def fn(x):
+    return x + 1
+fn(torch.ones(3))
+fn(torch.ones(4))
+</pre> </div> </div> <p>Make sure that the dynamic option of <code>torch.compile</code> is not set to <code>False</code>. The default option, <code>dynamic=None</code>, will only attempt dynamic shapes after the first compilation. You can set <code>dynamic=True</code> to upfront compile as dynamic as possible:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">@torch.compile(dynamic=True)
+def gn(x):
+    return x + 1
+gn(torch.ones(3))
+gn(torch.ones(4))
+</pre> </div> </div> <p>For more information on dynamic shapes, including dealing with errors/recompilations due to dynamic shapes, see <a class="reference external" href="https://docs.google.com/document/d/1GgvOe7C8_NVOMLOCwDaYV1mXXyHMXY7ExoewHqooxrs/edit?tab=t.0#heading=h.fh8zzonyw8ng">the dynamic shapes manual</a>.</p> </section> <section id="wrapping-constants-with-tensors"> <h2>Wrapping Constants with Tensors</h2> <p>By default, <code>int</code> / <code>float</code> variables are treated as constants and are guarded on their exact value. In the below example, we have a recompilation for each function call.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">@torch.compile
+def fn(x, c):
+    return x + c
+for i in range(5):
+    fn(torch.ones(i), 0.5 + i)
+</pre> </div> </div> <p>In particular, for LR schedulers, initializing with a constant can lead to recompilations:</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">mod = torch.nn.Linear(3, 3)
+opt = torch.optim.Adam(mod.parameters(), lr=0.01)
+sched = torch.optim.lr_scheduler.ExponentialLR(opt, 0.9)
+@torch.compile
+def gn(inp):
+    opt.zero_grad(True)
+    out = mod(inp).sum()
+    out.backward()
+    opt.step()
+    sched.step()
+for i in range(5):
+    gn(torch.ones(3, 3))
+</pre> </div> </div> <p>In both examples, we can wrap <code>float</code> variables in tensors in order to prevent recompilations.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none"># first example
+for i in range(5):
+    fn(torch.ones(i), torch.tensor(0.5 + i))
+# second example
+opt = torch.optim.Adam(mod.parameters(), lr=torch.tensor(0.01))
+sched = torch.optim.lr_scheduler.ExponentialLR(opt, torch.tensor(0.9))
+for i in range(5):
+    gn(torch.ones(3, 3))
+</pre> </div> </div> </section> <section id="unspecializing-integer-attributes-on-nn-modules"> <h2>Unspecializing Integer Attributes on <code>nn.Module</code>s</h2> <p>By default, Dynamo specializes on (guards the exact value of) integer attributes of an <code>nn.Module</code>. An integer that changes every call – such as a step counter incremented inside <code>forward</code> – therefore triggers a recompilation on each call, quickly hitting the recompilation limit and falling back to eager.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">class Mod(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c = 0
+
+    def forward(self, x):
+        self.c += 1  # specialized on -&gt; recompiles every call
+        return x * self.c
+
+mod = Mod()
+opt_mod = torch.compile(mod, backend="eager")
+for _ in range(5):
+    opt_mod(torch.randn(4))
+</pre> </div> </div> <p>If you do not need the integer specialized, set the flag below so Dynamo treats it as dynamic instead of recompiling. See <a class="reference internal" href="dynamic_shapes_advanced_control_options.html#dynamic-shapes-advanced-control-options"><span class="std std-ref">Advanced Options to Control Dynamic Behavior</span></a> for related static/dynamic control flags.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">torch._dynamo.config.allow_unspec_int_on_nn_module = True
+mod = Mod()
+opt_mod = torch.compile(mod, backend="eager")
+for _ in range(5):
+    opt_mod(torch.randn(4))
+torch._dynamo.config.allow_unspec_int_on_nn_module = False
+</pre> </div> </div> </section> <section id="changing-the-cache-size-limit"> <h2 id="programming-model-recompilation-changing-cache-size-limit">Changing the Cache Size Limit</h2> <p>There is a limit to how many times a function can be recompiled, determined by <code>torch._dynamo.config.cache_size_limit</code> and <code>torch._dynamo.config.accumulated_cache_size_limit</code> (The exact difference between these 2 values is detailed in <a class="reference external" href="https://github.com/pytorch/pytorch/blob/4ce6e6ec8890a3f6ee604c9efb3ff153825ce575/torch/_dynamo/cache_size.py#L14"><code>torch/_dynamo/cache_size.py</code></a>). If the Dynamo cache limit is hit, then all future compilation attempts <strong>will result in the function being skipped (run eagerly)</strong>. Dynamo will still attempt to use previously compiled bytecode for future function calls, if the guards pass. Note that in the case of a recompilation limit hit, <strong>all nested function calls WILL be skipped</strong> (Dynamo will try to use previously compiled bytecode for the nested functions). Dynamo will also issue a warning containing the affected function and which limit was hit. In the example below, each function call results in a recompile attempt. When we hit the cache size limit (by default, 8), we stop attempting to recompile. (Note that we set <code>dynamic=False</code> for demonstration purposes to force recompilation every time).</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">@torch.compile(dynamic=False)
+def fn(x):
+    return x + 1
+for i in range(1, 10):
+    # recompile every time due to dynamic=False
+    fn(torch.ones(i))
+</pre> </div> </div> <p>If you know that the number of recompilations has a reasonable constant upper bound, you can raise the cache size limit. If the cost of recompilation outweighs the benefit of compilation, then you can consider lowering the cache size limit.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">torch._dynamo.config.cache_size_limit = 16
+@torch.compile(dynamic=False)
+def gn(x):
+    return x + 1
+for i in range(1, 10):
+    gn(torch.ones(i))
+</pre> </div> </div> <p>Reducing recompilations is one way to lower compile time; for other levers (regional and hierarchical compilation, measuring compile time), see <a class="reference internal" href="programming_model.reducing_compile_time.html"><span class="doc std std-doc">Reducing Compile Time</span></a>.</p> </section> <section id="graph-breaking-to-reduce-recompilation-costs"> <h2>Graph Breaking to Reduce Recompilation Costs</h2> <p>If a large graph is recompiling and causing high compile time, you can intentionally introduce a graph break in order to reduce recompilation costs, at the expense of introducing a performance hit.</p> <div class="cell docutils container"> <div class="cell_input docutils container"> <pre data-language="none">def very_large_function(x):
+    return x + 1
+
+@torch.compile(dynamic=False)
+def fn(x, c):
+    y = very_large_function(x)  # recompiled every time
+    return y + c
+
+for i in range(1, 5):
+    fn(torch.ones(3), i)
+
+@torch.compile(dynamic=False)
+def gn(x, c):
+    y = very_large_function(x)  # compiled only once
+    torch._dynamo.graph_break()
+    return y + c  # recompiled every time
+
+for i in range(1, 5):
+    gn(torch.ones(3), i)
+</pre> </div> </div> </section> </section> </article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2026, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/compile/programming_model.recompilation.html" class="_attribution-link">https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/compile/programming_model.recompilation.html</a>
+  </p>
+</div>

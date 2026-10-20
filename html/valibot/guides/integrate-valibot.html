@@ -1,0 +1,202 @@
+<h1 id="integrate-valibot">Integrate Valibot</h1>
+
+<p>This guide is aimed at library authors who want to build on top of Valibot — whether that is a form library, an ORM, an API framework, a code generator, or other tooling. It covers Standard Schema for schema-agnostic integrations, schema introspection for extracting types and runtime properties, and schema tree traversal for analysis and code generation.</p>
+
+<h2 id="standard-schema">Standard Schema</h2>
+
+<p>Valibot implements <a href="https://standardschema.dev/schema">Standard Schema v1</a>. Every schema object exposes a <code>&#39;~standard&#39;</code> property that provides a vendor-neutral <code>validate</code> function and inferred TypeScript types. We recommend reading the Standard Schema documentation for the full interface specification.</p>
+
+<p>When building a library that accepts user-defined schemas, we recommend accepting a <code>StandardSchemaV1</code> instead of a Valibot-specific type — unless your integration requires Valibot-specific APIs. This ensures your library works with any Standard Schema-compatible library, not just Valibot.</p>
+
+<pre data-language="ts"><code>import type { StandardSchemaV1 } from &#39;@standard-schema/spec&#39;;
+
+async function validateData(schema: StandardSchemaV1, data: unknown) {
+  const result = await schema[&#39;~standard&#39;].validate(data);
+  if (result.issues) {
+    // Validation failed — result.issues is a readonly array of StandardIssue
+    console.log(result.issues);
+  } else {
+    // Validation succeeded — result.value is the typed output
+    console.log(result.value);
+  }
+}
+</code></pre>
+
+<p>One important limitation: <code>&#39;~standard&#39;.validate</code> always uses Valibot&#39;s global config. There is no way to pass a custom config (such as <code>abortEarly</code> or a custom <code>lang</code>) through the Standard Schema interface. If you need that level of control, use Valibot&#39;s own parsing APIs directly.</p>
+
+<blockquote>
+<p>Valibot also supports the <a href="https://standardschema.dev/json-schema">Standard JSON Schema</a> specification via the <code>@valibot/to-json-schema</code> package, which exposes a <code>toStandardJsonSchema</code> function.</p>
+</blockquote>
+
+<h2 id="schema-introspection">Schema introspection</h2>
+
+<p>Valibot schemas are plain objects, so all their properties are readable at runtime. This section covers how to extract static TypeScript types, read runtime properties, and use built-in type guards to narrow schema values safely.</p>
+
+<h3 id="static-types">Static types</h3>
+
+<p>Valibot exposes three generic utility types for extracting type information from any schema, validation, transformation, or metadata object.</p>
+
+<pre data-language="ts"><code>import * as v from &#39;valibot&#39;;
+
+const Schema = v.pipe(v.string(), v.decimal(), v.toNumber());
+
+type Input = v.InferInput&lt;typeof Schema&gt;; // string
+type Output = v.InferOutput&lt;typeof Schema&gt;; // number
+type Issue = v.InferIssue&lt;typeof Schema&gt;; // StringIssue | DecimalIssue | ToNumberIssue
+</code></pre>
+
+<p><a href="../api/types/inferinput.html"><code>InferInput</code></a>,
+<a href="../api/types/inferoutput.html"><code>InferOutput</code></a>, and
+<a href="../api/types/inferissue.html"><code>InferIssue</code></a> read the phantom <code>&#39;~types&#39;</code>
+field. They work on schemas, validations, transformations, and metadata alike.
+<code>&#39;~types&#39;</code> is always <code>undefined</code> at runtime — this field exists solely for
+TypeScript&#39;s type inference, so we recommend never reading it in runtime code.</p>
+
+<h3 id="runtime-properties">Runtime properties</h3>
+
+<p>Every schema and action is a plain object, so you can read its properties directly at runtime. The base properties (<code>kind</code>, <code>type</code>, <code>async</code>, etc.) are always present. Use <code>kind</code> to distinguish schemas from actions, and <code>type</code> to identify specific schemas and actions. Some schemas expose additional properties listed in the table below.</p>
+
+<table><thead>
+<tr>
+<th>Schema</th>
+<th>Extra property</th>
+<th>Description</th>
+</tr>
+</thead><tbody>
+<tr>
+<td><code>object</code>, <code>looseObject</code>, <code>strictObject</code></td>
+<td><code>entries</code></td>
+<td><code>Record&lt;string, BaseSchema&gt;</code> of named fields</td>
+</tr>
+<tr>
+<td><code>objectWithRest</code></td>
+<td><code>entries</code>, <code>rest</code></td>
+<td>named fields + rest element schema</td>
+</tr>
+<tr>
+<td><code>array</code></td>
+<td><code>item</code></td>
+<td>element schema</td>
+</tr>
+<tr>
+<td><code>tuple</code>, <code>looseTuple</code>, <code>strictTuple</code></td>
+<td><code>items</code></td>
+<td>ordered tuple of element schemas</td>
+</tr>
+<tr>
+<td><code>tupleWithRest</code></td>
+<td><code>items</code>, <code>rest</code></td>
+<td>ordered elements + rest element schema</td>
+</tr>
+<tr>
+<td><code>record</code>, <code>map</code></td>
+<td><code>key</code>, <code>value</code></td>
+<td>key and value schemas</td>
+</tr>
+<tr>
+<td><code>set</code></td>
+<td><code>value</code></td>
+<td>value schema</td>
+</tr>
+<tr>
+<td><code>union</code>, <code>intersect</code></td>
+<td><code>options</code></td>
+<td>array of member schemas</td>
+</tr>
+<tr>
+<td><code>variant</code></td>
+<td><code>key</code>, <code>options</code></td>
+<td>discriminant key string + array of object schemas</td>
+</tr>
+<tr>
+<td><code>optional</code>, <code>nullable</code>, and other wrappers</td>
+<td><code>wrapped</code></td>
+<td>inner schema</td>
+</tr>
+<tr>
+<td><code>lazy</code></td>
+<td><code>getter</code></td>
+<td><code>(input: unknown) =&gt; BaseSchema</code> deferred getter</td>
+</tr>
+<tr>
+<td>any schema passed through <code>pipe</code></td>
+<td><code>pipe</code></td>
+<td>tuple of the root schema followed by pipe items</td>
+</tr>
+</tbody></table>
+
+<h3 id="type-guards">Type guards</h3>
+
+<p>Use these helpers to narrow the TypeScript type of an unknown Valibot object before accessing its properties. Valibot exports three type guard helpers — <a href="../api/isofkind.html"><code>isOfKind</code></a>, <a href="../api/isoftype.html"><code>isOfType</code></a>, and <a href="../api/isvalierror.html"><code>isValiError</code></a> — that narrow <code>kind</code> and <code>type</code> with TypeScript inference:</p>
+
+<pre data-language="ts"><code>import * as v from &#39;valibot&#39;;
+
+// Narrows to BaseSchema by kind
+if (v.isOfKind(&#39;schema&#39;, item)) {
+  item; // BaseSchema&lt;...&gt;
+}
+
+// Narrows to StringSchema by type
+if (v.isOfType(&#39;string&#39;, schema)) {
+  schema; // StringSchema&lt;...&gt;
+}
+</code></pre>
+
+<p>Direct <code>===</code> comparisons on <code>kind</code> and <code>type</code> are fine too, but <code>isOfKind</code> and <code>isOfType</code> can better narrow the TypeScript type of the object in some edge cases.</p>
+
+<p><a href="../api/isvalierror.html"><code>isValiError</code></a> is a separate helper for
+error handling. <a href="../api/valierror.html"><code>ValiError</code></a> is the error
+class thrown by <a href="../api/parse.html"><code>parse</code></a> and
+<a href="../api/parser.html"><code>parser</code></a>. It extends <code>Error</code> with <code>name =
+&#39;ValiError&#39;</code> and a typed <code>issues</code> array:</p>
+
+<pre data-language="ts"><code>import * as v from &#39;valibot&#39;;
+
+try {
+  v.parse(Schema, input);
+} catch (error) {
+  if (v.isValiError&lt;typeof Schema&gt;(error)) {
+    // error is ValiError&lt;typeof Schema&gt;
+    console.log(error.issues);
+  }
+}
+</code></pre>
+
+<h2 id="schema-tree-traversal">Schema tree traversal</h2>
+
+<p>Because schemas are plain objects, we can walk a schema tree by reading its properties (see <a href="#runtime-properties">Runtime properties</a>). When traversing a piped schema, read the <code>pipe</code> tuple — its first item is the root schema and subsequent items are pipe actions or nested schemas.</p>
+
+<p>Here is a simplified example inspired by <a href="../api/getdefaults.html"><code>getDefaults</code></a> that extracts deeply nested default values from object and tuple schemas:</p>
+
+<pre data-language="ts"><code>import * as v from &#39;valibot&#39;;
+
+function getDefaults&lt;
+  const TSchema extends
+    | v.BaseSchema&lt;unknown, unknown, v.BaseIssue&lt;unknown&gt;&gt;
+    | v.ObjectSchema&lt;v.ObjectEntries, v.ErrorMessage&lt;v.ObjectIssue&gt; | undefined&gt;
+    | v.TupleSchema&lt;v.TupleItems, v.ErrorMessage&lt;v.TupleIssue&gt; | undefined&gt;,
+&gt;(schema: TSchema): v.InferDefaults&lt;TSchema&gt; {
+  // If it is an object schema, return defaults of entries
+  if (&#39;entries&#39; in schema) {
+    const object: Record&lt;string, unknown&gt; = {};
+    for (const key in schema.entries) {
+      object[key] = getDefaults(schema.entries[key]);
+    }
+    return object;
+  }
+
+  // If it is a tuple schema, return defaults of items
+  if (&#39;items&#39; in schema) {
+    return schema.items.map(getDefaults);
+  }
+
+  // Otherwise, return default or `undefined`
+  return v.getDefault(schema);
+}
+</code></pre>
+<div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Fabian Hiller<br>Licensed under the MIT License.<br>
+    <a href="https://valibot.dev/guides/integrate-valibot/" class="_attribution-link">https://valibot.dev/guides/integrate-valibot/</a>
+  </p>
+</div>

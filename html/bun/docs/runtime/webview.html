@@ -1,0 +1,748 @@
+<header><h1>WebView</h1>
+<p>Control a headless browser from Bun for automation, testing, and scraping — zero dependencies on macOS, Chrome DevTools Protocol everywhere else</p></header><div>
+<p><code>Bun.WebView</code> is a headless browser built into the runtime. Use it to load pages, run JavaScript inside them, simulate real user input, and capture screenshots — without Puppeteer, Playwright, or a separate browser download.</p>
+<div data-callout="warning">
+<div>This API is experimental and may change in future releases.</div>
+</div>
+<div data-lang="ts"><div><div><div><div data-h="0"><pre data-language="typescript">await using view = new Bun.WebView();
+
+await view.navigate("https://example.com");
+await view.click("a[href]"); // waits for the link to be clickable
+const title = await view.evaluate("document.title");
+
+await Bun.write("page.png", await view.screenshot());</pre></div></div></div></div></div>
+<p>On macOS, <code>Bun.WebView</code> uses the system's <code>WKWebView</code> — nothing to install. On Linux and Windows it drives an installed Chrome, Chromium, Edge, or Brave over the Chrome DevTools Protocol; on Windows the preinstalled Edge is enough.</p>
+<p>Each view runs its page in a separate renderer process. All input methods (<code>click</code>, <code>type</code>, <code>press</code>, <code>scroll</code>) dispatch <strong>native</strong> browser events, so the page sees <code>isTrusted: true</code> — the same as a real user.</p>
+<hr>
+<h2 id="creating-a-view">Creating a view</h2>
+<div data-lang="ts"><div><div><div><div data-h="1"><pre data-language="typescript">const view = new Bun.WebView({
+  width: 1280, // viewport width in CSS pixels (1-16384, default 800)
+  height: 720, // viewport height in CSS pixels (1-16384, default 600)
+  url: "https://bun.com", // optional: start navigating immediately
+});</pre></div></div></div></div></div>
+<p>The constructor is synchronous — it returns immediately and spawns the browser subprocess in the background. The first operation you <code>await</code> (such as <code>navigate()</code> or <code>evaluate()</code>) waits for the browser to be ready.</p>
+<p>If you pass <code>url</code>, the view begins navigating before the constructor returns. Passing <code>url</code> is equivalent to calling <code>view.navigate(url)</code> on the next line.</p>
+<h3 id="automatic-cleanup-with-using">Automatic cleanup with <code>using</code>
+</h3>
+<p><code>Bun.WebView</code> implements <code>Symbol.dispose</code> and <code>Symbol.asyncDispose</code>, so you can use <code>using</code> or <code>await using</code> to close the view automatically when it goes out of scope:</p>
+<div data-lang="ts"><div><div><div><div data-h="2"><pre data-language="typescript">{
+  await using view = new Bun.WebView();
+  await view.navigate("https://example.com");
+  // ...
+} // view.close() called automatically here</pre></div></div></div></div></div>
+<h3 id="persistent-storage">Persistent storage</h3>
+<p>By default, each view uses <strong>ephemeral</strong> in-memory storage — cookies, <code>localStorage</code>, IndexedDB, and cache are discarded when the view closes. To persist state across runs, pass a directory:</p>
+<div data-lang="ts"><div><div><div><div data-h="3"><pre data-language="typescript">const view = new Bun.WebView({
+  dataStore: { directory: "./browser-profile" },
+});</pre></div></div></div></div></div>
+<p>Views that share the same <code>directory</code> share cookies and storage. Pass <code>dataStore: "ephemeral"</code> (the default) to opt back into in-memory storage explicitly.</p>
+<div data-callout="note">
+<div><p>With the Chrome backend, <code>dataStore.directory</code> maps to <code>--user-data-dir</code> and applies to the <strong>entire Chrome process</strong>, not per-view. Bun spawns Chrome once per Bun process, so the first view's directory wins for all subsequent views.</p></div>
+</div>
+<div data-callout="note">
+<div><p>With the WebKit backend, persistent storage requires macOS 15.2+. On older macOS versions, use <code>dataStore:
+  "ephemeral"</code> (the default).</p></div>
+</div>
+<hr>
+<h2 id="backends">Backends</h2>
+<p><code>Bun.WebView</code> supports two rendering engines. The default depends on your platform:</p>
+<div><table>
+<thead><tr>
+<th>Backend</th>
+<th>Engine</th>
+<th>Platforms</th>
+<th>Requirements</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>"webkit"</code></td>
+<td>WKWebView</td>
+<td>macOS only</td>
+<td>None — uses the system <code>WebKit.framework</code>
+</td>
+</tr>
+<tr>
+<td><code>"chrome"</code></td>
+<td>Blink</td>
+<td>macOS / Linux / Windows</td>
+<td>Chrome, Chromium, Edge, or Brave installed (or Playwright's <code>chrome-headless-shell</code>)</td>
+</tr>
+</tbody>
+</table></div>
+<p>On macOS the default is <code>"webkit"</code>; elsewhere it's <code>"chrome"</code>. Requesting <code>backend: "webkit"</code> on a non-macOS platform throws. The <code>"chrome"</code> backend drives one browser per process and can only be used from the main thread; constructing it inside a <code>Worker</code> throws.</p>
+<div data-lang="ts"><div><div><div><div data-h="4"><pre data-language="typescript">// Force Chrome on macOS
+const view = new Bun.WebView({ backend: "chrome" });</pre></div></div></div></div></div>
+<h3 id="how-the-webkit-backend-works">How the WebKit backend works</h3>
+<p>Bun spawns a lightweight host subprocess (the <code>bun</code> binary itself, re-executed in a special mode) that owns the <code>WKWebView</code> on its main thread. Your Bun process talks to it over a Unix socket using a compact binary protocol. Bun spawns the host process once, and every <code>"webkit"</code> view in your program shares it.</p>
+<h3 id="how-the-chrome-backend-works">How the Chrome backend works</h3>
+<p>Bun either <strong>connects</strong> to an already-running Chrome over a WebSocket, or <strong>spawns</strong> a headless Chrome subprocess and talks to it over a pipe (<code>--remote-debugging-pipe</code>). Either way, communication uses the <a href="https://chromedevtools.github.io/devtools-protocol/" target="_blank" rel="noopener noreferrer">Chrome DevTools Protocol</a>.</p>
+<p>Bun spawns (or connects to) Chrome once per Bun process. Each <code>new Bun.WebView({ backend: "chrome" })</code> creates a new tab with <code>Target.createTarget</code> in that single Chrome instance.</p>
+<h4 id="finding-the-chrome-executable">Finding the Chrome executable</h4>
+<p>When Bun needs to spawn Chrome, it searches in this order:</p>
+<ol>
+<li>The <code>path</code> you passed in <code>backend: { type: "chrome", path: "..." }</code>
+</li>
+<li>The <code>BUN_CHROME_PATH</code> environment variable</li>
+<li>
+<code>$PATH</code> (<code>google-chrome-stable</code>, <code>google-chrome</code>, <code>chromium-browser</code>, <code>chromium</code>, <code>brave-browser</code>, <code>microsoft-edge</code>, <code>chrome</code>; on Windows <code>chrome</code>, <code>chromium</code>, <code>brave</code>, <code>msedge</code>)</li>
+<li>Standard install locations (<code>/Applications/Google Chrome.app</code>, <code>~/Applications/...</code>, <code>/usr/bin/...</code>, <code>/snap/bin/...</code>; on Windows the <code>Application\*.exe</code> directories under <code>%ProgramFiles%</code>, <code>%ProgramFiles(x86)%</code>, and <code>%LOCALAPPDATA%</code>)</li>
+<li>Playwright's cache (<code>~/Library/Caches/ms-playwright</code>, <code>~/.cache/ms-playwright</code>, or <code>%LOCALAPPDATA%\ms-playwright</code>) for <code>chrome-headless-shell</code>
+</li>
+</ol>
+<p>If Bun finds none, the constructor throws.</p>
+<div data-callout="note">
+<div><p>Microsoft Edge refuses to start under the Windows <code>LocalSystem</code> account: it exits immediately and the first operation rejects with "Chrome process closed the pipe". A service or CI agent that only has Edge available needs to run Bun as a regular user account.</p></div>
+</div>
+<h4 id="existing-chrome">Connecting to an already-running Chrome</h4>
+<p>By default, before spawning, Bun reads the <code>DevToolsActivePort</code> file from standard profile directories to check whether a Chrome-family browser is <strong>already running</strong> with remote debugging enabled. If found, Bun connects to that browser over WebSocket instead of spawning a new one — your views open as tabs in your existing browser.</p>
+<p>To enable remote debugging in a running Chrome, visit <code>chrome://inspect/#remote-debugging</code> and flip the toggle, or launch Chrome with <code>--remote-debugging-port=9222</code>. Chrome prompts for permission on each new connection when you use the <code>chrome://inspect</code> toggle.</p>
+<p>To control this behavior explicitly, use the object form of <code>backend</code>:</p>
+<div data-lang="ts"><div><div><div><div data-h="5"><pre data-language="typescript">// Always spawn a fresh headless Chrome; never auto-connect
+new Bun.WebView({
+  backend: { type: "chrome", url: false },
+});
+
+// Connect to a specific DevTools WebSocket URL
+new Bun.WebView({
+  backend: {
+    type: "chrome",
+    url: "ws://127.0.0.1:9222/devtools/browser/abc123...",
+  },
+});</pre></div></div></div></div></div>
+<p>If auto-detect finds a stale <code>DevToolsActivePort</code> file (Chrome crashed or restarted), the WebSocket connect fails and Bun transparently falls back to spawning its own Chrome. An explicit <code>url: "ws://..."</code> does <strong>not</strong> fall back — a failed connection throws.</p>
+<div data-callout="note">
+<div><p>Passing <code>path</code> or <code>argv</code> implies spawn mode and skips auto-detect. <code>url: "ws://..."</code> cannot be combined with <code>path</code> or <code>argv</code>.</p></div>
+</div>
+<h4 id="launch-flags">Launch flags</h4>
+<p>When spawning, Bun passes a minimal flag set:</p>
+<div data-lang="txt"><div><div><div><div data-h="6"><pre>--user-data-dir=&lt;temp&gt; --remote-debugging-pipe --headless --no-first-run
+--no-default-browser-check --disable-gpu --disable-extensions
+--disable-background-networking --disable-background-timer-throttling
+--disable-backgrounding-occluded-windows --disable-renderer-backgrounding
+--disable-ipc-flooding-protection --no-startup-window</pre></div></div></div></div></div>
+<p>Append your own with <code>argv</code> — Chrome resolves duplicate switches last-wins, so you can override any default:</p>
+<div data-lang="ts"><div><div><div><div data-h="7"><pre data-language="typescript">new Bun.WebView({
+  backend: {
+    type: "chrome",
+    argv: ["--headless=new", "--lang=ja-JP", "--window-size=1920,1080"],
+  },
+});</pre></div></div></div></div></div>
+<h4 id="subprocess-output">Subprocess output</h4>
+<p>Browser subprocess stdout/stderr are silenced by default. Chrome in particular is noisy on stderr (font-config warnings, GCM registration, updater checks). To see it — useful when Chrome crashes silently — pass <code>"inherit"</code>:</p>
+<div data-lang="ts"><div><div><div><div data-h="8"><pre data-language="typescript">new Bun.WebView({
+  backend: { type: "chrome", stderr: "inherit", stdout: "inherit" },
+});</pre></div></div></div></div></div>
+<p>The <code>"webkit"</code> backend accepts the same <code>stdout</code>/<code>stderr</code> options.</p>
+<hr>
+<h2 id="navigation">Navigation</h2>
+<div data-lang="ts"><div><div><div><div data-h="9"><pre data-language="typescript">await view.navigate("https://example.com");
+await view.navigate("data:text/html,&lt;h1&gt;hello&lt;/h1&gt;");
+await view.navigate("file:///path/to/index.html");</pre></div></div></div></div></div>
+<p><code>navigate()</code> resolves when the main frame's <code>load</code> event fires. After it resolves, <code>view.url</code> and <code>view.title</code> reflect the new page, and <code>view.loading</code> is <code>false</code>.</p>
+<p>If the navigation fails (DNS failure, connection refused, invalid URL), the promise rejects with an <code>Error</code> describing the failure.</p>
+<p>Only one navigation may be in flight per view at a time. Calling <code>navigate()</code> while another is pending throws <code>ERR_INVALID_STATE</code> synchronously.</p>
+<h3 id="history">History</h3>
+<div data-lang="ts"><div><div><div><div data-h="10"><pre data-language="typescript">await view.goBack(); // like the browser's back button
+await view.goForward(); // like the browser's forward button
+await view.reload(); // reload the current page</pre></div></div></div></div></div>
+<p>Calling <code>goBack()</code> at the beginning of history (or <code>goForward()</code> at the end) resolves <code>undefined</code> without navigating — it doesn't reject.</p>
+<h3 id="navigation-callbacks">Navigation callbacks</h3>
+<p>Set <code>onNavigated</code> and <code>onNavigationFailed</code> to observe every navigation, including ones triggered by the page itself (link clicks, <code>location.href = ...</code>, redirects) and by <code>reload()</code>/<code>goBack()</code>/<code>goForward()</code>:</p>
+<div data-lang="ts"><div><div><div><div data-h="11"><pre data-language="typescript">view.onNavigated = (url, title) =&gt; {
+  console.log("Loaded", url);
+};
+
+view.onNavigationFailed = error =&gt; {
+  console.error("Navigation failed:", error.message);
+};</pre></div></div></div></div></div>
+<p>These fire <strong>before</strong> the corresponding <code>navigate()</code> promise settles, so by the time <code>await view.navigate(...)</code> returns, your callback has already run. Set to <code>null</code> to remove.</p>
+<hr>
+<h2 id="evaluating-javascript">Evaluating JavaScript</h2>
+<p>Run an expression in the page's main frame and get its result back as a native JavaScript value:</p>
+<div data-lang="ts"><div><div><div><div data-h="12"><pre data-language="typescript">const title = await view.evaluate("document.title");
+const items = await view.evaluate("[...document.querySelectorAll('li')].map(li =&gt; li.textContent)");
+const user = await view.evaluate("({ name: 'bun', ok: true })");</pre></div></div></div></div></div>
+<p>Bun wraps the script as <code>await (&lt;your script&gt;)</code>, so:</p>
+<ul>
+<li>It must be an <strong>expression</strong>, not a statement sequence. For multiple statements, wrap in an IIFE: <code>evaluate("(() =&gt; { let x = foo(); return x + 1 })()")</code>.</li>
+<li>If it evaluates to a <code>Promise</code>, <code>evaluate()</code> awaits the promise and returns its resolved value.</li>
+</ul>
+<p>The result round-trips through <code>JSON.stringify</code> in the page and <code>JSON.parse</code> in Bun. Arrays and plain objects come back as real structures; <code>undefined</code>, functions, and symbols resolve to <code>undefined</code>; circular references reject.</p>
+<div data-lang="ts"><div><div><div><div data-h="13"><pre data-language="typescript">await view.evaluate("42"); // 42
+await view.evaluate("[1, 2, 3]"); // [1, 2, 3]
+await view.evaluate("undefined"); // undefined
+await view.evaluate("() =&gt; 1"); // undefined (functions don't serialize)
+await view.evaluate("fetch('/api').then(r =&gt; r.json())"); // awaited</pre></div></div></div></div></div>
+<p>If the script throws (or returns a rejected promise), <code>evaluate()</code> rejects with an <code>Error</code> whose message comes from the page-side exception.</p>
+<p>Only one <code>evaluate()</code> may be in flight per view at a time; a second concurrent call throws <code>ERR_INVALID_STATE</code>.</p>
+<hr>
+<h2 id="screenshots">Screenshots</h2>
+<p>Capture the current viewport as an image:</p>
+<div data-lang="ts"><div><div><div><div data-h="14"><pre data-language="typescript">const png = await view.screenshot();
+await Bun.write("page.png", png);</pre></div></div></div></div></div>
+<h3 id="image-format">Image format</h3>
+<div data-lang="ts"><div><div><div><div data-h="15"><pre data-language="typescript">await view.screenshot({ format: "png" }); // lossless (default)
+await view.screenshot({ format: "jpeg", quality: 90 }); // lossy, quality 0-100 (default 80)
+await view.screenshot({ format: "webp", quality: 75 }); // Chrome backend only</pre></div></div></div></div></div>
+<p><code>quality</code> is ignored for PNG. <code>"webp"</code> is only available with <code>backend: "chrome"</code> — the WebKit backend throws.</p>
+<h3 id="return-type">Return type</h3>
+<p>The <code>encoding</code> option controls how Bun hands back the image bytes:</p>
+<div><table>
+<thead><tr>
+<th><code>encoding</code></th>
+<th>Returns</th>
+<th>Notes</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>
+<code>"blob"</code> <em>(default)</em>
+</td>
+<td><code>Blob</code></td>
+<td>MIME type set automatically. Zero-copy mmap-backed on WebKit. Works with <code>Bun.write()</code>, <code>new Response()</code>
+</td>
+</tr>
+<tr>
+<td><code>"buffer"</code></td>
+<td><code>Buffer</code></td>
+<td>Node <code>Buffer</code>. Zero-copy mmap-backed on WebKit</td>
+</tr>
+<tr>
+<td><code>"base64"</code></td>
+<td><code>string</code></td>
+<td>Base64-encoded. Zero-decode on Chrome (CDP returns base64 natively)</td>
+</tr>
+<tr>
+<td><code>"shmem"</code></td>
+<td><code>{ name: string, size: number }</code></td>
+<td>POSIX shared-memory segment name. Caller owns <code>shm_unlink</code>. Not supported on Windows</td>
+</tr>
+</tbody>
+</table></div>
+<div data-lang="ts"><div><div><div><div data-h="16"><pre data-language="typescript">const buf = await view.screenshot({ encoding: "buffer" });
+console.log(buf[0] === 0x89); // PNG magic byte
+
+const b64 = await view.screenshot({ encoding: "base64" });
+console.log(`&lt;img src="data:image/png;base64,${b64}"&gt;`);</pre></div></div></div></div></div>
+<h4 id="shared-memory-for-terminal-graphics">Shared memory for terminal graphics</h4>
+<p><code>encoding: "shmem"</code> is designed for Kitty's <a href="https://sw.kovidgoyal.net/kitty/graphics-protocol/" target="_blank" rel="noopener noreferrer">terminal graphics protocol</a> <code>t=s</code> transmission mode. Bun writes the image to a POSIX shared-memory segment and returns its name. The terminal reads it directly and unlinks it when done. No copying through the pipe.</p>
+<div data-lang="ts"><div><div><div><div data-h="17"><pre data-language="typescript">const { name, size } = await view.screenshot({ encoding: "shmem" });
+process.stdout.write(`\x1b_Gf=100,t=s,a=T,S=${size};${btoa(name)}\x1b\\`);
+// Kitty reads the PNG from shared memory and unlinks the segment</pre></div></div></div></div></div>
+<p>On WebKit, the shm name looks like <code>/bun-webview-&lt;pid&gt;-&lt;seq&gt;</code>; on Chrome, <code>/bun-chrome-&lt;pid&gt;-&lt;seq&gt;</code>. If you request <code>"shmem"</code> and don't hand the name to something that will <code>shm_unlink</code> it, the segment leaks until your process exits.</p>
+<hr>
+<h2 id="input-simulation">Input simulation</h2>
+<p>All input methods dispatch <strong>native</strong> browser events. The page receives <code>pointerdown</code>/<code>mousedown</code>/<code>keydown</code>/<code>wheel</code> events with <code>isTrusted: true</code>. CSS <code>:active</code> and <code>:hover</code> states apply. Default actions (form submission, link navigation, text selection) fire exactly as if a user performed them.</p>
+<h3 id="clicking">Clicking</h3>
+<p>Click at viewport coordinates:</p>
+<div data-lang="ts"><div><div><div><div data-h="18"><pre data-language="typescript">await view.click(150, 200);
+await view.click(150, 200, { button: "right" });
+await view.click(150, 200, { clickCount: 2 }); // double-click
+await view.click(150, 200, { modifiers: ["Shift", "Meta"] });</pre></div></div></div></div></div>
+<p>The promise resolves <strong>after</strong> the page has processed the full <code>mousedown</code> → <code>mouseup</code> → <code>click</code> sequence, including any JavaScript handlers. No polling needed — a subsequent <code>evaluate()</code> sees the result.</p>
+<h4 id="clicking-by-selector">Clicking by selector</h4>
+<p>Pass a CSS selector instead of coordinates and Bun waits for the element to become <strong>actionable</strong>, then clicks its center:</p>
+<div data-lang="ts"><div><div><div><div data-h="19"><pre data-language="typescript">await view.click("#submit");
+await view.click("button.primary", { timeout: 5000 });</pre></div></div></div></div></div>
+<p>An element is actionable when it:</p>
+<ul>
+<li>exists in the DOM</li>
+<li>has a non-zero bounding box</li>
+<li>is inside the viewport</li>
+<li>has been <strong>stable</strong> (bounding box unchanged) for two consecutive animation frames</li>
+<li>is the topmost element at its center point (not covered by an overlay)</li>
+</ul>
+<p>The check runs page-side at <code>requestAnimationFrame</code> rate. If the element never becomes actionable within <code>timeout</code> milliseconds (default <code>30000</code>), the promise rejects with an error like <code>timeout waiting for '#submit' to be actionable</code>.</p>
+<p>Bun passes the selector as data instead of interpolating it into a script, so selectors containing quotes or JavaScript syntax are safe.</p>
+<h3 id="typing-text">Typing text</h3>
+<p>Insert text into the currently focused element:</p>
+<div data-lang="ts"><div><div><div><div data-h="20"><pre data-language="typescript">await view.click("input#email"); // focus it first
+await view.type("hello@example.com");</pre></div></div></div></div></div>
+<p><code>type()</code> uses the browser's <code>InsertText</code> editing command (the same path as paste), not per-character keystrokes. It fires <code>beforeinput</code>/<code>input</code> events with <code>isTrusted: true</code>, but <strong>no <code>keydown</code>/<code>keyup</code> events</strong>. There's no IME processing and no smart-quote substitution — the text lands exactly as given.</p>
+<h3 id="pressing-keys">Pressing keys</h3>
+<div data-lang="ts"><div><div><div><div data-h="21"><pre data-language="typescript">await view.press("Enter");
+await view.press("Escape");
+await view.press("ArrowDown");
+await view.press("a", { modifiers: ["Meta"] }); // Cmd+A / Ctrl+A</pre></div></div></div></div></div>
+<p>Named virtual keys: <code>Enter</code>, <code>Tab</code>, <code>Space</code>, <code>Backspace</code>, <code>Delete</code>, <code>Escape</code>, <code>ArrowLeft</code>, <code>ArrowRight</code>, <code>ArrowUp</code>, <code>ArrowDown</code>, <code>Home</code>, <code>End</code>, <code>PageUp</code>, <code>PageDown</code>.</p>
+<p>Any single character (for example, <code>"a"</code>) combined with <code>modifiers</code> sends a keyboard chord.</p>
+<p>On the WebKit backend, most named keys (without modifiers) map to editing commands such as <code>DeleteBackward</code>, <code>MoveLeft</code>, and <code>InsertNewline</code>, and resolve after the page has applied them. <code>Escape</code>, <code>Space</code>, and any key with modifiers fall back to raw <code>keydown</code>/<code>keyup</code> events. These keys fire a <code>keydown</code> the page can observe, but there's no completion barrier. Follow with an <code>evaluate()</code> if you need to observe the effect.</p>
+<p>Modifier names: <code>"Shift"</code>, <code>"Control"</code> (or <code>"Ctrl"</code>), <code>"Alt"</code> (or <code>"Option"</code>), <code>"Meta"</code> (or <code>"Cmd"</code> / <code>"Command"</code>).</p>
+<h3 id="scrolling">Scrolling</h3>
+<p>Scroll by a pixel delta — fires a native <code>wheel</code> event at the viewport center:</p>
+<div data-lang="ts"><div><div><div><div data-h="22"><pre data-language="typescript">await view.scroll(0, 500); // scroll down 500px
+await view.scroll(-100, 0); // scroll left 100px</pre></div></div></div></div></div>
+<p>Positive <code>dy</code> scrolls down (content moves up), matching <code>window.scrollBy</code>. If a scrollable element sits under the viewport center, it receives the wheel event instead of the document.</p>
+<p>Scroll an element into view by selector:</p>
+<div data-lang="ts"><div><div><div><div data-h="23"><pre data-language="typescript">await view.scrollTo("#footer"); // center it (default)
+await view.scrollTo("#hero", { block: "start" }); // align its top to the viewport top
+await view.scrollTo(".card", { block: "nearest" }); // minimal scroll</pre></div></div></div></div></div>
+<p><code>scrollTo()</code> waits (at <code>requestAnimationFrame</code> rate) for the element to exist, then calls <code>element.scrollIntoView({ block, behavior: "instant" })</code>. It scrolls every scrollable ancestor, not just the document. The default <code>timeout</code> is <code>30000</code> ms.</p>
+<h3 id="resizing">Resizing</h3>
+<div data-lang="ts"><div><div><div><div data-h="24"><pre data-language="typescript">await view.resize(1920, 1080);</pre></div></div></div></div></div>
+<p>Width and height must each be between <code>1</code> and <code>16384</code>.</p>
+<hr>
+<h2 id="console-capture">Console capture</h2>
+<p>Forward <code>console.*</code> calls from the page to your Bun process by passing the <code>console</code> option to the constructor.</p>
+<h3 id="mirror-to-bun-s-console">Mirror to Bun's console</h3>
+<p>Pass <code>globalThis.console</code> (the actual object, by reference). Page-side <code>console.log("hi")</code> then prints <code>hi</code> to your stdout with Bun's formatter, and <code>console.error</code> goes to stderr. This path dispatches directly through Bun's console implementation with no per-call JavaScript overhead.</p>
+<div data-lang="ts"><div><div><div><div data-h="25"><pre data-language="typescript">const view = new Bun.WebView({
+  console: globalThis.console,
+});</pre></div></div></div></div></div>
+<h3 id="custom-handler">Custom handler</h3>
+<p>Pass a function to receive each call yourself:</p>
+<div data-lang="ts"><div><div><div><div data-h="26"><pre data-language="typescript">const view = new Bun.WebView({
+  console: (type, ...args) =&gt; {
+    // type is "log" | "warn" | "error" | "info" | "debug" | ...
+    if (type === "error") reportError(args);
+  },
+});</pre></div></div></div></div></div>
+<p>Primitive arguments (strings, numbers, booleans, <code>null</code>, <code>undefined</code>) unwrap to their raw values. Object arguments arrive as a serialized descriptor:</p>
+<ul>
+<li>
+<strong>Chrome backend</strong>: the raw CDP <a href="https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#type-RemoteObject" target="_blank" rel="noopener noreferrer"><code>RemoteObject</code></a> — an object with <code>type</code>, <code>className</code>, <code>description</code>, and (when available) a <code>preview.properties</code> array.</li>
+<li>
+<strong>WebKit backend</strong>: the <code>JSON.stringify</code> round-trip of the object. Functions, circular references, and other non-serializable values fall back to their <code>String(...)</code> coercion.</li>
+</ul>
+<p>If you don't pass <code>console</code>, Bun drops page-side console output.</p>
+<div data-callout="note">
+<div><p>Ordering guarantee: a <code>console.log(...)</code> inside a script you pass to <code>evaluate()</code> reaches your handler <strong>before</strong> that <code>evaluate()</code> resolves. Both travel over the same IPC connection.</p></div>
+</div>
+<hr>
+<h2 id="cdp">Raw Chrome DevTools Protocol</h2>
+<p>When using <code>backend: "chrome"</code>, you can drop down to raw <a href="https://chromedevtools.github.io/devtools-protocol/" target="_blank" rel="noopener noreferrer">CDP</a> commands for anything the high-level API doesn't cover.</p>
+<h3 id="sending-commands">Sending commands</h3>
+<div data-lang="ts"><div><div><div><div data-h="27"><pre data-language="typescript">const view = new Bun.WebView({ backend: "chrome" });
+await view.navigate("https://example.com"); // required: sets up the CDP session
+
+await view.cdp("Emulation.setUserAgentOverride", {
+  userAgent: "MyBot/1.0",
+});
+
+const { root } = await view.cdp("DOM.getDocument");
+const { nodeId } = await view.cdp("DOM.querySelector", {
+  nodeId: root.nodeId,
+  selector: "input[name=q]",
+});
+await view.cdp("DOM.focus", { nodeId });</pre></div></div></div></div></div>
+<p><code>cdp(method, params?)</code> returns the <code>result</code> object from the CDP response. If Chrome returns an error (unknown method, bad params), the promise rejects with its <code>error.message</code>.</p>
+<p>Commands are scoped to this view's session (they target this tab). You must <code>await navigate(...)</code> at least once before calling <code>cdp()</code> — the first navigation establishes the session. Calling <code>cdp()</code> before that throws <code>ERR_INVALID_STATE</code>.</p>
+<p><code>params</code> must be a JSON-serializable object; omit it for commands that take no parameters. One <code>cdp()</code> call may be in flight at a time per view.</p>
+<h3 id="subscribing-to-events">Subscribing to events</h3>
+<p><code>Bun.WebView</code> extends <code>EventTarget</code>. With the Chrome backend, the view dispatches CDP events as DOM events whose <code>type</code> is the CDP method name and whose <code>data</code> is the parsed <code>params</code> object:</p>
+<div data-lang="ts"><div><div><div><div data-h="28"><pre data-language="typescript">await view.navigate("about:blank");
+await view.cdp("Network.enable"); // Chrome only emits events for enabled domains
+
+view.addEventListener("Network.responseReceived", event =&gt; {
+  console.log(event.data.response.status, event.data.response.url);
+});
+
+await view.navigate("https://example.com");</pre></div></div></div></div></div>
+<p>Bun drops events that have no registered listener before it even parses their JSON <code>params</code>, so enabling a chatty domain (like <code>Network</code>) is cheap if you only listen for one or two event types.</p>
+<p>On the WebKit backend, <code>cdp()</code> throws <code>ERR_METHOD_NOT_IMPLEMENTED</code> — there is no DevTools Protocol bridge. The <code>EventTarget</code> interface still works for your own <code>dispatchEvent()</code> calls.</p>
+<hr>
+<h2 id="lifecycle">Lifecycle</h2>
+<h3 id="closing-a-view">Closing a view</h3>
+<div data-lang="ts"><div><div><div><div data-h="29"><pre data-language="typescript">view.close();</pre></div></div></div></div></div>
+<p>Closing is synchronous and idempotent. It destroys the page's renderer process, rejects any pending promises on the view with <code>Error("WebView closed")</code>, and makes every subsequent method call throw <code>ERR_INVALID_STATE</code>.</p>
+<p><code>view[Symbol.dispose]</code> and <code>view[Symbol.asyncDispose]</code> both point to <code>close()</code>, so <code>using</code> / <code>await using</code> work.</p>
+<h3 id="killing-all-browsers">Killing all browsers</h3>
+<div data-lang="ts"><div><div><div><div data-h="30"><pre data-language="typescript">Bun.WebView.closeAll();</pre></div></div></div></div></div>
+<p>Force-kills (<code>SIGKILL</code>) both the Chrome subprocess and the WebKit host subprocess. Pending promises on every view reject on the next event-loop tick. Subsequent <code>new Bun.WebView()</code> calls respawn as needed.</p>
+<p>Bun calls this automatically at process exit, so browser subprocesses never outlive your script.</p>
+<h3 id="event-loop-behavior">Event-loop behavior</h3>
+<p>The browser subprocess does <strong>not</strong> keep Bun's event loop alive on its own. An open <code>WebView</code> keeps the process alive only while it has a pending operation (such as an unsettled <code>navigate()</code> or <code>evaluate()</code>). Once you <code>close()</code> the last view — or the last pending operation settles — Bun exits naturally.</p>
+<h3 id="subprocess-death">Subprocess death</h3>
+<p>If the browser subprocess dies unexpectedly (crash, OOM-kill, <code>SIGKILL</code>), every pending promise on every view rejects with an error describing how it died (<code>"Chrome killed by signal 9"</code>, <code>"WebView host process died"</code>). Further operations on those views throw.</p>
+<hr>
+<h2 id="concurrency-model">Concurrency model</h2>
+<p>Each view has a small number of independent operation "slots". One operation of each kind may be in flight at a time:</p>
+<ul>
+<li>one <code>navigate()</code> (shared with <code>reload()</code>/<code>goBack()</code>/<code>goForward()</code> on the Chrome backend)</li>
+<li>one <code>evaluate()</code>
+</li>
+<li>one <code>screenshot()</code>
+</li>
+<li>one <code>cdp()</code> (Chrome only)</li>
+<li>one "simple" operation — <code>click()</code>, <code>type()</code>, <code>press()</code>, <code>scroll()</code>, <code>scrollTo()</code>, <code>resize()</code> (and <code>reload()</code>/<code>goBack()</code>/<code>goForward()</code> on the WebKit backend) share this slot</li>
+</ul>
+<p>Starting a second operation while its slot is occupied throws <code>ERR_INVALID_STATE</code> synchronously — it does <strong>not</strong> queue. In practice, <code>await</code> each call.</p>
+<p>Operations on <strong>different views</strong> are fully independent and run in parallel — each view has its own renderer process.</p>
+<hr>
+<h2 id="reference">Reference</h2>
+<h3 id="new-bun-webview-options"><code>new Bun.WebView(options?)</code></h3>
+<div><table>
+<thead><tr>
+<th>Option</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>width</code></td>
+<td><code>number</code></td>
+<td><code>800</code></td>
+<td>Viewport width in CSS pixels. Range 1-16384.</td>
+</tr>
+<tr>
+<td><code>height</code></td>
+<td><code>number</code></td>
+<td><code>600</code></td>
+<td>Viewport height in CSS pixels. Range 1-16384.</td>
+</tr>
+<tr>
+<td><code>url</code></td>
+<td><code>string</code></td>
+<td>—</td>
+<td>Begin navigating to this URL immediately.</td>
+</tr>
+<tr>
+<td><code>headless</code></td>
+<td><code>boolean</code></td>
+<td><code>true</code></td>
+<td>Only <code>true</code> is implemented; <code>false</code> throws.</td>
+</tr>
+<tr>
+<td><code>backend</code></td>
+<td>
+<code>"webkit"</code> | <code>"chrome"</code> | <a href="#backends">object</a>
+</td>
+<td>
+<code>"webkit"</code> on macOS, <code>"chrome"</code> elsewhere</td>
+<td>Rendering engine.</td>
+</tr>
+<tr>
+<td><code>console</code></td>
+<td>
+<code>typeof console</code> | <code>(type, ...args) =&gt; void</code>
+</td>
+<td>—</td>
+<td>Capture page-side <code>console.*</code> calls. See <a href="#console-capture">Console capture</a>.</td>
+</tr>
+<tr>
+<td><code>dataStore</code></td>
+<td>
+<code>"ephemeral"</code> | <code>{ directory: string }</code>
+</td>
+<td><code>"ephemeral"</code></td>
+<td>Storage for cookies / localStorage / IndexedDB. See <a href="#persistent-storage">Persistent storage</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<h4 id="backend-object-form">
+<code>backend</code> object form</h4>
+<div><table>
+<thead><tr>
+<th>Option</th>
+<th>Type</th>
+<th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>type</code></td>
+<td>
+<code>"chrome"</code> | <code>"webkit"</code>
+</td>
+<td>
+<strong>Required.</strong> Which engine to use.</td>
+</tr>
+<tr>
+<td><code>path</code></td>
+<td><code>string</code></td>
+<td>(<code>chrome</code> only) Path to the Chrome/Chromium executable. Forces spawn mode.</td>
+</tr>
+<tr>
+<td><code>argv</code></td>
+<td><code>string[]</code></td>
+<td>(<code>chrome</code> only) Extra launch flags, appended after the defaults. Forces spawn mode.</td>
+</tr>
+<tr>
+<td><code>url</code></td>
+<td>
+<code>string</code> | <code>false</code>
+</td>
+<td>(<code>chrome</code> only) <code>ws://</code> URL of an existing Chrome's DevTools endpoint, or <code>false</code> to skip auto-detect and always spawn. See <a href="#existing-chrome">above</a>.</td>
+</tr>
+<tr>
+<td><code>stdout</code></td>
+<td>
+<code>"inherit"</code> | <code>"ignore"</code>
+</td>
+<td>Route the subprocess's stdout to Bun's. Default <code>"ignore"</code>.</td>
+</tr>
+<tr>
+<td><code>stderr</code></td>
+<td>
+<code>"inherit"</code> | <code>"ignore"</code>
+</td>
+<td>Route the subprocess's stderr to Bun's. Default <code>"ignore"</code>.</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="instance-properties">Instance properties</h3>
+<div><table>
+<thead><tr>
+<th>Property</th>
+<th>Type</th>
+<th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>url</code></td>
+<td>
+<code>string</code> <em>(readonly)</em>
+</td>
+<td>The current URL. Updated when a navigation completes. Empty string before first navigation.</td>
+</tr>
+<tr>
+<td><code>title</code></td>
+<td>
+<code>string</code> <em>(readonly)</em>
+</td>
+<td>The page's <code>&lt;title&gt;</code>. Updated when a navigation completes.</td>
+</tr>
+<tr>
+<td><code>loading</code></td>
+<td>
+<code>boolean</code> <em>(readonly)</em>
+</td>
+<td>
+<code>true</code> while a navigation is in flight.</td>
+</tr>
+<tr>
+<td><code>onNavigated</code></td>
+<td><code>((url: string, title: string) =&gt; void) | null</code></td>
+<td>Fires after each successful navigation, before the <code>navigate()</code> promise resolves.</td>
+</tr>
+<tr>
+<td><code>onNavigationFailed</code></td>
+<td><code>((error: Error) =&gt; void) | null</code></td>
+<td>Fires after each failed navigation, before the <code>navigate()</code> promise rejects.</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="instance-methods">Instance methods</h3>
+<div><table>
+<thead><tr>
+<th>Method</th>
+<th>Returns</th>
+<th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>navigate(url)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Load a URL. Resolves on the main frame's <code>load</code> event.</td>
+</tr>
+<tr>
+<td><code>evaluate(script)</code></td>
+<td><code>Promise&lt;unknown&gt;</code></td>
+<td>Run a JS expression in the page and return its JSON-serialized result.</td>
+</tr>
+<tr>
+<td><code>screenshot(options?)</code></td>
+<td><code>Promise&lt;Blob | Buffer | string | {name, size}&gt;</code></td>
+<td>Capture the viewport. See <a href="#screenshots">Screenshots</a>.</td>
+</tr>
+<tr>
+<td><code>click(x, y, options?)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Native click at viewport coordinates.</td>
+</tr>
+<tr>
+<td><code>click(selector, options?)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Wait for the element to be actionable, then click its center.</td>
+</tr>
+<tr>
+<td><code>type(text)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Insert text into the focused element with the <code>InsertText</code> editing command.</td>
+</tr>
+<tr>
+<td><code>press(key, options?)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Press a named virtual key or single-character chord.</td>
+</tr>
+<tr>
+<td><code>scroll(dx, dy)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Fire a native <code>wheel</code> event at the viewport center. <code>dx</code>/<code>dy</code> must be finite.</td>
+</tr>
+<tr>
+<td><code>scrollTo(selector, options?)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Wait for the element to exist, then <code>scrollIntoView</code>.</td>
+</tr>
+<tr>
+<td><code>resize(width, height)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Change the viewport size. Each dimension 1-16384.</td>
+</tr>
+<tr>
+<td><code>goBack()</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Navigate back in session history. No-op at the start.</td>
+</tr>
+<tr>
+<td><code>goForward()</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Navigate forward in session history. No-op at the end.</td>
+</tr>
+<tr>
+<td><code>reload()</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Reload the current page.</td>
+</tr>
+<tr>
+<td><code>cdp(method, params?)</code></td>
+<td><code>Promise&lt;unknown&gt;</code></td>
+<td>(Chrome only) Send a raw CDP command scoped to this tab. See <a href="#cdp">Raw CDP</a>.</td>
+</tr>
+<tr>
+<td><code>addEventListener(type, fn)</code></td>
+<td><code>void</code></td>
+<td>Inherited from <code>EventTarget</code>. With Chrome, <code>type</code> may be a CDP event name; <code>event.data</code> is the parsed <code>params</code>.</td>
+</tr>
+<tr>
+<td><code>close()</code></td>
+<td><code>void</code></td>
+<td>Destroy the page. Rejects pending promises. Idempotent.</td>
+</tr>
+</tbody>
+</table></div>
+<h4 id="click-options">
+<code>click()</code> options</h4>
+<div><table>
+<thead><tr>
+<th>Option</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>button</code></td>
+<td>
+<code>"left"</code> | <code>"right"</code> | <code>"middle"</code>
+</td>
+<td><code>"left"</code></td>
+<td>Mouse button.</td>
+</tr>
+<tr>
+<td><code>modifiers</code></td>
+<td><code>("Shift" | "Control" | "Alt" | "Meta")[]</code></td>
+<td><code>[]</code></td>
+<td>Modifier keys held during the click.</td>
+</tr>
+<tr>
+<td><code>clickCount</code></td>
+<td>
+<code>1</code> | <code>2</code> | <code>3</code>
+</td>
+<td><code>1</code></td>
+<td>Click count for double/triple-click.</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td><code>number</code></td>
+<td><code>30000</code></td>
+<td>(Selector overload only) Max milliseconds to wait for actionability.</td>
+</tr>
+</tbody>
+</table></div>
+<h4 id="press-options">
+<code>press()</code> options</h4>
+<div><table>
+<thead><tr>
+<th>Option</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr></thead>
+<tbody><tr>
+<td><code>modifiers</code></td>
+<td><code>("Shift" | "Control" | "Alt" | "Meta")[]</code></td>
+<td><code>[]</code></td>
+<td>Modifier keys held during the keypress.</td>
+</tr></tbody>
+</table></div>
+<h4 id="scrollto-options">
+<code>scrollTo()</code> options</h4>
+<div><table>
+<thead><tr>
+<th>Option</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>block</code></td>
+<td>
+<code>"start"</code> | <code>"center"</code> | <code>"end"</code> | <code>"nearest"</code>
+</td>
+<td><code>"center"</code></td>
+<td>Vertical alignment after scrolling.</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td><code>number</code></td>
+<td><code>30000</code></td>
+<td>Max milliseconds to wait for the element to exist.</td>
+</tr>
+</tbody>
+</table></div>
+<h4 id="screenshot-options">
+<code>screenshot()</code> options</h4>
+<div><table>
+<thead><tr>
+<th>Option</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>format</code></td>
+<td>
+<code>"png"</code> | <code>"jpeg"</code> | <code>"webp"</code>
+</td>
+<td><code>"png"</code></td>
+<td>Image format. <code>"webp"</code> requires the Chrome backend.</td>
+</tr>
+<tr>
+<td><code>quality</code></td>
+<td><code>number</code></td>
+<td><code>80</code></td>
+<td>0-100. JPEG/WebP only; ignored for PNG.</td>
+</tr>
+<tr>
+<td><code>encoding</code></td>
+<td>
+<code>"blob"</code> | <code>"buffer"</code> | <code>"base64"</code> | <code>"shmem"</code>
+</td>
+<td><code>"blob"</code></td>
+<td>Return-type encoding. <code>"shmem"</code> not supported on Windows.</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="static-methods">Static methods</h3>
+<div><table>
+<thead><tr>
+<th>Method</th>
+<th>Description</th>
+</tr></thead>
+<tbody><tr>
+<td><code>WebView.closeAll()</code></td>
+<td>
+<code>SIGKILL</code> every browser subprocess. Pending promises reject on the next tick. Called automatically at exit.</td>
+</tr></tbody>
+</table></div>
+</div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; bun.com, oven-sh, Jarred Sumner<br>Licensed under the MIT License.<br>
+    <a href="https://bun.com/docs/runtime/webview" class="_attribution-link">https://bun.com/docs/runtime/webview</a>
+  </p>
+</div>

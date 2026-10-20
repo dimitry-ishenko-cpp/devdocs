@@ -1,0 +1,117 @@
+<p class="_links"><a href="../../dart-isolate/dart-isolate-library.html" class="_links-link">dart:isolate</a></p> <h1>run&lt;<wbr>R&gt;</wbr> static method </h1> <section class="multi-line-signature"> <div> <ol class="annotation-list"> <li>@Since.new("2.19")</li> </ol> </div> <a href="../../dart-async/future-class.html">Future</a>&lt;<wbr>R&gt;</wbr> run&lt;<wbr>R&gt;(<wbr><ol class="parameter-list"> <li>
+<a href="../../dart-async/futureor-class.html">FutureOr</a>&lt;<wbr>R&gt;</wbr> computation(), {</li> <li>
+<a href="../../dart-core/string-class.html">String</a>? debugName, </li> </ol>}) </wbr></wbr></section>  <p>Runs <code>computation</code> in a new isolate and returns the result.</p> <pre class="language-dart" data-language="dart">int slowFib(int n) =&gt;
+    n &lt;= 1 ? 1 : slowFib(n - 1) + slowFib(n - 2);
+
+// Compute without blocking current isolate.
+var fib40 = await Isolate.run(() =&gt; slowFib(40));</pre> <p>If <code>computation</code> is asynchronous (returns a <code>Future&lt;R&gt;</code>) then that future is awaited in the new isolate, completing the entire asynchronous computation, before returning the result.</p> <pre class="language-dart" data-language="dart">int slowFib(int n) =&gt;
+    n &lt;= 1 ? 1 : slowFib(n - 1) + slowFib(n - 2);
+Stream&lt;int&gt; fibStream() async* {
+  for (var i = 0;; i++) yield slowFib(i);
+}
+
+// Returns `Future&lt;int&gt;`.
+var fib40 = await Isolate.run(() =&gt; fibStream().elementAt(40));</pre> <p>If <code>computation</code> throws, the isolate is terminated and this function throws the same error.</p> <pre data-metadata="import:convert" class="language-dart" data-language="dart">Future&lt;int&gt; eventualError() async {
+  await Future.delayed(const Duration(seconds: 1));
+  throw StateError("In a bad state!");
+}
+
+try {
+  await Isolate.run(eventualError);
+} on StateError catch (e, s) {
+  print(e.message); // In a bad state!
+  print(LineSplitter.split("$s").first); // Contains "eventualError"
+}</pre> <p>Any uncaught asynchronous errors will terminate the computation as well, but will be reported as a <a href="../remoteerror-class.html">RemoteError</a> because <a href="adderrorlistener.html">addErrorListener</a> does not provide the original error object.</p> <p>The result is sent using <a href="exit.html">exit</a>, which means it's sent to this isolate without copying.</p> <p>The <code>computation</code> function and its result (or error) must be sendable between isolates. Objects that cannot be sent include open files and sockets (see <a href="../sendport/send.html">SendPort.send</a> for details).</p> <p>If <code>computation</code> is a closure then it may implicitly send unexpected state to the isolate due to limitations in the Dart implementation. This can cause performance issues, increased memory usage (see <a href="http://dartbug.com/36983">http://dartbug.com/36983</a>) or, if the state includes objects that can't be spent between isolates, a runtime failure.</p> <pre data-metadata="import:convert import:io" class="language-dart" data-language="dart">void serializeAndWrite(File f, Object o) async {
+  final openFile = await f.open(mode: FileMode.append);
+  Future writeNew() async {
+    // Will fail with:
+    // "Invalid argument(s): Illegal argument in isolate message"
+    // because `openFile` is captured.
+    final encoded = await Isolate.run(() =&gt; jsonEncode(o));
+    await openFile.writeString(encoded);
+    await openFile.flush();
+    await openFile.close();
+  }
+
+  if (await openFile.position() == 0) {
+    await writeNew();
+  }
+}</pre> <p>In such cases, you can create a new function to call <a href="run.html">Isolate.run</a> that takes all of the required state as arguments.</p> <pre data-metadata="import:convert import:io" class="language-dart" data-language="dart">void serializeAndWrite(File f, Object o) async {
+  final openFile = await f.open(mode: FileMode.append);
+  Future writeNew() async {
+    Future&lt;String&gt; encode(o) =&gt; Isolate.run(() =&gt; jsonEncode(o));
+    final encoded = await encode(o);
+    await openFile.writeString(encoded);
+    await openFile.flush();
+    await openFile.close();
+  }
+
+  if (await openFile.position() == 0) {
+    await writeNew();
+  }
+}</pre> <p>The <code>debugName</code> is only used to name the new isolate for debugging.</p>   <h2 id="source">Implementation</h2> <pre class="language-dart" data-language="dart">@Since("2.19")
+static Future&lt;R&gt; run&lt;R&gt;(FutureOr&lt;R&gt; computation(), {String? debugName}) {
+  var result = Completer&lt;R&gt;();
+  var resultPort = RawReceivePort();
+  resultPort.handler = (response) {
+    resultPort.close();
+    if (response == null) {
+      // onExit handler message, isolate terminated without sending result.
+      result.completeError(
+        RemoteError("Computation ended without result", ""),
+        StackTrace.empty,
+      );
+      return;
+    }
+    var list = response as List&lt;Object?&gt;;
+    if (list.length == 2) {
+      var remoteError = list[0];
+      var remoteStack = list[1];
+      if (remoteStack is StackTrace) {
+        // Typed error.
+        result.completeError(remoteError!, remoteStack);
+      } else {
+        // onError handler message, uncaught async error.
+        // Both values are strings, so calling `toString` is efficient.
+        var error = RemoteError(
+          remoteError.toString(),
+          remoteStack.toString(),
+        );
+        result.completeError(error, error.stackTrace);
+      }
+    } else {
+      assert(list.length == 1);
+      result.complete(list[0] as R);
+    }
+  };
+  try {
+    Isolate.spawn(
+      _RemoteRunner._remoteExecute,
+      _RemoteRunner&lt;R&gt;(computation, resultPort.sendPort),
+      onError: resultPort.sendPort,
+      onExit: resultPort.sendPort,
+      errorsAreFatal: true,
+      debugName: debugName,
+    ).then&lt;void&gt;(
+      (_) {},
+      onError: (error, stack) {
+        // Sending the computation failed asynchronously.
+        // Do not expect a response, report the error asynchronously.
+        resultPort.close();
+        result.completeError(error, stack);
+      },
+    );
+  } on Object {
+    // Sending the computation failed synchronously.
+    // This is not expected to happen, but if it does,
+    // the synchronous error is respected and rethrown synchronously.
+    resultPort.close();
+    rethrow;
+  }
+  return result.future;
+}</pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2012 the Dart project authors<br>Licensed under the BSD 3-Clause "New" or "Revised" License.<br>
+    <a href="https://api.dart.dev/stable/3.13.2/dart-isolate/Isolate/run.html" class="_attribution-link">https://api.dart.dev/stable/3.13.2/dart-isolate/Isolate/run.html</a>
+  </p>
+</div>

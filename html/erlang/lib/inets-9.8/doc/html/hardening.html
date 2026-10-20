@@ -1,0 +1,311 @@
+<h1>Hardening</h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/inets/doc/guides/hardening.md#L1" title="View Source" class="source" rel="help nofollow">Source</a>  <h2 id="introduction">Introduction</h2>
+<p>The Erlang/OTP <code>inets</code> application provides an HTTP client (<code>httpc</code>) and an HTTP server (<code>httpd</code>), intended to be used as libraries in other applications.</p>
+<p>Different deployments have very different security requirements. A development tool running on localhost has different needs than a service exposed to the public internet. Because of this, <code>inets</code> ships with permissive defaults that prioritize ease of use. This guide describes how to tighten those defaults for production deployments.</p>
+<p>This guide targets <strong>OTP 29</strong>. Where behavior differs from OTP 28 and earlier, the differences are noted inline. A summary of changes is provided in the <a href="#changes-from-otp-28">Changes from OTP 28</a> section.</p>
+<p>For general configuration, see the <a href="httpc"><code>httpc</code></a> and <a href="httpd"><code>httpd</code></a> reference manuals.</p>
+<h2 id="http-client-httpc">HTTP Client (httpc)</h2>
+<h3 id="tls-configuration">TLS Configuration</h3>
+<p>Since OTP 26.0, <code>httpc</code> verifies the server certificate by default when no <code>{ssl, ...}</code> option is given. The default is equivalent to calling <code>httpc:ssl_verify_host_options(true)</code>, which enables <code>verify_peer</code> with the system CA store.</p>
+<p>If you need to customize TLS settings (for example, to pin a specific CA or restrict protocol versions), pass them explicitly:</p>
+<pre data-language="erlang">SslOpts = [{verify, verify_peer},
+           {cacertfile, "/path/to/ca-bundle.crt"},
+           {versions, ['tlsv1.2', 'tlsv1.3']}],
+httpc:request(get, {"https://example.com", []}, [{ssl, SslOpts}], []).</pre>
+<div class="warning">
+<p class="label">Warning</p>
+<p>Setting <code>{ssl, [{verify, verify_none}]}</code> disables certificate verification entirely. This makes the connection vulnerable to man-in-the-middle attacks and should only be used for testing.</p>
+</div>
+<h3 id="timeouts">Timeouts</h3>
+<p>The default value for both <code>timeout</code> and <code>connect_timeout</code> is <code>infinity</code>, meaning a request can hang indefinitely. Always set explicit timeouts in production:</p>
+<pre data-language="erlang">HttpOpts = [{timeout, 30000},        %% 30 s total request timeout
+            {connect_timeout, 5000}], %% 5 s TCP connect timeout
+httpc:request(get, {"https://example.com", []}, HttpOpts, []).</pre>
+<ul>
+<li><p><strong><a href="httpc#opt_timeout"><code>timeout</code></a></strong> - Maximum time for the entire request (connect + send + receive). Default: <code>infinity</code>.</p></li>
+<li><p><strong><a href="httpc#opt_connect_timeout"><code>connect_timeout</code></a></strong> - Maximum time for the TCP connection setup. Defaults to the value of <code>timeout</code>.</p></li>
+<li>
+<p><strong><a href="httpc#opt_autoretry"><code>autoretry</code></a></strong> <em>(since OTP 28.4)</em> - Controls how long the client honors a server's <code>Retry-After</code> header before retrying. The client automatically retries the request once on a 503 response with a <code>Retry-After</code> header. Default: <code>infinity</code> (always honor the server's value). Set to <code>0</code> to disable automatic retries, or to a finite number of milliseconds to cap the wait. If the server's <code>Retry-After</code> value exceeds the configured limit, no retry is performed. Before OTP 28.4, the retry behavior was hardcoded to only honor <code>Retry-After</code> values of 99 seconds or less.</p>
+<pre data-language="erlang">HttpOpts = [{timeout, 30000},
+            {connect_timeout, 5000},
+            {autoretry, 10000}].  %% Wait at most 10 s for Retry-After</pre>
+</li>
+</ul>
+<h3 id="redirect-following">Redirect Following</h3>
+<p>By default, <code>httpc</code> follows HTTP redirects automatically (<a href="httpc#opt_autoredirect"><code>{autoredirect, true}</code></a>). This can be exploited for Server-Side Request Forgery (SSRF) if the client is used to fetch user-supplied URLs, because a redirect can point to internal hosts or services.</p>
+<p>For requests to untrusted URLs, disable automatic redirects and validate the target manually. Check that the redirect target does not resolve to a private network address (10.x, 127.x, 169.254.x, etc.) before following it:</p>
+<pre data-language="erlang">httpc:request(get, {UserUrl, []},
+              [{autoredirect, false}, {timeout, 10000}], []).</pre>
+<h3 id="client-connection-limits">Client Connection Limits</h3>
+<p>Profile-level options control how many connections <code>httpc</code> keeps open. The per-host defaults are conservative, but the global limit defaults to <code>infinity</code>:</p>
+<ul>
+<li>
+<p><strong><a href="httpc#opt_max_connections_open"><code>max_connections_open</code></a></strong> <em>(since OTP 29)</em> - Maximum total number of open handlers across all hosts. Default: <code>infinity</code>. Set a finite value to prevent unbounded resource consumption:</p>
+<pre data-language="erlang">httpc:set_options([{max_connections_open, 100}]).</pre>
+</li>
+<li><p><strong><a href="httpc#opt_max_sessions"><code>max_sessions</code></a></strong> - Maximum persistent connections per host:port. Default: <code>2</code>.</p></li>
+<li><p><strong><a href="httpc#opt_max_keep_alive_length"><code>max_keep_alive_length</code></a></strong> - Maximum queued requests on a keep-alive connection. Default: <code>5</code>.</p></li>
+<li><p><strong><a href="httpc#opt_max_pipeline_length"><code>max_pipeline_length</code></a></strong> - Maximum pipelined requests per connection. Default: <code>2</code>.</p></li>
+<li><p><strong><a href="httpc#opt_pipeline_timeout"><code>pipeline_timeout</code></a></strong> - Idle time before closing a pipelined connection, in milliseconds. Default: <code>0</code> (pipelining disabled). Pipelining is only used when this is set to a positive value.</p></li>
+<li><p><strong><a href="httpc#opt_keep_alive_timeout"><code>keep_alive_timeout</code></a></strong> - Idle time before closing a persistent connection. Default: <code>120000</code> ms (2 minutes).</p></li>
+</ul>
+<p>For a service making requests to many different hosts, set <code>max_connections_open</code> to a value appropriate for your system's file descriptor limits.</p>
+<h3 id="cookie-handling">Cookie Handling</h3>
+<p>Cookies are disabled by default (<code>{cookies, disabled}</code>). If you enable them, prefer <code>verify</code> mode, which lets you inspect cookies before they are stored via <a href="httpc#store_cookies/3"><code>httpc:store_cookies/3</code></a>:</p>
+<pre data-language="erlang">httpc:set_options([{cookies, verify}]).</pre>
+<h3 id="proxy-configuration">Proxy Configuration</h3>
+<p>When using a proxy, ensure that the <code>no_proxy</code> list excludes internal hosts that should not be routed through the proxy:</p>
+<pre data-language="erlang">httpc:set_options([
+    {proxy, {{"proxy.example.com", 8080},
+             ["localhost", "*.internal.example.com"]}}
+]).</pre>
+<p>For HTTPS traffic through a proxy, configure <code>https_proxy</code> separately. The client uses the HTTP CONNECT method to establish a tunnel through the proxy. By default, <code>https_proxy</code> inherits the value of <code>proxy</code>.</p>
+<h3 id="sensitive-options">Sensitive Options</h3>
+<div class="warning">
+<p class="label">Warning</p>
+<p>The following options can introduce injection, file overwrite, or data leakage vulnerabilities if misused.</p>
+</div>
+<p>Per-request options:</p>
+<ul>
+<li><p><strong><a href="httpc#opt_socket_opts"><code>{socket_opts, Opts}</code></a></strong> - Passed directly to the transport layer without validation. Avoid exposing this to untrusted input.</p></li>
+<li><p><strong><a href="httpc#opt_headers_as_is"><code>{headers_as_is, true}</code></a></strong> - Bypasses header normalization. This can enable header injection if header values come from untrusted sources.</p></li>
+<li><p><strong><a href="httpc#opt_stream"><code>{stream, {self, once}}</code></a></strong> or <strong><code>{stream, Filename}</code></strong> - Streaming to a file path could overwrite files. Validate paths before use.</p></li>
+</ul>
+<p>Per-profile options:</p>
+<ul><li><p><strong><a href="httpc#opt_verbose"><code>{verbose, debug | trace}</code></a></strong> - May log sensitive data such as headers containing authorization tokens.</p></li></ul>
+<h2 id="http-server-httpd">HTTP Server (httpd)</h2>
+<h3 id="enable-tls">Enable TLS</h3>
+<p>By default, <code>httpd</code> listens in plaintext (<a href="httpd#prop_socket_type"><code>{socket_type, ip_comm}</code></a>). For any deployment beyond localhost, enable TLS:</p>
+<pre data-language="erlang">httpd:start_service([{port, 8443},
+                     {server_root, "/var/www"},
+                     {document_root, "/var/www/htdocs"},
+                     {socket_type, {ssl, [{cert_keys, [#{certfile =&gt; "/path/to/cert.pem",
+                                                          keyfile =&gt; "/path/to/key.pem"}]},
+                                          {versions, ['tlsv1.2', 'tlsv1.3']}]}}]).</pre>
+<h3 id="bind-address">Bind Address</h3>
+<p>The default <a href="httpd#prop_bind_address"><code>{bind_address, any}</code></a> listens on all network interfaces. Restrict this to the intended interface:</p>
+<pre data-language="erlang">{bind_address, {127, 0, 0, 1}}   %% Localhost only</pre>
+<p>or</p>
+<pre data-language="erlang">{bind_address, "192.168.1.10"}    %% Specific interface</pre>
+<h3 id="request-size-limits">Request Size Limits</h3>
+<p>Several size limits default to <code>nolimit</code>, which allows arbitrarily large requests that can exhaust memory. Set explicit limits:</p>
+<pre data-language="erlang">[{max_uri_size, 8192},              %% 8 KB URI limit
+ {max_header_size, 10240},          %% 10 KB (already the default)
+ {max_body_size, 10_485_760},       %% 10 MB body limit
+ {max_content_length, 10_485_760}]  %% 10 MB Content-Length check</pre>
+<ul>
+<li><p><strong><a href="httpd#prop_max_uri"><code>max_uri_size</code></a></strong> - Maximum URI length in bytes. Default: <code>nolimit</code>.</p></li>
+<li><p><strong><a href="httpd#prop_max_header_size"><code>max_header_size</code></a></strong> - Maximum total header size. Default: <code>10240</code> (10 KB).</p></li>
+<li><p><strong><a href="httpd#prop_max_body_size"><code>max_body_size</code></a></strong> - Maximum received body size during parsing. Default: <code>nolimit</code>.</p></li>
+<li><p><strong><a href="httpd#prop_max_content_length"><code>max_content_length</code></a></strong> - Rejects requests whose <code>Content-Length</code> header exceeds this value with a 413 response, before reading the body. Default: <code>100_000_000</code> (100 MB).</p></li>
+<li><p><strong><a href="httpd#max_client_body_chunk"><code>max_client_body_chunk</code></a></strong> - When handling large PUT or POST bodies via <code>mod_esi</code>, setting this option enforces chunked delivery to the ESI callback. This prevents the server from buffering the entire request body in memory, which could be exploited to cause memory exhaustion.</p></li>
+</ul>
+<div class="note">
+<p class="label">Note</p>
+<p><code>max_body_size</code> and <code>max_content_length</code> serve different purposes. <code>max_content_length</code> is a fast pre-check on the header value. <code>max_body_size</code> limits the actual bytes received. Set both for defense in depth.</p>
+</div>
+<h3 id="server-connection-limits">Server Connection Limits</h3>
+<ul>
+<li><p><strong><a href="httpd#prop_max_clients"><code>max_clients</code></a></strong> - Maximum simultaneous connections. Default: <code>150</code>. Tune this to your expected load and available resources.</p></li>
+<li><p><strong><a href="httpd#prop_keep_alive"><code>keep_alive</code></a></strong> - Controls whether persistent connections are used. Default: <code>true</code>. Disabling persistent connections (<code>false</code>) eliminates certain classes of connection-reuse attacks at the cost of performance.</p></li>
+<li>
+<p><strong><a href="httpd#prop_max_keep_alive_req"><code>max_keep_alive_request</code></a></strong> - Maximum requests per persistent connection. Default: <code>infinity</code>. Set a finite value to prevent a single connection from monopolizing server resources:</p>
+<pre data-language="erlang">{max_keep_alive_request, 1000}</pre>
+</li>
+<li><p><strong><a href="httpd#prop_keep_alive_timeout"><code>keep_alive_timeout</code></a></strong> - Seconds before closing an idle persistent connection. Default: <code>150</code>.</p></li>
+<li>
+<p><strong><a href="httpd#prop_minimum_bytes_per_second"><code>minimum_bytes_per_second</code></a></strong> - Closes connections that transfer data below this rate. Not set by default. Enable it to mitigate slow-rate DoS attacks (for example, Slowloris):</p>
+<pre data-language="erlang">{minimum_bytes_per_second, 100}</pre>
+</li>
+</ul>
+<p>The following table summarizes when each limit is checked during the request lifecycle:</p>
+<table>
+<thead><tr>
+<th style="text-align: left;">Stage</th>
+<th style="text-align: left;">Event</th>
+<th style="text-align: left;">Limit checked</th>
+</tr></thead>
+<tbody>
+<tr>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;">TCP connected</td>
+<td style="text-align: left;"><code>max_clients</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;">Headers received</td>
+<td style="text-align: left;">
+<code>max_uri_size</code>, <code>max_header_size</code>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">3</td>
+<td style="text-align: left;">Content-Length checked</td>
+<td style="text-align: left;"><code>max_content_length</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">4</td>
+<td style="text-align: left;">Body received</td>
+<td style="text-align: left;"><code>max_body_size</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">5</td>
+<td style="text-align: left;">Idle on keep-alive</td>
+<td style="text-align: left;"><code>keep_alive_timeout</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">6</td>
+<td style="text-align: left;">Slow transfer</td>
+<td style="text-align: left;"><code>minimum_bytes_per_second</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="server-identity">Server Identity</h3>
+<p>The default <a href="httpd#prop_server_tokens"><code>{server_tokens, minimal}</code></a> reveals the complete <code>inets</code> version string in the <code>Server</code> response header (for example, <code>inets/9.3.1</code>). Despite the name, <code>minimal</code> still includes the full version number. This helps attackers identify known vulnerabilities. Reduce information disclosure:</p>
+<pre data-language="erlang">{server_tokens, none}   %% Omit the Server header entirely</pre>
+<p>or</p>
+<pre data-language="erlang">{server_tokens, prod}   %% Just "inets", no version</pre>
+<h3 id="module-chain">Module Chain</h3>
+<p>The <a href="httpd#prop_modules"><code>{modules, ...}</code></a> option controls which httpd modules are active. In OTP 29, <code>mod_cgi</code> and <code>mod_actions</code> are deprecated and removed from the default module list. The default is:</p>
+<pre data-language="erlang">[mod_alias, mod_auth, mod_esi,
+ mod_dir, mod_get, mod_head, mod_log, mod_disk_log]</pre>
+<div class="warning">
+<p class="label">Warning</p>
+<p>In OTP 28 and earlier, the default module list also includes <code>mod_cgi</code> and <code>mod_actions</code>, enabling CGI execution out of the box. If you are running an older release, removing these modules manually is especially important.</p>
+</div>
+<p>Review this list and remove modules you do not need:</p>
+<ul>
+<li><p><strong><code>mod_cgi</code></strong> and <strong><code>mod_actions</code></strong> - Enable CGI script execution. Deprecated in OTP 29 and scheduled for removal in OTP 30. If you still need CGI support, add them explicitly to your module list. CGI introduces a large attack surface (arbitrary process execution, environment variable injection).</p></li>
+<li><p><strong><code>mod_dir</code></strong> - Enables directory listing. Remove it to prevent information disclosure about your file structure.</p></li>
+<li><p><strong><code>mod_esi</code></strong> - Enables Erlang Scripting Interface. If used, restrict it with <a href="httpd#prop_esi_alias"><code>erl_script_alias</code></a> to a whitelist of allowed modules.</p></li>
+<li><p><strong><code>mod_trace</code></strong> - Handles HTTP TRACE requests. TRACE can be exploited in cross-site tracing (XST) attacks. This module is not in the default list but should never be added in production.</p></li>
+</ul>
+<p>A minimal module chain for a static file server:</p>
+<pre data-language="erlang">{modules, [mod_alias, mod_get, mod_head, mod_log]}</pre>
+<h3 id="authentication-mod_auth">Authentication (mod_auth)</h3>
+<p>If using <code>mod_auth</code>:</p>
+<ul>
+<li><p><strong>Avoid <a href="httpd#prop_auth_type"><code>{auth_type, plain}</code></a></strong> in production. It stores passwords in cleartext files. Prefer <code>dets</code> or <code>mnesia</code>.</p></li>
+<li><p><strong>Place auth files outside <code>document_root</code></strong>. The <a href="httpd#prop_auth_user_file"><code>auth_user_file</code></a> and <a href="httpd#prop_auth_group_file"><code>auth_group_file</code></a> must not be accessible via HTTP.</p></li>
+<li><p><strong>Set <a href="httpd#prop_auth_access_passwd"><code>auth_access_password</code></a></strong> to a strong value. When not set or set to <code>"NoPassword"</code>, no password is required for the authentication management API.</p></li>
+<li><p><strong>Use IP-based restrictions</strong> (<a href="httpd#prop_allow_from"><code>allow_from</code></a>, <a href="httpd#prop_deny_from"><code>deny_from</code></a>) as an additional layer, not as the sole access control mechanism.</p></li>
+</ul>
+<div class="warning">
+<p class="label">Warning</p>
+<p>The <code>mod_auth</code> module implements HTTP Basic Authentication, which transmits credentials in base64 encoding (effectively cleartext). <strong>Always use TLS</strong> when authentication is enabled.</p>
+</div>
+<h3 id="brute-force-protection-mod_security">Brute Force Protection (mod_security)</h3>
+<p><code>mod_security</code> acts as a filter on top of <code>mod_auth</code>, tracking failed login attempts per user and temporarily blocking users who exceed a threshold. This mitigates credential-stuffing and brute-force password guessing attacks.</p>
+<p>Enable <code>mod_security</code> to throttle authentication brute force attempts:</p>
+<pre data-language="erlang">{security_directory, {"/protected", [
+    {data_file, "/var/lib/httpd/security.dat"},
+    {max_retries, 3},
+    {block_time, 60},        %% Block for 60 minutes
+    {fail_expire_time, 30},  %% Remember failures for 30 minutes
+    {auth_timeout, 30}
+]}}</pre>
+<ul>
+<li><p><strong><a href="httpd#prop_data_file"><code>data_file</code></a></strong> - Path to the persistent security data file. Store this outside <code>document_root</code>. Required for <code>mod_security</code> to persist blocked-user state across server restarts.</p></li>
+<li><p><strong><a href="httpd#prop_max_retries"><code>max_retries</code></a></strong> - Maximum failed authentication attempts before the user is blocked. Default: <code>3</code>.</p></li>
+<li><p><strong><a href="httpd#prop_block_time"><code>block_time</code></a></strong> - Minutes a blocked user remains locked out. Default: <code>60</code>.</p></li>
+<li><p><strong><a href="httpd#prop_fail_exp_time"><code>fail_expire_time</code></a></strong> - Minutes before a failed attempt is forgotten. If the user does not retry within this window, the failure counter resets. Default: <code>30</code>.</p></li>
+<li><p><strong><a href="httpd#prop_auth_timeout"><code>auth_timeout</code></a></strong> - Seconds a successful authentication is remembered. After expiry the user must re-authenticate. Default: <code>30</code>.</p></li>
+</ul>
+<div class="warning">
+<p class="label">Warning</p>
+<p><code>mod_security</code> must appear <strong>after</strong> <code>mod_auth</code> in the module chain. It relies on <code>mod_auth</code> to perform the actual authentication; <code>mod_security</code> only observes the results and enforces blocking policy.</p>
+</div>
+<p>For runtime inspection and manual blocking, see <a href="mod_security.html"><code>mod_security</code></a> (<a href="mod_security.html#list_blocked_users/1"><code>list_blocked_users/1</code></a>, <a href="mod_security.html#block_user/5"><code>block_user/5</code></a>, <a href="mod_security.html#unblock_user/4"><code>unblock_user/4</code></a>).</p>
+<h3 id="cgi-and-esi-execution">CGI and ESI Execution</h3>
+<ul>
+<li><p><strong><a href="httpd#prop_script_alias"><code>script_alias</code></a></strong> maps URL paths to CGI script directories. Ensure the mapped directory contains only intended scripts and is not writable by the web server process.</p></li>
+<li>
+<p><strong><a href="httpd#prop_esi_alias"><code>erl_script_alias</code></a></strong> controls which Erlang modules can be called via ESI. Always specify an explicit whitelist:</p>
+<pre data-language="erlang">{erl_script_alias, {"/esi", [my_allowed_module]}}</pre>
+<p>Never use a wildcard or overly broad module list.</p>
+</li>
+<li><p><strong><a href="httpd#prop_script_timeout"><code>script_timeout</code></a></strong> and <strong><a href="httpd#prop_esi_timeout"><code>erl_script_timeout</code></a></strong> default to 15 seconds. Review whether this is appropriate for your use case.</p></li>
+<li><p><strong><a href="httpd#prop_script_nocache"><code>script_nocache</code></a></strong> and <strong><a href="httpd#prop_esi_nocache"><code>erl_script_nocache</code></a></strong> - When set to <code>true</code>, the server adds HTTP header fields preventing proxies from caching dynamic responses. Default: <code>false</code>. Enable these to prevent stale or sensitive dynamic content from being served from proxy caches.</p></li>
+</ul>
+<div class="warning">
+<p class="label">Warning</p>
+<p>The <code>script_alias</code> path resolution can bypass <code>mod_auth</code> directory protections depending on module ordering. Ensure <code>mod_auth</code> appears before <code>mod_cgi</code> in the module chain, and test that authentication is enforced on CGI paths.</p>
+</div>
+<h3 id="logging">Logging</h3>
+<p>Enable logging to detect and investigate security incidents:</p>
+<pre data-language="erlang">[{error_log, "/var/log/httpd/error.log"},
+ {security_log, "/var/log/httpd/security.log"},
+ {transfer_log, "/var/log/httpd/access.log"},
+ {log_format, combined}]  %% Includes referer and user-agent (default: common)</pre>
+<p>For production systems, the <a href="../../../kernel-11.0.4/doc/html/disk_log.html"><code>disk_log</code></a> variants (<code>transfer_disk_log</code>, <code>error_disk_log</code>, <code>security_disk_log</code>) are recommended as they support wrap logs with configurable size limits, preventing log files from consuming all available disk space.</p>
+<p>For integration with the OTP logger framework, where <code>my_httpd</code> is the <code>ServerID</code> atom used in the logger domain hierarchy <code>[otp, inets, httpd, ServerID, error]</code>:</p>
+<pre data-language="erlang">{logger, [{error, my_httpd}]}</pre>
+<p>Ensure log files are rotated and that log directories are not writable by the web server process.</p>
+<h2 id="hardened-example">Hardened Example</h2>
+<p>The following is a complete example combining the recommendations above for an httpd deployment serving static files with TLS:</p>
+<pre data-language="erlang">httpd:start_service([
+    {port, 8443},
+    {bind_address, {127, 0, 0, 1}},
+    {server_root, "/var/www"},
+    {document_root, "/var/www/htdocs"},
+    {server_tokens, none},
+    {socket_type, {ssl, [{cert_keys, [#{certfile =&gt; "/path/to/cert.pem",
+                                        keyfile =&gt; "/path/to/key.pem"}]},
+                         {versions, ['tlsv1.2', 'tlsv1.3']}]}},
+    {modules, [mod_alias, mod_auth, mod_security, mod_get, mod_head, mod_log]},
+    {max_clients, 100},
+    {max_keep_alive_request, 1000},
+    {keep_alive_timeout, 60},
+    {max_uri_size, 8192},
+    {max_header_size, 10240},
+    {max_body_size, 10_485_760},
+    {max_content_length, 10_485_760},
+    {minimum_bytes_per_second, 100},
+    {error_log, "/var/log/httpd/error.log"},
+    {transfer_log, "/var/log/httpd/access.log"},
+    {log_format, combined}
+]).</pre>
+<p>And a hardened <code>httpc</code> request:</p>
+<pre data-language="erlang">HttpOpts = [{timeout, 30000},
+            {connect_timeout, 5000},
+            {autoredirect, false},
+            {autoretry, 10000},
+            {ssl, [{verify, verify_peer},
+                   {cacerts, public_key:cacerts_get()},
+                   {versions, ['tlsv1.2', 'tlsv1.3']}]}],
+httpc:request(get, {"https://example.com", []}, HttpOpts, []).</pre>
+<h2 id="general-recommendations">General Recommendations</h2>
+<h3 id="defense-in-depth">Defense in Depth</h3>
+<p>The <code>inets</code> application provides application-level security controls. For production deployments, combine these with:</p>
+<ul>
+<li>
+<strong>Network-level controls</strong> - Firewalls, network segmentation, and rate limiting.</li>
+<li>
+<strong>OS-level controls</strong> - Run the BEAM VM as an unprivileged user. Use file system permissions to protect configuration files, log files, and credential stores.</li>
+<li>
+<strong>Reverse proxy</strong> - Consider placing <code>httpd</code> behind a dedicated reverse proxy (such as Nginx or HAProxy) that provides additional request filtering, rate limiting, and TLS termination.</li>
+</ul>
+<h3 id="monitoring">Monitoring</h3>
+<p>Use the OTP <a href="../../../kernel-11.0.4/doc/html/logger.html"><code>logger</code></a> framework to monitor for:</p>
+<ul>
+<li>Repeated authentication failures (potential brute-force attacks).</li>
+<li>Unusual request patterns (potential scanning or fuzzing).</li>
+<li>Connection limit exhaustion (potential DoS).</li>
+</ul>
+<h3 id="keep-up-to-date">Keep Up to Date</h3>
+<p>Security vulnerabilities are fixed in new releases of Erlang/OTP. Monitor the <a rel="nofollow" href="https://github.com/erlang/otp/releases">Erlang/OTP releases</a> and apply updates promptly.</p>
+<h2 id="changes-from-otp-28">Changes from OTP 28</h2>
+<p>If you are upgrading from OTP 28 or running an older release, be aware of the following differences:</p>
+<h3 id="httpc">httpc</h3>
+<ul>
+<li><p><strong><code>autoretry</code> not available before OTP 28.4</strong> - The <code>{autoretry, timeout()}</code> option for <code>httpc</code> was introduced in OTP 28.4. On older releases, the client still retries on 503 with <code>Retry-After</code>, but only honors values of 99 seconds or less (hardcoded). The new option allows configuring this limit or disabling retries entirely with <code>{autoretry, 0}</code>.</p></li>
+<li><p><strong><code>max_connections_open</code> not available before OTP 29</strong> - The <code>{max_connections_open, integer()}</code> profile option for <code>httpc</code> was introduced in OTP 29. On older releases, there is no global limit on the number of open handlers.</p></li>
+<li><p><strong>TLS verification default</strong> - <code>httpc</code> has verified server certificates by default since OTP 26.0. On releases before 26.0, you must pass <code>{ssl, httpc:ssl_verify_host_options(true)}</code> explicitly or connections will proceed without certificate verification.</p></li>
+</ul>
+<h3 id="httpd">httpd</h3>
+<ul><li>
+<strong><code>mod_cgi</code> and <code>mod_actions</code> in default modules</strong> - In OTP 28 and earlier, the default <code>{modules, ...}</code> list includes <code>mod_cgi</code> and <code>mod_actions</code>, enabling CGI execution by default. In OTP 29 these modules are deprecated and removed from the defaults. On older releases, remove them explicitly.</li></ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

@@ -1,0 +1,53 @@
+<div data-color-mode="auto" data-light-theme="light" data-dark-theme="dark" class="markdown-body mt-4">
+<div class="block mb-2 space-y-2">
+<h1 class="leading-none md:text-4xl text-balance">Deno.serve request abort behavior</h1>
+</div>
+<p><a href="https://docs.deno.com/api/deno/~/Deno.serve"><code>Deno.serve</code></a> historically fired the <code>abort</code> event on a request's <a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal"><code>AbortSignal</code></a> (<code>request.signal</code>) whenever the request finished, <strong>including when your handler returned a successful response</strong>. The signal was meant to indicate that the client went away (for example, the connection was closed before the response was sent), but in practice it also fired on every successful response.</p> <p>This is the "legacy abort" behavior, and it is enabled by default today. The <a href="cli/unstable_flags.html#--unstable-no-legacy-abort"><code>--unstable-no-legacy-abort</code></a> flag opts in to the corrected behavior, which will become the default in an upcoming release.</p> <h2 id="why-the-behavior-is-changing" tabindex="-1">Why the behavior is changing </h2> <p>Because the signal aborted on success, code that watches <code>request.signal</code> could not tell the difference between "the client disconnected" and "the response was delivered normally". This breaks a number of common libraries, most visibly Node-style HTTP proxies such as <a href="https://www.npmjs.com/package/http-proxy"><code>http-proxy</code></a> and <a href="https://www.npmjs.com/package/http-proxy-middleware"><code>http-proxy-middleware</code></a> (used by Vite, among others), which treat the upstream abort as a genuine failure and surface a spurious error.</p> <p>See issues <a href="https://github.com/denoland/deno/issues/28850">#28850</a> and <a href="https://github.com/denoland/deno/issues/29111">#29111</a> for background.</p> <h2 id="the-new-behavior" tabindex="-1">The new behavior </h2> <p>With <code>--unstable-no-legacy-abort</code> enabled, <code>request.signal</code> aborts <strong>only</strong> when the client actually cancels the request or the connection is lost before the response has been fully sent. A successful response no longer triggers an abort.</p> <div class="relative">
+<pre data-language="ts"><code class="highlight notranslate language-ts">Deno<span class="token punctuation">.</span><span class="token function">serve</span><span class="token punctuation">(</span><span class="token punctuation">(</span>req<span class="token punctuation">)</span> <span class="token operator">=&gt;</span> <span class="token punctuation">{</span>
+  req<span class="token punctuation">.</span>signal<span class="token punctuation">.</span><span class="token function">addEventListener</span><span class="token punctuation">(</span><span class="token string">"abort"</span><span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">=&gt;</span> <span class="token punctuation">{</span>
+    <span class="token comment">// With --unstable-no-legacy-abort this only runs on a real client</span>
+    <span class="token comment">// disconnect, not on every successful response.</span>
+    <span class="token builtin">console</span><span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token string">"client went away"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token keyword">return</span> <span class="token keyword">new</span> <span class="token class-name">Response</span><span class="token punctuation">(</span><span class="token string">"hello"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre>  </div>
+<h2 id="detecting-when-a-request-has-been-fully-delivered" tabindex="-1">Detecting when a request has been fully delivered </h2> <p>If you relied on the legacy abort to know that a response had been fully sent, use the <code>completed</code> promise on the second argument to the handler (<a href="https://docs.deno.com/api/deno/~/Deno.ServeHandlerInfo"><code>ServeHandlerInfo</code></a>) instead. It is the intended, mode-independent way to observe delivery:</p> <div class="relative">
+<pre data-language="ts"><code class="highlight notranslate language-ts">Deno<span class="token punctuation">.</span><span class="token function">serve</span><span class="token punctuation">(</span><span class="token punctuation">(</span>req<span class="token punctuation">,</span> info<span class="token punctuation">)</span> <span class="token operator">=&gt;</span> <span class="token punctuation">{</span>
+  info<span class="token punctuation">.</span>completed
+    <span class="token punctuation">.</span><span class="token function">then</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">=&gt;</span> <span class="token punctuation">{</span>
+      <span class="token comment">// The response, including a streaming body, was sent successfully.</span>
+      <span class="token builtin">console</span><span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token string">"response fully delivered"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span>
+    <span class="token punctuation">.</span><span class="token function">catch</span><span class="token punctuation">(</span><span class="token punctuation">(</span>err<span class="token punctuation">)</span> <span class="token operator">=&gt;</span> <span class="token punctuation">{</span>
+      <span class="token comment">// Delivery failed partway through (client disconnected, write error, ...).</span>
+      <span class="token builtin">console</span><span class="token punctuation">.</span><span class="token function">error</span><span class="token punctuation">(</span><span class="token string">"response was not sent successfully:"</span><span class="token punctuation">,</span> err<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token keyword">return</span> <span class="token keyword">new</span> <span class="token class-name">Response</span><span class="token punctuation">(</span>someStream<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre>  </div>
+<p><code>info.completed</code>:</p> <ul> <li>
+<strong>resolves</strong> once the response (including any streaming body) has been sent to the client, and</li> <li>
+<strong>rejects</strong> if delivery failed before completing.</li> </ul> <p>The promise is lazily created, so handlers that never read <code>info.completed</code> pay no extra cost.</p> <h2 id="migrating" tabindex="-1">Migrating </h2> <ol> <li> <p>Enable the flag while you test:</p> <div>
+<div class="markdownBlockTitle"><span aria-label="Terminal" role="img">›_</span></div>
+<div class="relative">
+<pre data-language="sh"><code class="highlight notranslate language-sh">deno run --unstable-no-legacy-abort main.ts
+</code></pre>  </div>
+</div>
+<p>or in <code>deno.json</code>:</p> <div>
+<div class="markdownBlockTitle">deno.json</div>
+<div class="relative">
+<pre data-language="json"><code class="highlight notranslate language-json"><span class="token punctuation">{</span>
+  <span class="token property">"unstable"</span><span class="token operator">:</span> <span class="token punctuation">[</span><span class="token string">"no-legacy-abort"</span><span class="token punctuation">]</span>
+<span class="token punctuation">}</span>
+</code></pre>  </div>
+</div>
+</li> <li> <p>Use <code>request.signal</code> only for cancellation, and move completion/cleanup logic onto <code>info.completed</code> (or onto the handler's return path).</p> </li> </ol> <p>Once you have adopted the new behavior, your code will continue to work unchanged when it becomes the default.</p> </div>
+<div class="mt-24"><p class="text-sm text-foreground-secondary mb-2 leading-none">Last updated on <time datetime="2026-07-02T00:00:00.000Z">July 2, 2026</time></p></div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2018&ndash;2025 the Deno authors<br>Licensed under the MIT License.<br>
+    <a href="https://docs.deno.com/runtime/reference/deno_serve_legacy_abort" class="_attribution-link">https://docs.deno.com/runtime/reference/deno_serve_legacy_abort</a>
+  </p>
+</div>

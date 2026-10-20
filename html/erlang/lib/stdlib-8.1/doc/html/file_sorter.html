@@ -1,0 +1,205 @@
+<h1> <span>file_sorter</span>  </h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L22" title="View Source" class="source" rel="help nofollow">Source</a>   <p>File sorter.</p>
+<p>This module contains functions for sorting terms on files, merging already sorted files, and checking files for sortedness. Chunks containing binary terms are read from a sequence of files, sorted internally in memory and written on temporary files, which are merged producing one sorted file as output. Merging is provided as an optimization; it is faster when the files are already sorted, but it always works to sort instead of merge.</p>
+<p>On a file, a term is represented by a header and a binary. Two options define the format of terms on files:</p>
+<ul>
+<li><p><strong><code>{header, HeaderLength}</code></strong> - <code>HeaderLength</code> determines the number of bytes preceding each binary and containing the length of the binary in bytes. Defaults to 4. The order of the header bytes is defined as follows: if <code>B</code> is a binary containing a header only, size <code>Size</code> of the binary is calculated as <code>&lt;&lt;Size:HeaderLength/unit:8&gt;&gt; = B</code>.</p></li>
+<li>
+<p><strong><code>{format, Format}</code></strong> - Option <code>Format</code> determines the function that is applied to binaries to create the terms to be sorted. Defaults to <code>binary_term</code>, which is equivalent to <code>fun binary_to_term/1</code>. Value <code>binary</code> is equivalent to <code>fun(X) -&gt; X end</code>, which means that the binaries are sorted as they are. This is the fastest format. If <code>Format</code> is <code>term</code>, <a href="io.html#read/2"><code>io:read/2</code></a> is called to read terms. In that case, only the default value of option <code>header</code> is allowed.</p>
+<p>Option <code>format</code> also determines what is written to the sorted output file: if <code>Format</code> is <code>term</code>, then <a href="io.html#format/3"><code>io:format/3</code></a> is called to write each term, otherwise the binary prefixed by a header is written. Notice that the binary written is the same binary that was read; the results of applying function <code>Format</code> are thrown away when the terms have been sorted. Reading and writing terms using the <code>io</code> module is much slower than reading and writing binaries.</p>
+</li>
+</ul>
+<p>Other options are:</p>
+<ul>
+<li><p><strong><code>{order, Order}</code></strong> - The default is to sort terms in ascending order, but that can be changed by value <code>descending</code> or by specifying an ordering function <code>Fun</code>. An ordering function is antisymmetric, transitive, and total. <code>Fun(A, B)</code> is to return <code>true</code> if <code>A</code> comes before <code>B</code> in the ordering, otherwise <code>false</code>. An example of a typical ordering function is less than or equal to, <code>=&lt;/2</code>. Using an ordering function slows down the sort considerably. Functions <code>keysort</code>, <code>keymerge</code> and <code>keycheck</code> do not accept ordering functions.</p></li>
+<li><p><strong><code>{unique, boolean()}</code></strong> - When sorting or merging files, only the first of a sequence of terms that compare equal (<code>==</code>) is output if this option is set to <code>true</code>. Defaults to <code>false</code>, which implies that all terms that compare equal are output. When checking files for sortedness, a check that no pair of consecutive terms compares equal is done if this option is set to <code>true</code>.</p></li>
+<li><p><strong><code>{tmpdir, TempDirectory}</code></strong> - The directory where temporary files are put can be chosen explicitly. The default, implied by value <code>""</code>, is to put temporary files on the same directory as the sorted output file. If output is a function (see below), the directory returned by <code>file:get_cwd()</code> is used instead. The names of temporary files are derived from the Erlang nodename (<a href="../../../../erts-17.1/doc/html/erlang.html#node/0"><code>node/0</code></a>), the process identifier of the current Erlang emulator (<code>os:getpid()</code>), and a unique integer (<code>erlang:unique_integer([positive])</code>). A typical name is <code>fs_mynode@myhost_1763_4711.17</code>, where <code>17</code> is a sequence number. Existing files are overwritten. Temporary files are deleted unless some uncaught <code>EXIT</code> signal occurs.</p></li>
+<li><p><strong><code>{compressed, boolean()}</code></strong> - Temporary files and the output file can be compressed. Defaults <code>false</code>, which implies that written files are not compressed. Regardless of the value of option <code>compressed</code>, compressed files can always be read. Notice that reading and writing compressed files are significantly slower than reading and writing uncompressed files.</p></li>
+<li><p><strong><code>{size, Size}</code></strong> - By default about 512*1024 bytes read from files are sorted internally. This option is rarely needed.</p></li>
+<li><p><strong><code>{no_files, NoFiles}</code></strong> - By default 16 files are merged at a time. This option is rarely needed.</p></li>
+</ul>
+<p>As an alternative to sorting files, a function of one argument can be specified as input. When called with argument <code>read</code>, the function is assumed to return either of the following:</p>
+<ul>
+<li>
+<code>end_of_input</code> or <code>{end_of_input, Value}}</code> when there is no more input (<code>Value</code> is explained below).</li>
+<li>
+<code>{Objects, Fun}</code>, where <code>Objects</code> is a list of binaries or terms depending on the format, and <code>Fun</code> is a new input function.</li>
+</ul>
+<p>Any other value is immediately returned as value of the current call to <code>sort</code> or <code>keysort</code>. Each input function is called exactly once. If an error occurs, the last function is called with argument <code>close</code>, the reply of which is ignored.</p>
+<p>A function of one argument can be specified as output. The results of sorting or merging the input is collected in a non-empty sequence of variable length lists of binaries or terms depending on the format. The output function is called with one list at a time, and is assumed to return a new output function. Any other return value is immediately returned as value of the current call to the sort or merge function. Each output function is called exactly once. When some output function has been applied to all of the results or an error occurs, the last function is called with argument <code>close</code>, and the reply is returned as value of the current call to the sort or merge function.</p>
+<p>If a function is specified as input and the last input function returns <code>{end_of_input, Value}</code>, the function specified as output is called with argument <code>{value, Value}</code>. This makes it easy to initiate the sequence of output functions with a value calculated by the input functions.</p>
+<p>As an example, consider sorting the terms on a disk log file. A function that reads chunks from the disk log and returns a list of binaries is used as input. The results are collected in a list of terms.</p>
+<pre data-language="erlang">sort(Log) -&gt;
+    {ok, _} = disk_log:open([{name,Log}, {mode,read_only}]),
+    Input = input(Log, start),
+    Output = output([]),
+    Reply = file_sorter:sort(Input, Output, {format,term}),
+    ok = disk_log:close(Log),
+    Reply.
+
+input(Log, Cont) -&gt;
+    fun(close) -&gt;
+            ok;
+       (read) -&gt;
+            case disk_log:chunk(Log, Cont) of
+                {error, Reason} -&gt;
+                    {error, Reason};
+                {Cont2, Terms} -&gt;
+                    {Terms, input(Log, Cont2)};
+                {Cont2, Terms, _Badbytes} -&gt;
+                    {Terms, input(Log, Cont2)};
+                eof -&gt;
+                    end_of_input
+            end
+    end.
+
+output(L) -&gt;
+    fun(close) -&gt;
+            lists:append(lists:reverse(L));
+       (Terms) -&gt;
+            output([Terms | L])
+    end.</pre>
+<p>For more examples of functions as input and output, see the end of the <code>file_sorter</code> module; the <code>term</code> format is implemented with functions.</p>
+<p>The possible values of <code>Reason</code> returned when an error occurs are:</p>
+<ul>
+<li>
+<code>bad_object</code>, <code>{bad_object, FileName}</code> - Applying the format function failed for some binary, or the key(s) could not be extracted from some term.</li>
+<li>
+<code>{bad_term, FileName}</code> - <a href="io.html#read/2"><code>io:read/2</code></a> failed to read some term.</li>
+<li>
+<code>{file_error, FileName, file:posix()}</code> - For an explanation of <a href="../../../kernel-11.0.4/doc/html/file.html#t:posix/0"><code>file:posix()</code></a>, see <a href="../../../kernel-11.0.4/doc/html/file.html"><code>file</code></a>.</li>
+<li>
+<code>{premature_eof, FileName}</code> - End-of-file was encountered inside some binary term.</li>
+</ul>   <section id="summary" class="details-list"> <h2>Summary</h2> <h3>Types</h3>
+<dl class="summary-types summary">   <dt> <a href="#t:file_name/0">file_name()</a> </dt>   <dt> <a href="#t:file_names/0">file_names()</a> </dt>   <dt> <a href="#t:format/0">format()</a> </dt>   <dt> <a href="#t:format_fun/0">format_fun()</a> </dt>   <dt> <a href="#t:header_length/0">header_length()</a> </dt>   <dt> <a href="#t:i_command/0">i_command()</a> </dt>   <dt> <a href="#t:i_reply/0">i_reply()</a> </dt>   <dt> <a href="#t:infun/0">infun()</a> </dt>   <dt> <a href="#t:input/0">input()</a> </dt>   <dt> <a href="#t:input_reply/0">input_reply()</a> </dt>   <dt> <a href="#t:key_pos/0">key_pos()</a> </dt>   <dt> <a href="#t:no_files/0">no_files()</a> </dt>   <dt> <a href="#t:o_command/0">o_command()</a> </dt>   <dt> <a href="#t:o_reply/0">o_reply()</a> </dt>   <dt> <a href="#t:object/0">object()</a> </dt>   <dt> <a href="#t:option/0">option()</a> </dt>   <dt> <a href="#t:options/0">options()</a> </dt>   <dt> <a href="#t:order/0">order()</a> </dt>   <dt> <a href="#t:order_fun/0">order_fun()</a> </dt>   <dt> <a href="#t:outfun/0">outfun()</a> </dt>   <dt> <a href="#t:output/0">output()</a> </dt>   <dt> <a href="#t:output_reply/0">output_reply()</a> </dt>   <dt> <a href="#t:reason/0">reason()</a> </dt>   <dt> <a href="#t:size/0">size()</a> </dt>   <dt> <a href="#t:tmp_directory/0">tmp_directory()</a> </dt>   <dt> <a href="#t:value/0">value()</a> </dt>  </dl> <h3>Functions</h3>
+<dl class="summary-functions summary">   <dt> <a href="#check/1">check(FileName)</a> </dt> <dd><p>Equivalent to <a href="#check/2"><code>check([FileName], [])</code></a>.</p></dd>   <dt> <a href="#check/2">check(FileNames, Options)</a> </dt> <dd><p>Checks files for sortedness. If a file is not sorted, the first out-of-order element is returned. The first term on a file has position 1.</p></dd>   <dt> <a href="#keycheck/2">keycheck(KeyPos, FileName)</a> </dt> <dd><p>Equivalent to <a href="#keycheck/3"><code>keycheck(KeyPos, [Filename], [])</code></a>.</p></dd>   <dt> <a href="#keycheck/3">keycheck(KeyPos, FileNames, Options)</a> </dt> <dd><p>Checks files for sortedness. If a file is not sorted, the first out-of-order element is returned. The first term on a file has position 1.</p></dd>   <dt> <a href="#keymerge/3">keymerge(KeyPos, FileNames, Output)</a> </dt> <dd><p>Equivalent to <a href="#keymerge/4"><code>keymerge(KeyPos, FileNames, Output, [])</code></a>.</p></dd>   <dt> <a href="#keymerge/4">keymerge(KeyPos, FileNames, Output, Options)</a> </dt> <dd><p>Merges tuples on files. Each input file is assumed to be sorted on key(s).</p></dd>   <dt> <a href="#keysort/2">keysort(KeyPos, FileName)</a> </dt> <dd><p>Sorts tuples on files.</p></dd>   <dt> <a href="#keysort/3">keysort(KeyPos, Input, Output)</a> </dt> <dd><p>Equivalent to <a href="#keysort/4"><code>keysort(KeyPos, Input, Output, [])</code></a>.</p></dd>   <dt> <a href="#keysort/4">keysort(KeyPos, Input, Output, Options)</a> </dt> <dd><p>Sorts tuples on files. The sort is performed on the element(s) mentioned in <code>KeyPos</code>. If two tuples compare equal (<code>==</code>) on one element, the next element according to <code>KeyPos</code> is compared. The sort is stable.</p></dd>   <dt> <a href="#merge/2">merge(FileNames, Output)</a> </dt> <dd><p>Equivalent to <a href="#merge/3"><code>merge(FileNames, Output, [])</code></a>.</p></dd>   <dt> <a href="#merge/3">merge(FileNames, Output, Options)</a> </dt> <dd><p>Merges terms on files. Each input file is assumed to be sorted.</p></dd>   <dt> <a href="#sort/1">sort(FileName)</a> </dt> <dd><p>Sorts terms on files.</p></dd>   <dt> <a href="#sort/2">sort(Input, Output)</a> </dt> <dd><p>Equivalent to <a href="#sort/3"><code>sort(Input, Output, [])</code></a>.</p></dd>   <dt> <a href="#sort/3">sort(Input, Output, Options)</a> </dt> <dd><p>Sorts terms on files.</p></dd>  </dl> </section> <section id="types" class="details-list"> <h2>Types</h2> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:file_name/0">file_name() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L216" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> file_name() :: <a href="../../../kernel-11.0.4/doc/html/file.html#t:name/0">file:name</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:file_names/0">file_names() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L217" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> file_names() :: [<a href="../../../kernel-11.0.4/doc/html/file.html#t:name/0">file:name</a>()].</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:format/0">format() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L241" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> format() :: binary_term | term | binary | <a href="#t:format_fun/0">format_fun</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:format_fun/0">format_fun() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L242" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> format_fun() :: fun((<a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0">binary</a>()) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()).</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:header_length/0">header_length() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L243" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> header_length() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:i_command/0">i_command() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L218" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> i_command() :: read | close.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:i_reply/0">i_reply() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L219" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> i_reply() :: end_of_input | {end_of_input, <a href="#t:value/0">value</a>()} | {[<a href="#t:object/0">object</a>()], <a href="#t:infun/0">infun</a>()} | <a href="#t:input_reply/0">input_reply</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:infun/0">infun() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L221" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> infun() :: fun((<a href="#t:i_command/0">i_command</a>()) -&gt; <a href="#t:i_reply/0">i_reply</a>()).</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:input/0">input() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L222" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> input() :: <a href="#t:file_names/0">file_names</a>() | <a href="#t:infun/0">infun</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:input_reply/0">input_reply() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L223" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> input_reply() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:key_pos/0">key_pos() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L244" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> key_pos() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>() | [<a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>()].</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:no_files/0">no_files() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L245" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> no_files() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:o_command/0">o_command() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L224" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> o_command() :: {value, <a href="#t:value/0">value</a>()} | [<a href="#t:object/0">object</a>()] | close.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:o_reply/0">o_reply() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L225" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> o_reply() :: <a href="#t:outfun/0">outfun</a>() | <a href="#t:output_reply/0">output_reply</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:object/0">object() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L226" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> object() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:binary/0">binary</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:option/0">option() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L233" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> option() ::
+          {compressed, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {header, <a href="#t:header_length/0">header_length</a>()} |
+          {format, <a href="#t:format/0">format</a>()} |
+          {no_files, <a href="#t:no_files/0">no_files</a>()} |
+          {order, <a href="#t:order/0">order</a>()} |
+          {size, <a href="#t:size/0">size</a>()} |
+          {tmpdir, <a href="#t:tmp_directory/0">tmp_directory</a>()} |
+          {unique, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:options/0">options() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L232" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> options() :: [<a href="#t:option/0">option</a>()] | <a href="#t:option/0">option</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:order/0">order() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L246" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> order() :: ascending | descending | <a href="#t:order_fun/0">order_fun</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:order_fun/0">order_fun() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L247" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> order_fun() :: fun((<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()).</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:outfun/0">outfun() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L227" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> outfun() :: fun((<a href="#t:o_command/0">o_command</a>()) -&gt; <a href="#t:o_reply/0">o_reply</a>()).</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:output/0">output() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L228" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> output() :: <a href="#t:file_name/0">file_name</a>() | <a href="#t:outfun/0">outfun</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:output_reply/0">output_reply() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L229" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> output_reply() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:reason/0">reason()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L251" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> reason() ::
+          bad_object |
+          {bad_object, <a href="#t:file_name/0">file_name</a>()} |
+          {bad_term, <a href="#t:file_name/0">file_name</a>()} |
+          {file_error, <a href="#t:file_name/0">file_name</a>(), <a href="../../../kernel-11.0.4/doc/html/file.html#t:posix/0">file:posix</a>() | badarg | system_limit} |
+          {premature_eof, <a href="#t:file_name/0">file_name</a>()}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:size/0">size() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L248" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> size() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:tmp_directory/0">tmp_directory() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L249" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> tmp_directory() :: [] | <a href="../../../kernel-11.0.4/doc/html/file.html#t:name/0">file:name</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:value/0">value() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L230" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> value() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  </section> </section> </div> </section> <section id="functions" class="details-list"> <h2>Functions</h2> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="check/1">check(FileName)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L408" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> check(FileName) -&gt; Reply
+               when
+                   FileName :: <a href="#t:file_name/0">file_name</a>(),
+                   Reply :: {ok, [Result]} | {error, <a href="#t:reason/0">reason</a>()},
+                   Result :: {FileName, TermPosition, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()},
+                   TermPosition :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>().</pre>  <p>Equivalent to <a href="#check/2"><code>check([FileName], [])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="check/2">check(FileNames, Options)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L422" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> check(FileNames, Options) -&gt; Reply
+               when
+                   FileNames :: <a href="#t:file_names/0">file_names</a>(),
+                   Options :: <a href="#t:options/0">options</a>(),
+                   Reply :: {ok, [Result]} | {error, <a href="#t:reason/0">reason</a>()},
+                   Result :: {FileName, TermPosition, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()},
+                   FileName :: <a href="#t:file_name/0">file_name</a>(),
+                   TermPosition :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>().</pre>  <p>Checks files for sortedness. If a file is not sorted, the first out-of-order element is returned. The first term on a file has position 1.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="keycheck/2">keycheck(KeyPos, FileName)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L437" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> keycheck(KeyPos, FileName) -&gt; Reply
+                  when
+                      KeyPos :: <a href="#t:key_pos/0">key_pos</a>(),
+                      FileName :: <a href="#t:file_name/0">file_name</a>(),
+                      Reply :: {ok, [Result]} | {error, <a href="#t:reason/0">reason</a>()},
+                      Result :: {FileName, TermPosition, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()},
+                      TermPosition :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>().</pre>  <p>Equivalent to <a href="#keycheck/3"><code>keycheck(KeyPos, [Filename], [])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="keycheck/3">keycheck(KeyPos, FileNames, Options)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L452" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> keycheck(KeyPos, FileNames, Options) -&gt; Reply
+                  when
+                      KeyPos :: <a href="#t:key_pos/0">key_pos</a>(),
+                      FileNames :: <a href="#t:file_names/0">file_names</a>(),
+                      Options :: <a href="#t:options/0">options</a>(),
+                      Reply :: {ok, [Result]} | {error, <a href="#t:reason/0">reason</a>()},
+                      Result :: {FileName, TermPosition, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()},
+                      FileName :: <a href="#t:file_name/0">file_name</a>(),
+                      TermPosition :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>().</pre>  <p>Checks files for sortedness. If a file is not sorted, the first out-of-order element is returned. The first term on a file has position 1.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="keymerge/3">keymerge(KeyPos, FileNames, Output)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L371" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> keymerge(KeyPos, FileNames, Output) -&gt; Reply
+                  when
+                      KeyPos :: <a href="#t:key_pos/0">key_pos</a>(),
+                      FileNames :: <a href="#t:file_names/0">file_names</a>(),
+                      Output :: <a href="#t:output/0">output</a>(),
+                      Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Equivalent to <a href="#keymerge/4"><code>keymerge(KeyPos, FileNames, Output, [])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="keymerge/4">keymerge(KeyPos, FileNames, Output, Options)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L383" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> keymerge(KeyPos, FileNames, Output, Options) -&gt; Reply
+                  when
+                      KeyPos :: <a href="#t:key_pos/0">key_pos</a>(),
+                      FileNames :: <a href="#t:file_names/0">file_names</a>(),
+                      Output :: <a href="#t:output/0">output</a>(),
+                      Options :: <a href="#t:options/0">options</a>(),
+                      Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Merges tuples on files. Each input file is assumed to be sorted on key(s).</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="keysort/2">keysort(KeyPos, FileName)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L298" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> keysort(KeyPos, FileName) -&gt; Reply
+                 when
+                     KeyPos :: <a href="#t:key_pos/0">key_pos</a>(),
+                     FileName :: <a href="#t:file_name/0">file_name</a>(),
+                     Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:input_reply/0">input_reply</a>() | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Sorts tuples on files.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="keysort/3">keysort(KeyPos, Input, Output)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L307" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> keysort(KeyPos, Input, Output) -&gt; Reply
+                 when
+                     KeyPos :: <a href="#t:key_pos/0">key_pos</a>(),
+                     Input :: <a href="#t:input/0">input</a>(),
+                     Output :: <a href="#t:output/0">output</a>(),
+                     Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:input_reply/0">input_reply</a>() | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Equivalent to <a href="#keysort/4"><code>keysort(KeyPos, Input, Output, [])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="keysort/4">keysort(KeyPos, Input, Output, Options)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L321" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> keysort(KeyPos, Input, Output, Options) -&gt; Reply
+                 when
+                     KeyPos :: <a href="#t:key_pos/0">key_pos</a>(),
+                     Input :: <a href="#t:input/0">input</a>(),
+                     Output :: <a href="#t:output/0">output</a>(),
+                     Options :: <a href="#t:options/0">options</a>(),
+                     Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:input_reply/0">input_reply</a>() | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Sorts tuples on files. The sort is performed on the element(s) mentioned in <code>KeyPos</code>. If two tuples compare equal (<code>==</code>) on one element, the next element according to <code>KeyPos</code> is compared. The sort is stable.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="merge/2">merge(FileNames, Output)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L345" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> merge(FileNames, Output) -&gt; Reply
+               when
+                   FileNames :: <a href="#t:file_names/0">file_names</a>(),
+                   Output :: <a href="#t:output/0">output</a>(),
+                   Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Equivalent to <a href="#merge/3"><code>merge(FileNames, Output, [])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="merge/3">merge(FileNames, Output, Options)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L356" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> merge(FileNames, Output, Options) -&gt; Reply
+               when
+                   FileNames :: <a href="#t:file_names/0">file_names</a>(),
+                   Output :: <a href="#t:output/0">output</a>(),
+                   Options :: <a href="#t:options/0">options</a>(),
+                   Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Merges terms on files. Each input file is assumed to be sorted.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="sort/1">sort(FileName)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L264" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> sort(FileName) -&gt; Reply
+              when
+                  FileName :: <a href="#t:file_name/0">file_name</a>(),
+                  Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:input_reply/0">input_reply</a>() | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Sorts terms on files.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="sort/2">sort(Input, Output)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L272" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> sort(Input, Output) -&gt; Reply
+              when
+                  Input :: <a href="#t:input/0">input</a>(),
+                  Output :: <a href="#t:output/0">output</a>(),
+                  Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:input_reply/0">input_reply</a>() | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Equivalent to <a href="#sort/3"><code>sort(Input, Output, [])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="sort/3">sort(Input, Output, Options)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/file_sorter.erl#L283" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> sort(Input, Output, Options) -&gt; Reply
+              when
+                  Input :: <a href="#t:input/0">input</a>(),
+                  Output :: <a href="#t:output/0">output</a>(),
+                  Options :: <a href="#t:options/0">options</a>(),
+                  Reply :: ok | {error, <a href="#t:reason/0">reason</a>()} | <a href="#t:input_reply/0">input_reply</a>() | <a href="#t:output_reply/0">output_reply</a>().</pre>  <p>Sorts terms on files.</p> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

@@ -1,0 +1,106 @@
+<div style="display:none;" hidden data-nosnippet>Are you an LLM? You can read better optimized documentation at /guide/recipes/wait-for.md for this page in Markdown format</div>
+<h1 id="waiting-for-async-conditions" tabindex="-1">Waiting for Async Conditions </h1>
+<p>Plenty of things in tests don't happen synchronously. A server takes a moment to boot, or a DOM element renders after a microtask. Waiting with <code>setTimeout</code> tends to land on either a flaky undershoot or a wasteful long sleep, and a manual polling loop is more code than you want to write per test.</p>
+<p>Vitest provides helpers that poll on your behalf, retrying on a fixed interval until the condition holds or a timeout elapses.</p>
+<h2 id="expect-poll-retry-an-assertion" tabindex="-1">
+<code>expect.poll</code>: retry an assertion </h2>
+<p>Use <a href="../../api/expect.html#poll"><code>expect.poll</code></a> when the wait condition is an assertion. The callback returns the value to assert on, the matcher does the comparison, and Vitest retries the whole expression at each interval until the matcher passes.</p>
+<div class="language-ts">
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">import { expect, test } from 'vitest'
+import { createServer } from './server.ts'
+
+test('server starts', async () =&gt; {
+  const server = createServer()
+
+  await expect.poll(() =&gt; server.isReady, {
+    timeout: 500,
+    interval: 20
+  }).toBe(true)
+})</pre>
+</div>
+<p>The failure message is the standard <code>expect</code> diff, with no manual <code>throw new Error('Server not started')</code> to maintain. This is the right tool for most "wait for X to become Y" cases.</p>
+<p><code>expect.poll</code> makes every assertion asynchronous, so the call must be awaited. Some matchers don't pair with it: snapshot matchers (which would always succeed under polling), <code>.resolves</code> and <code>.rejects</code> (the condition is already awaited), and <code>toThrow</code> (the value is resolved before the matcher sees it). For any of those, reach for <code>vi.waitFor</code> instead.</p>
+<h2 id="vi-waitfor-wait-and-capture-the-value" tabindex="-1">
+<code>vi.waitFor</code>: wait and capture the value </h2>
+<p><a href="../../api/vi.html#vi-waitfor"><code>vi.waitFor</code></a> is the right tool when the wait condition is the work itself succeeding rather than an assertion you write. It runs the callback at each interval; a thrown error queues another attempt, and the first call that doesn't throw resolves the wait with whatever the callback returned.</p>
+<div class="language-ts">
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">import { expect, test, vi } from 'vitest'
+import { connect, DB_URL } from './db.ts'
+
+test('database is reachable', async () =&gt; {
+  // `connect` throws ECONNREFUSED until the database accepts connections
+  const client = await vi.waitFor(() =&gt; connect(DB_URL), {
+    timeout: 5000,
+    interval: 100,
+  })
+
+  const rows = await client.query('SELECT 1 AS ok')
+  expect(rows[0].ok).toBe(1)
+})</pre>
+</div>
+<p>The throw that drives the retry comes from <code>connect</code> itself, not from an <code>expect</code> you wrote inside the callback. <code>expect.poll</code> doesn't fit this shape because it's built around assertions, and "retry until this call stops throwing and hand me the result" isn't an assertion. Wrapping the call in a <code>try</code>/<code>catch</code> to fake one would either duplicate the work after the wait or require building the retry loop by hand.</p>
+<h2 id="vi-waituntil-poll-until-truthy-fail-fast-on-errors" tabindex="-1">
+<code>vi.waitUntil</code>: poll until truthy, fail fast on errors </h2>
+<p>Use <a href="../../api/vi.html#vi-waituntil"><code>vi.waitUntil</code></a> for a value lookup where any thrown error should fail the test on the spot rather than be retried away. Each interval calls the callback again. A truthy return resolves the wait; a falsy return waits for the next interval. A thrown error fails the test immediately.</p>
+<div class="language-ts">
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">import { expect, test, vi } from 'vitest'
+import { jobResults, startJob } from './worker.ts'
+
+test('worker completes the job', async () =&gt; {
+  startJob('build-42')
+
+  const result = await vi.waitUntil(
+    () =&gt; jobResults.get('build-42'),
+    { timeout: 5000, interval: 100 },
+  )
+
+  expect(result.status).toBe('ok')
+  expect(result.steps).toHaveLength(4)
+})</pre>
+</div>
+<p><code>jobResults.get('build-42')</code> returns <code>JobResult | undefined</code>. <code>waitUntil</code> polls until it returns a truthy value, narrows the resolved type to <code>JobResult</code>, and hands it back for further assertions. If the lookup itself throws because of a programming error like a typo in the import, <code>waitUntil</code> surfaces the error on the first attempt rather than retrying past it.</p>
+<p>In browser mode, prefer <a href="../../api/browser/locators.html"><code>page.locator</code></a> and <a href="../../api/browser/assertions.html"><code>expect.element</code></a> over <code>waitUntil</code> for DOM queries: locators retry on their own and produce richer failure messages.</p>
+<h2 id="picking-between-them" tabindex="-1">Picking between them </h2>
+<table tabindex="0">
+<thead><tr>
+<th></th>
+<th><code>expect.poll</code></th>
+<th><code>vi.waitFor</code></th>
+<th><code>vi.waitUntil</code></th>
+</tr></thead>
+<tbody>
+<tr>
+<td>Reach for it when</td>
+<td>the wait is an assertion</td>
+<td>the work might fail until it's ready</td>
+<td>a lookup might be falsy and that's fine</td>
+</tr>
+<tr>
+<td>Retries on thrown error</td>
+<td>yes</td>
+<td>yes</td>
+<td>no, fails fast</td>
+</tr>
+<tr>
+<td>Resolves with</td>
+<td>the assertion</td>
+<td>callback's return value</td>
+<td>callback's return value</td>
+</tr>
+</tbody>
+</table>
+<p>Each of these accepts <code>{ timeout, interval }</code> options, defaulting to a 1000 ms timeout and 50 ms intervals. <code>vi.waitFor</code> and <code>vi.waitUntil</code> also accept a number in place of the options object as shorthand for the timeout.</p>
+<h2 id="fake-timers" tabindex="-1">Fake timers </h2>
+<p>If <a href="../../api/vi.html#vi-usefaketimers"><code>vi.useFakeTimers</code></a> is active, <code>vi.waitFor</code> automatically calls <code>vi.advanceTimersByTime(interval)</code> between attempts. That keeps <code>setTimeout</code>-based code under test reachable without leaking real time into the test.</p>
+<h2 id="see-also" tabindex="-1">See also </h2>
+<ul>
+<li><a href="../../api/expect.html#poll"><code>expect.poll</code></a></li>
+<li><a href="../../api/vi.html#vi-waitfor"><code>vi.waitFor</code></a></li>
+<li><a href="../../api/vi.html#vi-waituntil"><code>vi.waitUntil</code></a></li>
+<li><a href="../../api/vi.html#vi-usefaketimers"><code>vi.useFakeTimers</code></a></li>
+</ul><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2021-Present VoidZero Inc. and Vitest contributors<br>Licensed under the MIT License.<br>
+    <a href="https://vitest.dev/guide/recipes/wait-for" class="_attribution-link">https://vitest.dev/guide/recipes/wait-for</a>
+  </p>
+</div>

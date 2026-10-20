@@ -1,0 +1,1219 @@
+<h1>Secure Coding Guidelines</h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/system/doc/design_principles/secure_coding.md#L1" title="View Source" class="source" rel="help nofollow">Source</a>  
+<p>This section provides a guideline for writing secure Erlang code, describing common pitfalls and weaknesses best avoided. From time to time, it will reference the <a rel="nofollow" href="https://cwe.mitre.org" title="">Common Weakness Enumeration</a> (CWE) maintained by <a rel="nofollow" href="https://mitre.org" title="">MITRE</a>, as well as the application security risks maintained by <a rel="nofollow" href="https://owasp.org/" title="">OWASP</a>.</p>
+<p>There are also sections addressing the <a href="#h-top-40-cwes" title="">Top 40 CWEs</a>, the <a href="#h-owasp-top-10" title="">OWASP Top 10</a> security risks, and the <a href="#owasp-api-top-10" title="">OWASP API Security Top 10</a>. Finally, there is a section with concrete <a href="#secure-coding-rules" title="">Secure Coding Rules</a>.</p>
+<p>This is a living document and is updated as new best practices are discovered. It is by no means complete, and contributions to improve it are warmly welcomed. Those following these guidelines will hopefully avoid the listed issues, but undiscovered issues remain.</p>
+<h2 id="background">Background</h2>
+<p>Before going into rules and guidelines, it is important to describe a few things specific to Erlang that may not be obvious coming from other languages. We will begin with the threat model used throughout Erlang/OTP itself. Your applications may have a different model, but it is nevertheless necessary to understand what Erlang/OTP can be expected to protect against, and what it cannot be.</p>
+<p>Throughout this document we will use the terms <em>trusted</em> and <em>untrusted</em> to mean <em>fully trusted</em> and <em>not fully trusted</em>, respectively. No distinction is made between <em>partially trusted</em> and <em>untrusted</em> and it is important to remember that anything that is not <em>fully and completely trusted</em> must be considered as <em>untrusted</em> as something given to you by a malicious actor.</p>
+<h4>What <em>is not</em> protected against</h4>
+<ul>
+<li>
+<p>All loaded code is assumed to be trusted. There is no built-in sand-boxing mechanism for running untrusted Erlang code. Any code loaded and executed within the environment has unrestricted access to the system.</p>
+<ul>
+<li>
+<p>This means that a malicious BEAM module can do anything, including breaking the memory safety protections of the runtime system and crashing the virtual machine. This is no different from other languages, where for example modifying a Rust executable on disk could also break memory safety.</p>
+<p>It is therefore important that the user secures the host system so that an attacker cannot modify any files relevant to the program.</p>
+</li>
+<li><p>Excessive resource usage is not prevented by default. Unless safeguards are are put in place (for example heap size limitations), a process is free to consume enough resources to crash the whole program.</p></li>
+</ul>
+</li>
+<li>
+<p>All nodes connected through Erlang distribution are assumed to be trusted, and have unrestricted access to all other connected systems.</p>
+<p>Crucially, there is no authentication built into the default distribution protocol, merely a <a href="distributed.html#security" title="">"cookie" mechanism</a> that prevents the unintentional mixing of Erlang clusters on the same network. For secure communication over an unsecured network, the distribution should be configured to use <a href="../../lib/ssl-11.7.7/doc/html/ssl_distribution.html" title="">TLS with client certificate verification</a>.</p>
+</li>
+<li>
+<p>Inappropriate usage of functionality is not guaranteed to crash or produce sensible results. The arguments given to many Erlang functions are assumed to be trusted, so providing valid-appearing but nonsensical input to a function can have it produce valid-appearing garbage instead of crashing or returning an error.</p>
+<p>Furthermore, using undocumented functionality, whether it is a function, option, et cetera, can result in almost anything happening.</p>
+</li>
+</ul>
+<h4>What <em>is</em> protected against</h4>
+<ul>
+<li>
+<p>Erlang is a memory-safe language.</p>
+<p>CWE categories related to memory safety (both spatial and temporal), such as <a href="#cwe-416" title=""><code>CWE-416</code></a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/465.html" title="">CWE-465</a> or <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/1218.html" title="">CWE-1218</a>, cannot occur. This safety extends to concurrent operation and race conditions can only affect application logic, which is further limited as Erlang only provides message-passing (as opposed to memory-sharing) concurrency; a classical data race (<a href="#cwe-362" title=""><code>CWE-362</code></a>) cannot occur unless the programmer has explicitly built a shared resource for which it can happen. Furthermore, errors relating to the use of uninitialized variables cannot occur.</p>
+<p>Importing memory-unsafe code through the Foreign Function Interfaces (FFI), such as <a href="../../erts-17.1/doc/html/erl_driver.html" title="">drivers</a> and <a href="../../erts-17.1/doc/html/erl_nif.html" title="">Native Implemented Functions</a> (NIFs), may, of course, violate this property, but there are no unsafe constructs in the language itself.</p>
+</li>
+<li><p>Classical memory leaks cannot occur. While data can be explicitly referenced for longer than necessary by mistake, memory that is no longer referenced will eventually be reclaimed by the garbage collector.</p></li>
+<li>
+<p>Erlang processes are isolated and can only affect other entities through the use of signals: messages, links, monitors, and so on. A process that crashes will do so without any impact on other processes other than that defined by the programmer.</p>
+<p>Furthermore, the execution of a process cannot block that of another process, other than as defined by the programmer such as waiting for a response to a message that the other process never sends. The effects of, for example, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/835.html" title="">CWE-835</a> are thus limited to the offending process and can be recovered from through termination.</p>
+</li>
+<li>
+<p>The behavior of all Erlang programs is defined for all possible inputs, and while an operation may appear partial in that it only returns a result for certain arguments and otherwise throws an exception, the latter always leaves the program in a well-defined state.</p>
+<p>Like with memory safety, this property can be violated if the foreign function interfaces are misused.</p>
+</li>
+<li><p>Erlang uses arbitrary precision integer arithmetic, and overflow will only occur once the numbers reach several megabits in size, and will in any event throw an exception instead of wrapping around or otherwise behaving in an unsafe manner (<a href="#cwe-190" title=""><code>CWE-190</code></a>).</p></li>
+</ul>
+
+<h3 id="error-handling">Error Handling</h3>
+<p>Generally, errors can be split into three categories regardless of the language used:</p>
+<ol>
+<li>The errors that we do not expect to handle gracefully, such as our local disk storage suddenly becoming unavailable. A sensible way to deal with this would be, for example, to raise an alarm.</li>
+<li>The errors that we expect to handle gracefully, such as a web server responding with a 404 error when it cannot find a file.</li>
+<li>
+<em>Program bugs</em>, such as writing to a closed file.</li>
+</ol>
+<p>What we wish to do with these three categories is entirely different, but unfortunately classical error handling tends to mix the three, either using return values or exceptions for all of them, which causes issues more often than not. The third category is especially sinister because of the difficulty in ensuring that the offending code has not left parts of the program in an invalid state, but it is nevertheless necessary for a language to be able to handle it since a broken invariant in an insignificant part of the program would otherwise tear the entire program down.</p>
+<p>The isolation properties given by Erlang processes works together with the idea of supervision trees to allow generalized recovery from third-category errors without the programmer having to define each particular case. Whatever the crashing process worked on is lost, but the program as a whole is spared.</p>
+<p>This has far-reaching implications. Because the effects of a crash are so limited, a cornerstone of idiomatic error handling in Erlang is to abandon execution once something unexpected occurs, leaving the consequences to the program's supervision structure instead of ignoring or trying to handle the condition and continuing execution. If a program encounters an error of the first or second categories, it can either handle them explicitly, or leave it to the supervision structure by either pattern-matching on the return value or leaving exceptions uncaught.</p>
+<p>This greatly improves security and reliability, as blindly continuing execution may not only result in unexpected behavior, but can also become a security issue as assumptions that are made may no longer be valid.</p>
+<p>That is not to say that <em>expected</em> errors should not be handled, but rather that each component that cannot meaningfully handle all the consequences of an error on its own should not attempt to do so, but should instead leave it to the supervision structure. Another way of looking at this is to say that program execution should be "deny by default" and that it may only continue as explicitly defined.</p>
+<p>Needless to say, a well-designed supervision structure is a prerequisite for this. To be effective it must adequately model the program's domain such that local failures are contained locally: for example, in a server a single failed request should not tear down the entire program, but only the subtree started through said request. Care should also be taken to handle the errors that are expected and can be handled locally to avoid spamming the error logs, for example by responding to the request with an error message (such as "404 File not found" in a web context).</p>
+<p>The importance of this cannot be overstated. Security issues are almost by definition a result of unexpected program behavior, and restricting program behavior to only that which is expected greatly reduces the surface area for bugs and security issues.</p>
+
+<h3 id="memory-management">Memory Management</h3>
+<p>Erlang is a memory-safe language, with automatic memory management handled by its runtime system. Each process primarily allocates data on its own heap, while large binaries can be shared efficiently between processes. Process heaps undergo individual garbage collection, ensuring that unused memory within a process is reclaimed promptly.</p>
+<p>In addition to process heaps, Erlang provides Erlang Term Storage (ETS), an in-memory storage system for terms. Memory for ETS entries is allocated automatically upon insertion and freed when entries are removed. This automatic memory management effectively eliminates many common memory-related vulnerabilities typical in low-level languages, such as use-after-free errors.</p>
+<p>Erlang's automatic memory management prevents memory leaks by releasing memory once there are no remaining references. However, developers must still make sure to drop references to unused data, just as in other programming languages. Failing to do so can lead to memory retention issues similar to leaks, which may cause performance degradation or potentially become exploitable vulnerabilities. Therefore, careful management of data references remains essential to maintain application reliability and security.</p>
+
+<h3 id="atom-exhaustion">Atom Exhaustion</h3>
+<p>Data of the type <code>atom</code> is very space efficient and performant to use, but it must be used with care as it is not intended to be used dynamically: the intended use case is to provide named constants in code. The amount of atoms in the system is limited (see <a href="system_limits.html" title="">system limits</a> and <a href="#cwe-770" title=""><code>CWE-770</code></a>) and cannot be reclaimed once created. That is, if you dynamically create a large amount of atoms, the system might crash.</p>
+<p>See <a href="#rule-dsg-003" title=""><code>DSG-003</code></a> for ways to prevent this.</p>
+
+<h3 id="native-code">Native Code</h3>
+<p>Native code can be dynamically linked into the Erlang runtime system either as a <a href="../../erts-17.1/doc/html/erl_driver.html" title="">driver</a> or <a href="../../erts-17.1/doc/html/erl_nif.html" title="">NIF library</a>. Drivers and NIF libraries are typically written in C or C++ and have, if not full access, access to a large part of the runtime system internals.</p>
+<p>Drivers and NIF libraries are, of course, not necessarily unsafe and sometimes their use is unavoidable, but it is much easier to avoid introducing vulnerabilities and other problems by writing Erlang code whenever possible. Thorough care needs to be taken both to follow secure programming guidelines for the language that the native code is written in as well as the guidelines for writing drivers and NIF libraries. Poorly written native code can both introduce vulnerabilities as well as stability problems.</p>
+<p>A NIF library is loaded using <a href="../../erts-17.1/doc/html/erlang.html#load_nif/2"><code>erlang:load_nif/2</code></a> function while a driver is loaded using one of the <a href="../../lib/kernel-11.0.4/doc/html/erl_ddll.html"><code>erl_ddll</code></a> load functions.</p>
+<h2 id="application-specific-guidelines">Application-Specific Guidelines</h2>
+
+<h3 id="crypto-application">crypto Application</h3>
+
+<h4>Initializing <code>crypto</code>
+</h4>
+<p>The <code>libcrypto</code> library from OpenSSL will be loaded and configured when the <a href="../../lib/crypto-5.10/doc/html/crypto.html"><code>crypto</code></a> module is loaded. During loading of the <a href="../../lib/crypto-5.10/doc/html/crypto.html"><code>crypto</code></a> module some crypto application parameters will be read in order to configure the <code>libcrypto</code> library. Such application parameters are only available after the application has been started using the <a href="../../lib/kernel-11.0.4/doc/html/application.html#start/1"><code>application:start/1</code></a> functionality. That is, in order to make sure that the <code>libcrypto</code> library is configured as expected, make sure not to load the <a href="../../lib/crypto-5.10/doc/html/crypto.html"><code>crypto</code></a> module by any other means than calling <code>application:start(crypto)</code>. Any calls to the <a href="../../lib/crypto-5.10/doc/html/crypto.html"><code>crypto</code></a> library will load the module. Make sure not to call any functions in the <a href="../../lib/crypto-5.10/doc/html/crypto.html"><code>crypto</code></a> module, including <a href="../../lib/crypto-5.10/doc/html/crypto.html#start/0"><code>crypto:start/0</code></a> prior to the call to <code>application:start(crypto)</code>.</p>
+<p>In order to ensure that the FIPS mode is configured correctly in the <code>libcrypto</code> library from OpenSSL, use the <a href="../../lib/crypto-5.10/doc/html/crypto_app.html#fips_mode" title=""><code>fips_mode</code></a> application parameter instead of calling <a href="../../lib/crypto-5.10/doc/html/crypto.html#enable_fips_mode/1"><code>crypto:enable_fips_mode/1</code></a>.</p>
+
+<h4>Cryptographically Secure Random Numbers</h4>
+<p>Do not use <a href="../../lib/crypto-5.10/doc/html/crypto.html#rand_uniform/2"><code>crypto:rand_uniform/2</code></a> since it uses functionality from the OpenSSL <code>libcrypto</code> library that in old versions of the library does not produce cryptographically secure random numbers (<a rel="nofollow" href="https://cwe.mitre.org/data/definitions/338.html" title="">CWE-338</a>). An alternative is using <a href="../../lib/stdlib-8.1/doc/html/rand.html#uniform/1"><code>rand:uniform/1</code></a> together with a cryptographically secure random number generator like <a href="../../lib/crypto-5.10/doc/html/crypto.html#rand_seed/0"><code>crypto:rand_seed/0</code></a>. Note that <a href="../../lib/crypto-5.10/doc/html/crypto.html#rand_seed/0"><code>crypto:rand_seed/0</code></a> not only produces a seed but also selects a generator that will be used by <a href="../../lib/stdlib-8.1/doc/html/rand.html#uniform/1"><code>rand:uniform/1</code></a>.</p>
+<p>The above mentioned functionality will store a state in the <a href="ref_man_processes.html#process-dictionary" title="">process dictionary</a> of the currently executing process. This state could be modified to select another generator by other functionality called interleaved with calls retrieving random numbers. A better solution is to use the functional API, which will pass the state between calls instead of storing it in the process dictionary. The functional API are functions in the <a href="../../lib/stdlib-8.1/doc/html/rand.html"><code>rand</code></a> and <a href="../../lib/crypto-5.10/doc/html/crypto.html"><code>crypto</code></a> modules with function names having the suffix <code>_s</code>. That is, you might want to consider using <a href="../../lib/crypto-5.10/doc/html/crypto.html#rand_seed_s/0"><code>crypto:rand_seed_s/0</code></a>/<a href="../../lib/stdlib-8.1/doc/html/rand.html#uniform_s/2"><code>rand:uniform_s/2</code></a> instead of <a href="../../lib/crypto-5.10/doc/html/crypto.html#rand_seed/0"><code>crypto:rand_seed/0</code></a>/<a href="../../lib/stdlib-8.1/doc/html/rand.html#uniform/1"><code>rand:uniform/1</code></a>.</p>
+
+<h4>Legacy <code>crypto</code> Functions</h4>
+<p>RSA with PKCS-1 padding is weak and should be avoided: do not use the <code>rsa_pkcs1_padding</code> option with <a href="../../lib/crypto-5.10/doc/html/crypto.html#private_encrypt/4"><code>crypto:private_encrypt/4</code></a>, <a href="../../lib/crypto-5.10/doc/html/crypto.html#private_decrypt/4"><code>crypto:private_decrypt/4</code></a>, <a href="../../lib/crypto-5.10/doc/html/crypto.html#public_encrypt/4"><code>crypto:public_encrypt/4</code></a>, or <a href="../../lib/crypto-5.10/doc/html/crypto.html#public_decrypt/4"><code>crypto:public_decrypt/4</code></a>.</p>
+<p>For signatures, use <a href="../../lib/crypto-5.10/doc/html/crypto.html#sign/4"><code>crypto:sign/4</code></a>/<a href="../../lib/crypto-5.10/doc/html/crypto.html#verify/5"><code>crypto:verify/5</code></a> instead.</p>
+
+<h3 id="ssl-application">ssl Application</h3>
+<p>The <span title=""><code>ssl</code></span> application is secure by default and remains so if the recommendations in its documentation is followed. One must be especially careful when enabling legacy functionality, as it weakens security. It should only be done when absolutely necessary.</p>
+<p>However, disabling functionality can be beneficial. If you control both the server and the client, consider disabling the (now old) TLS 1.2 in favor of TLS 1.3. The <a href="../../lib/ssl-11.7.7/doc/html/ssl.html#t:common_option_cert/0"><code>cert_keys</code></a> option can also be used to configure more than one possible certificate/key pair for a client or server, giving good security while allowing interoperability with legacy systems for a period of time.</p>
+<p>See also <a href="../../lib/ssl-11.7.7/doc/html/ssl_hardening.html"><code>TLS Hardening Guide</code></a></p>
+
+<h3 id="ssh-application">ssh Application</h3>
+<p>See the <span title=""><code>ssh</code></span> documentation's <a href="../../lib/ssh-6.0.6/doc/html/hardening.html">hardening chapter</a>.</p>
+
+<h3 id="public_key-application">public_key Application</h3>
+<p>RSA with PKCS-1 padding is weak and should be avoided: do not use the <code>rsa_pkcs1_padding</code> option with <a href="../../lib/public_key-1.21.7/doc/html/public_key.html#encrypt_private/3" title=""><code>public_key:encrypt_private/2,3</code></a>, <a href="../../lib/public_key-1.21.7/doc/html/public_key.html#decrypt_private/3" title=""><code>public_key:decrypt_private/2,3</code></a>, <a href="../../lib/public_key-1.21.7/doc/html/public_key.html#encrypt_public/3" title=""><code>public_key:encrypt_public/2,3</code></a> or <a href="../../lib/public_key-1.21.7/doc/html/public_key.html#decrypt_public/3" title=""><code>public_key:decrypt_public/2,3</code></a>.</p>
+<p>For signatures, use <a href="../../lib/public_key-1.21.7/doc/html/public_key.html#sign/4"><code>public_key:sign/4</code></a>/<a href="../../lib/public_key-1.21.7/doc/html/public_key.html#verify/5"><code>public_key:verify/5</code></a> instead.</p>
+
+<h3 id="xmerl-application">xmerl Application</h3>
+<p>The <a href="../../lib/xmerl-2.2/doc/html/xmerl_scan.html"><code>xmerl_scan</code></a> module dynamically produces new atoms and is therefore not suitable for decoding XML data originating untrusted sources.</p>
+<p>When parsing untrusted XML, you want to prevent XML entity attacks by disabling parsing of entities. In the <a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html"><code>xmerl_sax_parser</code></a> you can do that by passing the <a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html#t:options/0"><code>disallow_entities</code></a> option.</p>
+
+<h2 id="rules-secure-coding-standard">Rules / Secure Coding Standard</h2>
+
+<p>This section contains some general rules that may be helpful in writing more secure code. The rules link to related CWEs and OWASP risks, and also have a rough priority for the order in which we think the rules should be applied on an existing code base. The priorities are <code>Critical</code>, <code>High</code>, <code>Medium</code>, and <code>Recommendation</code>. The priority of a rule largely reflects how likely it is for related flaws to lead to a vulnerability, how severe said vulnerability is, and how easy it is to fix.</p>
+<h3 id="code-style">Code Style</h3>
+
+<h4>
+<a href="#rule-stl-001" title=""><code>STL-001</code></a> - Be Restrictive</h4>
+<p>As described in the <a href="#h-error-handling" title="">Error Handling</a> section, all unexpected errors should be left to the supervision structure, and all unexpected <em>conditions</em> should be considered errors. In brief, this is because encountering something unexpected means that we have left the <em>known and tested</em> path, and continuing greatly increases the risk for bugs and security issues.</p>
+<p>Erlang code should be written as restrictively as possible, to provoke errors whenever anything unexpected happens. The idea is to make the third error category, program bugs, visible as a crash instead of silently continuing.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>High</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/252.html" title="">CWE-252</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/253.html" title="">CWE-253</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/391.html" title="">CWE-391</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/392.html" title="">CWE-392</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/394.html" title="">CWE-394</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/396.html" title="">CWE-396</a>, <a href="#owasp-a10-2025" title=""><code>A10:2025</code></a></p>
+<pre data-language="erlang">%% DO
+case operation(A, B) of
+    true -&gt; C;
+    false -&gt; D
+end.
+
+%% DO NOT
+case operation(A, B) of
+    true -&gt; C;
+    %% What if operation/2 is extended to also return 'maybe', or someone
+    %% misspells 'true' as 'tru'?
+    _ -&gt; D
+end.
+
+%% DO
+ok = file:write(Fd, Data)
+
+%% DO NOT
+_ = file:write(Fd, Data)
+
+%% DO
+foo([First | Rest]) -&gt;
+    [bar(First) | foo(Rest)];
+foo([]) -&gt;
+    [].
+
+%% DO NOT
+foo([First | Rest]) -&gt;
+    [bar(First) | foo(Rest)];
+foo(_) -&gt;
+    [].
+
+%% DO
+input_to_atom(&lt;&lt;"foo"&gt;&gt;) -&gt; foo;
+input_to_atom(&lt;&lt;"bar"&gt;&gt;) -&gt; bar;
+input_to_atom(&lt;&lt;"quux"&gt;&gt;) -&gt; quux.
+
+%% DO NOT, when set of possible atoms is known beforehand
+input_to_atom(Text) -&gt; binary_to_existing_atom(Text).
+
+%% DO
+try operation(A, B) of
+    {ok, X} -&gt; something(X)
+catch
+    error:specific_error -&gt; error
+end.
+
+%% DO NOT
+try operation(A, B) of
+    {ok, X} -&gt; something(X)
+catch
+    error:_ -&gt; error
+end.
+
+%% PREFER
+case my_filter(List0, unchanged) of
+    unchanged -&gt; List0;
+    {changed, List} -&gt; List
+end
+
+%% AVOID
+case my_filter(List0, unchanged) of
+    unchanged -&gt; List0;
+    %% What if a misspelled atom like 'uchanged' is returned?
+    List -&gt; List
+end
+
+%% PREFER
+[op(L) || #my_record{}=L &lt;:- ListOfMyRecord]
+
+%% AVOID, this silently filters out entries that do not match #my_record{}
+[op(L) || #my_record{}=L &lt;- ListOfMyRecord]</pre>
+
+<h4>
+<a href="#rule-stl-002" title=""><code>STL-002</code></a> - Avoid Boolean Blindness</h4>
+<p>Whenever boolean values have a context, prefer using more descriptive atoms to express the boolean value, for example <code>initialized</code>/<code>uninitialized</code> or <code>changed</code>/<code>unchanged</code>. This makes it easier to distinguish between different boolean variables when many of them are used together, especially when matching in function heads and the like.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Recommendation</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/628.html" title="">CWE-628</a></p>
+<pre data-language="erlang">%% DO
+case my_filter(List0, unchanged) of
+    unchanged -&gt; List0;
+    {changed, List} -&gt; List
+end
+
+%% DO NOT
+case my_filter(List0, false) of
+    false -&gt; List0;
+    {true, List} -&gt; List
+end</pre>
+
+<h4>
+<a href="#rule-stl-003" title=""><code>STL-003</code></a> - Use Uppercase Names for Macros</h4>
+<p>Macros are distinguished by a <code>?</code> prefix, so an accidental omission of the prefix leaves the name there instead of applying the macro. For example, <code>function_call(?my_macro, SomeArg)</code> becomes <code>function_call(my_macro, SomeArg)</code> which is syntactically valid, hiding the error.</p>
+<p>Static analysis tools can often find these issues, but a quicker way to find them is to adopt the convention that all macros should be upper-case. Missing a <code>?</code> will in most cases then lead to an unbound variable error or similar.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Recommendation</code></p>
+<pre data-language="erlang">%% DO
+-define(MY_MACRO, 65535).
+
+%% DO NOT
+-define(my_macro, 65535).</pre>
+<h3 id="deployment">Deployment</h3>
+
+<h4>
+<a href="#rule-dep-001" title=""><code>DEP-001</code></a> - Do Not Expose Default Erlang Distribution on Untrusted Networks</h4>
+<p>The builtin Erlang distribution makes it possible to easily and transparently communicate between Erlang nodes. By default, communication is performed over an unencrypted TCP connection with a rudimentary <a href="distributed.html#security" title="">cookie based authentication</a> only present in order to prevent mistakes. This configuration should <em>only</em> be used in a trusted network. In order to communicate between nodes over an untrusted network, the Erlang distribution protocol should be configured to <a href="../../lib/ssl-11.7.7/doc/html/ssl_distribution.html" title="">communicate between nodes using TLS</a>.</p>
+<p>Note that the Erlang Port Mapper Daemon (<a href="../../erts-17.1/doc/html/erl_dist_protocol.html#epmd-protocol" title="">EPMD</a>) service will respond to unauthenticated requests, and can by this leak information about what Erlang nodes exist and what ports they are listening on (<a rel="nofollow" href="https://cwe.mitre.org/data/definitions/668.html" title="">CWE-668</a>, <a href="#cwe-200" title=""><code>CWE-200</code></a>). You are therefore advised to <a href="../../erts-17.1/doc/html/erl_cmd.html#start_epmd" title="">disable the default EPMD</a> and implement your own <a href="../../lib/kernel-11.0.4/doc/html/erl_epmd.html" title="">EPMD module</a> using another port lookup scheme and <a href="../../lib/kernel-11.0.4/doc/html/kernel_app.html#epmd_module" title="">enable that EPMD module</a>. The simplest solution, assuming only one Erlang node per IP address, would be to use a statically assigned port, skip registration of nodes, and just assume that a node will be listening on that port.</p>
+<p>Also note that all nodes admitted into an Erlang cluster must be trusted. Once a node is connected to the cluster, it gains complete access to the resources and operations of all other nodes, making node trustworthiness a critical security consideration.</p>
+<p>If the distribution protocol is not required per se, Erlang/OTP includes the <span title=""><code>ssh</code></span> and <span title=""><code>ssl</code></span> applications, enabling secure communication over untrusted networks. Depending on the nature of the communication and the remote parties involved, you may need to explicitly validate and sanitize incoming data to ensure safety and correctness.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Critical</code></p>
+<p>Related CWEs and OWASP risks: <a href="#cwe-200" title=""><code>CWE-200</code></a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/668.html" title="">CWE-668</a>, <a href="#owasp-a01-2025" title=""><code>A01:2025</code></a>, <a href="#owasp-a02-2025" title=""><code>A02:2025</code></a>, <a href="#owasp-api2-2023" title=""><code>API2:2023</code></a>, <a href="#owasp-api6-2023" title=""><code>API6:2023</code></a>, <a href="#owasp-api8-2023" title=""><code>API8:2023</code></a></p>
+
+<h4>
+<a href="#rule-dep-002" title=""><code>DEP-002</code></a> - Build and Install Erlang/OTP Yourself</h4>
+<p>Recommendations found elsewhere on the internet on how to build and install Erlang/OTP are often problematic. While tools like <code>kerl</code> and <code>asdf</code> or prebuilt docker images are convenient, they sometimes patch Erlang/OTP or set <code>CFLAGS</code>/<code>LDFLAGS</code> themselves, which has caused problems in some cases. It is better to <a href="install.html" title="">build Erlang/OTP</a> yourself instead of relying on external build tools or already-built installations from other suppliers.</p>
+<p>Setting <code>CFLAGS</code> and <code>LDFLAGS</code> may cause issues if you are not careful. When building Erlang/OTP, a lot of different executables as well as shared libraries will be built. Options set in <code>CFLAGS</code> and <code>LDFLAGS</code> will be used when compiling both executables and shared libraries, so you only want to pass flags that are useful for all executables as well as all shared libraries in that manner.</p>
+<p>Some guides recommend passing the <code>pie</code> options (position independent executables), which <em>should not</em> be passed in <code>CFLAGS</code> and <code>LDFLAGS</code> since it might conflict with the <code>pic</code> (position independent code) options used when building shared libraries. In order to build position independent executables, you instead want to pass the <code>--enable-pie</code> <a href="install.html#advanced-configuration-and-build-of-erlang-otp" title=""><code>configure</code></a> argument when configuring the build, which will make sure to use <code>pie</code> options where appropriate.</p>
+<p>As of Erlang/OTP 28.0, the <code>configure</code> script that you run when building Erlang/OTP will, on Unix like systems, try to enable most of the C/C++ hardening flags recommended by the Open Source Security Foundation. By setting the environment variable <code>V=1</code> when building, you can see the full command line for each invocation of the compiler as well as the linker. By inspecting that output you can see what hardening flags is being used in your build.</p>
+<p>Make sure to build Erlang/OTP using an up to date OpenSSL. By pointing out the OpenSSL installation to use by passing the <code>--with-ssl=PATH</code> argument to <a href="install.html#advanced-configuration-and-build-of-erlang-otp" title=""><code>configure</code></a> when building one can ensure that the build does not build against another old OpenSSL installation found on the system. By passing the <code>--disable-dynamic-ssl-lib</code> <a href="install.html#advanced-configuration-and-build-of-erlang-otp" title=""><code>configure</code></a> when building, the <code>libcrypto</code> library from OpenSSL will be statically linked into the crypto NIF library ensuring that the selected version from OpenSSL actually will be used, and not another version being picked up from the system where Erlang/OTP is being run. Note that only the <code>libcrypto</code> library from OpenSSL will be used and that vulnerabilities in other parts of OpenSSL do not affect Erlang/OTP. The <code>ssl</code> and <code>public_key</code> applications implement most things except for crypto functionality, which is provided by the <code>crypto</code> application, which in turn uses <code>libcrypto</code>.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>High</code></p>
+<p>Related CWEs and OWASP risks: <a href="#owasp-a03-2025" title=""><code>A03:2025</code></a></p>
+
+<h4>
+<a href="#rule-dep-003" title=""><code>DEP-003</code></a> - Use Actively Maintained Versions of Erlang/OTP</h4>
+<p>Make sure to use an actively maintained version of Erlang/OTP. The <a href="https://erlang.org/download/otp_versions_tree.html" title="">OTP Versions Tree</a> page contains information about maintained Erlang/OTP releases as well as CVEs affecting different OTP versions. <a href="https://erlang.org/download/vex/" title="">VEX documents</a>, which provide information about potential vulnerabilites, are regularly updated for currently maintained OTP releases. Patches are announced on the <a href="https://erlang.org/pipermail/erlang-announce" title=""><code>erlang-announce</code></a> mailing list as well as on the <a rel="nofollow" href="https://erlangforums.com/" title="">erlang forums</a> web site.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Critical</code></p>
+<p>Related CWEs and OWASP risks: <a href="#owasp-a03-2025" title=""><code>A03:2025</code></a></p>
+
+<h4>
+<a href="#rule-dep-004" title=""><code>DEP-004</code></a> - Protect the Code Path</h4>
+<p>If a malicious actor can write to a folder in the code path used by the Erlang VM (either the Erlang code path or the host system's shared library load path), and they have the capability to coerce the system into loading that code (made worse by <code>interactive</code> mode, see <a href="#rule-dep-005" title=""><code>DEP-005</code></a>), then it is possible for an attacker to load malicious code.</p>
+<p>To mitigate this, ensure that the folders in the code paths are only writable by a dedicated user, separate from the user running the VM.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+<p>Related CWEs and OWASP risks: <a href="#cwe-427" title=""><code>CWE-427</code></a>, <a href="#owasp-a08-2025" title=""><code>A08:2025</code></a></p>
+
+<h4>
+<a href="#rule-dep-005" title=""><code>DEP-005</code></a> - Avoid <code>interactive</code> Mode in Production</h4>
+<p><code>interactive</code> mode loads code on demand, making it easy to trigger code loading. There is generally little reason to use this mode outside of development, so consider using <code>embedded</code> mode instead.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Critical</code></p>
+<p>Related CWEs and OWASP risks: <a href="#owasp-a08-2025" title=""><code>A08:2025</code></a></p>
+
+<h4>
+<a href="#rule-dep-006" title=""><code>DEP-006</code></a> - Minimize VM Privileges</h4>
+<p>The virtual machine should run with the fewest possible privileges your system needs. It should not have the right to interact with (let alone affect) anything it does not require for its operation.</p>
+<p>The VM should at the very least run under its own dedicated user, and preferably also be further restricted through <code>SELinux</code>/<code>AppArmor</code>, containerization, and similar techniques.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+<h3 id="design">Design</h3>
+
+<h4>
+<a href="#rule-dsg-001" title=""><code>DSG-001</code></a> - Encode the Problem Domain in the Supervision Tree</h4>
+<p>The supervision tree is central to <a href="#h-error-handling" title="">Error Handling</a> in Erlang, and is what allows graceful operation in the presence of errors regardless of their cause.</p>
+<p>For this to be effective, the supervision structure must reflect the problem that your program is trying to solve, and in particular the parts that are isolated from each other in the problem domain should also be isolated as separate Erlang processes.</p>
+<p>At its face, this prevents unrelated flows from affecting others, limiting the "blast radius" of problems and with it also the security implications (such as in denial-of-service attacks).</p>
+<p>However, one less well-understood benefit is that it moves a great deal of complexity out of the program's <em>code</em> and into its <em>overall structure</em>, where it is much easier to handle. Error handling is notoriously difficult to get right as errors are often uncommon by their very nature, and thereby difficult to test.</p>
+<p>When an unexpected condition merely crashes a single isolated process, <em>and the program structure rolls back anything that process may have done</em>, the need for pervasive error handling throughout the code at large is drastically reduced, and with it a large source of bugs and security issues.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/389.html" title="">CWE-389</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/544.html" title="">CWE-544</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/653.html" title="">CWE-653</a>, <a href="#owasp-a10-2025" title=""><code>A10:2025</code></a></p>
+
+<h4>
+<a href="#rule-dsg-002" title=""><code>DSG-002</code></a> - Prefer Letting the User Decide What Warrants an Exception</h4>
+<p>Prefer to design your interfaces so that the user decides whether an error is exceptional or not, by following the <code>{ok, Result} | {error, Reason}</code> convention. Generally speaking the user of an interface has more context than the one implementing it, and giving them the freedom to choose through pattern matching tends to result in clearer code as the handling of raised exceptions is more difficult to follow.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Recommendation</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/389.html" title="">CWE-389</a>, <a href="#owasp-a10-2025" title=""><code>A10:2025</code></a></p>
+<pre data-language="erlang">%% PREFER
+{ok, C} = some_function(A, B)
+
+%% PREFER
+case some_function(A, B) of
+    {ok, C} -&gt;
+        %% Happy path
+        ...;
+    {error, Error} -&gt;
+        %% Handle it
+end
+
+%% AVOID
+try some_function(A, B) of
+    C -&gt; 
+        %% Happy path
+        ...
+catch
+    error:_ -&gt;
+        %% Handle it
+end</pre>
+
+<h4>
+<a href="#rule-dsg-003" title=""><code>DSG-003</code></a> - Do Not Abuse Atoms</h4>
+<p>Atoms are designed to provide an easy way to create named constants in code. Defining them programmatically is not something that we have optimized for, and may also lead to <a href="#h-atom-exhaustion" title="">Atom Exhaustion</a>.</p>
+<p>Specifically, the <a href="../../erts-17.1/doc/html/erlang.html#binary_to_atom/2" title=""><code>binary_to_atom/1,2</code></a> and <a href="../../erts-17.1/doc/html/erlang.html#list_to_atom/1" title=""><code>list_to_atom/1</code></a> functions will create a new atom if it does not already exist. Doing so without care might cause the system to crash. If you know that the atom already should exist in the system, you can use the <a href="../../erts-17.1/doc/html/erlang.html#binary_to_existing_atom/2" title=""><code>binary_to_existing_atom/1,2</code></a> and <a href="../../erts-17.1/doc/html/erlang.html#list_to_existing_atom/1" title=""><code>list_to_existing_atom/1</code></a> instead. These functions will throw an exception instead of creating a new atom if the atom does not already exist. Note that there are valid use-cases for using <a href="../../erts-17.1/doc/html/erlang.html#binary_to_atom/2" title=""><code>binary_to_atom/1,2</code></a> and <a href="../../erts-17.1/doc/html/erlang.html#list_to_atom/1" title=""><code>list_to_atom/1</code></a>, so you cannot blindly replace these calls.</p>
+<p>However, before using the <code>*_to_existing_atom()</code> functions, consider whether an explicit conversion is more appropriate. Quite often there are only a few atoms that are valid in the context the conversion is done, and in those cases it is better to translate them yourself and reject invalid inputs, as <code>*_to_existing_atom()</code> can return <em>any</em> atom that exists in the system, not just those expected in the context.</p>
+<p>There are also a number APIs that create general Erlang terms from data of some serialized format. You should not use such APIs if the data is not trusted (see <a href="#rule-dsg-011" title=""><code>DSG-011</code></a>) unless the API also provides some way of preventing creation of atoms. For example, <a href="../../erts-17.1/doc/html/erlang.html#binary_to_term/2" title=""><code>binary_to_term/2</code></a> with the <code>safe</code> option will prevent new atoms from being created. However, note that even if the <code>safe</code> option is used and the data originates from an untrusted source, it still has to be validated and sanitized, since it can still be harmful to the Erlang application in other ways.</p>
+<p>In general, it is best to avoid using such functions altogether on untrusted data, even with the <code>safe</code> option.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>High</code></p>
+<p>Related CWEs and OWASP risks: <a href="#cwe-770" title=""><code>CWE-770</code></a>, <a href="#owasp-api10-2023" title=""><code>API10:2023</code></a></p>
+<pre data-language="erlang">%% DO, AND PREFER (see STL-001)
+input_to_atom(&lt;&lt;"foo"&gt;&gt;) -&gt; foo;
+input_to_atom(&lt;&lt;"bar"&gt;&gt;) -&gt; bar;
+input_to_atom(&lt;&lt;"quux"&gt;&gt;) -&gt; quux.
+
+%% DO
+input_to_atom(Text) -&gt; binary_to_existing_atom(Text).
+
+%% DO NOT
+input_to_atom(Text) -&gt; binary_to_atom(Text).</pre>
+
+<h4>
+<a href="#rule-dsg-004" title=""><code>DSG-004</code></a> - Do Not Use Undocumented Functionality</h4>
+<p>Undocumented functions or functionality must <strong>never</strong> be used. This includes undocumented arguments to documented functions and undocumented system services. Using such functionality poses a serious security risk. These functions and features are intended strictly for internal use within Erlang/OTP and are not supported for external use.</p>
+<p>Merely passing the wrong arguments to these functions can cause the system to behave in unexpected ways from that point on, and their behavior may change or they may be removed without prior notice.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Critical</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/242.html" title="">CWE-242</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/477.html" title="">CWE-477</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/676.html" title="">CWE-676</a></p>
+
+<h4>
+<a href="#rule-dsg-005" title=""><code>DSG-005</code></a> - Do Not Use Deprecated Functionality</h4>
+<p>When functionality is deprecated in Erlang/OTP, the documentation will typically point to other or new functionality to use instead. The deprecation may have been made for various reasons, which could include security issues, but it is not the most frequent reason. However, if the compiler gives you a deprecation warning it is worth taking a look at the functionality and how it is used.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/242.html" title="">CWE-242</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/477.html" title="">CWE-477</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/676.html" title="">CWE-676</a></p>
+
+<h4>
+<a href="#rule-dsg-006" title=""><code>DSG-006</code></a> - Do Not Use Unsafe Functionality</h4>
+<p><a href="#unsafe-functions" title="">Unsafe Functions</a> must not be used, and <a href="#potentially-unsafe-functions" title="">Potentially Unsafe Functions</a> should only be used in a safe manner, and are best avoided if possible.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Critical</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/242.html" title="">CWE-242</a></p>
+
+<h4>
+<a href="#rule-dsg-007" title=""><code>DSG-007</code></a> - Know Your Data</h4>
+<p>Always know what data your code is operating on, and make sure it is documented. Preferably in a way such that it can be checked by automated tools such as declaring <a href="nominals.html"><code>-nominal</code></a> types to distinguish conceptually different but otherwise identical data (consider <code>20 meters</code> and <code>20 feet</code>, when both are represented as the number <code>20</code>).</p>
+<p>Something as simple as marking data as trusted or untrusted can be a great help since all code implicitly trusts the data it is given to different degrees. Documenting what data your code expects to be operating on helps protect against, for example, injection attacks in match specifications (see <a href="#rule-msc-005" title=""><code>MSC-005</code></a>), or the leakage of sensitive data (see <a href="#rule-msc-004" title=""><code>MSC-004</code></a>).</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+<p>Related CWEs and OWASP risks: <a href="#cwe-20" title=""><code>CWE-20</code></a>, <a href="#cwe-22" title=""><code>CWE-22</code></a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/74.html" title="">CWE-74</a>, <a href="#cwe-78" title=""><code>CWE-78</code></a>, <a href="#cwe-89" title=""><code>CWE-89</code></a>, <a href="#cwe-502" title=""><code>CWE-502</code></a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/532.html" title="">CWE-532</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/843.html" title="">CWE-843</a>, <a href="#cwe-918" title=""><code>CWE-918</code></a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/1287.html" title="">CWE-1287</a></p>
+
+<h4>
+<a href="#rule-dsg-008" title=""><code>DSG-008</code></a> - Avoid Designing Unrealistic Interfaces</h4>
+<p>Much of what we do as programmers is to provide abstractions that make life easier for other people. For the most part this works fine but it is important not to design interfaces that run afoul of mathematical, physical, or otherwise implacable constraints. As obvious as that might sound it is surprisingly easy to make promises that are impossible to deliver without realizing it, and it is difficult to back out once the interface is in wide use.</p>
+<p>The clearest example of this would be interfaces that hide the fact that they operate on a distributed system, whether through promising absolute consistency and availability at all times (a violation of <a rel="nofollow" href="https://en.wikipedia.org/wiki/PACELC_design_principle" title="">PACELC</a>), through omitting a recovery strategy, or simply just not documenting the trade-offs. This is especially important to understand as Erlang acts as a distributed system internally, with message passing between processes instead of over a physical network. While a solution may very well work fine as long as nothing crashes, it may <a rel="nofollow" href="https://en.wikipedia.org/wiki/Two_Generals%27_Problem" title="">subtly fail</a> in the face of unknown errors.</p>
+<p>It can also be as simple as an interface whose operations are not fully independent, such as described in <a href="#rule-dsg-010" title=""><code>DSG-010</code></a>, or an interface that cannot behave in a transactional manner (and thus persisting a broken state if crashing in the middle of or between operations).</p>
+<p>Before finishing an interface, consider what promises your implementation can and cannot deliver, determine which of these could leak through to your users, and ask yourself whether it is better to change the interface than to leave it as it is (or whether to document said behavior).</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Recommendation</code></p>
+<p>Related CWEs and OWASP risks: <a href="#cwe-362" title=""><code>CWE-362</code></a></p>
+
+<h4>
+<a href="#rule-dsg-009" title=""><code>DSG-009</code></a> - Consider Providing Methods to Control Resource Consumption</h4>
+<p>When writing a library, consider providing ways for the user to limit resource usage, such as a configurable upper bound on the number of concurrent sessions or similar.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+<p>Related CWEs and OWASP risks: <a href="#cwe-770" title=""><code>CWE-770</code></a>, <a href="#owasp-api4-2023" title=""><code>API4:2023</code></a></p>
+
+<h4>
+<a href="#rule-dsg-010" title=""><code>DSG-010</code></a> - Avoid Name Races</h4>
+<p>Erlang processes and ETS tables can have registered names, letting others find them through their name instead of their process or table identifier. This should be used with care, as a process or table may terminate at any time. For example, if two messages are sent to a process through a registered name, the second message may arrive to a newly restarted process that has not seen the first, which may be significant (<a rel="nofollow" href="https://cwe.mitre.org/data/definitions/386.html" title="">CWE-386</a>).</p>
+<p>To prevent these issues, either redesign your interface so that multiple messages or lookups are not necessary, or look up the identifier from the registered name and use the identifier instead.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Recommendation</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/386.html" title="">CWE-386</a></p>
+<pre data-language="erlang">%% DO
+Pid = whereis(registered_process),
+Pid ! hello,
+Pid ! world.
+
+Tid = ets:whereis(registered_table),
+A = ets:lookup(Tid, KeyA),
+B = ets:lookup(Tid, KeyB).
+
+%% DO NOT
+registered_process ! hello,
+registered_process ! world.
+
+A = ets:lookup(registered_table, KeyA),
+B = ets:lookup(registered_table, KeyB).</pre>
+
+<h4>
+<a href="#rule-dsg-011" title=""><code>DSG-011</code></a> - Only Deserialize Trusted Data</h4>
+<p>Erlang/OTP provides various functionality that serializes and deserializes general Erlang terms. Such functionality is intended to be used in a trusted environment and is not suitable for communication with untrusted entities. For example, you do not want to load a <span title=""><code>mnesia</code></span> backup from an untrusted entity. One issue with this being the potential for atom exhaustion, but more importantly you could potentially end up with a <code>mnesia</code> table containing harmful data (<a href="#cwe-502" title=""><code>CWE-502</code></a>). Other examples are <a href="../../lib/stdlib-8.1/doc/html/dets.html"><code>dets</code></a> and <a href="../../lib/kernel-11.0.4/doc/html/disk_log.html"><code>disk_log</code></a>.</p>
+<p>JSON is an example of a better format to use when communicating with untrusted entities. Erlang/OTP provides the <a href="../../lib/stdlib-8.1/doc/html/json.html"><code>json</code></a> module for JSON encoding/decoding. XML is another example of a format that can be used. The <span title=""><code>xmerl</code></span> application provides functionality for encoding/decoding; see the <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a> section below for more security related information.</p>
+<p>The decoded data, of course, needs to be validated and sanitized if it does not originate from a trusted entity. Using the <a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html"><code>xmerl_sax_parser</code></a> when decoding XML you can do this validation during decoding, and, for example, prevent issues like memory exhaustion. The <a href="../../lib/stdlib-8.1/doc/html/json.html"><code>json</code></a> module also provides a SAX style decoding with user defined callbacks in which you can do the same.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>High</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/74.html" title="">CWE-74</a>, <a href="#owasp-a05-2025" title=""><code>A05:2025</code></a></p>
+<h3 id="language">Language</h3>
+
+<h4>
+<a href="#rule-lng-001" title=""><code>LNG-001</code></a> - Prefer Tuples Over Exporting Variables</h4>
+<p>For historical reasons, Erlang does not employ lexical scoping, and variables defined in "inner" expressions are available in "outer" expressions that follow them. Using this makes code harder to reason about, and it is preferable to write your code as if Erlang has lexical scoping by returning a tuple instead. There are no performance penalties for doing this.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Recommendation</code></p>
+<pre data-language="erlang">%% DO
+some_function(State0)
+    {C, State1} = case foo(State0) of
+                      {ok, A} -&gt;
+                          {a, bar(A)};
+                      b -&gt;
+                          {b, State0}
+                  end,
+    bar(C, State1).
+
+%% DO NOT
+some_function(State0)
+    C = case foo(State0) of
+            {ok, A} -&gt;
+                State1 = bar(A),
+                a;
+            b -&gt;
+                State1 = State0,
+                b
+        end,
+    bar(C, State1).</pre>
+
+<h4>
+<a href="#rule-lng-002" title=""><code>LNG-002</code></a> - Do Not Use <code>catch</code>
+</h4>
+<p>The legacy <code>catch</code> construct cannot distinguish between <a href="../../erts-17.1/doc/html/erlang.html#throw/1"><code>throw/1</code></a> and a normal return, which can have very unexpected results. For instance, the <a href="../../lib/stdlib-8.1/doc/html/gen_server.html"><code>gen_server</code></a> behavior will unintentionally accept any documented return value when thrown because of its use of <code>catch</code>.</p>
+<p>Instead, the modern <a href="expressions.html"><code>try ... catch ... end</code></a> construct should be used.</p>
+<p>Starting from Erlang/OTP 29, the compiler will by default raise warnings for uses of the legacy <code>catch</code> construct.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Recommendation</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/253.html" title="">CWE-253</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/480.html" title="">CWE-480</a>, <a href="#owasp-a10-2025" title=""><code>A10:2025</code></a></p>
+<pre data-language="erlang">%% DO
+try operation(A, B) of
+    C -&gt; ...
+catch
+    throw:Value -&gt;
+        ....;
+    error:Reason -&gt;
+        ....
+end
+
+%% DO NOT
+case (catch operation(A, B)) of
+    {'EXIT', Reason} -&gt;
+        ...;
+    C -&gt;
+        ...
+end</pre>
+
+<h4>
+<a href="#rule-lng-003" title=""><code>LNG-003</code></a> - Do Not Use the Legacy <code>and</code> and <code>or</code> Operators</h4>
+<p>These operators have been superseded by <code>andalso</code> and <code>orelse</code>, respectively.</p>
+<p>The legacy operators have higher precedence than in most other languages. For example <code>X and Y =:= 3</code> is parsed as <code>(X and Y) =:= 3</code>. In a function body, this will crash, but when used in a guard it will silently fail. It can also unexpectedly corrupt the intended logic without crashing when all operands are booleans, for example <code>X and Y =:= Z</code> being parsed as <code>(X and Y) =:= Z</code>.</p>
+<p>Instead, either use the modern <code>andalso</code> and <code>orelse</code> operators, or use <code>,</code> and <code>;</code>, respectively.</p>
+<p>Starting from Erlang/OTP 29, the compiler can raise warnings for <code>and</code> and <code>or</code> by enabling the <code>warn_obsolete_bool_op</code> option.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Recommendation</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/783.html" title="">CWE-783</a></p>
+<h3 id="miscellaneous">Miscellaneous</h3>
+
+<h4>
+<a href="#rule-msc-001" title=""><code>MSC-001</code></a> - Do Not Abuse <a href="../../erts-17.1/doc/html/persistent_term.html"><code>persistent_term</code></a>
+</h4>
+<p><a href="../../erts-17.1/doc/html/persistent_term.html"><code>persistent_term</code></a> is a very fast key-value storage intended for values that rarely, if ever, change. Modifying one of these terms is allowed but comes at an extreme performance cost as every single process in the system needs to be scanned to potentially garbage-collect the old value. Use this feature with great care.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+
+<h4>
+<a href="#rule-msc-002" title=""><code>MSC-002</code></a> - Consider Path Traversal Attacks</h4>
+<p>The Erlang file routines do not protect against path traversal attacks by default. When dealing with paths from an untrusted source (see <a href="#rule-dsg-007" title=""><code>DSG-007</code></a>), the <a href="../../lib/stdlib-8.1/doc/html/filelib.html#safe_relative_path/2"><code>filelib:safe_relative_path/2</code></a> function should be used to get a safe path relative to a given directory.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+<p>Related CWEs and OWASP risks: <a href="#cwe-22" title=""><code>CWE-22</code></a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/59.html" title="">CWE-59</a></p>
+
+<h4>
+<a href="#rule-msc-003" title=""><code>MSC-003</code></a> - Use <a href="../../erts-17.1/doc/html/erlang.html#open_port/2"><code>open_port/2</code></a> With the <code>spawn_executable</code> Option To Start External Executables</h4>
+<p>Calling <a href="../../erts-17.1/doc/html/erlang.html#open_port/2" title=""><code>open_port/2</code></a> with the <code>{spawn, _}</code> argument will either start an instance of a driver, or spawn an external program using the passed command line. When spawning an external program, some platforms will start a shell, which will search in the <code>PATH</code> in order to find the program. Environment variable expansion may also be performed. If user input is to be part of the command line for an external program, this makes it hard to verify and sanitize this input. Even if user input is not part of the command, mistakes can easily be made in non-trivial scenarios. Since loaded drivers and programs compete in the same name-space, one can also unintentionally start an instance of a driver instead of spawning an external program.</p>
+<p>When spawning an external program, a safer approach is to use <a href="../../erts-17.1/doc/html/erlang.html#open_port/2" title=""><code>open_port/2</code></a> with the <code>{spawn_executable, _}</code> argument. No shell is used and the arguments to the program needs to be explicitly listed using the <code>{args, Args}</code> option where no environment variable expansion is made. You may also want to overwrite certain environment variables using the <code>{env, Env}</code> option in order not to expose those to the external program.</p>
+<p>When starting an instance of a loaded driver, a safer approach is to use <a href="../../erts-17.1/doc/html/erlang.html#open_port/2" title=""><code>open_port/2</code></a> with the <code>{spawn_driver, _}</code> argument where no mix-up with external programs may occur.</p>
+<p>External OS commands can also be executed by calling <a href="../../lib/kernel-11.0.4/doc/html/os.html#cmd/1"><code>os:cmd/1</code></a> (or <a href="../../lib/kernel-11.0.4/doc/html/os.html#cmd/2"><code>os:cmd/2</code></a>) with a command line as argument. <code>os:cmd/1,2</code> suffers from most of the same issues as <a href="../../erts-17.1/doc/html/erlang.html#open_port/2" title=""><code>open_port/2</code></a> with the <code>{spawn, _}</code> argument. A shell will be started in which the passed command line is executed. The <code>PATH</code> will be searched for the command and environment variables will be expanded. A safer approach is to use <a href="../../erts-17.1/doc/html/erlang.html#open_port/2" title=""><code>open_port/2</code></a> with the <code>{spawn_executable, _}</code> argument. It requires gathering of the output from the command instead of getting it returned as a string, but it is an easy task to handle.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>High</code></p>
+<p>Related CWEs and OWASP risks: <a href="#cwe-78" title=""><code>CWE-78</code></a></p>
+
+<h4>
+<a href="#rule-msc-004" title=""><code>MSC-004</code></a> - Protect Sensitive Data</h4>
+<p>As Erlang logs many things by default, it is common for application data to appear in log files and the like. This is not necessarily a problem but some environments are under regulatory or compliance requirements not to leak certain data to disk or similar in case an unauthorized person were to get ahold of them (see <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/532.html" title="">CWE-532</a>).</p>
+<p>As the system cannot make any distinction between which data is sensitive and which is not, it is up to the user to protect sensitive data. Ways of doing this include, but are not limited to:</p>
+<ol>
+<li><p>Using the <code>private</code> option for ETS tables containing sensitive data, preventing the table contents from being read by other processes.</p></li>
+<li>
+<p>Using <code>process_flag(sensitive, true)</code> for processes operating on sensitive data.</p>
+<p>This disables nearly all introspection for the process: other processes cannot inspect the message queue of this process, tracing is disabled, the process' data will not be included in a crash dump, and so on.</p>
+</li>
+<li>
+<p>Implementing the <code>format_status/2</code> callback for <code>gen*</code> behaviors (<a href="../../lib/stdlib-8.1/doc/html/gen_server.html"><code>gen_server</code></a> et al) for processes operating on sensitive data.</p>
+<p>This lets you control how the process state is presented in introspection tools such as <code>observer</code>.</p>
+</li>
+</ol>
+<p>Furthermore, to prevent leaking data by stack traces or certain introspection features, a common technique is to wrap secrets in a zero-arity <code>fun()</code> that is then called in order to retrieve the secret. When passed around, the <code>fun()</code> will appear instead of the data it retrieves when called. Whether the secret is retrieved on demand or is part of the function environment is up to you, but the latter has two drawbacks:</p>
+<ol>
+<li>The secret becomes at least as long-lived as the <code>fun()</code>, increasing the risk of it showing up in a crash dump.</li>
+<li>In a distributed system you may have differing versions of the code, and calling the <code>fun()</code> may crash because it's for a different version of its defining module. A workaround for that would be to extract the secret with <code>[Secret] = erlang:fun_info(Fun, env)</code> instead of calling the fun.</li>
+</ol>
+<p>Another approach is to catch errors in sensitive sections of code and then walking through each stack frame, discarding the arguments, before raising the exception again. However, note that neither approach prevents the data from leaking out through a crash or core dump.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/209.html" title="">CWE-209</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/532.html" title="">CWE-532</a></p>
+
+<h4>
+<a href="#rule-msc-005" title=""><code>MSC-005</code></a> - Treat Match Specifications As Code</h4>
+<p>Match specifications, such as those used with ETS, are vulnerable to injection attacks if they are constructed based on untrusted input.</p>
+<p>When untrusted data is matched verbatim (such as a key), it is important to wrap it in <code>{const, UntrustedData}</code> expressions. Building general queries based on untrusted data should be avoided, but if that cannot be done, the query should be the result of <em>parsing</em> the untrusted data into a match specification (where the final shape is controlled by the programmer), rather than attempting to <em>validate</em> the data before passing it in unaltered.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>High</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/74.html" title="">CWE-74</a></p>
+<pre data-language="erlang">%% DO
+find(Table, Needle) -&gt;
+    ets:match(Table, {'_', {const, Needle}, '$1'}).
+
+
+%% DO NOT
+find(Table, Needle) -&gt;
+    ets:match(Table, {'_', Needle, '$1'}).</pre>
+
+<h4>
+<a href="#rule-msc-006" title=""><code>MSC-006</code></a> - Consider "Link Following" Attacks</h4>
+<p>When operating on untrusted file paths and trying to access files through them, it is possible that the name does not actually identify a file, but a link instead, which can in turn point at an unintended resource which is potentially outside of the intended boundaries.</p>
+<p>This can be mitigated by using <a href="../../lib/stdlib-8.1/doc/html/filelib.html#safe_relative_path/2"><code>filelib:safe_relative_path/2</code></a> to ensure that the path does not escape the given bounds regardless of links. Note that it is impossible to guarantee atomicity across several filesystem operations, so care must be taken to avoid time-of-check time-of-use (TOCTOU) race conditions where a file or symbolic link is swapped out in the middle of these operations. When operating on a shared folder structure, ensure that only one entity has access to said structure.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Medium</code></p>
+<p>Related CWEs and OWASP risks: <a href="#cwe-22" title=""><code>CWE-22</code></a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/59.html" title="">CWE-59</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/61.html" title="">CWE-61</a></p>
+<pre data-language="erlang">%% DO
+open(UntrustedPath, Root, Opts) -&gt;
+    case filelib:safe_relative_path(UntrustedPath, Root) of
+        unsafe -&gt; {error, unsafe};
+        Path -&gt; file:open(filename:join(Root, Path), Opts)
+    end.
+
+%% DO NOT
+file:open(UntrustedPath, Opts).</pre>
+
+<h4>
+<a href="#rule-msc-007" title=""><code>MSC-007</code></a> - Avoid Using Debug Functionality in Production</h4>
+<p>Functionality that has been explicitly marked to be used only for debugging, such as <a href="../../erts-17.1/doc/html/erlang.html#list_to_pid/1"><code>erlang:list_to_pid/1</code></a> or the <a href="../../lib/ssl-11.7.7/doc/html/ssl.html#t:common_option/0"><code>keep_secrets</code></a> <span title=""><code>ssl</code></span> option should not be used in production environments, except during interactive debugging. Unlike with normal functionality, there are no promises of API stability for debug functionality, and they may change without notice. They sometimes also have adverse effects on system properties while used (such as greatly increasing scheduling latency), which are acceptable during testing but not in production.</p>
+<p>In production environments, debug functionality should be considered unsafe as per <a href="#rule-dsg-006" title=""><code>DSG-006</code></a>.</p>
+<p><a href="#rule-priority" title="">Rule priority:</a> <code>Critical</code></p>
+<p>Related CWEs and OWASP risks: <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/242.html" title="">CWE-242</a>, <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/489.html" title="">CWE-489</a>, <a href="#owasp-a06-2025" title=""><code>A06:2025</code></a></p>
+
+<h3 id="list-of-unsafe-functionality-that-should-not-be-used-cwe-242">List of Unsafe Functionality that Should not be Used (CWE-242)</h3>
+<table>
+<thead><tr>
+<th style="text-align: left;">Unsafe functionality</th>
+<th style="text-align: left;">Alternative functionality</th>
+<th style="text-align: left;">Note</th>
+</tr></thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Undocumented functions/functionality</td>
+<td style="text-align: left;">
+<em>Only</em> use documented and supported functionality</td>
+<td style="text-align: left;">See <a href="#rule-dsg-004" title=""><code>DSG-004</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../erts-17.1/doc/html/erlang.html#open_port/2" title=""><code>open_port/2</code></a> with <code>{spawn, _}</code> argument</td>
+<td style="text-align: left;">
+<a href="../../erts-17.1/doc/html/erlang.html#open_port/2" title=""><code>open_port/2</code></a> with <code>{spawn_executable|spawn_driver, _}</code> argument</td>
+<td style="text-align: left;">See <a href="#rule-msc-003" title=""><code>MSC-003</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/inets-9.8/doc/html/http_uri.html"><code>http_uri</code></a> module</td>
+<td style="text-align: left;">
+<a href="../../lib/stdlib-8.1/doc/html/uri_string.html"><code>uri_string</code></a> module</td>
+<td style="text-align: left;"></td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/crypto-5.10/doc/html/crypto.html#start/0"><code>crypto:start/0</code></a></td>
+<td style="text-align: left;"><code>application:start(crypto)</code></td>
+<td style="text-align: left;">See <a href="#initializing-crypto" title="">Initializing <code>crypto</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/crypto-5.10/doc/html/crypto.html#enable_fips_mode/1"><code>crypto:enable_fips_mode/1</code></a></td>
+<td style="text-align: left;">Use <a href="../../lib/crypto-5.10/doc/html/crypto_app.html#fips_mode" title=""><code>fips_mode</code></a> application parameter instead</td>
+<td style="text-align: left;">See <a href="#initializing-crypto" title="">Initializing <code>crypto</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/crypto-5.10/doc/html/crypto.html#rand_uniform/2"><code>crypto:rand_uniform/2</code></a></td>
+<td style="text-align: left;">
+<a href="../../lib/stdlib-8.1/doc/html/rand.html#uniform_s/2"><code>rand:uniform_s/2</code></a> with a cryptographically strong generator</td>
+<td style="text-align: left;">See <a href="#cryptographically-secure-random-numbers" title="">Cryptographically Secure Random Numbers</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/crypto-5.10/doc/html/crypto.html#private_encrypt/4"><code>crypto:private_encrypt/4</code></a> with <code>rsa_pkcs1_padding</code> option</td>
+<td style="text-align: left;">For signatures use <a href="../../lib/crypto-5.10/doc/html/crypto.html#sign/4"><code>crypto:sign/4</code></a> instead</td>
+<td style="text-align: left;">See <a href="#legacy-crypto-functions" title="">Legacy <code>crypto</code> Functions</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/crypto-5.10/doc/html/crypto.html#private_decrypt/4"><code>crypto:private_decrypt/4</code></a> with <code>rsa_pkcs1_padding</code> option</td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#legacy-crypto-functions" title="">Legacy <code>crypto</code> Functions</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/crypto-5.10/doc/html/crypto.html#public_encrypt/4"><code>crypto:public_encrypt/4</code></a> with <code>rsa_pkcs1_padding</code> option</td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#legacy-crypto-functions" title="">Legacy <code>crypto</code> Functions</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/crypto-5.10/doc/html/crypto.html#public_decrypt/4"><code>crypto:public_decrypt/4</code></a> with <code>rsa_pkcs1_padding</code> option</td>
+<td style="text-align: left;">For signatures use <a href="../../lib/crypto-5.10/doc/html/crypto.html#verify/5"><code>crypto:verify/5</code></a> instead</td>
+<td style="text-align: left;">See <a href="#legacy-crypto-functions" title="">Legacy <code>crypto</code> Functions</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/public_key-1.21.7/doc/html/public_key.html#encrypt_private/2"><code>public_key:encrypt_private/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-public_key-application" title=""><code>public_key</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/public_key-1.21.7/doc/html/public_key.html#encrypt_private/3"><code>public_key:encrypt_private/3</code></a> with <code>rsa_pkcs1_padding</code> option</td>
+<td style="text-align: left;">For signatures use <a href="../../lib/public_key-1.21.7/doc/html/public_key.html#sign/4"><code>public_key:sign/4</code></a> instead</td>
+<td style="text-align: left;">See <a href="#h-public_key-application" title=""><code>public_key</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/public_key-1.21.7/doc/html/public_key.html#decrypt_private/2"><code>public_key:decrypt_private/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-public_key-application" title=""><code>public_key</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/public_key-1.21.7/doc/html/public_key.html#decrypt_private/3"><code>public_key:decrypt_private/3</code></a> with <code>rsa_pkcs1_padding</code> option</td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-public_key-application" title=""><code>public_key</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/public_key-1.21.7/doc/html/public_key.html#encrypt_public/2"><code>public_key:encrypt_public/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-public_key-application" title=""><code>public_key</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/public_key-1.21.7/doc/html/public_key.html#encrypt_public/3"><code>public_key:encrypt_public/3</code></a> with <code>rsa_pkcs1_padding</code> option</td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-public_key-application" title=""><code>public_key</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/public_key-1.21.7/doc/html/public_key.html#decrypt_public/2"><code>public_key:decrypt_public/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-public_key-application" title=""><code>public_key</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/public_key-1.21.7/doc/html/public_key.html#decrypt_public/3"><code>public_key:decrypt_public/3</code></a> with <code>rsa_pkcs1_padding</code> option</td>
+<td style="text-align: left;">For signatures use <a href="../../lib/public_key-1.21.7/doc/html/public_key.html#verify/5"><code>public_key:verify/5</code></a> instead</td>
+<td style="text-align: left;">See <a href="#h-public_key-application" title=""><code>public_key</code> Application</a>
+</td>
+</tr>
+</tbody>
+</table>
+
+<h3 id="list-of-potentially-unsafe-functionality-cwe-676">List of Potentially Unsafe Functionality (CWE-676)</h3>
+<p><em>All of the below listed functions have valid use-cases</em>, but may become a concern if not used properly.</p>
+<table>
+<thead><tr>
+<th style="text-align: left;">Potentially unsafe functionality</th>
+<th style="text-align: left;">Potential alternative functionality</th>
+<th style="text-align: left;">Note</th>
+</tr></thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><a href="../../erts-17.1/doc/html/erlang.html#binary_to_atom/1" title=""><code>binary_to_atom/1</code></a></td>
+<td style="text-align: left;"><a href="../../erts-17.1/doc/html/erlang.html#binary_to_existing_atom/1" title=""><code>binary_to_existing_atom/1</code></a></td>
+<td style="text-align: left;">See <a href="#rule-dsg-003" title=""><code>DSG-003</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../erts-17.1/doc/html/erlang.html#binary_to_atom/2" title=""><code>binary_to_atom/2</code></a></td>
+<td style="text-align: left;"><a href="../../erts-17.1/doc/html/erlang.html#binary_to_existing_atom/2" title=""><code>binary_to_existing_atom/2</code></a></td>
+<td style="text-align: left;">See <a href="#rule-dsg-003" title=""><code>DSG-003</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../erts-17.1/doc/html/erlang.html#list_to_atom/1" title=""><code>list_to_atom/1</code></a></td>
+<td style="text-align: left;"><a href="../../erts-17.1/doc/html/erlang.html#list_to_existing_atom/1" title=""><code>list_to_existing_atom/1</code></a></td>
+<td style="text-align: left;">See <a href="#rule-dsg-003" title=""><code>DSG-003</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/os.html#cmd/1"><code>os:cmd/1</code></a></td>
+<td style="text-align: left;">
+<a href="../../erts-17.1/doc/html/erlang.html#open_port/2" title=""><code>open_port/2</code></a> with <code>{spawn_executable, _}</code> argument</td>
+<td style="text-align: left;">See <a href="#rule-msc-003" title=""><code>MSC-003</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/os.html#cmd/2"><code>os:cmd/2</code></a></td>
+<td style="text-align: left;">
+<a href="../../erts-17.1/doc/html/erlang.html#open_port/2" title=""><code>open_port/2</code></a> with <code>{spawn_executable, _}</code> argument</td>
+<td style="text-align: left;">See <a href="#rule-msc-003" title=""><code>MSC-003</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../erts-17.1/doc/html/erlang.html#load_nif/2"><code>erlang:load_nif/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-native-code" title="">Native Code</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/erl_ddll.html#load/2"><code>erl_ddll:load/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-native-code" title="">Native Code</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/erl_ddll.html#load_driver/2"><code>erl_ddll:load_driver/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-native-code" title="">Native Code</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/erl_ddll.html#try_load/3"><code>erl_ddll:try_load/3</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-native-code" title="">Native Code</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/erl_ddll.html#reload/2"><code>erl_ddll:reload/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-native-code" title="">Native Code</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/erl_ddll.html#reload_driver/2"><code>erl_ddll:reload_driver/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#h-native-code" title="">Native Code</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/file.html#consult/1"><code>file:consult/1</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#rule-dsg-003" title=""><code>DSG-003</code></a> and <a href="#rule-dsg-011" title=""><code>DSG-011</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/file.html#path_consult/2"><code>file:path_consult/2</code></a></td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#rule-dsg-003" title=""><code>DSG-003</code></a> and <a href="#rule-dsg-011" title=""><code>DSG-011</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../erts-17.1/doc/html/erlang.html#binary_to_term/1"><code>binary_to_term/1</code></a></td>
+<td style="text-align: left;">
+<a href="../../erts-17.1/doc/html/erlang.html#binary_to_term/2" title=""><code>binary_to_term/2</code></a> with <code>safe</code> option</td>
+<td style="text-align: left;">See <a href="#rule-dsg-003" title=""><code>DSG-003</code></a> and <a href="#rule-dsg-011" title=""><code>DSG-011</code></a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../erts-17.1/doc/html/erlang.html#binary_to_term/2"><code>binary_to_term/2</code></a> without <code>safe</code> option</td>
+<td style="text-align: left;">
+<a href="../../erts-17.1/doc/html/erlang.html#binary_to_term/2" title=""><code>binary_to_term/2</code></a> with <code>safe</code> option</td>
+<td style="text-align: left;">See <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/xmerl-2.2/doc/html/xmerl_scan.html#file/1"><code>xmerl_scan:file/1</code></a></td>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html"><code>xmerl_sax_parser</code></a> module</td>
+<td style="text-align: left;">See <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/xmerl-2.2/doc/html/xmerl_scan.html#file/2"><code>xmerl_scan:file/2</code></a></td>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html"><code>xmerl_sax_parser</code></a> module</td>
+<td style="text-align: left;">See <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/xmerl-2.2/doc/html/xmerl_scan.html#string/1"><code>xmerl_scan:string/1</code></a></td>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html"><code>xmerl_sax_parser</code></a> module</td>
+<td style="text-align: left;">See <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/xmerl-2.2/doc/html/xmerl_scan.html#string/2"><code>xmerl_scan:string/2</code></a></td>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html"><code>xmerl_sax_parser</code></a> module</td>
+<td style="text-align: left;">See <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/xmerl-2.2/doc/html/xmerl_scan.html#string/1"><code>xmerl_scan:string/1</code></a></td>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html"><code>xmerl_sax_parser</code></a> module</td>
+<td style="text-align: left;">See <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/xmerl-2.2/doc/html/xmerl_scan.html#string/2"><code>xmerl_scan:string/2</code></a></td>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html"><code>xmerl_sax_parser</code></a> module</td>
+<td style="text-align: left;">See <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html#file/2"><code>xmerl_sax_parser:file/2</code></a> without <code>disallow_entities</code> option</td>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html#file/2"><code>xmerl_sax_parser:file/2</code></a> with <code>disallow_entities</code> option</td>
+<td style="text-align: left;">See <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html#stream/2"><code>xmerl_sax_parser:stream/2</code></a> without <code>disallow_entities</code> option</td>
+<td style="text-align: left;">
+<a href="../../lib/xmerl-2.2/doc/html/xmerl_sax_parser.html#stream/2"><code>xmerl_sax_parser:stream/2</code></a> with <code>disallow_entities</code> option</td>
+<td style="text-align: left;">See <a href="#h-xmerl-application" title=""><code>xmerl</code> Application</a>
+</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/kernel-11.0.4/doc/html/socket.html#open/1"><code>socket:open/1</code></a></td>
+<td style="text-align: left;">
+<a href="../../lib/kernel-11.0.4/doc/html/socket.html#open/2"><code>socket:open/2</code></a> with <code>dup</code> option, which must still be used with extreme care</td>
+<td style="text-align: left;"></td>
+</tr>
+<tr>
+<td style="text-align: left;">
+<a href="../../lib/kernel-11.0.4/doc/html/socket.html#open/2"><code>socket:open/2</code></a> without <code>dup</code> option</td>
+<td style="text-align: left;">
+<a href="../../lib/kernel-11.0.4/doc/html/socket.html#open/2"><code>socket:open/2</code></a> with <code>dup</code> option, which must still be used with extreme care</td>
+<td style="text-align: left;"></td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/ssl-11.7.7/doc/html/ssl.html#prf/5"><code>ssl:prf/5</code></a></td>
+<td style="text-align: left;"><a href="../../lib/ssl-11.7.7/doc/html/ssl.html#export_key_materials/4"><code>ssl:export_key_materials/4</code></a></td>
+<td style="text-align: left;"></td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/ssl-11.7.7/doc/html/ssl.html#prf/5"><code>ssl:prf/5</code></a></td>
+<td style="text-align: left;"><a href="../../lib/ssl-11.7.7/doc/html/ssl.html#export_key_materials/4"><code>ssl:export_key_materials/4</code></a></td>
+<td style="text-align: left;"></td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="../../lib/ssl-11.7.7/doc/html/ssl.html#prf/5"><code>ssl:prf/5</code></a></td>
+<td style="text-align: left;"><a href="../../lib/ssl-11.7.7/doc/html/ssl.html#export_key_materials/4"><code>ssl:export_key_materials/4</code></a></td>
+<td style="text-align: left;"></td>
+</tr>
+<tr>
+<td style="text-align: left;">Deprecated functionality</td>
+<td style="text-align: left;"></td>
+<td style="text-align: left;">See <a href="#rule-dsg-005" title=""><code>DSG-005</code></a>
+</td>
+</tr>
+</tbody>
+</table>
+
+<h2 id="top-40-cwes">Top 40 CWEs</h2>
+<p>This section comments on the top 40 CWEs in 2025 and how they relate to Erlang/OTP, covering both the <a rel="nofollow" href="https://cwe.mitre.org/top25/archive/2025/2025_cwe_top25.html" title="">CWE Top 25</a> and the <a rel="nofollow" href="https://cwe.mitre.org/top25/archive/2025/2025_onthecusp_list.html" title="">On The Cusp</a> list.</p>
+
+<ol>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/79.html" title="">CWE-79</a> - Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')</p>
+<p>Erlang/OTP does not include any web frameworks, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/79.html">CWE description</a> for general advice on how to deal with this.</p>
+<p>As with other injection attacks, following <a href="#rule-dsg-007" title=""><code>DSG-007</code></a> may also help.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/89.html" title="">CWE-89</a> - Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')</p>
+<p>Erlang/OTP does not provide any SQL database adapters. However, similar attacks could potentially be targeted at match specifications when used in ETS, see <a href="#rule-msc-005" title=""><code>MSC-005</code></a>. As with other injection attacks, following <a href="#rule-dsg-007" title=""><code>DSG-007</code></a> may also help.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/89.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/352.html" title="">CWE-352</a> - Cross-Site Request Forgery (CSRF)</p>
+<p>Erlang/OTP does not include any web frameworks, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/352.html">CWE description</a> for general advice on how to deal with this.</p>
+<p>As with other injection attacks, following <a href="#rule-dsg-007" title=""><code>DSG-007</code></a> may also help.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/862.html" title="">CWE-862</a> - Missing Authorization</p>
+<p>Aside from the previously mentioned issues regarding the default Erlang distribution protocol, this is not an Erlang-specific issue.</p>
+<p>Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/862.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/787.html" title="">CWE-787</a> - Out-of-bounds Write</p>
+<p>This issue cannot occur because Erlang is memory safe.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/22.html" title="">CWE-22</a> - Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')</p>
+<p>See <a href="#rule-msc-002" title=""><code>MSC-002</code></a>. As with other injection attacks, following <a href="#rule-dsg-007" title=""><code>DSG-007</code></a> may also help.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/416.html" title="">CWE-416</a> - Use After Free</p>
+<p>This issue cannot occur because Erlang is memory safe.</p>
+<p>However, as an example it is still possible to attempt to read from a file that the user has explicitly closed. Doing so results in an error being raised.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/125.html" title="">CWE-125</a> - Out-of-bounds read</p>
+<p>This issue cannot occur because Erlang is memory safe.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/78.html" title="">CWE-78</a> - Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')</p>
+<p>See <a href="#rule-msc-003" title=""><code>MSC-003</code></a>. As with other injection attacks, following <a href="#rule-dsg-007" title=""><code>DSG-007</code></a> may also help.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/94.html" title="">CWE-94</a> - Improper Control of Generation of Code ('Code Injection')</p>
+<p>This is not Erlang-specific, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/94.html">CWE description</a> for general advice on how to deal with this.</p>
+<p>As with other injection attacks, following <a href="#rule-dsg-007" title=""><code>DSG-007</code></a> may also help.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/120.html" title="">CWE-120</a> - Buffer Copy without Checking Size of Input ('Classic Buffer Overflow')</p>
+<p>This issue cannot occur because Erlang is memory safe.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/434.html" title="">CWE-434</a> - Unrestricted Upload of File with Dangerous Type</p>
+<p>When using the <code>ssh_sftpd</code> module, a custom <code>file_handler</code> module can be provided to filter out unwanted uploads, but note that this does not permit a deep inspection of file contents before upload, and is under no circumstances a replacement for proper authentication.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/434.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/476.html" title="">CWE-476</a> - NULL Pointer Dereference</p>
+<p>This issue cannot occur because Erlang is memory safe.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/121.html" title="">CWE-121</a> - Stack-based Buffer Overflow</p>
+<p>This issue cannot occur because Erlang is memory safe.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/502.html" title="">CWE-502</a> - Deserialization of Untrusted Data</p>
+<p>See <a href="#rule-dsg-011" title=""><code>DSG-011</code></a>.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/122.html" title="">CWE-122</a> - Heap-based Buffer Overflow</p>
+<p>This issue cannot occur because Erlang is memory safe.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/863.html" title="">CWE-863</a> - Incorrect Authorization </p>
+<p>Aside from the previously mentioned issues regarding the default Erlang distribution protocol (see <a href="#rule-dep-001" title=""><code>DEP-001</code></a>), this is a general issue.</p>
+<p>Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/863.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/20.html" title="">CWE-20</a> - Improper Input Validation</p>
+<p>Special care should be taken around atoms as described in the <a href="#h-atom-exhaustion" title="">Atom Exhaustion</a> section. Following <a href="#rule-dsg-003" title=""><code>DSG-003</code></a>, <a href="#rule-dsg-011" title=""><code>DSG-011</code></a> and <a href="#rule-dsg-007" title=""><code>DSG-007</code></a> may also help.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/20.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/284.html" title="">CWE-284</a> - Improper Access Control</p>
+<p>This is not Erlang-specific, please refer to <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/284.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/200.html" title="">CWE-200</a> - Exposure of Sensitive Information to an Unauthorized Actor</p>
+<p>Aside from the previously mentioned issues regarding the default Erlang distribution protocol (see <a href="#rule-dep-001" title=""><code>DEP-001</code></a>), this is a general issue.</p>
+<p>Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/200.html">CWE description</a> for general advice on how to deal with this.</p>
+<p>See also <a href="#rule-msc-004" title=""><code>MSC-004</code></a> and <a href="#rule-dsg-007" title=""><code>DSG-007</code></a>.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/306.html" title="">CWE-306</a> - Missing Authentication for Critical Function</p>
+<p>Aside from the previously mentioned issues regarding the default Erlang distribution protocol (see <a href="#rule-dep-001" title=""><code>DEP-001</code></a>), this is a general issue. Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/306.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/918.html" title="">CWE-918</a> - Server-Side Request Forgery (SSRF) </p>
+<p>Erlang/OTP does not include any web frameworks, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/918.html">CWE description</a> for general advice on how to deal with this.</p>
+<p>As with other injection attacks, following <a href="#rule-dsg-007" title=""><code>DSG-007</code></a> may also help.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/77.html" title="">CWE-77</a> - Improper Neutralization of Special Elements used in a Command ('Command Injection')</p>
+<p>This is a general issue. Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/77.html">CWE description</a> for general advice on how to deal with this.</p>
+<p>As with other injection attacks, following <a href="#rule-dsg-007" title=""><code>DSG-007</code></a> may also help.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/639.html" title="">CWE-639</a> - Authorization Bypass Through User-Controlled Key</p>
+<p>This is a general issue. Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/639.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/770.html" title="">CWE-770</a> - Allocation of Resources Without Limits or Throttling</p>
+<p>See <a href="#rule-dsg-009" title=""><code>DSG-009</code></a>. Otherwise, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/770.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/266.html" title="">CWE-266</a> - Incorrect Privilege Assignment</p>
+<p>This is not Erlang-specific, please refer to <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/266.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/276.html" title="">CWE-276</a> - Incorrect Default Permissions</p>
+<p>Aside from the previously mentioned issues regarding the default Erlang distribution protocol (which is effectively wide open by default, see <a href="#rule-dep-001" title=""><code>DEP-001</code></a>), this is a general issue.</p>
+<p>Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/276.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/98.html" title="">CWE-98</a> - Improper Control of Filename for Include/Require Statement in PHP Program ('PHP Remote File Inclusion')</p>
+<p>This is specific to PHP, all other languages (including Erlang) are unaffected.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/269.html" title="">CWE-269</a> - Improper Privilege Management </p>
+<p>This is not Erlang-specific, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/269.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/190.html" title="">CWE-190</a> - Integer Overflow or Wraparound</p>
+<p>Erlang uses arbitrary-precision arithmetic rather than wrapping around or behaving in an ill-defined manner on overflow. Note that this weakness is distinct from throwing an error on overflow, which may still occur if the number grows to be several megabits in size. See <a href="system_limits.html" title="">system limits</a>.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/287.html" title="">CWE-287</a> - Improper Authentication</p>
+<p>Aside from the previously mentioned issues regarding the default Erlang distribution protocol (see <a href="#rule-dep-001" title=""><code>DEP-001</code></a>), this is a general issue.</p>
+<p>Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/287.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/400.html" title="">CWE-400</a> - Uncontrolled Resource Consumption</p>
+<p>Aside from the previously mentioned issues regarding <a href="#h-atom-exhaustion" title="">Atom Exhaustion</a>, this is a general issue.</p>
+<p>Most network-facing OTP applications provide options for controlling resource consumption. See <a href="#h-ssl-application" title=""><code>ssl</code> Application</a> and <a href="#h-ssh-application" title=""><code>ssh</code> Application</a> for more information.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/400.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/288.html" title="">CWE-288</a> - Authentication Bypass Using an Alternate Path or Channel </p>
+<p>This is a general issue. Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/288.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/427.html" title="">CWE-427</a> - Uncontrolled Search Path Element</p>
+<p>See <a href="#rule-dep-004" title=""><code>DEP-004</code></a>.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/798.html" title="">CWE-798</a> - Use of Hard-coded Credentials </p>
+<p>This is not Erlang-specific, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/798.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/362.html" title="">CWE-362</a> - Concurrent Execution using Shared Resource with Improper Synchronization ('Race Condition')</p>
+<p>As Erlang provides message-passing concurrency, race conditions are very easily avoided. Wrapping a shared resource in an Erlang process and routing all access through it guarantees atomicity regardless of the nature of the resource.</p>
+<p>Following <a href="#rule-dsg-008" title=""><code>DSG-008</code></a> may also help.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/401.html" title="">CWE-401</a> - Missing Release of Memory after Effective Lifetime</p>
+<p>Erlang has automatic memory management so this issue cannot occur. However, it is of course still possible to create something similar to a memory leak by explicitly keeping data around forever. For example, if your application has a cache that lacks an eviction strategy (i.e. never removes elements), it is possible for the cache to grow endlessly and cause the system to run out of memory.</p>
+<p>See the <a href="#h-memory-management" title="">Memory Management</a> section for more details.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/732.html" title="">CWE-732</a> - Incorrect Permission Assignment for Critical Resource</p>
+<p>Aside from the previously mentioned issues regarding the default Erlang distribution protocol (see <a href="#rule-dep-001" title=""><code>DEP-001</code></a>), this is a general issue. Please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/732.html">CWE description</a> for general advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/119.html" title="">CWE-119</a> - Improper Restriction of Operations within the Bounds of a Memory Buffer</p>
+<p>This issue cannot occur because Erlang is memory safe.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://cwe.mitre.org/data/definitions/601.html" title="">CWE-601</a> - URL Redirection to Untrusted Site ('Open Redirect')</p>
+<p>This is a general issue. When acting as a client using <a href="../../lib/inets-9.8/doc/html/httpc.html"><code>httpc</code></a>, the <code>{autoredirect, false}</code> option can be passed to avoid blindly following redirects.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://cwe.mitre.org/data/definitions/601.html">CWE description</a> for general advice on how to deal with this.</p>
+</li>
+</ol>
+
+<h2 id="owasp-top-10">OWASP Top 10</h2>
+<p>This section comments on the <a rel="nofollow" href="https://owasp.org/Top10/2025/0x00_2025-Introduction/" title="">top ten security risks</a> as catalogued by <a rel="nofollow" href="https://owasp.org/" title="">OWASP</a>. In general, following the Erlang/OTP conventions and documentation mitigates these risks.</p>
+
+<ol>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A01_2025-Broken_Access_Control/" title="">A01:2025</a> - Broken Access Control</p>
+<p>This risk does not relate to Erlang/OTP per se, other than the previously described deficiencies regarding the default distribution protocol, see <a href="#rule-dep-001" title=""><code>DEP-001</code></a>.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://owasp.org/Top10/2025/A01_2025-Broken_Access_Control/" title="">A01:2025</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A02_2025-Security_Misconfiguration/" title="">A02:2025</a> - Security Misconfiguration</p>
+<p>See <a href="#owasp-a01-2025" title=""><code>A01:2025</code></a> and the <a rel="nofollow" href="https://owasp.org/Top10/2025/A02_2025-Security_Misconfiguration/" title="">A02:2025</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A03_2025-Software_Supply_Chain_Failures/" title="">A03:2025</a> - Software Supply Chain Failures</p>
+<p>This risk does not relate to Erlang per se. For what it is worth, Erlang/OTP provides a built source Software Bill of Materials (SBoM) for every release.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://owasp.org/Top10/2025/A03_2025-Software_Supply_Chain_Failures/" title="">A03:2025</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A04_2025-Cryptographic_Failures/" title="">A04:2025</a> - Cryptographic Failures</p>
+<p>This risk does not relate to Erlang/OTP per se, but some risks can be mitigated by following the advice in the <a href="#h-crypto-application" title=""><code>crypto</code> Application</a> section.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://owasp.org/Top10/2025/A04_2025-Cryptographic_Failures/" title="">A04:2025</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A05_2025-Injection/" title="">A05:2025</a> - Injection</p>
+<p>See <a href="#rule-msc-004" title=""><code>MSC-004</code></a> and the <a rel="nofollow" href="https://owasp.org/Top10/2025/A05_2025-Injection/" title="">A05:2025</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A06_2025-Insecure_Design/" title="">A06:2025</a> - Insecure Design</p>
+<p>This risk does not relate to Erlang per se, but following this guide, our <a href="https://www.erlang.org/doc/system/design_principles.html" title="">Design principles</a>, and the <a rel="nofollow" href="https://owasp.org/Top10/2025/A06_2025-Insecure_Design/" title="">A06:2025</a> description provides a good foundation to build upon.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A07_2025-Authentication_Failures/" title="">A07:2025</a> - Authentication Failures</p>
+<p>See <a href="#owasp-a01-2025" title=""><code>A01:2025</code></a> and the <a rel="nofollow" href="https://owasp.org/Top10/2025/A07_2025-Authentication_Failures/" title="">A07:2025</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A08_2025-Software_or_Data_Integrity_Failures/" title="">A08:2025</a> - Software or Data Integrity Failures</p>
+<p>Erlang/OTP provides various tools to help ensure data integrity, notably <a href="../../lib/public_key-1.21.7/doc/html/public_key.html#sign/4"><code>public_key:sign/4</code></a> and <a href="../../lib/public_key-1.21.7/doc/html/public_key.html#verify/5"><code>public_key:verify/5</code></a>.</p>
+<p>Note, however, that there is <em>no built-in support</em> for software integrity checks. All components of the software itself are considered <em>trusted</em> and are <em>only</em> subject to checks that protect against some kinds of accidental corruption.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://owasp.org/Top10/2025/A08_2025-Software_or_Data_Integrity_Failures/" title="">A08:2025</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A09_2025-Logging_and_Alerting_Failures/" title="">A09:2025</a> - Logging &amp; Alerting Failures</p>
+<p>Erlang/OTP logs many things by default, including processes that terminate abnormally ("crash"), which is especially effective when following the convention outlined in the <a href="#h-error-handling" title="">Error Handling</a> section. These logs are passed through the <a href="../../lib/kernel-11.0.4/doc/html/logger.html"><code>logger</code></a> framework and can be configured at will.</p>
+<p>It is also important to consider the possibility of leaking sensitive information through logs, see <a href="#rule-msc-004" title=""><code>MSC-004</code></a>.</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://owasp.org/Top10/2025/A09_2025-Logging_and_Alerting_Failures/" title="">A09:2025</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/Top10/2025/A10_2025-Mishandling_of_Exceptional_Conditions/" title="">A10:2025</a> - Mishandling of Exceptional Conditions</p>
+<p>As mentioned in the <a href="#h-error-handling" title="">Error Handling</a> section, program execution should be restricted to that which is expected, and unexpected situations should be left to the supervision structure. See also <a href="#rule-dsg-001" title=""><code>DSG-001</code></a> and the <a rel="nofollow" href="https://owasp.org/Top10/2025/A10_2025-Mishandling_of_Exceptional_Conditions/" title="">A10:2025</a> description for advice on how to deal with this.</p>
+</li>
+</ol>
+
+<h2 id="owasp-api-security-top-10">OWASP API Security Top 10</h2>
+<p>This section comments on the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0x11-t10/" title="">top ten API security risks</a> as catalogued by <a rel="nofollow" href="https://owasp.org/" title="">OWASP</a>. In general, following the Erlang/OTP conventions and documentation mitigates these risks, but their nature means that there are few Erlang-specific recommendations.</p>
+
+<ol>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/" title="">API1:2023</a> - Broken Object Level Authorization</p>
+<p>This is a general issue, please refer to the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/" title="">API1:2023</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/" title="">API2:2023</a> - Broken Authentication</p>
+<p>This is a general issue, similar to <a href="#owasp-a01-2025" title=""><code>A01:2025</code></a> - Broken Access Control. Please refer to the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/" title="">API2:2023</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/" title="">API3:2023</a> - Broken Object Property Level Authorization</p>
+<p>This is a general issue, similar to <a href="#owasp-api1-2023" title=""><code>API1:2023</code></a> - Broken Object Level Authorization. Please refer to the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/" title="">API3:2023</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/" title="">API4:2023</a> - Unrestricted Resource Consumption</p>
+<p>Aside from the previously mentioned issues regarding <a href="#h-atom-exhaustion" title="">Atom Exhaustion</a>, this is a general issue. Please refer to <a href="#rule-dsg-009" title=""><code>DSG-009</code></a>, <a href="#cwe-770" title=""><code>CWE-770</code></a>, and the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/" title="">API4:2023</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/" title="">API5:2023</a> - Broken Function Level Authorization</p>
+<p>This is a general issue, similar to <a href="#owasp-api1-2023" title=""><code>API1:2023</code></a> - Broken Object Level Authorization. Please refer to the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/" title="">API5:2023</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa6-unrestricted-access-to-sensitive-business-flows/" title="">API6:2023</a> - Unrestricted Access to Sensitive Business Flows</p>
+<p>This is a general issue, similar to <a href="#owasp-api1-2023" title=""><code>API1:2023</code></a> - Broken Object Level Authorization. Please refer to the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa6-unrestricted-access-to-sensitive-business-flows/" title="">API6:2023</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa7-server-side-request-forgery/" title="">API7:2023</a> - Server Side Request Forgery</p>
+<p>This is a general issue, please refer to <a href="#cwe-918" title=""><code>CWE-918</code></a> and the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa7-server-side-request-forgery/" title="">API7:2023</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa8-security-misconfiguration/" title="">API8:2023</a> - Security Misconfiguration</p>
+<p>This risk does not relate to Erlang/OTP per se, other than the previously described deficiencies regarding the default distribution protocol (see <a href="#rule-dep-001" title=""><code>DEP-001</code></a>).</p>
+<p>Otherwise, please refer to the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa8-security-misconfiguration/" title="">API8:2023</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa9-improper-inventory-management/" title="">API9:2023</a> - Improper Inventory Management</p>
+<p>This is a general issue, please refer to the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xa9-improper-inventory-management/" title="">API9:2023</a> description for advice on how to deal with this.</p>
+
+</li>
+<li>
+<p><a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xaa-unsafe-consumption-of-apis/" title="">API10:2023</a> - Unsafe Consumption of APIs</p>
+<p>This is a general issue, please refer to the <a rel="nofollow" href="https://owasp.org/API-Security/editions/2023/en/0xaa-unsafe-consumption-of-apis/" title="">API10:2023</a> description for advice on how to deal with this.</p>
+</li>
+</ol><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

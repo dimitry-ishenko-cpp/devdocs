@@ -1,0 +1,328 @@
+<h1> <span>supervisor</span> <small>behaviour</small>  </h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L22" title="View Source" class="source" rel="help nofollow">Source</a>   <p>Generic supervisor behavior.</p>
+<p>This behavior module provides a supervisor, a process that supervises other processes called child processes. A child process can either be another supervisor or a worker process. Worker processes are normally implemented using one of the <a href="gen_event.html"><code>gen_event</code></a>, <a href="gen_server.html"><code>gen_server</code></a>, or <a href="gen_statem.html"><code>gen_statem</code></a> behaviors. A supervisor implemented using this module has a standard set of interface functions and includes functionality for tracing and error reporting. Supervisors are used to build a hierarchical process structure called a supervision tree, a nice way to structure a fault-tolerant application. For more information, see <a href="../../../../doc/system/sup_princ.html">Supervisor Behaviour</a> in OTP Design Principles.</p>
+<p>A supervisor expects the definition of which child processes to supervise to be specified in a callback module exporting a predefined set of functions.</p>
+<p>Unless otherwise stated, all functions in this module fail if the specified supervisor does not exist or if bad arguments are specified.</p>
+
+<h2 id="module-supervision-principles">Supervision Principles</h2>
+<p>The supervisor is responsible for starting, stopping, and monitoring its child processes. The basic idea of a supervisor is that it must keep its child processes alive by restarting them when necessary.</p>
+<p>The children of a supervisor are defined as a list of <em>child specifications</em>. When the supervisor is started, the child processes are started in order from left to right according to this list. When the supervisor is going to terminate, it first terminates its child processes in reversed start order, from right to left.</p>
+
+<h3 id="module-supervisor-flags">Supervisor flags</h3>
+<p>The supervisor properties are defined by the supervisor flags. The type definition for the supervisor flags is as follows:</p>
+<pre data-language="erlang">sup_flags() = #{strategy =&gt; strategy(),           % optional
+                intensity =&gt; non_neg_integer(),   % optional
+                period =&gt; pos_integer(),          % optional
+                hibernate_after =&gt; timeout(),     % optional, available since OTP 28.0
+                auto_shutdown =&gt; auto_shutdown()} % optional</pre>
+<h4>Restart Strategies</h4>
+<p>A supervisor can have one of the following <em>restart strategies</em> specified with the <code>strategy</code> key in the above map:</p>
+<ul>
+<li><p><code>one_for_one</code> - If one child process terminates and is to be restarted, only that child process is affected. This is the default restart strategy.</p></li>
+<li><p><code>one_for_all</code> - If one child process terminates and is to be restarted, all other child processes are terminated and then all child processes are restarted.</p></li>
+<li><p><code>rest_for_one</code> - If one child process terminates and is to be restarted, the 'rest' of the child processes (that is, the child processes after the terminated child process in the start order) are terminated. Then the terminated child process and all child processes after it are restarted.</p></li>
+<li>
+<p><code>simple_one_for_one</code> - A simplified <code>one_for_one</code> supervisor, where all child processes are dynamically added instances of the same process type, that is, running the same code.</p>
+<p>Functions <a href="#delete_child/2"><code>delete_child/2</code></a> and <a href="#restart_child/2"><code>restart_child/2</code></a> are invalid for <code>simple_one_for_one</code> supervisors and return <code>{error,simple_one_for_one}</code> if the specified supervisor uses this restart strategy.</p>
+<p>Function <a href="#terminate_child/2"><code>terminate_child/2</code></a> can be used for children under <code>simple_one_for_one</code> supervisors by specifying the child's <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a> as the second argument. If instead the child specification identifier is used, <a href="#terminate_child/2"><code>terminate_child/2</code></a> return <code>{error,simple_one_for_one}</code>.</p>
+<p>As a <code>simple_one_for_one</code> supervisor can have many children, it shuts them all down asynchronously. This means that the children do their cleanup in parallel, and therefore the order in which they are stopped is not defined.</p>
+</li>
+</ul>
+<h4>Restart intensity and period</h4>
+<p>To prevent a supervisor from getting into an infinite loop of child process terminations and restarts, a <em>maximum restart intensity</em> is defined using two integer values specified with keys <code>intensity</code> and <code>period</code> in the above map. Assuming the values <code>MaxR</code> for <code>intensity</code> and <code>MaxT</code> for <code>period</code>, then, if more than <code>MaxR</code> restarts occur within <code>MaxT</code> seconds, the supervisor terminates all child processes and then itself. The termination reason for the supervisor itself in that case will be <code>shutdown</code>. <code>intensity</code> defaults to <code>1</code> and <code>period</code> defaults to <code>5</code>.</p>
+<h4>Hibernate after</h4>
+<p>In order to save memory, a supervisor, like any other process, can go into hibernation. By default, a <code>simple_one_for_one</code> supervisor will never hibernate, as it is expected its children will come and go at potentially high rates. In counterpart, other strategies rather expect children to be stable and therefore will default to hibernating after a certain period of time of inactivity, in order to be responsive to bursts of restarts and save memory in periods of stability. You can finetune this flag by setting <code>hibernate_after</code>, when for example the supervisor will be regularly queried for <code>which_child/1</code> or similar and hibernation is to be better controlled.</p>
+
+<h4>Automatic Shutdown</h4>
+<p>A supervisor can be configured to automatically shut itself down with exit reason <code>shutdown</code> when <a href="supervisor.html#significant_child">significant children</a> terminate with the <code>auto_shutdown</code> key in the above map:</p>
+<ul>
+<li>
+<p><code>never</code> - Automic shutdown is disabled. This is the default setting.</p>
+<p>With <code>auto_shutdown</code> set to <code>never</code>, child specs with the <code>significant</code> flag set to <code>true</code> are considered invalid and will be rejected.</p>
+</li>
+<li><p><code>any_significant</code> - The supervisor will shut itself down when <em>any</em> significant child terminates, that is, when a <code>transient</code> significant child terminates normally or when a <code>temporary</code> significant child terminates normally or abnormally.</p></li>
+<li><p><code>all_significant</code> - The supervisor will shut itself down when <em>all</em> significant children have terminated, that is, when the <em>last active</em> significant child terminates. The same rules as for <code>any_significant</code> apply.</p></li>
+</ul>
+<p>For more information, see the section <a href="../../../../doc/system/sup_princ.html#automatic-shutdown">Automatic Shutdown</a> in Supervisor Behavior in OTP Design Principles.</p>
+<div class="warning">
+<p class="label">Warning</p>
+<p>The automatic shutdown feature appeared in OTP 24.0, but applications using this feature will also compile and run with older OTP versions.</p>
+<p>However, such applications, when compiled with an OTP version that predates the appearance of the automatic shutdown feature, will leak processes because the automatic shutdowns they rely on will not happen.</p>
+<p>It is up to implementors to take proper precautions if they expect that their applications may be compiled with older OTP versions.</p>
+</div>
+
+<h3 id="module-child-specification">Child specification</h3>
+<p>The type definition of a child specification is as follows:</p>
+<pre data-language="erlang">child_spec() = #{id =&gt; child_id(),             % mandatory
+                 start =&gt; mfargs(),            % mandatory
+                 restart =&gt; restart(),         % optional
+                 significant =&gt; significant(), % optional
+                 shutdown =&gt; shutdown(),       % optional
+                 type =&gt; worker(),             % optional
+                 modules =&gt; modules()}         % optional</pre>
+<p>The old tuple format is kept for backwards compatibility, see <a href="#t:child_spec/0"><code>child_spec/0</code></a>, but the map is preferred.</p>
+<ul>
+<li>
+<p><code>id</code> is used to identify the child specification internally by the supervisor.</p>
+<p>The <code>id</code> key is mandatory.</p>
+<p>Notice that this identifier on occasion has been called "name". As far as possible, the terms "identifier" or "id" are now used but to keep backward compatibility, some occurences of "name" can still be found, for example in error messages.</p>
+</li>
+<li>
+<p><code>start</code> defines the function call used to start the child process. It must be a module-function-arguments tuple <code>{M,F,A}</code> used as <a href="../../../../erts-17.1/doc/html/erlang.html#apply/3"><code>apply(M,F,A)</code></a>.</p>
+<p>The start function <em>must create and link to</em> the child process, and must return <code>{ok,Child}</code> or <code>{ok,Child,Info}</code>, where <code>Child</code> is the pid of the child process and <code>Info</code> any term that is ignored by the supervisor.</p>
+<p>The start function can also return <code>ignore</code> if the child process for some reason cannot be started, in which case the child specification is kept by the supervisor (unless it is a temporary child) but the non-existing child process is ignored.</p>
+<p>If something goes wrong, the function can also return an error tuple <code>{error,Error}</code>.</p>
+<p>Notice that the <code>start_link</code> functions of the different behavior modules fulfill the above requirements.</p>
+<p>The <code>start</code> key is mandatory.</p>
+</li>
+<li>
+<p> <code>restart</code> defines when a terminated child process must be restarted. A <code>permanent</code> child process is always restarted. A <code>temporary</code> child process is never restarted (even when the supervisor's restart strategy is <code>rest_for_one</code> or <code>one_for_all</code> and a sibling's death causes the temporary process to be terminated). A <code>transient</code> child process is restarted only if it terminates abnormally, that is, with another exit reason than <code>normal</code>, <code>shutdown</code>, or <code>{shutdown,Term}</code>.</p>
+<p>The <code>restart</code> key is optional. If it is not specified, it defaults to <code>permanent</code>.</p>
+</li>
+<li>
+<p> <code>significant</code> defines if a child is considered significant for <a href="supervisor.html#auto_shutdown">automatic self-shutdown</a> of the supervisor.</p>
+<p>Setting this option to <code>true</code> when the <a href="supervisor.html#restart">restart type</a> is <code>permanent</code> is invalid. Also, it is considered invalid to start children with this option set to <code>true</code> in a supervisor when the <a href="supervisor.html#auto_shutdown"><code>auto_shutdown</code></a> supervisor flag is set to <code>never</code>.</p>
+<p>The <code>significant</code> key is optional. If it is not specified, it defaults to <code>false</code>.</p>
+</li>
+<li>
+<p><code>shutdown</code> defines how a child process must be terminated. <code>brutal_kill</code> means that the child process is unconditionally terminated using <a href="../../../../erts-17.1/doc/html/erlang.html#exit_signal/2"><code>exit_signal(Child,kill)</code></a>. An integer time-out value means that the supervisor tells the child process to terminate by calling <a href="../../../../erts-17.1/doc/html/erlang.html#exit_signal/2"><code>exit_signal(Child,shutdown)</code></a> and then wait for an exit signal with reason <code>shutdown</code> back from the child process. If no exit signal is received within the specified number of milliseconds, the child process is unconditionally terminated using <a href="../../../../erts-17.1/doc/html/erlang.html#exit_signal/2"><code>exit_signal(Child,kill)</code></a>.</p>
+<p>If the child process is another supervisor, the shutdown time must be set to <code>infinity</code> to give the subtree ample time to shut down.</p>
+<div class="warning">
+<p class="label">Warning</p>
+<p>Setting the shutdown time to anything other than <code>infinity</code> for a child of type <code>supervisor</code> can cause a race condition where the child in question unlinks its own children, but fails to terminate them before it is killed.</p>
+</div>
+<p>It is also allowed to set it to <code>infinity</code>, if the child process is a worker.</p>
+<div class="warning">
+<p class="label">Warning</p>
+<p>Be careful when setting the shutdown time to <code>infinity</code> when the child process is a worker. Because, in this situation, the termination of the supervision tree depends on the child process, it must be implemented in a safe way and its cleanup procedure must always return.</p>
+</div>
+<p>Notice that all child processes implemented using the standard OTP behavior modules automatically adhere to the shutdown protocol.</p>
+<p>The <code>shutdown</code> key is optional. If it is not specified, it defaults to <code>5000</code> if the child is of type <code>worker</code> and it defaults to <code>infinity</code> if the child is of type <code>supervisor</code>.</p>
+</li>
+<li>
+<p><code>type</code> specifies if the child process is a supervisor or a worker.</p>
+<p>The <code>type</code> key is optional. If it is not specified, it defaults to <code>worker</code>.</p>
+</li>
+<li>
+<p><code>modules</code> is used by the release handler during code replacement to determine which processes are using a certain module. As a rule of thumb, if the child process is a <a href="supervisor.html"><code>supervisor</code></a>, <a href="gen_server.html"><code>gen_server</code></a> or, <a href="gen_statem.html"><code>gen_statem</code></a>, this is to be a list with one element <code>[Module]</code>, where <code>Module</code> is the callback module. If the child process is an event manager (<a href="gen_event.html"><code>gen_event</code></a>) with a dynamic set of callback modules, value <code>dynamic</code> must be used. For more information about release handling, see <a href="../../../../doc/system/release_handling.html">Release Handling</a> in OTP Design Principles.</p>
+<p>The <code>modules</code> key is optional. If it is not specified, it defaults to <code>[M]</code>, where <code>M</code> comes from the child's start <code>{M,F,A}</code>.</p>
+</li>
+<li><p>Internally, the supervisor also keeps track of the pid <code>Child</code> of the child process, or <code>undefined</code> if no pid exists.</p></li>
+</ul>
+<h3 id="module-see-also">See Also</h3>
+<p><a href="gen_event.html"><code>gen_event</code></a>, <a href="gen_statem.html"><code>gen_statem</code></a>, <a href="gen_server.html"><code>gen_server</code></a>, <a href="sys.html"><code>sys</code></a></p>   <section id="summary" class="details-list"> <h2>Summary</h2> <h3>Types</h3>
+<dl class="summary-types summary">   <dt> <a href="#t:auto_shutdown/0">auto_shutdown()</a> </dt>   <dt> <a href="#t:child/0">child()</a> </dt>   <dt> <a href="#t:child_id/0">child_id()</a> </dt> <dd><p>Not a <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a>.</p></dd>   <dt> <a href="#t:child_rec/0">child_rec()</a> </dt>   <dt> <a href="#t:child_spec/0">child_spec()</a> </dt> <dd><p>The tuple format is kept for backward compatibility only. A map is preferred; see more details <a href="supervisor.html#child_spec">above</a>.</p></dd>   <dt> <a href="#t:children/0">children()</a> </dt>   <dt> <a href="#t:mfargs/0">mfargs()</a> </dt> <dd><p>Value <code>undefined</code> for <code>A</code> (the argument list) is only to be used internally in <a href="supervisor.html"><code>supervisor</code></a>. If the restart type of the child is <code>temporary</code>, the process is never to be restarted and therefore there is no need to store the real argument list. Value <code>undefined</code> is then stored instead.</p></dd>   <dt> <a href="#t:modules/0">modules()</a> </dt>   <dt> <a href="#t:restart/0">restart()</a> </dt>   <dt> <a href="#t:shutdown/0">shutdown()</a> </dt>   <dt> <a href="#t:significant/0">significant()</a> </dt>   <dt> <a href="#t:startchild_err/0">startchild_err()</a> </dt>   <dt> <a href="#t:startchild_ret/0">startchild_ret()</a> </dt>   <dt> <a href="#t:startlink_err/0">startlink_err()</a> </dt>   <dt> <a href="#t:startlink_ret/0">startlink_ret()</a> </dt>   <dt> <a href="#t:strategy/0">strategy()</a> </dt>   <dt> <a href="#t:sup_flags/0">sup_flags()</a> </dt> <dd><p>The tuple format is kept for backward compatibility only. A map is preferred; see more details <a href="supervisor.html#sup_flags">above</a>.</p></dd>   <dt> <a href="#t:sup_name/0">sup_name()</a> </dt> <dd><p>Name specification to use when starting a <code>supervisor</code>. See function <a href="#start_link/2"><code>start_link/2,3</code></a> and the type <a href="#t:sup_ref/0"><code>sup_ref/0</code></a> below.</p></dd>   <dt> <a href="#t:sup_ref/0">sup_ref()</a> </dt> <dd><p>Supervisor specification to use when addressing a <code>supervisor</code>. See <a href="#count_children/1"><code>count_children/1</code></a>, <a href="#delete_child/2"><code>delete_child/2</code></a>, <a href="#get_childspec/2"><code>get_childspec/2</code></a>, <a href="#restart_child/2"><code>restart_child/2</code></a>, <a href="#start_child/2"><code>start_child/2</code></a>, <a href="#terminate_child/2"><code>terminate_child/2</code></a>, <a href="#which_children/1"><code>which_children/1</code></a> and the type <a href="#t:sup_name/0"><code>sup_name/0</code></a> above.</p></dd>   <dt> <a href="#t:worker/0">worker()</a> </dt>  </dl> <h3>Callbacks</h3>
+<dl class="summary-callbacks summary">   <dt> <a href="#c:init/1">init(Args)</a> </dt> <dd><p>Whenever a supervisor is started using <a href="#start_link/2"><code>start_link/2,3</code></a>, this function is called by the new process to find out about restart strategy, maximum restart intensity, and child specifications.</p></dd>  </dl> <h3>Functions</h3>
+<dl class="summary-functions summary">   <dt> <a href="#check_childspecs/1">check_childspecs(ChildSpecs)</a> </dt> <dd><p>Equivalent to <a href="#check_childspecs/2"><code>check_childspecs(ChildSpecs, undefined)</code></a>.</p></dd>   <dt> <a href="#check_childspecs/2">check_childspecs(ChildSpecs, AutoShutdown)</a> </dt> <dd><p>Takes a list of child specification as argument and returns <code>ok</code> if all of them are syntactically correct, otherwise <code>{error,Error}</code>.</p></dd>   <dt> <a href="#count_children/1">count_children(SupRef)</a> </dt> <dd><p>Returns a <a href="proplists.html#t:proplist/0">property list</a> containing the counts for each of the following elements of the supervisor's child specifications and managed processes</p></dd>   <dt> <a href="#delete_child/2">delete_child(SupRef, Id)</a> </dt> <dd><p>Tells supervisor <code>SupRef</code> to delete the child specification identified by <code>Id</code>. The corresponding child process must not be running. Use <a href="#terminate_child/2"><code>terminate_child/2</code></a> to terminate it.</p></dd>   <dt> <a href="#get_childspec/2">get_childspec(SupRef, Id)</a> </dt> <dd><p>Returns the child specification map for the child identified by <code>Id</code> under supervisor <code>SupRef</code>. The returned map contains all keys, both mandatory and optional.</p></dd>   <dt> <a href="#restart_child/2">restart_child(SupRef, Id)</a> </dt> <dd><p>Tells supervisor <code>SupRef</code> to restart a child process corresponding to the child specification identified by <code>Id</code>. The child specification must exist, and the corresponding child process must not be running.</p></dd>   <dt> <a href="#start_child/2">start_child(Supervisor, ChildSpecOrExtraArgs)</a> </dt> <dd><p>Dynamically adds a child specification to supervisor <code>SupRef</code>, which starts the corresponding child process.</p></dd>   <dt> <a href="#start_link/2">start_link(Module, Args)</a> </dt> <dd><p>Creates a nameless supervisor process as part of a supervision tree.</p></dd>   <dt> <a href="#start_link/3">start_link(SupName, Module, Args)</a> </dt> <dd><p>Creates a supervisor process as part of a supervision tree.</p></dd>   <dt> <a href="#stop/1">stop(SupRef)</a> </dt> <dd><p>Equivalent to <a href="#stop/3"><code>stop(SupRef, normal, infinity)</code></a>.</p></dd>   <dt> <a href="#stop/3">stop(SupRef, Reason, Timeout)</a> </dt> <dd><p>Stop a supervisor.</p></dd>   <dt> <a href="#terminate_child/2">terminate_child(SupRef, Id)</a> </dt> <dd><p>Tells supervisor <code>SupRef</code> to terminate the specified child.</p></dd>   <dt> <a href="#which_child/2">which_child(SupRef, Id)</a> </dt> <dd><p>Returns information about the child specification and child process identified by the given <code>Id</code>.</p></dd>   <dt> <a href="#which_children/1">which_children(SupRef)</a> </dt> <dd><p>Returns a newly created list with information about all child specifications and child processes belonging to supervisor <code>SupRef</code>.</p></dd>  </dl> </section> <section id="types" class="details-list"> <h2>Types</h2> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:auto_shutdown/0">auto_shutdown() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L340" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> auto_shutdown() :: never | any_significant | all_significant.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:child/0">child() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L341" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> child() :: undefined | <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:child_id/0">child_id() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L343" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> child_id() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Not a <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:child_rec/0">child_rec() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L465" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> child_rec() ::
+          #child{pid :: <a href="#t:child/0">child</a>() | {restarting, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | undefined} | [<a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()],
+                 id :: <a href="#t:child_id/0">child_id</a>(),
+                 mfargs :: <a href="#t:mfargs/0">mfargs</a>(),
+                 restart_type :: <a href="#t:restart/0">restart</a>(),
+                 significant :: <a href="#t:significant/0">significant</a>(),
+                 shutdown :: <a href="#t:shutdown/0">shutdown</a>(),
+                 child_type :: <a href="#t:worker/0">worker</a>(),
+                 modules :: <a href="#t:modules/0">modules</a>()}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:child_spec/0">child_spec()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L410" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> child_spec() ::
+          #{id := <a href="#t:child_id/0">child_id</a>(),
+            start := <a href="#t:mfargs/0">mfargs</a>(),
+            restart =&gt; <a href="#t:restart/0">restart</a>(),
+            significant =&gt; <a href="#t:significant/0">significant</a>(),
+            shutdown =&gt; <a href="#t:shutdown/0">shutdown</a>(),
+            type =&gt; <a href="#t:worker/0">worker</a>(),
+            modules =&gt; <a href="#t:modules/0">modules</a>()} |
+          {Id :: <a href="#t:child_id/0">child_id</a>(),
+           StartFunc :: <a href="#t:mfargs/0">mfargs</a>(),
+           Restart :: <a href="#t:restart/0">restart</a>(),
+           Shutdown :: <a href="#t:shutdown/0">shutdown</a>(),
+           Type :: <a href="#t:worker/0">worker</a>(),
+           Modules :: <a href="#t:modules/0">modules</a>()}.</pre>  <p>The tuple format is kept for backward compatibility only. A map is preferred; see more details <a href="supervisor.html#child_spec">above</a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:children/0">children() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L439" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> children() :: {Ids :: [<a href="#t:child_id/0">child_id</a>()], Db :: #{<a href="#t:child_id/0">child_id</a>() =&gt; <a href="#t:child_rec/0">child_rec</a>()}}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:mfargs/0">mfargs() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L350" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> mfargs() :: {M :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), F :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), A :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()] | undefined}.</pre>  <p>Value <code>undefined</code> for <code>A</code> (the argument list) is only to be used internally in <a href="supervisor.html"><code>supervisor</code></a>. If the restart type of the child is <code>temporary</code>, the process is never to be restarted and therefore there is no need to store the real argument list. Value <code>undefined</code> is then stored instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:modules/0">modules() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L351" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> modules() :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>()] | dynamic.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:restart/0">restart() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L352" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> restart() :: permanent | transient | temporary.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:shutdown/0">shutdown() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L354" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> shutdown() :: brutal_kill | <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:significant/0">significant() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L353" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> significant() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:startchild_err/0">startchild_err()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L605" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> startchild_err() :: already_present | {already_started, Child :: <a href="#t:child/0">child</a>()} | <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:startchild_ret/0">startchild_ret()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L607" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> startchild_ret() ::
+          {ok, Child :: <a href="#t:child/0">child</a>()} | {ok, Child :: <a href="#t:child/0">child</a>(), Info :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {error, <a href="#t:startchild_err/0">startchild_err</a>()}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:startlink_err/0">startlink_err()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L533" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> startlink_err() :: {already_started, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()} | {shutdown, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:startlink_ret/0">startlink_ret()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L536" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> startlink_ret() :: {ok, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()} | ignore | {error, <a href="#t:startlink_err/0">startlink_err</a>()}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:strategy/0">strategy()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L424" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> strategy() :: one_for_all | one_for_one | rest_for_one | simple_one_for_one.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:sup_flags/0">sup_flags()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L431" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> sup_flags() ::
+          #{strategy =&gt; <a href="#t:strategy/0">strategy</a>(),
+            intensity =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+            period =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>(),
+            auto_shutdown =&gt; <a href="#t:auto_shutdown/0">auto_shutdown</a>(),
+            hibernate_after =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>()} |
+          {RestartStrategy :: <a href="#t:strategy/0">strategy</a>(), Intensity :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), Period :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>()}.</pre>  <p>The tuple format is kept for backward compatibility only. A map is preferred; see more details <a href="supervisor.html#sup_flags">above</a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:sup_name/0">sup_name()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L373" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> sup_name() ::
+          {local, Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>()} | {global, Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {via, Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:any/0">any</a>()}.</pre>  <p>Name specification to use when starting a <code>supervisor</code>. See function <a href="#start_link/2"><code>start_link/2,3</code></a> and the type <a href="#t:sup_ref/0"><code>sup_ref/0</code></a> below.</p>
+<ul>
+<li><p><strong><code>{local,LocalName}</code></strong> - Register the <code>supervisor</code> locally as <code>LocalName</code> using <a href="../../../../erts-17.1/doc/html/erlang.html#register/2"><code>register/2</code></a>.</p></li>
+<li><p><strong><code>{global,GlobalName}</code></strong> - Register the <code>supervisor</code> process id globally as <code>GlobalName</code> using <a href="../../../kernel-11.0.4/doc/html/global.html#register_name/2"><code>global:register_name/2</code></a>.</p></li>
+<li><p><strong><code>{via,RegMod,ViaName}</code></strong> - Register the <code>supervisor</code> process with the registry represented by <code>RegMod</code>. The <code>RegMod</code> callback is to export the functions <code>register_name/2</code>, <code>unregister_name/1</code>, <code>whereis_name/1</code>, and <code>send/2</code>, which are to behave like the corresponding functions in <a href="../../../kernel-11.0.4/doc/html/global.html"><code>global</code></a>. Thus, <code>{via,global,GlobalName}</code> is a valid reference equivalent to <code>{global,GlobalName}</code>.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:sup_ref/0">sup_ref()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L401" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> sup_ref() ::
+          (Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>()) |
+          {Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Node :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:node/0">node</a>()} |
+          {global, Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} |
+          {via, Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:any/0">any</a>()} |
+          <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>().</pre>  <p>Supervisor specification to use when addressing a <code>supervisor</code>. See <a href="#count_children/1"><code>count_children/1</code></a>, <a href="#delete_child/2"><code>delete_child/2</code></a>, <a href="#get_childspec/2"><code>get_childspec/2</code></a>, <a href="#restart_child/2"><code>restart_child/2</code></a>, <a href="#start_child/2"><code>start_child/2</code></a>, <a href="#terminate_child/2"><code>terminate_child/2</code></a>, <a href="#which_children/1"><code>which_children/1</code></a> and the type <a href="#t:sup_name/0"><code>sup_name/0</code></a> above.</p>
+<p>It can be:</p>
+<ul>
+<li><p><strong><a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a></strong> - The <code>supervisor</code>'s process identifier.</p></li>
+<li><p><strong><code>LocalName</code></strong> - The <code>supervisor</code> is locally registered as <code>LocalName</code> with <a href="../../../../erts-17.1/doc/html/erlang.html#register/2"><code>register/2</code></a>.</p></li>
+<li><p><strong><code>{Name,Node}</code></strong> - The <code>supervisor</code> is locally registered on another node.</p></li>
+<li><p><strong><code>{global,GlobalName}</code></strong> - The <code>supervisor</code> is globally registered in <a href="../../../kernel-11.0.4/doc/html/global.html"><code>global</code></a>.</p></li>
+<li><p><strong><code>{via,RegMod,ViaName}</code></strong> - The <code>supervisor</code> is registered in an alternative process registry. The registry callback module <code>RegMod</code> is to export functions <code>register_name/2</code>, <code>unregister_name/1</code>, <code>whereis_name/1</code>, and <code>send/2</code>, which are to behave like the corresponding functions in <a href="../../../kernel-11.0.4/doc/html/global.html"><code>global</code></a>. Thus, <code>{via,global,GlobalName}</code> is the same as <code>{global,GlobalName}</code>.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:worker/0">worker() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L355" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> worker() :: worker | supervisor.</pre>  </section> </section> </div> </section> <section id="callbacks" class="details-list"> <h2>Callbacks</h2> <div class="callbacks-list"> <section class="detail"> <h3 class="detail-header" id="c:init/1">init(Args)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L521" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> init(Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt; {ok, {SupFlags :: <a href="#t:sup_flags/0">sup_flags</a>(), [ChildSpec :: <a href="#t:child_spec/0">child_spec</a>()]}} | ignore.</pre>  <p>Whenever a supervisor is started using <a href="#start_link/2"><code>start_link/2,3</code></a>, this function is called by the new process to find out about restart strategy, maximum restart intensity, and child specifications.</p>
+<p><code>Args</code> is the <code>Args</code> argument provided to the start function.</p>
+<p><code>SupFlags</code> is the supervisor flags defining the restart strategy and maximum restart intensity for the supervisor. <code>[ChildSpec]</code> is a list of valid child specifications defining which child processes the supervisor must start and monitor. See the discussion in section <a href="supervisor.html#supervision_princ"><code>Supervision Principles</code></a> earlier.</p>
+<p>Notice that when the restart strategy is <code>simple_one_for_one</code>, the list of child specifications must be a list with one child specification only. (The child specification identifier is ignored.) No child process is then started during the initialization phase, but all children are assumed to be started dynamically using <a href="#start_child/2"><code>start_child/2</code></a>.</p>
+<p>The function can also return <code>ignore</code>.</p>
+<p>Notice that this function can also be called as a part of a code upgrade procedure. Therefore, the function is not to have any side effects. For more information about code upgrade of supervisors, see section <a href="../../../../doc/system/appup_cookbook.html#sup">Changing a Supervisor</a> in OTP Design Principles.</p> </section> </section> </div> </section> <section id="functions" class="details-list"> <h2>Functions</h2> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="check_childspecs/1">check_childspecs(ChildSpecs)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L878" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> check_childspecs(ChildSpecs) -&gt; Result
+                          when ChildSpecs :: [<a href="#t:child_spec/0">child_spec</a>()], Result :: ok | {error, Error :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>Equivalent to <a href="#check_childspecs/2"><code>check_childspecs(ChildSpecs, undefined)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="check_childspecs/2">check_childspecs(ChildSpecs, AutoShutdown) <span class="since">(since OTP 24.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L894" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> check_childspecs(ChildSpecs, AutoShutdown) -&gt; Result
+                          when
+                              ChildSpecs :: [<a href="#t:child_spec/0">child_spec</a>()],
+                              AutoShutdown :: undefined | <a href="#t:auto_shutdown/0">auto_shutdown</a>(),
+                              Result :: ok | {error, Error :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>Takes a list of child specification as argument and returns <code>ok</code> if all of them are syntactically correct, otherwise <code>{error,Error}</code>.</p>
+<p>If the <code>AutoShutdown</code> argument is not <code>undefined</code>, also checks if the child specifications are allowed for the given <a href="supervisor.html#auto_shutdown">auto_shutdown</a> option.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="count_children/1">count_children(SupRef) <span class="since">(since OTP R13B04)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L829" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> count_children(SupRef) -&gt; PropListOfCounts
+                        when
+                            SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(),
+                            PropListOfCounts :: [Count],
+                            Count ::
+                                {specs, ChildSpecCount :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+                                {active, ActiveProcessCount :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+                                {supervisors, ChildSupervisorCount :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+                                {workers, ChildWorkerCount :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()}.</pre>  <p>Returns a <a href="proplists.html#t:proplist/0">property list</a> containing the counts for each of the following elements of the supervisor's child specifications and managed processes:</p>
+<ul>
+<li>
+<code>specs</code> - The total count of children, dead or alive.</li>
+<li>
+<code>active</code> - The count of all actively running child processes managed by this supervisor. For a <code>simple_one_for_one</code> supervisors, no check is done to ensure that each child process is still alive, although the result provided here is likely to be very accurate unless the supervisor is heavily overloaded.</li>
+<li>
+<code>supervisors</code> - The count of all children marked as <code>child_type = supervisor</code> in the specification list, regardless if the child process is still alive.</li>
+<li>
+<code>workers</code> - The count of all children marked as <code>child_type = worker</code> in the specification list, regardless if the child process is still alive.</li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="delete_child/2">delete_child(SupRef, Id)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L704" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> delete_child(SupRef, Id) -&gt; Result
+                      when
+                          SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(),
+                          Id :: <a href="#t:child_id/0">child_id</a>(),
+                          Result :: ok | {error, Error},
+                          Error :: running | restarting | not_found | simple_one_for_one.</pre>  <p>Tells supervisor <code>SupRef</code> to delete the child specification identified by <code>Id</code>. The corresponding child process must not be running. Use <a href="#terminate_child/2"><code>terminate_child/2</code></a> to terminate it.</p>
+<p>If successful, the function returns <code>ok</code>. If the child specification identified by <code>Id</code> exists but the corresponding child process is running or is about to be restarted, the function returns <code>{error,running}</code> or <code>{error,restarting}</code>, respectively. If the child specification identified by <code>Id</code> does not exist, the function returns <code>{error,not_found}</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="get_childspec/2">get_childspec(SupRef, Id) <span class="since">(since OTP 18.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L757" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> get_childspec(SupRef, Id) -&gt; Result
+                       when
+                           SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(),
+                           Id :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | <a href="#t:child_id/0">child_id</a>(),
+                           Result :: {ok, <a href="#t:child_spec/0">child_spec</a>()} | {error, Error},
+                           Error :: not_found.</pre>  <p>Returns the child specification map for the child identified by <code>Id</code> under supervisor <code>SupRef</code>. The returned map contains all keys, both mandatory and optional.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="restart_child/2">restart_child(SupRef, Id)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L685" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> restart_child(SupRef, Id) -&gt; Result
+                       when
+                           SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(),
+                           Id :: <a href="#t:child_id/0">child_id</a>(),
+                           Result ::
+                               {ok, Child :: <a href="#t:child/0">child</a>()} |
+                               {ok, Child :: <a href="#t:child/0">child</a>(), Info :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} |
+                               {error, Error},
+                           Error :: running | restarting | not_found | simple_one_for_one | <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Tells supervisor <code>SupRef</code> to restart a child process corresponding to the child specification identified by <code>Id</code>. The child specification must exist, and the corresponding child process must not be running.</p>
+<p>Notice that for temporary children, the child specification is automatically deleted when the child terminates; thus, it is not possible to restart such children.</p>
+<p>If the child specification identified by <code>Id</code> does not exist, the function returns <code>{error,not_found}</code>. If the child specification exists but the corresponding process is already running, the function returns <code>{error,running}</code>.</p>
+<p>If the child process start function returns <code>{ok,Child}</code> or <code>{ok,Child,Info}</code>, the pid is added to the supervisor and the function returns the same value.</p>
+<p>If the child process start function returns <code>ignore</code>, the pid remains set to <code>undefined</code> and the function returns <code>{ok,undefined}</code>.</p>
+<p>If the child process start function returns an error tuple or an erroneous value, or if it fails, the function returns <code>{error,Error}</code>, where <code>Error</code> is a term containing information about the error.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_child/2">start_child(Supervisor, ChildSpecOrExtraArgs)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L650" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_child(SupRef, ChildSpec) -&gt; <a href="#t:startchild_ret/0">startchild_ret</a>()
+                     when SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(), ChildSpec :: <a href="#t:child_spec/0">child_spec</a>();
+                 (SupRef, ExtraArgs) -&gt; <a href="#t:startchild_ret/0">startchild_ret</a>() when SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(), ExtraArgs :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()].</pre>  <p>Dynamically adds a child specification to supervisor <code>SupRef</code>, which starts the corresponding child process.</p>
+<p>For <code>one_for_one</code>, <code>one_for_all</code> and <code>rest_for_one</code> supervisors, the second argument must be a valid child specification <code>ChildSpec</code>. The child process is started by using the start function as defined in the child specification.</p>
+<p>For <code>simple_one_for_one</code> supervisors, the child specification defined in <a href="#c:init/1"><code>Module:init/1</code></a> is used, and the second argument must instead be an arbitrary list of terms <code>ExtraArgs</code>. The child process is then started by appending <code>ExtraArgs</code> to the existing start function arguments, that is, by calling <a href="../../../../erts-17.1/doc/html/erlang.html#apply/3"><code>apply(M, F, A++ExtraArgs)</code></a>, where <code>{M,F,A}</code> is the start function defined in the child specification.</p>
+<ul>
+<li>If there already exists a child specification with the specified identifier, <code>ChildSpec</code> is discarded, and the function returns <code>{error,already_present}</code> or <code>{error,{already_started,Child}}</code>, depending on if the corresponding child process is running or not.</li>
+<li>If the child process start function returns <code>{ok,Child}</code> or <code>{ok,Child,Info}</code>, the child specification and pid are added to the supervisor and the function returns the same value.</li>
+<li>If the child process start function returns <code>ignore</code>, the child specification <code>ChildSpec</code> is added to the supervisor if it is an <code>one_for_one</code>, <code>one_for_all</code> or <code>rest_for_one</code> supervisor, and the pid is set to <code>undefined</code>. For <code>simple_one_for_one</code> supervisors, no child is added to the supervisor. The function returns <code>{ok,undefined}</code>.</li>
+</ul>
+<p>If the child process start function returns an error tuple or an erroneous value, or if it fails, the child specification is discarded, and the function returns <code>{error,Error}</code>, where <code>Error</code> is a term containing information about the error and child specification.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_link/2">start_link(Module, Args)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L547" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_link(Module, Args) -&gt; <a href="#t:startlink_ret/0">startlink_ret</a>() when Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Creates a nameless supervisor process as part of a supervision tree.</p>
+<p>Equivalent to <a href="#start_link/3"><code>start_link/3</code></a> except that the supervisor process is not <a href="../../../../erts-17.1/doc/html/erlang.html#register/2"><code>registered</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_link/3">start_link(SupName, Module, Args)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L598" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_link(SupName, Module, Args) -&gt; <a href="#t:startlink_ret/0">startlink_ret</a>()
+                    when SupName :: <a href="#t:sup_name/0">sup_name</a>(), Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Creates a supervisor process as part of a supervision tree.</p>
+<p>For example, the function ensures that the supervisor is linked to the calling process (its supervisor).</p>
+<p>The created supervisor process calls <a href="#c:init/1"><code>Module:init/1</code></a> to find out about restart strategy, maximum restart intensity, and child processes. To ensure a synchronized startup procedure, <code>start_link/2,3</code> does not return until <a href="#c:init/1"><code>Module:init/1</code></a> has returned and all child processes have been started.</p>
+<ul>
+<li>If <code>SupName={local,Name}</code>, the supervisor is registered locally as <code>Name</code> using <a href="../../../../erts-17.1/doc/html/erlang.html#register/2"><code>register/2</code></a>.</li>
+<li>If <code>SupName={global,Name}</code>, the supervisor is registered globally as <code>Name</code> using <a href="../../../kernel-11.0.4/doc/html/global.html#register_name/2"><code>global:register_name/2</code></a>.</li>
+<li>If <code>SupName={via,Module,Name}</code>, the supervisor is registered as <code>Name</code> using the registry represented by <code>Module</code>. The <code>Module</code> callback must export the functions <code>register_name/2</code>, <code>unregister_name/1</code>, and <code>send/2</code>, which must behave like the corresponding functions in <a href="../../../kernel-11.0.4/doc/html/global.html"><code>global</code></a>. Thus, <code>{via,global,Name}</code> is a valid reference.</li>
+</ul>
+<p><code>Module</code> is the name of the callback module.</p>
+<p><code>Args</code> is any term that is passed as the argument to <a href="#c:init/1"><code>Module:init/1</code></a>.</p>
+<ul>
+<li>If the supervisor and its child processes are successfully created (that is, if all child process start functions return <code>{ok,Child}</code>, <code>{ok,Child,Info}</code>, or <code>ignore</code>), the function returns <code>{ok,Pid}</code>, where <code>Pid</code> is the pid of the supervisor.</li>
+<li>If there already exists a process with the specified <code>SupName</code>, the function returns <code>{error,{already_started,Pid}}</code>, where <code>Pid</code> is the pid of that process.</li>
+<li>If <a href="#c:init/1"><code>Module:init/1</code></a> returns <code>ignore</code>, this function returns <code>ignore</code> as well, and the supervisor terminates with reason <code>normal</code>.</li>
+<li>If <a href="#c:init/1"><code>Module:init/1</code></a> fails or returns an incorrect value, this function returns <code>{error,Term}</code>, where <code>Term</code> is a term with information about the error, and the supervisor terminates with reason <code>Term</code>.</li>
+<li>If any child process start function fails or returns an error tuple or an erroneous value, the supervisor first terminates all already started child processes with reason <code>shutdown</code> and then terminate itself and returns <code>{error, {shutdown, Reason}}</code>.</li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="stop/1">stop(SupRef) <span class="since">(since OTP 29.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L835" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> stop(SupRef :: <a href="#t:sup_ref/0">sup_ref</a>()) -&gt; ok.</pre>  <p>Equivalent to <a href="#stop/3"><code>stop(SupRef, normal, infinity)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="stop/3">stop(SupRef, Reason, Timeout) <span class="since">(since OTP 29.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L868" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> stop(SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Timeout :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>()) -&gt; ok.</pre>  <p>Stop a supervisor.</p>
+<p>Orders the supervisor specified by <code>SupRef</code> to exit with the specified <code>Reason</code> and waits for it to terminate. The supervisor will terminate all its children before exiting.</p>
+<p>The function returns <code>ok</code> if the supervisor terminates with the expected reason. Any other reason than <code>normal</code>, <code>shutdown</code>, or <code>{shutdown,Term}</code> causes an error report to be issued using <a href="../../../kernel-11.0.4/doc/html/logger.html"><code>logger</code></a>. An exit signal with the same reason is sent to linked processes and ports.</p>
+<p><code>Timeout</code> is an integer that specifies how many milliseconds to wait for the supervisor to terminate, or the atom <code>infinity</code> to wait indefinitely. If the supervisor has not terminated within the specified time, the call exits the calling process with reason <code>timeout</code>.</p>
+<p>If the process does not exist, the call exits the calling process with reason <code>noproc</code>, or with reason <code>{nodedown,Node}</code> if the connection fails to the remote <code>Node</code> where the supervisor runs.</p>
+<div class="warning">
+<p class="label">Warning</p>
+<p>Calling this function from a (sub-)child process of the given supervisor will result in a deadlock which will last until either the shutdown timeout of the child or the timeout given to <a href="#stop/3"><code>stop/3</code></a> has expired.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="terminate_child/2">terminate_child(SupRef, Id)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L743" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> terminate_child(SupRef, Id) -&gt; Result
+                         when
+                             SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(),
+                             Id :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | <a href="#t:child_id/0">child_id</a>(),
+                             Result :: ok | {error, Error},
+                             Error :: not_found | simple_one_for_one.</pre>  <p>Tells supervisor <code>SupRef</code> to terminate the specified child.</p>
+<p>If the supervisor is not <code>simple_one_for_one</code>, <code>Id</code> must be the child specification identifier. The process, if any, is terminated and, unless it is a temporary child, the child specification is kept by the supervisor. The child process can later be restarted by the supervisor. The child process can also be restarted explicitly by calling <a href="#restart_child/2"><code>restart_child/2</code></a>. Use <a href="#delete_child/2"><code>delete_child/2</code></a> to remove the child specification.</p>
+<p>If the child is temporary, the child specification is deleted as soon as the process terminates. This means that <a href="#delete_child/2"><code>delete_child/2</code></a> has no meaning and <a href="#restart_child/2"><code>restart_child/2</code></a> cannot be used for these children.</p>
+<p>If the supervisor is <code>simple_one_for_one</code>, <code>Id</code> must be the <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a> of the child process. If the specified process is alive, but is not a child of the specified supervisor, the function returns <code>{error,not_found}</code>. If the child specification identifier is specified instead of a <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a>, the function returns <code>{error,simple_one_for_one}</code>.</p>
+<p>If successful, the function returns <code>ok</code>. If there is no child specification with the specified <code>Id</code>, the function returns <code>{error,not_found}</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="which_child/2">which_child(SupRef, Id) <span class="since">(since OTP 28.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L803" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> which_child(SupRef, Id) -&gt; Result
+                     when
+                         SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(),
+                         Id :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | <a href="#t:child_id/0">child_id</a>(),
+                         Result :: {ok, {Id, Child, Type, Modules}} | {error, Error},
+                         Child :: <a href="#t:child/0">child</a>() | restarting,
+                         Type :: <a href="#t:worker/0">worker</a>(),
+                         Modules :: <a href="#t:modules/0">modules</a>(),
+                         Error :: not_found.</pre>  <p>Returns information about the child specification and child process identified by the given <code>Id</code>.</p>
+<p>See <a href="#which_children/1"><code>which_children/1</code></a> for an explanation of the information returned.</p>
+<p>If no child with the given <code>Id</code> exists, returns <code>{error, not_found}</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="which_children/1">which_children(SupRef)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/supervisor.erl#L783" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> which_children(SupRef) -&gt; [{Id, Child, Type, Modules}]
+                        when
+                            SupRef :: <a href="#t:sup_ref/0">sup_ref</a>(),
+                            Id :: <a href="#t:child_id/0">child_id</a>() | undefined,
+                            Child :: <a href="#t:child/0">child</a>() | restarting,
+                            Type :: <a href="#t:worker/0">worker</a>(),
+                            Modules :: <a href="#t:modules/0">modules</a>().</pre>  <p>Returns a newly created list with information about all child specifications and child processes belonging to supervisor <code>SupRef</code>.</p>
+<p>Notice that calling this function when supervising many children under low memory conditions can cause an out of memory exception.</p>
+<p>The following information is given for each child specification/process:</p>
+<ul>
+<li>
+<code>Id</code> - As defined in the child specification or <code>undefined</code> for a <code>simple_one_for_one</code> supervisor.</li>
+<li>
+<code>Child</code> - The pid of the corresponding child process, the atom <code>restarting</code> if the process is about to be restarted, or <code>undefined</code> if there is no such process.</li>
+<li>
+<code>Type</code> - As defined in the child specification.</li>
+<li>
+<code>Modules</code> - As defined in the child specification.</li>
+</ul> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

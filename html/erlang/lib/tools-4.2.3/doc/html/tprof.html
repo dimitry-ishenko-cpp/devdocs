@@ -1,0 +1,397 @@
+<h1> <span>tprof</span>  </h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L28" title="View Source" class="source" rel="help nofollow">Source</a>   <p>Process Tracing Profiling Tool</p>
+<p><code>tprof</code> provides convenience helpers for Erlang process profiling using the trace BIFs.</p>
+<div class="warning">
+<p class="label">Warning</p>
+<p>This module aims to replace <code>eprof</code> and <code>cprof</code> into a unified API for measuring call count, time, and allocation. It is experimental in Erlang/OTP 27.0.</p>
+</div>
+<p>It is possible to analyze the number of calls, the time spent by function, and heap allocations by function. Profiling can be done <a href="#module-ad-hoc-profiling">ad-hoc</a> or run in a <a href="#module-server-aided-profiling">server-aided mode</a> for deeper introspection of the code running in production. The server-aided mode can be run using the default tprof server or an isolated <a href="#t:server/0"><code>server/0</code></a> started through <a href="#start/1"><code>start(#{ session =&gt; atom() })</code></a>.</p>
+<p>There are <a href="#t:trace_type/0">three kinds of profiling</a> supported by this module:</p>
+<ul>
+<li><code>call_count</code></li>
+<li><code>call_time</code></li>
+<li><code>call_memory</code></li>
+</ul>
+<p>The default is <code>call_count</code>, which has the smallest performance impact and memory footprint, but it does not support per-process profiling. For this reason, all of the examples below uses <code>call_memory</code>, which measures heap allocation, and provide a more complex feature set to demonstrate.</p>
+<p>Erlang terms that do not fit in a single machine word are allocated on the process heap. For example, a function returning a tuple of two elements needs to allocate the tuple on the process heap. The actual consumption is three words, because the runtime systems also need an extra word to store the tuple size.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>Expect a slowdown in the program execution when profiling is enabled.</p>
+<p>For profiling convenience, measurements are accumulated for functions that are not enabled in some trace pattern. Consider this call stack example:</p>
+<pre>top_traced_function(...)
+not_traced_function()
+bottom_traced_function()</pre>
+<p>Allocations that happened within <code>not_traced_function</code> will be added to the allocations for <code>top_traced_function</code>. However, allocations that occurred within <code>bottom_traced_function</code> are not included in the <code>top_traced_function</code>. To only keep track of each function own allocations, it is necessary to trace all functions.</p>
+</div>
+<div class="warning">
+<p class="label">Warning</p>
+<p>Avoid hot code reloading for modules participating in the tracing. Reloading a module disables tracing and discards the accumulated statistics. The <code>tprof</code> results will probably be incorrect when the profiled code was reloading during a profiling session.</p>
+</div>
+<h2 id="module-ad-hoc-profiling">Ad-hoc profiling</h2>
+<p>Ad-hoc profiling is convenient for profiling a single function call.</p>
+<p>For example:</p>
+<pre data-language="erlang">1&gt; tprof:profile(lists, seq, [1, 16], #{type =&gt; call_memory}).
+
+****** Process &lt;0.92.0&gt;  --  100.00% of total *** 
+FUNCTION          CALLS  WORDS  PER CALL  [     %]
+lists:seq_loop/3      5     32      6.40  [100.00]
+                            32            [ 100.0]
+ok</pre>
+<p>By default tracing is enabled for all functions in all modules. When funs are created in the interactive shell, parts of shell code are also traced:</p>
+<pre data-language="erlang">1&gt; tprof:profile(fun() -&gt; lists:seq(1, 16) end, #{type =&gt; call_memory}).
+
+****** Process &lt;0.95.0&gt;  --  100.00% of total *** 
+FUNCTION                   CALLS  WORDS  PER CALL  [    %]
+erl_eval:do_apply/7            1      3      3.00  [ 3.61]
+erl_eval:match_list/6          1      3      3.00  [ 3.61]
+lists:reverse/1                1      4      4.00  [ 4.82]
+erl_eval:expr_list/7           3      7      2.33  [ 8.43]
+erl_eval:ret_expr/3            4     16      4.00  [19.28]
+erl_eval:merge_bindings/4      3     18      6.00  [21.69]
+lists:seq_loop/3               5     32      6.40  [38.55]
+                                     83            [100.0]
+ok</pre>
+<p>However, it is possible to limit the trace to specific functions or modules:</p>
+<pre data-language="erlang">2&gt; tprof:profile(fun() -&gt; lists:seq(1, 16) end,
+                 #{type =&gt; call_memory, pattern =&gt; [{lists, seq_loop, '_'}]}).
+****** Process &lt;0.98.0&gt;  --  100.00% of total *** 
+FUNCTION          CALLS  WORDS  PER CALL  [     %]
+lists:seq_loop/3      5     32      6.40  [100.00]
+                            32            [ 100.0]
+
+ok</pre>
+<p>Ad-hoc profiling results can be printed in a few different ways. The following examples use the <code>test</code> module defined like this:</p>
+<pre data-language="erlang">-module(test).
+-export([test_spawn/0]).
+test_spawn() -&gt;
+    {Pid, MRef} = spawn_monitor(fun () -&gt; lists:seq(1, 32) end),
+    receive
+        {'DOWN', MRef, process, Pid, normal} -&gt;
+            done
+    end.</pre>
+<p>By default per-process statistics is shown:</p>
+<pre data-language="erlang">1&gt; tprof:profile(test, test_spawn, [], #{type =&gt; call_memory}).
+
+****** Process &lt;0.176.0&gt;    -- 23.66 % of total allocations ***
+FUNCTION                CALLS  WORDS  PER CALL  [    %]
+erlang:spawn_monitor/1      1      2         2  [ 9.09]
+erlang:spawn_opt/4          1      6         6  [27.27]
+test:test_spawn/0           1     14        14  [63.64]
+                                  22            [100.0]
+
+****** Process &lt;0.177.0&gt;    -- 76.34 % of total allocations ***
+FUNCTION           CALLS  WORDS  PER CALL  [    %]
+erlang:apply/2         1      7         7  [ 9.86]
+lists:seq_loop/3       9     64         7  [90.14]
+                             71            [100.0]</pre>
+<p>The following example prints the combined memory allocation of all processes, sorted by the total number of allocated words in descending order:</p>
+<pre data-language="erlang">2&gt; tprof:profile(test, test_spawn, [],
+                 #{type =&gt; call_memory, report =&gt; {total, {measurement, descending}}}).
+
+FUNCTION                CALLS  WORDS  PER CALL  [    %]
+lists:seq_loop/3            9     64         7  [68.82]
+test:test_spawn/0           1     14        14  [15.05]
+erlang:apply/2              1      7         7  [ 7.53]
+erlang:spawn_opt/4          1      6         6  [ 6.45]
+erlang:spawn_monitor/1      1      2         2  [ 2.15]
+                                  93            [100.0]</pre>
+<p>The profiling data can also be collected for further inspection:</p>
+<pre data-language="erlang">3&gt; {done, ProfileData} = tprof:profile(fun test:test_spawn/0,
+                                       #{type =&gt; call_memory, report =&gt; return}).
+&lt;...&gt;
+4&gt; tprof:format(tprof:inspect(ProfileData, process, {percent, descending})).
+
+****** Process &lt;0.223.0&gt;    -- 23.66 % of total allocations ***
+FUNCTION                CALLS  WORDS  PER CALL  [    %]
+test:test_spawn/0           1     14        14  [63.64]
+erlang:spawn_opt/4          1      6         6  [27.27]
+erlang:spawn_monitor/1      1      2         2  [ 9.09]
+                                  22            [100.0]
+
+****** Process &lt;0.224.0&gt;    -- 76.34 % of total allocations ***
+FUNCTION           CALLS  WORDS  PER CALL  [    %]
+lists:seq_loop/3       9     64         7  [90.14]
+erlang:apply/2         1      7         7  [ 9.86]
+                             71            [100.0]</pre>
+<p>Which processes that are profiled depends on the profiling type.</p>
+<ul>
+<li><p><code>call_count</code> (default) counts calls in all processes.</p></li>
+<li><p><code>call_time</code> and <code>call_memory</code> limits the profiling to the processes spawned from the user-provided function (using the <code>set_on_spawn</code> option for <a href="../../../kernel-11.0.4/doc/html/trace.html#process/4"><code>trace:process/4</code></a>).</p></li>
+</ul>
+<p><code>call_time</code> and <code>call_memory</code> can be restricted to profile a single process:</p>
+<pre data-language="erlang">2&gt; tprof:profile(test, test_spawn, [],
+                 #{type =&gt; call_memory, set_on_spawn =&gt; false}).
+
+****** Process &lt;0.183.0&gt;    -- 100.00 % of total allocations ***
+FUNCTION                CALLS  WORDS  PER CALL  [    %]
+erlang:spawn_monitor/1      1      2         2  [ 9.09]
+erlang:spawn_opt/4          1      6         6  [27.27]
+test:test_spawn/0           1     14        14  [63.64]</pre>
+
+<p>Erlang programs can perform expensive operations in other processes than the original one. You can include multiple, new, or even all processes in the trace when measuring time or memory:</p>
+<pre data-language="erlang">7&gt; pg:start_link().
+{ok,&lt;0.252.0&gt;}
+8&gt; tprof:profile(fun() -&gt; pg:join(group, self()) end,
+                 #{type =&gt; call_memory, rootset =&gt; [pg]}).
+****** Process &lt;0.252.0&gt;    -- 52.86 % of total allocations ***
+FUNCTION                      CALLS  WORDS  PER CALL  [    %]
+pg:leave_local_update_ets/5       1      2         2  [ 1.80]
+gen:reply/2                       1      3         3  [ 2.70]
+erlang:monitor/2                  1      3         3  [ 2.70]
+gen_server:try_handle_call/4      1      3         3  [ 2.70]
+gen_server:try_dispatch/4         1      3         3  [ 2.70]
+maps:iterator/1                   2      4         2  [ 3.60]
+maps:take/2                       1      6         6  [ 5.41]
+pg:join_local_update_ets/5        1      8         8  [ 7.21]
+pg:handle_info/2                  1      8         8  [ 7.21]
+pg:handle_call/3                  1      9         9  [ 8.11]
+gen_server:loop/7                 2      9         4  [ 8.11]
+ets:lookup/2                      2     10         5  [ 9.01]
+pg:join_local/3                   1     11        11  [ 9.91]
+pg:notify_group/5                 2     16         8  [14.41]
+erlang:setelement/3               2     16         8  [14.41]
+                                       111            [100.0]
+
+****** Process &lt;0.255.0&gt;    -- 47.14 % of total allocations ***
+FUNCTION                   CALLS  WORDS  PER CALL  [    %]
+erl_eval:match_list/6          1      3         3  [ 3.03]
+erlang:monitor/2               1      3         3  [ 3.03]
+lists:reverse/1                2      4         2  [ 4.04]
+pg:join/3                      1      4         4  [ 4.04]
+erl_eval:add_bindings/2        1      5         5  [ 5.05]
+erl_eval:do_apply/7            2      6         3  [ 6.06]
+gen:call/4                     1      8         8  [ 8.08]
+erl_eval:expr_list/7           4     10         2  [10.10]
+gen:do_call/4                  1     16        16  [16.16]
+erl_eval:ret_expr/3            4     16         4  [16.16]
+erl_eval:merge_bindings/4      3     24         8  [24.24]
+                                     99            [100.0]</pre>
+<p>By default, there is no limit for the profiling time. For ad-hoc profiling, it is possible to configure a time limit. If the profiled function does not return before that time expires, the process is terminated with reason <code>kill</code>. Any unlinked children processes started by the user-supplied function are kept; it is the responsibility of the developer to take care of such processes.</p>
+<pre data-language="erlang">9&gt; tprof:profile(timer, sleep, [100000], #{timeout =&gt; 1000}).</pre>
+<p>By default, only one ad-hoc or server-aided profiling session is allowed at any point in time. It is possible to force multiple ad-hoc sessions concurrently, but it is the responsibility of the developer to ensure that trace patterns do not overlap:</p>
+<pre data-language="erlang">1&gt; tprof:profile(fun() -&gt; lists:seq(1, 32) end,
+    #{registered =&gt; false, pattern =&gt; [{lists, '_', '_'}]}).</pre>
+<h2 id="module-server-aided-profiling">Server-aided profiling</h2>
+<p>Server-aided profiling can be done on a system that is up and running. To do that, start the <code>tprof</code> server, and then add trace patterns and processes to trace while the system handles actual traffic. Data can extracted, inspected, and printed at any time. The following example traces activity of all processes supervised by the Kernel supervisor:</p>
+<pre data-language="erlang">1&gt; tprof:start(#{type =&gt; call_memory}).
+{ok,&lt;0.200.0&gt;}
+2&gt; tprof:enable_trace({all_children, kernel_sup}).
+34
+3&gt; tprof:set_pattern('_', '_' , '_').
+16728
+4&gt; Sample = tprof:collect().
+{call_memory,
+    [{gen_server,try_dispatch,4,[{&lt;0.154.0&gt;,2,6}]},
+     {erlang,iolist_to_iovec,1,[{&lt;0.161.0&gt;,1,8}]},
+&lt;...&gt;
+5 &gt; tprof:format(tprof:inspect(Sample)).
+
+****** Process &lt;0.154.0&gt;    -- 14.21 % of total allocations ***
+FUNCTION                   CALLS  WORDS  PER CALL  [    %]
+maps:iterator/1                2      4         2  [15.38]
+gen_server:try_dispatch/4      2      6         3  [23.08]
+net_kernel:handle_info/2       2     16         8  [61.54]
+                                     26            [100.0]
+
+****** Process &lt;0.161.0&gt;    -- 85.79 % of total allocations ***
+FUNCTION                        CALLS  WORDS  PER CALL  [    %]
+disk_log:handle/2                   2      2         1  [ 1.27]
+disk_log_1:maybe_start_timer/1      1      3         3  [ 1.91]
+disk_log_1:mf_write_cache/1         1      3         3  [ 1.91]
+&lt;...&gt;</pre>
+
+<p>It is possible to profile the entire running system, and then examine individual processes:</p>
+<pre data-language="erlang">1&gt; tprof:start(#{type =&gt; call_memory}).
+2&gt; tprof:enable_trace(all), tprof:set_pattern('_', '_' , '_').
+9041
+3&gt; timer:sleep(10000), tprof:disable_trace(all), Sample = tprof:collect().
+{call_memory,
+    [{user_drv,server,3,[{&lt;0.64.0&gt;,12,136}]},
+     {user_drv,contains_ctrl_g_or_ctrl_c,1,[{&lt;0.64.0&gt;,80,10}]},
+&lt;...&gt;
+4&gt; Inspected = tprof:inspect(Sample, process, measurement), Shell = maps:get(self(), Inspected).
+{call_memory, 2743,
+    [{shell,{enc,0},1,2,2,0.07291286912139992},
+&lt;...&gt;
+5&gt; tprof:format(Shell).
+
+FUNCTION                           CALLS  WORDS  PER CALL  [    %]
+&lt;...&gt;
+erl_lint:start/2                       2    300       150  [10.94]
+shell:used_records/1                 114    342         3  [12.47]</pre>   <section id="summary" class="details-list"> <h2>Summary</h2> <h3>Types</h3>
+<dl class="summary-types summary">   <dt> <a href="#t:column/0">column()</a> </dt> <dd><p>Column to sort by <a href="#inspect/3"><code>inspect/3</code></a> or <a href="#profile/4"><code>profile/4</code></a>.</p></dd>   <dt> <a href="#t:process/0">process()</a> </dt> <dd><p>A process identifier (pid) or a registered process name.</p></dd>   <dt> <a href="#t:profile_line/0">profile_line()</a> </dt> <dd><p>Inspected data for a single function of the specified <code>Module</code>.</p></dd>   <dt> <a href="#t:profile_options/0">profile_options()</a> </dt> <dd><p>Ad-hoc profiler options; see <a href="#profile/4"><code>profile/4</code></a>.</p></dd>   <dt> <a href="#t:profile_result/0">profile_result()</a> </dt> <dd><p>Profile of a single process, or combined profile of multiple processes, sorted by a selected column.</p></dd>   <dt> <a href="#t:rootset/0">rootset()</a> </dt>   <dt> <a href="#t:server/0">server()</a> </dt> <dd><p>A tprof server.</p></dd>   <dt> <a href="#t:sort_by/0">sort_by()</a> </dt>   <dt> <a href="#t:start_options/0">start_options()</a> </dt>   <dt> <a href="#t:trace_info/0">trace_info()</a> </dt> <dd><p>Raw data extracted from tracing BIFs.</p></dd>   <dt> <a href="#t:trace_map/0">trace_map()</a> </dt> <dd><p>Traced functions (with their arities) grouped by module name, or <code>all</code> if all code is traced.</p></dd>   <dt> <a href="#t:trace_options/0">trace_options()</a> </dt> <dd><p>Options for enabling profiling of the selected processes; see <a href="#enable_trace/2"><code>enable_trace/2</code></a>.</p></dd>   <dt> <a href="#t:trace_pattern/0">trace_pattern()</a> </dt>   <dt> <a href="#t:trace_type/0">trace_type()</a> </dt> <dd><p>The type of profiling that the tprof server will do.</p></dd>  </dl> <h3>Functions</h3>
+<dl class="summary-functions summary">   <dt> <a href="#clear_pattern/3">clear_pattern(Mod, Fun, Arity)</a> </dt> <dd><p>Disables tracing functions matching the supplied pattern.</p></dd>   <dt> <a href="#clear_pattern/4">clear_pattern(Server, Mod, Fun, Arity)</a> </dt> <dd><p>Equivalent to <a href="#clear_pattern/3"><code>clear_pattern(Mod, Fun, Arity)</code></a> but uses the provided <code>Server</code>.</p></dd>   <dt> <a href="#collect/0">collect()</a> </dt> <dd><p>Returns statistics for current trace map.</p></dd>   <dt> <a href="#collect/1">collect(Server)</a> </dt> <dd><p>Equivalent to <a href="#collect/0"><code>collect/0</code></a> but uses the provided <code>Server</code>.</p></dd>   <dt> <a href="#continue/0">continue()</a> </dt> <dd><p>Resumes previously paused profiling.</p></dd>   <dt> <a href="#continue/1">continue(Server)</a> </dt> <dd><p>Equivalent to <a href="#continue/0"><code>continue/0</code></a> but uses the provided <code>Server</code>.</p></dd>   <dt> <a href="#disable_trace/1">disable_trace(Rootset)</a> </dt> <dd><p>Equivalent to <a href="#disable_trace/2"><code>disable_trace(Spec, #{set_on_spawn =&gt; true})</code></a>.</p></dd>   <dt> <a href="#disable_trace/2">disable_trace(Spec, Options)</a> </dt> <dd><p>Stops accumulating traces for specified processes.</p></dd>   <dt> <a href="#disable_trace/3">disable_trace(Server, Spec, Options)</a> </dt>   <dt> <a href="#enable_trace/1">enable_trace(Rootset)</a> </dt> <dd><p>Equivalent to <a href="#enable_trace/2"><code>enable_trace(Spec, #{set_on_spawn =&gt; true})</code></a>.</p></dd>   <dt> <a href="#enable_trace/2">enable_trace(Spec, Options)</a> </dt> <dd><p>Similar to <a href="../../../kernel-11.0.4/doc/html/trace.html#process/4"><code>trace:process/4</code></a>, but supports a few more options for tracing convenience.</p></dd>   <dt> <a href="#enable_trace/3">enable_trace(Server, Spec, Options)</a> </dt> <dd><p>Equivalent to <a href="#enable_trace/2"><code>enable_trace/2</code></a> but uses the provided <code>Server</code>.</p></dd>   <dt> <a href="#format/1">format(Inspected)</a> </dt> <dd><p>Formats profile data transformed with <a href="#inspect/3"><code>inspect/3</code></a>, outputting to the default output device.</p></dd>   <dt> <a href="#format/2">format(IoDevice, Inspected)</a> </dt> <dd><p>Formats profile transformed with <a href="#inspect/3"><code>inspect/3</code></a>, outputting to device <code>IoDevice</code>.</p></dd>   <dt> <a href="#get_trace_map/0">get_trace_map()</a> </dt> <dd><p>Returns a map of module names to functions with their arities.</p></dd>   <dt> <a href="#get_trace_map/1">get_trace_map(Server)</a> </dt> <dd><p>Equivalent to <a href="#get_trace_map/0"><code>get_trace_map/0</code></a> but uses the provided <code>Server</code>.</p></dd>   <dt> <a href="#inspect/1">inspect(Profile)</a> </dt> <dd><p>Equivalent to <a href="#inspect/3"><code>inspect(Profile, process, percent)</code></a>.</p></dd>   <dt> <a href="#inspect/3">inspect(Profile, Type, SortBy)</a> </dt> <dd><p>Transforms raw data returned by tracing BIFs into a form convenient for subsequent analysis and formatting.</p></dd>   <dt> <a href="#pause/0">pause()</a> </dt> <dd><p>Pauses trace collection for all currently traced functions, retaining existing traces.</p></dd>   <dt> <a href="#pause/1">pause(Server)</a> </dt> <dd><p>Equivalent to <a href="#pause/0"><code>pause/0</code></a> but uses the provided <code>Server</code>.</p></dd>   <dt> <a href="#profile/1">profile(Fun)</a> </dt> <dd><p>Equivalent to <a href="#profile/2"><code>profile(Fun, #{})</code></a>.</p></dd>   <dt> <a href="#profile/2">profile(Fun, Options)</a> </dt> <dd><p>Does ad-hoc profiling of the call <code>Fun()</code>.</p></dd>   <dt> <a href="#profile/3">profile(Module, Function, Args)</a> </dt> <dd><p>Equivalent to <a href="#profile/4"><code>profile(Module, Function, Args, #{})</code></a>.</p></dd>   <dt> <a href="#profile/4">profile(Module, Function, Args, Options)</a> </dt> <dd><p>Does ad-hoc profiling for the call <code>apply(Module, Function, Args)</code>.</p></dd>   <dt> <a href="#restart/0">restart()</a> </dt> <dd><p>Clears accumulated profiles and starts profiling if it was paused.</p></dd>   <dt> <a href="#restart/1">restart(Server)</a> </dt> <dd><p>Equivalent to <a href="#restart/0"><code>restart/0</code></a> but uses the provided <code>Server</code>.</p></dd>   <dt> <a href="#set_pattern/3">set_pattern(Mod, Fun, Arity)</a> </dt> <dd><p>Enables tracing for all functions matching the supplied pattern.</p></dd>   <dt> <a href="#set_pattern/4">set_pattern(Server, Mod, Fun, Arity)</a> </dt> <dd><p>Equivalent to <a href="#set_pattern/3"><code>set_pattern/3</code></a> but uses the provided <code>Server</code>.</p></dd>   <dt> <a href="#start/0">start()</a> </dt> <dd><p>Equivalent to <a href="#start/1"><code>start(#{})</code></a>.</p></dd>   <dt> <a href="#start/1">start(Config)</a> </dt> <dd><p>Starts the server, not supervised.</p></dd>   <dt> <a href="#start_link/0">start_link()</a> </dt> <dd><p>Equivalent to <a href="#start_link/1"><code>start_link(#{})</code></a>.</p></dd>   <dt> <a href="#start_link/1">start_link(Config)</a> </dt> <dd><p>Equivalent to <a href="#start/1"><code>start/1</code></a> but also links the profiling server to the caller.</p></dd>   <dt> <a href="#stop/0">stop()</a> </dt> <dd><p>Stops the default <code>tprof</code> server and disable tracing enabled by the server.</p></dd>   <dt> <a href="#stop/1">stop(Server)</a> </dt> <dd><p>Equivalent to <a href="#stop/0"><code>stop/0</code></a> but uses the provided <code>Server</code>.</p></dd>  </dl> </section> <section id="types" class="details-list"> <h2>Types</h2> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:column/0">column() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L473" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> column() :: module | function | calls | measurement | measurement_per_call | percent.</pre>  <p>Column to sort by <a href="#inspect/3"><code>inspect/3</code></a> or <a href="#profile/4"><code>profile/4</code></a>.</p>
+<ul>
+<li><p><strong><code>module</code></strong> - Module name.</p></li>
+<li><p><strong><code>function</code></strong> - Function name.</p></li>
+<li><p><strong><code>calls</code></strong> - Number of calls to the function.</p></li>
+<li><p><strong><code>measurement</code></strong> - Total measurement (call count, time, or heap allocation) throughout all calls to the function.</p></li>
+<li><p><strong><code>measurement_per_call</code></strong> - Measurement (call count, time, or heap allocation) on average per function call.</p></li>
+<li><p><strong><code>percent</code></strong> - Percentage of measurement to total amount during the entire profile collection.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:process/0">process() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L639" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> process() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>().</pre>  <p>A process identifier (pid) or a registered process name.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:profile_line/0">profile_line() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L444" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> profile_line() ::
+          {<a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(),
+           Function :: {<a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:arity/0">arity</a>()},
+           Count :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>(),
+           Measurement :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>(),
+           MeasurementPerCall :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+           Percent :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:float/0">float</a>()}.</pre>  <p>Inspected data for a single function of the specified <code>Module</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:profile_options/0">profile_options() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L491" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> profile_options() ::
+          #{type =&gt; <a href="#t:trace_type/0">trace_type</a>(),
+            timeout =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>(),
+            pattern =&gt; <a href="#t:trace_pattern/0">trace_pattern</a>() | [<a href="#t:trace_pattern/0">trace_pattern</a>()],
+            set_on_spawn =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>(),
+            rootset =&gt; <a href="#t:rootset/0">rootset</a>(),
+            report =&gt; return | process | total | {process, <a href="#t:sort_by/0">sort_by</a>()} | {total, <a href="#t:sort_by/0">sort_by</a>()},
+            device =&gt; <a href="../../../stdlib-8.1/doc/html/io.html#t:device/0">io:device</a>()}.</pre>  <p>Ad-hoc profiler options; see <a href="#profile/4"><code>profile/4</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:profile_result/0">profile_result() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L452" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> profile_result() :: {<a href="#t:trace_type/0">trace_type</a>(), TotalMeasurement :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), [<a href="#t:profile_line/0">profile_line</a>()]}.</pre>  <p>Profile of a single process, or combined profile of multiple processes, sorted by a selected column.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:rootset/0">rootset() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L485" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> rootset() :: [<a href="#t:process/0">process</a>()] | all | existing | new.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:server/0">server() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L411" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> server() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | tprof.</pre>  <p>A tprof server.</p>
+<p>Each server uses a separate <a href="../../../kernel-11.0.4/doc/html/trace.html#t:session/0"><code>trace:session/0</code></a> in order to keep profiling isolated.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:sort_by/0">sort_by() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L476" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> sort_by() :: <a href="#t:column/0">column</a>() | {<a href="#t:column/0">column</a>(), ascending} | {<a href="#t:column/0">column</a>(), descending}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:start_options/0">start_options() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L403" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> start_options() :: #{type =&gt; <a href="#t:trace_type/0">trace_type</a>(), session =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>()}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_info/0">trace_info() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L439" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_info() ::
+          {<a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(),
+           Fun :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(),
+           Arity :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+           [{<a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Count :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>(), Measurement :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pos_integer/0">pos_integer</a>()}]}.</pre>  <p>Raw data extracted from tracing BIFs.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_map/0">trace_map() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L435" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_map() :: #{<a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>() =&gt; [{Fun :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:arity/0">arity</a>()}]} | all.</pre>  <p>Traced functions (with their arities) grouped by module name, or <code>all</code> if all code is traced.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_options/0">trace_options() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L480" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_options() :: #{set_on_spawn =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()}.</pre>  <p>Options for enabling profiling of the selected processes; see <a href="#enable_trace/2"><code>enable_trace/2</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_pattern/0">trace_pattern() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L428" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_pattern() :: {<a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Fun :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:arity/0">arity</a>() | '_'}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_type/0">trace_type() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L425" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_type() :: call_count | call_time | call_memory.</pre>  <p>The type of profiling that the tprof server will do.</p>
+<ul>
+<li>
+<strong>call_count</strong> - Counts the number of calls made to functions. This is a global profiling event that cannot be limited to specific processes. See <a href="../../../kernel-11.0.4/doc/html/trace.html#call_count">call_count</a> in <a href="../../../kernel-11.0.4/doc/html/trace.html#function/4"><code>trace:function/4</code></a> for more details.</li>
+<li>
+<strong>call_time</strong> - Counts the accumulated time spent in functions. See <a href="../../../kernel-11.0.4/doc/html/trace.html#call_time">call_time</a> in <a href="../../../kernel-11.0.4/doc/html/trace.html#function/4"><code>trace:function/4</code></a> for more details.</li>
+<li>
+<strong>call_memory</strong> - Counts the accumulated memory allocated in functions. See <a href="../../../kernel-11.0.4/doc/html/trace.html#call_memory">call_memory</a> in <a href="../../../kernel-11.0.4/doc/html/trace.html#function/4"><code>trace:function/4</code></a> for more details.</li>
+</ul> </section> </section> </div> </section> <section id="functions" class="details-list"> <h2>Functions</h2> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="clear_pattern/3">clear_pattern(Mod, Fun, Arity) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L602" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> clear_pattern(<a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:arity/0">arity</a>() | '_') -&gt; ok.</pre>  <p>Disables tracing functions matching the supplied pattern.</p>
+<pre data-language="erlang">1&gt; tprof:set_pattern(lists, seq, '_').
+2
+2&gt; tprof:clear_pattern(lists, seq, 3).
+1
+3&gt; tprof:get_trace_map().
+#{lists =&gt; [{seq,2}]}</pre>
+<p>Requires that the default <code>tprof</code> server has been <a href="#start/1"><code>started</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="clear_pattern/4">clear_pattern(Server, Mod, Fun, Arity) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L609" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> clear_pattern(<a href="#t:server/0">server</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:arity/0">arity</a>() | '_') -&gt; ok.</pre>  <p>Equivalent to <a href="#clear_pattern/3"><code>clear_pattern(Mod, Fun, Arity)</code></a> but uses the provided <code>Server</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="collect/0">collect() <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L624" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> collect() -&gt; {<a href="#t:trace_type/0">trace_type</a>(), [<a href="#t:trace_info/0">trace_info</a>()]}.</pre>  <p>Returns statistics for current trace map.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="collect/1">collect(Server) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L629" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> collect(<a href="#t:server/0">server</a>()) -&gt; {<a href="#t:trace_type/0">trace_type</a>(), [<a href="#t:trace_info/0">trace_info</a>()]}.</pre>  <p>Equivalent to <a href="#collect/0"><code>collect/0</code></a> but uses the provided <code>Server</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="continue/0">continue() <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L785" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> continue() -&gt; ok | not_paused.</pre>  <p>Resumes previously paused profiling.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="continue/1">continue(Server) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L790" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> continue(<a href="#t:server/0">server</a>()) -&gt; ok | not_paused.</pre>  <p>Equivalent to <a href="#continue/0"><code>continue/0</code></a> but uses the provided <code>Server</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="disable_trace/1">disable_trace(Rootset) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L726" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> disable_trace(Spec) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()
+                       when Spec :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | all | new | existing | {children | all_children, <a href="#t:process/0">process</a>()};
+                   ([<a href="#t:process/0">process</a>()]) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), [<a href="#t:process/0">process</a>()]}.</pre>  <p>Equivalent to <a href="#disable_trace/2"><code>disable_trace(Spec, #{set_on_spawn =&gt; true})</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="disable_trace/2">disable_trace(Spec, Options) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L743" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> disable_trace(Spec, <a href="#t:trace_options/0">trace_options</a>()) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()
+                       when Spec :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | all | new | existing | {children | all_children, <a href="#t:process/0">process</a>()};
+                   ([<a href="#t:process/0">process</a>()], <a href="#t:trace_options/0">trace_options</a>()) -&gt;
+                       <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), [<a href="#t:process/0">process</a>()]}.</pre>  <p>Stops accumulating traces for specified processes.</p>
+<p>See <a href="#enable_trace/2"><code>enable_trace/2</code></a> for a description of the options.</p>
+<p>The profile data accumulated before the process is removed from the traced list is retained. This makes it possible to enable tracing for many or all processes in the system, sleep for a short period of time, then disable tracing for all processes (to avoid system overload), but keeping profile data.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="disable_trace/3">disable_trace(Server, Spec, Options) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L750" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> disable_trace(<a href="#t:server/0">server</a>(), Spec, <a href="#t:trace_options/0">trace_options</a>()) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()
+                       when Spec :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | all | new | existing | {children | all_children, <a href="#t:process/0">process</a>()};
+                   (<a href="#t:server/0">server</a>(), [<a href="#t:process/0">process</a>()], <a href="#t:trace_options/0">trace_options</a>()) -&gt;
+                       <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), [<a href="#t:process/0">process</a>()]}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="enable_trace/1">enable_trace(Rootset) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L646" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> enable_trace(Spec) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()
+                      when Spec :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | all | new | existing | {children | all_children, <a href="#t:process/0">process</a>()};
+                  ([<a href="#t:process/0">process</a>()]) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), [<a href="#t:process/0">process</a>()]}.</pre>  <p>Equivalent to <a href="#enable_trace/2"><code>enable_trace(Spec, #{set_on_spawn =&gt; true})</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="enable_trace/2">enable_trace(Spec, Options) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L698" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> enable_trace(Spec, <a href="#t:trace_options/0">trace_options</a>()) -&gt; Traced :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()
+                      when Spec :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | all | new | existing;
+                  (Spec, <a href="#t:trace_options/0">trace_options</a>()) -&gt;
+                      Traced :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | {Traced :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), Failed :: [<a href="#t:process/0">process</a>()]}
+                      when Spec :: [<a href="#t:process/0">process</a>()] | {children | all_children, <a href="#t:process/0">process</a>()}.</pre>  <p>Similar to <a href="../../../kernel-11.0.4/doc/html/trace.html#process/4"><code>trace:process/4</code></a>, but supports a few more options for tracing convenience.</p>
+<p>Tracing per process is not supported by <code>call_count</code> profilers.</p>
+<p><code>Spec</code> is either a process identifier (pid) for a local process, one of the following atoms, or a list of local process identifiers or their registered names:</p>
+<ul>
+<li><p><strong><code>all</code></strong> - All currently existing processes and all that will be created in the future.</p></li>
+<li><p><strong><code>existing</code></strong> - All currently existing processes.</p></li>
+<li><p><strong><code>new</code></strong> - All processes that will be created in the future.</p></li>
+<li><p><strong><code>children</code></strong> - All currently running processes that were directly spawned by the specified process. This mode is helpful for tracing workers of a single supervisor.</p></li>
+<li><p><strong><code>all_children</code></strong> - All currently running processes that were spawned by the specified process, or any recursive descendant of it. This mode is designed to facilitate tracing of supervision trees.</p></li>
+</ul>
+<p>Returns the number of processes for which tracing was enabled.</p>
+<p>When a list of pids, <code>children</code> or <code>all_children</code> is used, the processes that tracing failed to be enabled on will also be returned. Tracing can fail to be enabled if the process has terminated before tracing could be enabled.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>The profiling server does not keep track of processes that were added to the tracing set. It is permitted to stop the profiling server (wiping out any accumulated data), restart the server, set entirely different tracing pattern keeping the list of traced processes for future use. Use <a href="#disable_trace/2"><code>disable_trace(Processes)</code></a> to clear the list of traced processes.</p>
+</div>
+<p>Specify <code>Options</code> to modify tracing behavior:</p>
+<ul><li>
+<strong><code>set_on_spawn</code></strong> - Automatically start tracing for processes spawned by the traced process. On by default.</li></ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="enable_trace/3">enable_trace(Server, Spec, Options) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L706" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> enable_trace(<a href="#t:server/0">server</a>(), Spec, <a href="#t:trace_options/0">trace_options</a>()) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()
+                      when Spec :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | all | new | existing | {children | all_children, <a href="#t:process/0">process</a>()};
+                  (<a href="#t:server/0">server</a>(), [<a href="#t:process/0">process</a>()], <a href="#t:trace_options/0">trace_options</a>()) -&gt;
+                      <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>() | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>(), [<a href="#t:process/0">process</a>()]}.</pre>  <p>Equivalent to <a href="#enable_trace/2"><code>enable_trace/2</code></a> but uses the provided <code>Server</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="format/1">format(Inspected) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L851" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> format(<a href="#t:profile_result/0">profile_result</a>() | #{<a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | all =&gt; <a href="#t:profile_result/0">profile_result</a>()}) -&gt; ok.</pre>  <p>Formats profile data transformed with <a href="#inspect/3"><code>inspect/3</code></a>, outputting to the default output device.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="format/2">format(IoDevice, Inspected) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L859" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> format(<a href="../../../stdlib-8.1/doc/html/io.html#t:device/0">io:device</a>(), <a href="#t:profile_result/0">profile_result</a>() | #{<a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | all =&gt; <a href="#t:profile_result/0">profile_result</a>()}) -&gt; ok.</pre>  <p>Formats profile transformed with <a href="#inspect/3"><code>inspect/3</code></a>, outputting to device <code>IoDevice</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="get_trace_map/0">get_trace_map() <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L614" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> get_trace_map() -&gt; <a href="#t:trace_map/0">trace_map</a>().</pre>  <p>Returns a map of module names to functions with their arities.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="get_trace_map/1">get_trace_map(Server) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L619" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> get_trace_map(<a href="#t:server/0">server</a>()) -&gt; <a href="#t:trace_map/0">trace_map</a>().</pre>  <p>Equivalent to <a href="#get_trace_map/0"><code>get_trace_map/0</code></a> but uses the provided <code>Server</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="inspect/1">inspect(Profile) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L816" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> inspect({<a href="#t:trace_type/0">trace_type</a>(), [<a href="#t:trace_info/0">trace_info</a>()]}) -&gt; #{all =&gt; <a href="#t:profile_result/0">profile_result</a>()}.</pre>  <p>Equivalent to <a href="#inspect/3"><code>inspect(Profile, process, percent)</code></a>.</p>
+<p>Transforms raw profile into a map of process identifiers to a tuple containing total count of words allocated, and a list of all traced functions sorted in the ascending order by the allocation percentage.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="inspect/3">inspect(Profile, Type, SortBy) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L835" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> inspect(Profile :: {<a href="#t:trace_type/0">trace_type</a>(), [<a href="#t:trace_info/0">trace_info</a>()]}, Type :: process | total, SortBy :: <a href="#t:sort_by/0">sort_by</a>()) -&gt;
+                 #{<a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | all =&gt; <a href="#t:profile_result/0">profile_result</a>()}.</pre>  <p>Transforms raw data returned by tracing BIFs into a form convenient for subsequent analysis and formatting.</p>
+<ul>
+<li><p>When the <code>Type</code> argument is <code>process</code>, this function returns a map of process identifiers with corresponding profiling results sorted by the selected column.</p></li>
+<li><p>When <code>Type</code> argument is <code>total</code> or when profiling by <code>call_count</code>, this function returns a map with a single <code>all</code> key with profiling results from all processes.</p></li>
+</ul>
+<p>The inspected profile data can be leveraged to <a href="tprof.html#inspect_example">print profiling results</a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="pause/0">pause() <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L775" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> pause() -&gt; ok | not_running.</pre>  <p>Pauses trace collection for all currently traced functions, retaining existing traces.</p>
+<p>Use <a href="#continue/0"><code>continue/0</code></a> to resume trace collection.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="pause/1">pause(Server) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L780" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> pause(<a href="#t:server/0">server</a>()) -&gt; ok | not_running.</pre>  <p>Equivalent to <a href="#pause/0"><code>pause/0</code></a> but uses the provided <code>Server</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="profile/1">profile(Fun) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L867" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> profile(fun(() -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>())) -&gt; ok | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), [<a href="#t:trace_info/0">trace_info</a>()]}.</pre>  <p>Equivalent to <a href="#profile/2"><code>profile(Fun, #{})</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="profile/2">profile(Fun, Options) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L882" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> profile(fun(() -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()), <a href="#t:profile_options/0">profile_options</a>()) -&gt; ok | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), {<a href="#t:trace_type/0">trace_type</a>(), [<a href="#t:trace_info/0">trace_info</a>()]}}.</pre>  <p>Does ad-hoc profiling of the call <code>Fun()</code>.</p>
+<p>By default, the result is formatted to the output device; use the <code>report</code> option to change this behavior.</p>
+<p>Ad-hoc profiling starts a new instance of <code>tprof</code> server, runs the profiling routine, extracts results, and shuts down the server.</p>
+<p>See <a href="#profile/4"><code>profile/4</code></a> for a list of the supported options.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="profile/3">profile(Module, Function, Args) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L888" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> profile(<a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Fun :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Args :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()]) -&gt;
+                 ok | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), {<a href="#t:trace_type/0">trace_type</a>(), [<a href="#t:trace_info/0">trace_info</a>()]}}.</pre>  <p>Equivalent to <a href="#profile/4"><code>profile(Module, Function, Args, #{})</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="profile/4">profile(Module, Function, Args, Options) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L927" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> profile(<a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Fun :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Args :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()], <a href="#t:profile_options/0">profile_options</a>()) -&gt;
+                 ok | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), {<a href="#t:trace_type/0">trace_type</a>(), [<a href="#t:trace_info/0">trace_info</a>()]}}.</pre>  <p>Does ad-hoc profiling for the call <code>apply(Module, Function, Args)</code>.</p>
+<p>By default, the result is formatted to the output device; use option <code>report</code> to change this behavior.</p>
+<p>Ad-hoc profiling starts a new instance of <code>tprof</code> server, runs the profiling routine, extracts results, and shuts down the server.</p>
+<p>The ad-hoc profiler supports the following <code>Options</code>:</p>
+<ul>
+<li><p><strong><code>type</code></strong> - The type of profiling to perform.</p></li>
+<li><p><strong><code>device</code></strong> - Specifies I/O devices to print the profile to. Useful to redirect text output to console or <code>standard_error</code>.</p></li>
+<li><p><strong><code>pattern</code></strong> - Specifies a trace pattern, or a list of trace patterns to enable. By default, all functions (<code>{'_', '_', '_'}</code>) are traced.</p></li>
+<li><p><strong><code>report</code></strong> - Controls output format. The default is <code>process</code>; printing per-process profiling data sorted by percentage of the total allocation. Specify <code>report =&gt; return</code> to suppress printing and get the raw data for further evaluation with <a href="#inspect/3"><code>inspect/3</code></a> and formatting with <a href="#format/2"><code>format/2</code></a>.</p></li>
+<li><p><strong><code>rootset</code></strong> - Includes extra processes in the trace list. Useful for profiling allocations for <a href="../../../stdlib-8.1/doc/html/gen_server.html"><code>gen_server</code></a>, calls, or other allocations caused by inter-process communications. See <a href="tprof.html#pg_example">this example</a>.</p></li>
+<li><p><strong><code>set_on_spawn</code></strong> - Automatically start tracing for processes spawned by the traced process. Enabled by default.</p></li>
+<li><p><strong><code>timeout</code></strong> - Terminate profiling after the specified amount of time (milliseconds).</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="restart/0">restart() <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L797" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> restart() -&gt; ok.</pre>  <p>Clears accumulated profiles and starts profiling if it was paused.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="restart/1">restart(Server) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L802" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> restart(<a href="#t:server/0">server</a>()) -&gt; ok.</pre>  <p>Equivalent to <a href="#restart/0"><code>restart/0</code></a> but uses the provided <code>Server</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="set_pattern/3">set_pattern(Mod, Fun, Arity) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L579" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> set_pattern(<a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:arity/0">arity</a>() | '_') -&gt; ok | {error, {trace_pattern, <a href="#t:trace_pattern/0">trace_pattern</a>()}}.</pre>  <p>Enables tracing for all functions matching the supplied pattern.</p>
+<p>Patterns are additive, following the same rules as <a href="../../../kernel-11.0.4/doc/html/trace.html#function/4"><code>trace:function/4</code></a>. Returns the number of functions matching the supplied pattern.</p>
+<pre data-language="erlang">1&gt; tprof:set_pattern(lists, seq, '_').
+2
+2&gt; tprof:set_pattern(lists, keyfind, 3).
+1
+3&gt; tprof:get_trace_map().
+#{lists =&gt; [{keyfind,3},{seq,2},{seq,3}]}</pre>
+<p>If no functions match the pattern, an <code>error</code> tuple is returned:</p>
+<pre data-language="erlang">&gt; tprof:set_pattern(no_module, func, '_').
+{error,{trace_pattern,no_module,func,'_'}}</pre>
+<p>Requires that the default <code>tprof</code> server has been <a href="#start/1"><code>started</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="set_pattern/4">set_pattern(Server, Mod, Fun, Arity) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L584" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> set_pattern(<a href="#t:server/0">server</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:arity/0">arity</a>() | '_') -&gt;
+                     ok | {error, {trace_pattern, <a href="#t:trace_pattern/0">trace_pattern</a>()}}.</pre>  <p>Equivalent to <a href="#set_pattern/3"><code>set_pattern/3</code></a> but uses the provided <code>Server</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start/0">start() <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L506" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start() -&gt; {ok, Server} | {error, Reason}
+               when Server :: <a href="#t:server/0">server</a>(), Reason :: {already_started, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()}.</pre>  <p>Equivalent to <a href="#start/1"><code>start(#{})</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start/1">start(Config) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L525" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start(Config :: <a href="#t:start_options/0">start_options</a>()) -&gt; {ok, Server} | {error, Reason}
+               when Server :: <a href="#t:server/0">server</a>(), Reason :: {already_started, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()}.</pre>  <p>Starts the server, not supervised.</p>
+<p>Profiling server stores current trace patterns and owns the <a href="../../../kernel-11.0.4/doc/html/trace.html#t:session/0">trace session</a> used for profiling.</p>
+<p>If no <code>session</code> is provided in <code>Config</code>, then a default session called <code>tprof</code> is used and the profiling server is <a href="../../../../erts-17.1/doc/html/erlang.html#register/2">registered</a> as <code>tprof</code>.</p>
+<p>If <code>session</code> is provided in <code>Config</code>, then a session with that name is created and all profiling is done within that session. The profiling server is not <a href="../../../../erts-17.1/doc/html/erlang.html#register/2">registered</a> in this case. When using <a href="tprof.html"><code>tprof</code></a> like this the <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a> returned from this function needs to be provided to the functions in this module.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_link/0">start_link() <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L533" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_link() -&gt; {ok, Server} | {error, Reason}
+                    when Server :: <a href="#t:server/0">server</a>(), Reason :: {already_started, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()}.</pre>  <p>Equivalent to <a href="#start_link/1"><code>start_link(#{})</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_link/1">start_link(Config) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L539" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_link(Config :: <a href="#t:start_options/0">start_options</a>()) -&gt; {ok, Server} | {error, Reason}
+                    when Server :: <a href="#t:server/0">server</a>(), Reason :: {already_started, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()}.</pre>  <p>Equivalent to <a href="#start/1"><code>start/1</code></a> but also links the profiling server to the caller.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="stop/0">stop() <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L546" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> stop() -&gt; ok.</pre>  <p>Stops the default <code>tprof</code> server and disable tracing enabled by the server.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="stop/1">stop(Server) <span class="since">(since OTP 27.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/tprof.erl#L551" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> stop(<a href="#t:server/0">server</a>()) -&gt; ok.</pre>  <p>Equivalent to <a href="#stop/0"><code>stop/0</code></a> but uses the provided <code>Server</code>.</p> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

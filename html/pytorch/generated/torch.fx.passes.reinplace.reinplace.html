@@ -1,0 +1,60 @@
+<div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList"> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Reference API"> <meta itemprop="position" content="1"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="torch.fx"> <meta itemprop="position" content="2"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem"> <meta itemprop="name" content="torch.fx.passes.reinplace.reinplace"> <meta itemprop="position" content="3"> </div> </div>  <article class="bd-article"> <section id="torch-fx-passes-reinplace-reinplace"> <h1>torch.fx.passes.reinplace.reinplace</h1> <dl class="py function"> <dt class="sig sig-object py" id="torch.fx.passes.reinplace.reinplace">
+<code>torch.fx.passes.reinplace.reinplace(gm, *sample_args)</code> <a class="reference external" href="https://github.com/pytorch/pytorch/blob/v2.14.0/torch/fx/passes/reinplace.py#L309"><span class="viewcode-link">[source]</span></a>
+</dt> <dd>
+<p>Given an fx.GraphModule, modifies it to perform “reinplacing”, mutating the nodes of the graph. We look for out-of-place op call sites like <code>b = a.add(...)</code>, and convert them to be inplace (<code>b = a.add_(...)</code>), as long as the input to the current operator (“a”) isn’t reused anywhere later in the graph.</p> <p>This pass currently expects to operate on a <strong>functional, ATen</strong> graph. This can be obtained by running <code>make_fx(functionalize(f))</code>.</p> <p>Sample inputs are needed to determine aliasing relationships of the inputs. In general, we can’t reinplace node <code>b = a.add(...)</code> if “a” aliases any of the inputs to the program.</p> <p>Given a node <code>b = foo(a, args...)</code> the algorithm for re-inplacing is as follows:</p> <p><strong>(1)</strong> Perform some initial checks on the metadata of “a” and “args…” that can disqualify them from being reinplaced.</p> <ul> <li>
+<p><strong>(1a)</strong> Check that the self argument we’re attempting to reinplace has acceptable dtype/size metadata to reinplace with.</p> <p>For example, if we have:</p> <pre data-language="python">a = torch.ones(1)
+b = torch.ones(10)
+out = torch.add(a, b)
+</pre> <p>We can’t turn that into <code>a.add_(b)</code> because that would require resizing “a”.</p> <p>Similarly, we can’t convert <code>torch.ge(a, b)</code> into <code>a.ge_(b)</code>, because that would require changing a’s dtype (from e.g. float32 to bool). Note that in this specific example, we could technically do better..</p> <p>If we see the pattern:</p> <pre data-language="python">a_1 = a.ge(b)
+a_2 = aten._to_copy(a_1, a.dtype)
+</pre> <p>Then this should be valid to completely re-inplace (this is exactly what functionalization will emit when it sees <code>a.ge_(b)</code>).</p> <p>This optimization is only really important for user programs that directly use inplace comparison ops though.</p> <p>We also cannot re-inplace on tensors that have overlapping memory, e.g. <code>torch.ones(1).expand(4, 4).add_(1)</code>.</p> </li> <li>
+<p><strong>(1b)</strong> Check if “a” is an alias of any of the program inputs.</p> <p>If it is, skip and move to the next node. Inplace’ing an op that would cause it to mutate a program is not sound, because that would be a side effect visible to the user.</p> <p>NOTE: there’s a future optimization that we should make: if “a” is a (alias of a) program input, but later in the program there is a node that looks like <code>a.copy_(...)</code>, then re-inplacing is ok to do - we are temporarily reusing a’s buffer, which will later be overwritten by the <code>copy_()</code> call.</p> <p>This will be an important optimization to have for programs that mutate their inputs. It currently isn’t implemented though.</p> </li> <li>
+<p><strong>(1c)</strong> Check if “a” and “args…” alias.</p> <p>For example, re-inplacing to create code like the below isn’t guaranteed to be sound:</p> <pre data-language="python">aten.mul_(a, a)
+</pre> </li> </ul> <p><strong>(2)</strong> Check that “a” and all of its outstanding aliases are not used anywhere later in the graph. If this is the case, then it’s safe to re-inplace to <code>b = foo_(a)</code>.</p> <p>There are a few caveats to this, explained in more detail below:</p> <ul class="simple"> <li>(a) If “a” is used later as an argument to a view op, that is okay. It’s only a problem if “a” (or that view) is later passed into a normal operator, or if it is returned as the program output.</li> <li>(b) If “a” is a repeat argument in <code>foo()</code>, then don’t reinplace. Most ATen kernels don’t make any guarantees that this is sound, e.g. if you do <code>aten.mul_(a, a)</code>. So we’ll just ban re-inplacing in this case.</li> <li>(c) If “a” is used as an input into a view “inverse” / “scatter” operator, it is potentially fine to re-inplace (and remove that scatter operator from the graph). See below for a more detailed example.</li> </ul> <p>NOTE: there is an optimization in this step that is crucial to fully recovering performance from functionalization.</p> <p>Given this program:</p> <pre data-language="python">def f(x):
+    a = torch.ops.aten.add(x, x)
+    b = torch.ops.aten.diagonal(a)
+    torch.ops.aten.fill_(b, 0)
+    return d
+</pre> <p>Functionalization will emit the following:</p> <pre data-language="python">def f(x):
+    a = torch.ops.aten.add(x, x)
+    b = torch.ops.aten.diagonal(a, 0, 1)
+    b_updated = torch.ops.aten.fill(b, 0)
+    a_updated = torch.ops.aten.diagonal_scatter(a, b_updated, 0, 1)
+    return a_updated
+</pre> <p>Ordinarily, we would not be able to reinplace the fill, because “b” aliases with “a” which is used by the diagonal_scatter call.</p> <p>“re-inplacing” is on the hook for figuring out that it is ok to completely remove the expensive diagonal_scatter call, if we re-inplace the add().</p> <p>So, for every <code>alias in alias_set(a)</code>, instead of checking that “alias” is not used anywhere later in the graph, we check that EITHER:</p> <ul> <li>
+<ol class="loweralpha simple"> <li>alias is not used anywhere later in the graph, OR</li> </ol> </li> <li>
+<p>(b) alias is used exactly once later on in the graph, in the following op:</p> <pre data-language="python">out = foo_scatter(alias, x, args...)
+</pre> <p>where the following must hold:</p> <ul> <li>
+<p>(i) <code>foo_scatter</code> is the “inverse” operator for foo. This only applies to “foo” ops that are view operators, which view into a subset of the original tensor’s memory. In practice, there are ~4 operators where this applies:</p> <pre data-language="python">diagonal -&gt; diagonal_scatter
+slice -&gt; slice_scatter
+select -&gt; select_scatter
+as_strided -&gt; as_strided_scatter
+</pre> </li> <li>(ii) “args…” are the same between the <code>foo()</code> and <code>foo_scatter()</code> calls.</li> </ul> </li> </ul> <p><strong>(3)</strong> Perform the actual re-inplacing on foo!</p> <p>(3b) is the common case, but special care is needed for <code>{view}_scatter</code> (3a).</p> <ul> <li>
+<p><strong>(3a)</strong> <code>{view}_scatter</code> ops.</p> <p>Consider this program:</p> <pre data-language="python">a = torch.zeros(2, 2)
+b = torch.ones(2)
+a[0] = b
+</pre> <p>Post functionalization, that will look like:</p> <pre data-language="python">a = torch.zeros(2)
+b = torch.ones(1)
+a_updated = torch.select_scatter(a, b, 0, 0)
+</pre> <p>In this case though, there is no “functional” op to re-inplace! Instead, we’d like to directly remove the select_scatter call. We already know from (3) that this is valid, because “a” has no later usages in the graph.</p> <p>We perform the re-inplacing on the <code>{view}_scatter</code> op like so.</p> <p>Before:</p> <pre data-language="python">a_updated = torch.select_scatter(a, b, args...)
+</pre> <p>After:</p> <pre data-language="python">a_slice = a.select(a, args...)
+a_slice.copy_(b)
+</pre> </li> <li>
+<p><strong>(3b)</strong> Otherwise, replace the functional op with its inplace variant.</p> <p>Before:</p> <pre data-language="python">b = foo(a, args...)
+</pre> <p>After:</p> <pre data-language="python">a.foo_(args...)
+</pre> </li> </ul> <p><strong>(4)</strong> Finally, after converting either:</p> <pre data-language="python"># Before:                              # After:
+b = foo(a)                             foo_(a)
+</pre> <p>or:</p> <pre data-language="python"># Before:
+b = {slice}_scatter(a, mutated_slice, args...)
+# After:
+slice = {slice}(a, args...)
+slice.copy_(mutated_slice)
+</pre> <p>We now need to find all later nodes that use “b” as an argument and update them to take in “a” instead.</p> <p>Note that for the majority of inplace ops, this isn’t actually necessary (because most inplace ops return “self” as their output). This isn’t generally true for all mutable ops though, which is why we need to actually replace all of the arguments.</p> <p>We also need to update our metadata of <code>Dict[StorageWeakRef, Set[Node]]</code>, that maps a given tensor storage to the set of all nodes that take in that storage as an input. Specifically, re-inplacing <code>b = foo(a)</code> causes “a” and “b“‘s sets to get fused together.</p> <p><strong>(5)</strong> Any <code>view_inverse/scatter</code> nodes that were identified as “it’s ok to ignore them” during step (3) get manually deleted from the graph. Their outputs are no longer used, so technically standard DCE would be able to do this, but we can no longer run FX’s DCE pass now that we have mutable ops in the graph.</p> <div class="admonition note"> <p class="admonition-title">Note</p> <p>Backwards-compatibility for this API is guaranteed.</p> </div> <dl class="field-list simple"> <dt class="field-odd">Return type<span class="colon">:</span>
+</dt> <dd class="field-odd">
+<p><a class="reference internal" href="../fx.html#torch.fx.GraphModule" title="torch.fx.graph_module.GraphModule">GraphModule</a></p> </dd> </dl> </dd>
+</dl> </section> </article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2026, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.14/generated/torch.fx.passes.reinplace.reinplace.html" class="_attribution-link">https://docs.pytorch.org/docs/2.14/generated/torch.fx.passes.reinplace.reinplace.html</a>
+  </p>
+</div>

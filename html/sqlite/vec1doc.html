@@ -1,0 +1,193 @@
+     <h1 class="fancy_title"> Vec1 User Manual </h1> <details class="fancy_toc"> <summary>Table Of Contents</summary> <div id="toc_sub">
+<div class="fancy-toc1"><a href="#vtab">1. Using The Virtual Table</a></div> <div class="fancy-toc1"><a href="#nn_and_ann">2. NN and ANN Configurations</a></div> <div class="fancy-toc2"><a href="#exhaustive">2.1. Exhaustive Search (NN) Modes</a></div> <div class="fancy-toc2"><a href="#ann">2.2. Approximate (ANN) Mode</a></div> <div class="fancy-toc3"><a href="#anntheory">2.2.1. Theory</a></div> <div class="fancy-toc3"><a href="#anntraining">2.2.2. Training and Index Building</a></div> <div class="fancy-toc3"><a href="#annparams">2.2.3. Recommended Training Parameters</a></div> <div class="fancy-toc3"><a href="#annquery">2.2.4. Querying</a></div> <div class="fancy-toc3"><a href="#reranking">2.2.5. Reranking</a></div> <div class="fancy-toc1"><a href="#filters">3. Filtered Vector Queries</a></div> <div class="fancy-toc2"><a href="#streaming">3.1. Streaming Queries</a></div> <div class="fancy-toc2"><a href="#metadata">3.2. Metadata Columns</a></div> </div> </details>  <p>This is a user manual that attempts to explain how <a href="vec1.html">vec1</a> may be used and integrated with other SQL queries. It is not a complete reference guide. For that, please see <a href="vec1ref.html">this page</a>. </p>
+<h1 id="vtab">
+<span>1. </span>Using The Virtual Table</h1> <p>A vec1 virtual table is created using the following syntax: </p>
+<pre data-language="sql">CREATE VIRTUAL TABLE vec1tbl USING vec1(vector);
+</pre> <p>where "vector" may be replaced with any legal SQLite column name. Or omitted entirely, in which case it defaults to "vector". This creates a virtual table that behaves similarly to a regular table with the following schema: </p>
+<pre data-language="sql">CREATE TABLE vec1tbl(vector BLOB);
+</pre> <p>The virtual table can then be populated using the usual SQL commands (e.g. INSERT, UPDATE, DELETE). The "vector" column of each row should be populated with a vector, in Vec1's <a href="vec1ref.html#native">native blob format</a>. Each row is identified by a "rowid" column, which may, as for regular SQLite tables, be populated explicitly or automatically. </p>
+<pre data-language="sql">-- Insert a row with explicitly specified rowid value 1234. A blob
+-- containing an array of 32-bit IEEE floating point values in machine-byte
+-- format must be bound to parameter :v1.
+INSERT INTO vec1tbl(rowid, vector) VALUES(1234, :v1);
+
+-- Insert a row with an automatically assigned rowid - which will
+-- presumably be retrieved later using sqlite3_last_insert_rowid() or
+-- similar.
+INSERT INTO vec1tbl(vector) VALUES(:v2);
+</pre> <p>The virtual table will resist attempts to insert anything other than a blob into the "vector" column. And, once the first vector has been inserted, it will also refuse to accept blobs of a different length. All vectors must have the same number of dimensions. </p>
+<p>Once the virtual table is populated, it may be used as a <a href="vtab.html#tabfunc2">table-valued function</a> for nearest-neighbor queries on its contents. For example: </p>
+<pre data-language="sql">-- Retrieve the rowid values identifying the 10 nearest-neighbors
+-- to vector :v. Parameter :v must be a blob containing a vector with
+-- the same number of dimensions as the table contents. 
+SELECT rowid FROM vec1tbl(:v, '{K: 10}');
+</pre> <p>The above works, but there are two drawbacks: </p>
+<ol> <li> Performance is poorer than it could be, and </li>
+<li> The distance metric used to determine the nearest-neighbors is always Euclidean. </li>
+</ol> <p>Fortunately, both these problems can be addressed by configuring the virtual table. </p>
+<h1 id="nn_and_ann">
+<span>2. </span>NN and ANN Configurations</h1> <p>It is currently considered impractical to provide <i>exact</i> results to a nearest-neighbor (NN) query without an exhaustive search, which can be slow. So many systems compromise and implement <i>approximate</i> nearest-neighbor (ANN) queries. The results returned may not be the true nearest-neighbors, but they'll usually be pretty close, and can be computed far more quickly than an exhaustive search. For many applications this tradeoff - slightly lower accuracy in exchange for much lower latency - is acceptable. </p>
+<p>Vec1 may be configured to support either NN or ANN queries. Use <a href="#exhaustive">NN mode</a> if: </p>
+<ul> <li> Exact results are required, or </li>
+<li> The database will contain relatively few (say &lt; 5000) vectors, or </li>
+<li> Training data is unavailable or training is inconvenient. In vec1, ANN mode requires a trained model, which requires training data - often a subset of the actual data - and training time. </li>
+</ul> <p>Otherwise, use <a href="#ann">ANN mode</a>. </p>
+<h2 id="exhaustive">
+<span>2.1. </span>Exhaustive Search (NN) Modes</h2> <p>If exact results are required, or using a trained ANN model is impractical for some reason, vec1 may still be used in either of the following modes: </p>
+<ul> <li> <b>No index</b> mode. This is the default. In this mode vectors are simply stored by the vec1 extension in an SQLite table. One vector per row. </li>
+<li> <b>Flat index</b> mode. In this mode vectors are stored in packed arrays in large blob fields. This can make exhaustive searches over twice as fast as in "no index" mode. </li>
+</ul> <p>To set a vec1 table to one of the above NN modes, an SQL statement like: </p>
+<pre data-language="sql">-- Persistently configure the vec1 table to use flat index mode with
+-- the Euclidean (l2) distance metric.
+-- 
+INSERT INTO vec1tbl(cmd, arg) VALUES('rebuild', '{index:"flat", distance:"l2"}');
+</pre> <p>The JSON object written to the "arg" column supports two parameters: </p>
+<ul> <li> <b>index</b> - this may be set to either "flat", for flat index mode, or "none", for no index mode. </li>
+<li> <b>distance</b> - this may be set to either "l2", to configure vec1 to use Euclidean distance to calculate nearest-neighbors, or "cos", to tell it to use cosine distance. </li>
+</ul> <p>Because they always return exact results, queries against vec1 in NN mode do NOT benefit from <a href="#reranking">reranking</a>. </p>
+<h2 id="ann">
+<span>2.2. </span>Approximate (ANN) Mode</h2> <p>To be most useful with a substantial number of vectors, a vec1 table should be configured to provide ANN search using a trained model. </p>
+<h3 id="anntheory">
+<span>2.2.1. </span>Theory</h3> <p>Approximate Nearest-Neighbor search in this system is implemented using IVFADC (sometimes called IVFPQ). There are many good introductions to this on the internet, but briefly: </p>
+<ul> <li> The model contains a fixed number of buckets, each with an associated centroid selected during training. During index population, each vector is assigned to the bucket with the closest centroid. </li>
+<li> Within each bucket, vectors are optionally compressed and stored in a packed array. Compression is usually done using a set of product quantization (PQ) codebooks that are part of the model, but may also use a simpler binary quantizer (BQ). </li>
+<li> When querying the index, the subset of buckets (say 3%) with the closest centroids to the query vector are selected. All other buckets are ignored by the query. The contents of the selected buckets are scanned and the nearest-neighbors identified based on calculating the distance between the query vector and the compressed form of the database vector stored in the index. </li>
+</ul>  <h3 id="anntraining" tags="vec1 training">
+<span>2.2.2. </span>Training and Index Building</h3> <p id="anntraining">Practically, a vec1 ANN model is a blob returned by running the SQL aggregate function <a href="vec1ref.html#train">vec1_train()</a> over a representative set of vectors - the training set. For example, to create a model based on the first 100,000 vectors currently stored in table vec1tbl: </p>
+<pre data-language="sql">-- Obtain a model - a blob - trained on the first 100,000 rows of
+-- table vec1tbl.  
+WITH training_set(vector) AS (
+  SELECT vector FROM vec1tbl LIMIT 100000
+)
+SELECT
+  vec1_train(vector, '{codesize: 16, nbucket: 1024, distance: "cos"}')
+FROM training_set;
+</pre> <p>The first parameter passed to vec1_train() is a training vector. The second parameter is a JSON object specifying parameters for the model training. These parameters are currently supported: </p>
+<ul> <li> <b>distance</b> - the distance metric to use. This must be set to either "l2" (Euclidean distance) or "cos" (cosine distance). The default value is "l2". </li>
+<li> <b>nbucket</b> - the number of buckets to use for the coarse quantizer. This must be set to a value between 2 and 65536, or else 0. A value of 0 disables the coarse quantizer altogether. The default value is 0. </li>
+<li> <b>codesize</b> - the size in bytes of the compressed vector codes to use. This must be set to a value between 0 and 256. A value of 0 disables PQ compression altogether, so that full vectors are stored in the index. Storing full vectors is almost always slower, but eliminates the need for <a href="#reranking">reranking</a>. The default value is 0. </li>
+<li> <b>quantizer</b> - a string that must be set to "none", "pq", "opq" or "bq". This determines the way in which vectors are compressed. If it is set to "none", then vectors are not compressed. If it is set to "pq", then standard Product Quantization codes are used. If it is set to "opq", then an Optimized Product Quantization is used. Enabling Optimized Product Quantization increases training time, but often significantly improves recall, especially with modern embedding datasets. Finally, if this option is set to "bq", then a binary quantizer is used. The default value is "none" if codesize is set to 0, or "pq" if codesize is something other than 0. </li>
+</ul> <p>Once obtained, a model is provided to the vec1 table using a special INSERT command: </p>
+<pre data-language="sql">-- Provide a model - a blob returned by vec1_train() - to the
+-- vec1 virtual table. 
+INSERT INTO vec1tbl(cmd, arg) VALUES('rebuild', :model);
+</pre> <p>The 'rebuild' command above provides the model to the vec1 virtual table and tells it to build its index based on the model and its current contents. Following this, nearest-neighbor queries should run faster and use the correct distance metric. </p>
+<p>A new model may be provided to an existing table at any time. The old index and model are discarded before the new ones are installed and built. Models may be trained on one host and used on another, provided that the hosts use the same byte-ordering for 32-bit floating point values. </p>
+<p>Training models and building indexes are both compute-heavy operations. Vec1 can be configured to use multiple threads using the <a href="vec1ref.html#config">vec1_config()</a> scalar function, as shown below. This setting applies to the database connection - it affects all training and rebuilding operations performed using the same (sqlite3*) handle. This should not be set to a value greater than the number of real cores that the CPU has. </p>
+<pre data-language="sql">-- Configure vec1 to use 8 threads for both training and index building
+SELECT vec1_config('nthread', 8);
+</pre> <h3 id="annparams">
+<span>2.2.3. </span>Recommended Training Parameters</h3> <p>Selecting the nbucket, codesize and quantizer parameters for an index can be difficult. Oft repeated guidelines are: </p>
+<ul> <li> <b>nbucket</b> should be set to roughly the square root of the expected size of the dataset. So for a 1,000,000 vector db, 1000 buckets is a reasonable value. </li>
+<li> <b>quantizer</b>. If using modern embeddings from a neural network, use "opq". If using engineered descriptors like SIFT, HOG or GIST where variance is already evenly distributed throughout dimensions, use "pq". Use "bq" only if you are particularly concerned with minimizing training time. </li>
+<li> <b>codesize</b> - the size of compressed vectors in bytes. If using the "opq" quantizer, set this to 32. If recall is too low, try increasing this to 48 or 64. <p> If using "pq" or "bq", this should be set to either 1/8 or 1/16 the number of vector dimensions (usually 1/8), for overall compression ratios of 32 or 64 times. So for a table containing 512-dimension vectors, 64 is a reasonable value to try first. </p>
+</li>
+</ul> <p>It is not usually necessary to train on the entire dataset, especially if the dataset is large. A representative sample of (100 * <i>nbucket</i>) vectors, where <i>nbucket</i> is the value assigned to the nbucket parameter, is often recommended. Using a smaller sample is also possible, but index performance and recall may degrade. </p>
+<p>A representative sample is often a random sample. A random sample may be extracted from a table and used to train a model as follows: </p>
+<pre data-language="sql">-- Extract roughly 100,000 random rows from vec1 table v1 and 
+-- train a model with the results.
+SELECT
+  vec1_train(v1.vector, '{nbucket:1000,codesize:32,quantizer:"opq"}')
+FROM v1
+WHERE (
+    (abs(random()) / 9223372036854775807.0) * (SELECT count(*) FROM v1) &lt; 100_000
+);
+</pre> <p>Often the best thing to do is to experiment with a variety of different parameters. Application developers need not regard these as set in stone. New models may be trained and indexes rebuilt as the dataset evolves. </p>
+<h3 id="annquery">
+<span>2.2.4. </span>Querying</h3> <p>Vec1 tables in ANN mode are queried in the same way as other vec1 tables, except that an extra JSON parameter, "nprobe", is relevant. For example: </p>
+<pre data-language="sql">-- Retrieve 50 approximate nearest-neighbors to vector :v. Search
+-- 8% of the buckets in the index to find results.  
+SELECT rowid FROM vec1tbl(:v, '{K:50, nprobe:0.08}');
+</pre> <p>Currently, three query parameters are supported: </p>
+<ul> <li> <b>K</b> is the number of neighbors to return. </li>
+<li> <b>nprobe</b> determines the number of buckets to search for nearest-neighbors. If this value is greater than or equal to 1.0, then it is an absolute number of buckets to search. Or, if it is less than 1.0, then it is the fraction of total buckets to search. For example, an "nprobe" value of 0.25 means to search 1/4 of the total buckets in the index. The default value is 0.05. </li>
+<li> <b>streaming</b> may be set to 0 or 1. See below <a href="#streaming">for details</a>. </li>
+</ul> <p>Larger values of nprobe improve the quality of results returned, but also increase query processing time. </p> <h3 id="reranking" tags="vec1 reranking">
+<span>2.2.5. </span>Reranking</h3> <p id="reranking">Unless the model uses codesize of 0, vec1 returns nearest-neighbors based on computing the distance between the query vector and the compressed vectors stored in the index. And because these vectors are heavily compressed (often 32 times or more), there is a discrepancy between the distance between the query vector and the compressed vector, and the distance between the query vector and the <i>actual, uncompressed</i> database vector. This difference is enough to make results look quite poor. </p>
+<p>The standard solution is "reranking". Reranking is basically saying - "instead of asking the index for the best 10 matches, I'll ask it for the best 100, then calculate the distances between the query vector and the actual vectors for those 100 and return the best 10". Because it's more flexible and just as easy to do in SQL, vec1 does not provide an option to automatically rerank results. For example: </p>
+<pre data-language="sql">SELECT rowid, vector
+FROM vec1tbl(:v, '{K:100}')            -- 1. grab 100 neighbors from the index
+ORDER BY vec1_l2_distance(:v, vector)  -- 2. order them by actual distance 
+LIMIT 10;                              -- 3. return only the best 10 
+</pre> <p>The query above uses <a href="vec1ref.html#l2_distance">vec1_l2_distance()</a>, a scalar function for calculating the Euclidean distance between two vectors of the same length. There is also <a href="vec1ref.html#cos_distance">vec1_cos_distance()</a>, to be used with vec1 tables that use cosine distance. </p>
+<p>There are some tests run on publicly available datasets <a href="vec1bench.html">here</a> that show clearly the advantages of reranking. </p>
+<p>To be 100% clear, <b>reranking is usually essential</b> for ANN queries with vec1. Unless you know otherwise, you need it. Unless of course you have a model with "codesize:0". Then it's pointless extra work. </p>
+<h1 id="filters">
+<span>3. </span>Filtered Vector Queries</h1> <p>Many applications require more than simply the nearest K neighbors to a query vector. Often the results must also satisfy additional database criteria. For example, a user searching an online store might want the nearest 10 items to a query vector that are in stock and cost less than $200. </p>
+<p>Vec1 offers two features to facilitate these types of queries: </p>
+<ul> <li> <a href="#streaming">Streaming queries</a>, for use when the metadata (e.g. price, stock levels) are stored in separate tables, and </li>
+<li> <a href="#metadata">Metadata columns</a>, which allow the metadata to be stored in the vector index itself. </li>
+</ul> <h2 id="streaming">
+<span>3.1. </span>Streaming Queries</h2> <p>Consider the following schema: </p>
+<pre data-language="sql">-- Each row in vec1products has a corresponding row in table products,
+-- linked by (vec1products.rowid=products.id).
+CREATE VIRTUAL TABLE vec1products USING vec1(vector);
+CREATE TABLE products(
+    id INTEGER PRIMARY KEY,
+    in_stock BOOLEAN,         -- 1 for in stock
+    price INTEGER             -- price in cents
+);
+</pre> <p>The user wants to find the nearest neighbor vectors corresponding to rows of the "products" table for which in_stock is true and price is less than 20000. It is awkward to formulate the query in SQL, because you have to pick a fixed value of "K" to pass to the virtual table. No matter what value you pick, it is possible that none of the best K results match the criteria. </p>
+<p>A streaming query solves this problem. Internally, vec1 assumes that SQLite will consume roughly K results. However, if SQLite continues to request rows after the first K have been returned, vec1 will continue producing additional results in roughly ascending order of distance to the query vector. Streaming mode is enabled by adding "streaming:1" to the JSON query parameters. </p>
+<p>Suppose the user's query vector is :v: </p>
+<pre data-language="sql">-- The CTE collects 100 approximate matches that survive the
+-- metadata filters.
+--
+-- "K:200" tells vec1 to expect that roughly 200 rows will be
+-- requested. We estimate that about half will pass the filter.
+-- If more rows are needed, vec1 continues streaming results until
+-- SQLite hits the "LIMIT 100" and stops requesting them.
+WITH best100(rowid, vector) AS (
+  SELECT vp.rowid, vp.vector
+  FROM vec1products(:v, '{K:200, streaming:1, nprobe:32}') vp
+  JOIN products p ON (vp.rowid=p.id)
+  WHERE p.in_stock AND p.price &lt; 20000
+  LIMIT 100
+)
+
+-- Rerank the 100 matches from the CTE and return the best 10.
+SELECT rowid FROM best100
+ORDER BY vec1_l2_distance(:v, vector)
+LIMIT 10;
+</pre> <p>Using the SQL above, 100 post-filter approximate neighbors are accumulated for reranking before returning the best 10 to the user. </p>
+<h2 id="metadata">
+<span>3.2. </span>Metadata Columns</h2> <p>A vec1 table may be configured with metadata columns. Values stored in metadata columns are embedded directly within the ANN index. This allows filters to be applied before computing the distance between database vectors and the query vector. Metadata columns are declared by adding column names after the vector column in the CREATE VIRTUAL TABLE statement. For example: </p>
+<pre data-language="sql">CREATE VIRTUAL TABLE vec1products USING vec1(vector, in_stock, price);
+</pre> <p>Metadata columns do not have declared types. Any valid SQLite column name may be used, except that it must not contain the "=" character. This character is reserved for future extensions. </p>
+<p>Any value may be stored in a metadata column. However, the system is optimized for small values - NULL, numbers or small text or blob fields (say 8 bytes). </p>
+<p>Metadata values may be read and written like ordinary columns. They also have a useful property: simple WHERE clause expressions that reference metadata columns may be evaluated inside the ANN index search. This allows filtering to occur before the nearest-neighbors are accumulated, which is usually much more efficient than filtering outside the index using streaming queries. </p>
+<p>A WHERE clause expression may be evaluated as part of the ANN index search if it: </p>
+<ul> <li> uses a comparison operator (&lt;, &gt;, =, &gt;=, &lt;=, or IS), and </li>
+<li> one side of the comparison is a metadata column. </li>
+</ul> <p>Expressions that cannot be evaluated inside the ANN search are applied after candidate vectors are returned from the index. </p>
+<p>So, for example, the following query retrieves 100 neighbors that match the two constraints from the vec1 table, then reranks them and returns the 10 best results: </p>
+<pre data-language="sql">SELECT rowid
+FROM vec1products(:v, '{K:100}')
+WHERE in_stock = 1 AND price &lt; 20000
+ORDER BY vec1_l2_distance(:v, vector)
+LIMIT 10;
+</pre> <p>But it is easy to make mistakes when writing this type of query. For example, if the user wrote "WHERE in_stock AND price &lt; 20000", which is logically equivalent, the results may differ. In this case the constraint on in_stock would not be evaluated inside the ANN search, because it does not use a comparison operator. </p>
+<p>As a result, vec1 would retrieve 100 nearest-neighbors that satisfy (price &lt; 20000), then apply the in_stock filter afterwards. If the in_stock filter removes too many rows, fewer than 10 results may remain. Even if 10 or more rows remain, this is effectively equivalent to silently reducing the value of K, which may reduce recall. </p>
+<p>This pitfall can be avoided by formulating the query as follows, which ensures that the LIMIT clause determines how many rows vec1 must produce: </p>
+<pre data-language="sql">WITH best100(rowid, vector) AS (
+  SELECT rowid, vector
+  FROM vec1products(:v, '{}')
+  WHERE in_stock = 1 AND price &lt; 20000
+  LIMIT 100
+)
+SELECT rowid FROM best100
+ORDER BY vec1_l2_distance(:v, vector)
+LIMIT 10;
+</pre> <p>In this case, no "K" value at all is passed to the vec1products virtual table. Usually, this would be an error. But, under some circumstances, vec1 is able to use the value attached to a LIMIT clause as its K value. These circumstances are: </p>
+<ul> <li> The query (or subquery) is not a join, </li>
+<li> the query is not an aggregate, </li>
+<li> there is no ORDER BY clause, and </li>
+<li> all WHERE clause terms are handled inside the ANN search. </li>
+</ul> <p>If no K value is supplied, and the query cannot use a value extracted from a LIMIT clause, it is an error. This means that if the user made a mistake and accidentally used WHERE clause terms that cannot be handled within the ANN search, SQLite would return an error trying to prepare the SQL statement. </p>
+<p>Alternatively, if using the second formulation of the query the user could supply a "K" value and also specify "streaming:1". Then vec1 would handle filtering as part of the ANN search whenever possible, falling back to a streaming query in other cases. </p>
+<p><small><i>This page was last updated on 2026-10-01 11:21:38Z </i></small></p> <div class="_attribution">
+  <p class="_attribution-p">
+    SQLite is in the Public Domain.<br>
+    <a href="https://sqlite.org/vec1doc.html" class="_attribution-link">https://sqlite.org/vec1doc.html</a>
+  </p>
+</div>

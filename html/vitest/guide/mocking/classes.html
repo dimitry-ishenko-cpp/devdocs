@@ -1,4 +1,4 @@
-<div style="display:none;" hidden="true" aria-hidden="true">Are you an LLM? You can read better optimized documentation at /guide/mocking/classes.md for this page in Markdown format</div>
+<div style="display:none;" hidden data-nosnippet>Are you an LLM? You can read better optimized documentation at /guide/mocking/classes.md for this page in Markdown format</div>
 <h1 id="mocking-classes" tabindex="-1">Mocking Classes </h1>
 <p>You can mock an entire class with a single <a href="../../api/vi.html#fn"><code>vi.fn</code></a> call.</p>
 <div class="language-ts">
@@ -25,7 +25,14 @@
   feed() {}
 }</pre>
 </div>
-<p>We can re-create this class with <code>vi.fn</code> (or <code>vi.spyOn().mockImplementation()</code>):</p>
+<p>Notice that this class defines its members in two different ways, and the difference matters for mocking:</p>
+<ul>
+<li>
+<code>greet</code> is a class field. The assignment runs during construction, so every instance gets its own copy of the function as its own property.</li>
+<li>
+<code>speak</code>, <code>isHungry</code>, and <code>feed</code> are prototype methods. They are created once and stored on <code>Dog.prototype</code>, an object that all instances share. An instance doesn't have a <code>speak</code> property of its own: when you call <code>dog.speak()</code>, JavaScript doesn't find <code>speak</code> on the instance and continues looking on <code>Dog.prototype</code>. Every instance finds the same function there, so <code>dog.speak === Dog.prototype.speak</code> is <code>true</code>.</li>
+</ul>
+<p>We can re-create this class with <code>vi.fn</code> (or <code>vi.spyOn().mockImplementation()</code>). By defining every method as a class field, each instance gets its own separate mock, which allows checking calls on a single instance:</p>
 <div class="language-ts">
 <pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">const Dog = vi.fn(class {
   static getType = vi.fn(() =&gt; 'mocked animal')
@@ -88,6 +95,7 @@ import { feed } from '../src/feed.js'
 
 const Dog = vi.fn(class {
   feed = vi.fn()
+  isHungry = vi.fn(() =&gt; false)
 })
 
 test('can feed dogs', () =&gt; {
@@ -117,7 +125,62 @@ const Max = new Dog('Max')
 expect(Max.speak).not.toHaveBeenCalled()
 expect(Max.greet).not.toHaveBeenCalled()</pre>
 </div>
-<p>We can reassign the return value for a specific instance:</p>
+<p>You don't have to redefine every method as a class field. Instances keep the prototype chain of the class you pass to <code>vi.fn</code>, so prototype methods stay available on instances, both during and after construction, and instances pass <code>instanceof</code> checks against that class:</p>
+<div class="language-ts">
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">class OriginalDog {
+  constructor(name) {
+    this.name = name
+  }
+
+  speak() {
+    return 'bark!'
+  }
+}
+
+const MockedDog = vi.fn(OriginalDog)
+const dog = new MockedDog('Cooper')
+
+dog.speak() // bark!
+dog instanceof MockedDog // true
+dog instanceof OriginalDog // true</pre>
+</div>
+<p>Note that nothing is mocked in this example. Unlike the <code>speak = vi.fn()</code> field in the <code>Dog</code> example above, the instance doesn't receive its own mock function. <code>dog.speak</code> is found through the prototype chain and refers to the original class method (<code>dog.speak === MockedDog.prototype.speak</code>), so call assertions throw:</p>
+<div class="language-ts">
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">expect(dog.speak).toHaveBeenCalled()
+// TypeError: [Function speak] is not a spy or a call to a spy!</pre>
+</div>
+<p>Since every instance finds <code>speak</code> on the prototype, you can mock it for all of them at once by assigning a mock there:</p>
+<div class="language-ts">
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">MockedDog.prototype.speak = vi.fn(() =&gt; 'woof!')
+
+const cooper = new MockedDog('Cooper')
+const max = new MockedDog('Max')
+
+cooper.speak() // woof!
+max.speak() // woof!
+
+// calls from both instances are recorded by the same mock
+expect(MockedDog.prototype.speak).toHaveBeenCalledTimes(2)
+// `mock.contexts` keeps the instance of every call
+expect(vi.mocked(MockedDog.prototype.speak).mock.contexts).toEqual([cooper, max])</pre>
+</div>
+<p>Assigning on <code>MockedDog.prototype</code> instead of <code>OriginalDog.prototype</code> keeps the original class untouched: the lookup order is <code>instance</code> → <code>MockedDog.prototype</code> → <code>OriginalDog.prototype</code>, so the assigned function shadows the original method. Because instances look the method up on every call rather than keeping a copy, the mock is visible to all of them, even those created before the assignment. The trade-off is that they also share a single call history, unlike class fields, which give every instance its own mock.</p>
+<div class="warning custom-block">
+<strong class="custom-block-title custom-block-title-default">WARNING</strong><p>The mock's <code>prototype</code> always follows the current implementation: it is re-pointed when you set a new implementation, when a queued <code>mockImplementationOnce</code> class is constructed, and when the mock is reset. If a single mock uses different class implementations, instances created by earlier implementations lose access to their prototype methods once a newer implementation takes over. Own properties assigned in the constructor or via class fields are not affected.</p>
+</div>
+<p>If you want to mock the method of one instance only, use <a href="../../api/vi.html#vi-spyon"><code>vi.spyOn</code></a>. It defines the mock directly on that instance, shadowing the prototype method just for it:</p>
+<div class="language-ts">
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">const cooper = new MockedDog('Cooper')
+const max = new MockedDog('Max')
+
+vi.spyOn(cooper, 'speak').mockReturnValue('meow!')
+
+cooper.speak() // meow!
+max.speak() // bark!, still the original method
+
+expect(cooper.speak).toHaveBeenCalledTimes(1)</pre>
+</div>
+<p>When methods are defined as class fields, like in the mocked <code>Dog</code> class at the top of this page, every instance already has its own mock, so you can reassign the return value for a specific instance directly:</p>
 <div class="language-ts">
 <pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">const dog = new Dog('Cooper')
 
@@ -129,7 +192,7 @@ vi.mocked(dog.speak).mockReturnValue('woof woof')
 
 dog.speak() // woof woof</pre>
 </div>
-<p>To mock the property, we can use the <code>vi.spyOn(dog, 'name', 'get')</code> method. This makes it possible to use spy assertions on the mocked property:</p>
+<p>To mock a non-function property, like <code>name</code>, we can use the <code>vi.spyOn(dog, 'name', 'get')</code> method. This makes it possible to use spy assertions on the mocked property:</p>
 <div class="language-ts">
 <pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e;" tabindex="0" dir="ltr" data-language="javascript">const dog = new Dog('Cooper')
 
@@ -142,7 +205,7 @@ expect(nameSpy).toHaveBeenCalledTimes(1)</pre>
 <strong class="custom-block-title custom-block-title-default">TIP</strong><p>You can also spy on getters and setters using the same method.</p>
 </div>
 <div class="danger custom-block">
-<strong class="custom-block-title custom-block-title-default">DANGER</strong><p>Using classes with <code>vi.fn()</code> was introduced in Vitest 4. Previously, you had to use <code>function</code> and <code>prototype</code> inheritence directly. See <a href="https://v3.vitest.dev/guide/mocking#classes" rel="noreferrer" target="_blank">v3 guide</a>.</p>
+<strong class="custom-block-title custom-block-title-default">DANGER</strong><p>Using classes with <code>vi.fn()</code> was introduced in Vitest 4. Previously, you had to use <code>function</code> and <code>prototype</code> inheritance directly. See <a href="https://v3.vitest.dev/guide/mocking#classes" rel="noreferrer" target="_blank">v3 guide</a>.</p>
 </div><div class="_attribution">
   <p class="_attribution-p">
     &copy; 2021-Present VoidZero Inc. and Vitest contributors<br>Licensed under the MIT License.<br>

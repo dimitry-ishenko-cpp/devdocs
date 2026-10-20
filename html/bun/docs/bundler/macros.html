@@ -1,0 +1,275 @@
+<header><h1>Macros</h1>
+<p>Run JavaScript functions at bundle-time with Bun macros</p></header><div>
+<p>Macros are JavaScript functions that run at bundle-time. Bun inlines their return values directly into your bundle.</p>
+<p>As a toy example, consider this function that returns a random number.</p>
+<div data-lang="ts">
+<div><span translate="no">random.ts</span></div>
+<div><div><div><div data-h="0"><pre data-language="typescript">export function random() {
+  return Math.random();
+}</pre></div></div></div></div>
+</div>
+<p>This is a regular function in a regular file, but you can use it as a macro:</p>
+<div data-lang="tsx">
+<div><span translate="no">cli.tsx</span></div>
+<div><div><div><div data-h="1"><pre data-language="jsx">import { random } from "./random.ts" with { type: "macro" };
+
+console.log(`Your random number is ${random()}`);</pre></div></div></div></div>
+</div>
+<div data-callout="note">
+<div><p>Macros are marked with import attribute syntax, a Stage 4 TC39 proposal for attaching additional metadata to import statements.</p></div>
+</div>
+<p>Bundle the file with <code>bun build</code>. Bun prints the bundled file to stdout.</p>
+<div data-lang="bash">
+<div><span translate="no">terminal</span></div>
+<div><div><div><div data-h="2"><pre data-language="bash">bun build ./cli.tsx</pre></div></div></div></div>
+</div>
+<div data-lang="js"><div><div><div><div data-h="3"><pre data-language="javascript">console.log(`Your random number is ${0.6805550949689833}`);</pre></div></div></div></div></div>
+<p>The source code of the <code>random</code> function occurs nowhere in the bundle. Instead, the function runs during bundling and Bun replaces the call (<code>random()</code>) with its result. Since the source code is never included in the bundle, macros can safely perform privileged operations like reading from a database.</p>
+<h2 id="when-to-use-macros">When to use macros</h2>
+<p>For small things you would otherwise write a one-off build script for, bundle-time code execution can be easier to maintain. It lives with the rest of your code and runs with the rest of the build. Bun parallelizes it automatically, and if it fails, the build fails too.</p>
+<p>If you find yourself running a lot of code at bundle-time though, consider running a server instead.</p>
+<h2 id="import-attributes">Import attributes</h2>
+<p>Macros are import statements annotated with either:</p>
+<ul>
+<li>
+<code>with { type: 'macro' }</code> — an import attribute, a Stage 4 ECMAScript proposal</li>
+<li>
+<code>assert { type: 'macro' }</code> — an import assertion, an earlier incarnation of import attributes that has now been abandoned (but several browsers and runtimes already support it)</li>
+</ul>
+<h2 id="security-considerations">Security considerations</h2>
+<p>You must explicitly import a macro with <code>{ type: "macro" }</code> for it to run at bundle-time. These imports have no effect unless you call them, unlike regular JavaScript imports which may have side effects.</p>
+<p>You can disable macros entirely with the <code>--no-macros</code> flag. It produces a build error like this:</p>
+<div data-lang="txt"><div><div><div><div data-h="4"><pre>error: Macros are disabled
+
+foo();
+^
+./hello.js:3:1 53</pre></div></div></div></div></div>
+<p>To reduce the potential attack surface for malicious packages, Bun does not let code inside <code>node_modules/**/*</code> invoke macros. If a package attempts to invoke a macro, you'll see an error like this:</p>
+<div data-lang="txt"><div><div><div><div data-h="5"><pre>error: For security reasons, macros cannot be run from node_modules.
+
+beEvil();
+^
+node_modules/evil/index.js:3:1 50</pre></div></div></div></div></div>
+<p>Your application code can still import macros from <code>node_modules</code> and invoke them.</p>
+<div data-lang="ts">
+<div><span translate="no">cli.tsx</span></div>
+<div><div><div><div data-h="6"><pre data-language="typescript">import { macro } from "some-package" with { type: "macro" };
+
+macro();</pre></div></div></div></div>
+</div>
+<h2 id="export-condition-macro">Export condition "macro"</h2>
+<p>When shipping a library containing a macro to npm or another package registry, use the <code>"macro"</code> export condition to provide a version of your package exclusively for the macro environment.</p>
+<div data-lang="json">
+<div><span translate="no">package.json</span></div>
+<div><div><div><div data-h="7"><pre data-language="json">{
+  "name": "my-package",
+  "exports": {
+    "import": "./index.js",
+    "require": "./index.js",
+    "default": "./index.js",
+    "macro": "./index.macro.js"
+  }
+}</pre></div></div></div></div>
+</div>
+<p>With this configuration, users can consume your package at runtime or at bundle-time using the same import specifier:</p>
+<div data-lang="ts">
+<div><span translate="no">index.ts</span></div>
+<div><div><div><div data-h="8"><pre data-language="typescript">import pkg from "my-package"; // runtime import
+import { macro } from "my-package" with { type: "macro" }; // macro import</pre></div></div></div></div>
+</div>
+<p>The first import resolves to <code>./node_modules/my-package/index.js</code>; Bun's bundler resolves the second to <code>./node_modules/my-package/index.macro.js</code>.</p>
+<h2 id="execution">Execution</h2>
+<p>When Bun's transpiler sees a macro import, it calls the function using Bun's JavaScript runtime and converts the return value into an AST node.</p>
+<p>Macros run synchronously in the transpiler during the visiting phase, after the transpiler parses the file into an AST. They run in the order their calls appear in the file; the transpiler does not load or run a macro module until it reaches a call to one of its exports. The transpiler waits for each macro to finish before continuing, and awaits any Promise a macro returns.</p>
+<p>Bun's bundler is multi-threaded, so macros execute in parallel in multiple spawned JavaScript "workers".</p>
+<h2 id="dead-code-elimination">Dead code elimination</h2>
+<p>The bundler performs dead code elimination after running and inlining macros. Given the following macro:</p>
+<div data-lang="ts">
+<div><span translate="no">returnFalse.ts</span></div>
+<div><div><div><div data-h="9"><pre data-language="typescript">export function returnFalse() {
+  return false;
+}</pre></div></div></div></div>
+</div>
+<p>...bundling the following file produces an empty bundle, provided that the minify syntax option is enabled.</p>
+<div data-lang="ts">
+<div><span translate="no">index.ts</span></div>
+<div><div><div><div data-h="10"><pre data-language="typescript">import { returnFalse } from "./returnFalse.ts" with { type: "macro" };
+
+if (returnFalse()) {
+  console.log("This code is eliminated");
+}</pre></div></div></div></div>
+</div>
+<h2 id="serializability">Serializability</h2>
+<p>Bun's transpiler must be able to serialize the result of the macro to inline it into the AST. All JSON-compatible data structures are supported:</p>
+<div data-lang="ts">
+<div><span translate="no">macro.ts</span></div>
+<div><div><div><div data-h="11"><pre data-language="typescript">export function getObject() {
+  return {
+    foo: "bar",
+    baz: 123,
+    array: [1, 2, { nested: "value" }],
+  };
+}</pre></div></div></div></div>
+</div>
+<p>Macros can be async, or return Promise instances. Bun's transpiler awaits the Promise and inlines the result.</p>
+<div data-lang="ts">
+<div><span translate="no">macro.ts</span></div>
+<div><div><div><div data-h="12"><pre data-language="typescript">export async function getText() {
+  return "async value";
+}</pre></div></div></div></div>
+</div>
+<p>The transpiler implements special logic for serializing common data formats like <code>Response</code> and <code>Blob</code>.</p>
+<ul>
+<li>
+<strong>Response</strong>: Bun reads the <code>Content-Type</code> and serializes accordingly. For example, it parses a Response with type <code>application/json</code> into an object and inlines <code>text/plain</code> as a string. Bun base64-encodes Responses with an unrecognized or undefined type.</li>
+<li>
+<strong>Blob</strong>: As with Response, the serialization depends on the <code>type</code> property.</li>
+</ul>
+<p>The result of <code>fetch</code> is <code>Promise&lt;Response&gt;</code>, so a macro can return it directly.</p>
+<div data-lang="ts">
+<div><span translate="no">macro.ts</span></div>
+<div><div><div><div data-h="13"><pre data-language="typescript">export function getObject() {
+  return fetch("https://bun.com");
+}</pre></div></div></div></div>
+</div>
+<p>Functions and instances of most classes (except those listed earlier) are not serializable.</p>
+<div data-lang="ts">
+<div><span translate="no">macro.ts</span></div>
+<div><div><div><div data-h="14"><pre data-language="typescript">export function getText(url: string) {
+  // this doesn't work!
+  return () =&gt; {};
+}</pre></div></div></div></div>
+</div>
+<h2 id="arguments">Arguments</h2>
+<p>Macros can accept inputs, but only in limited cases. The value must be statically known. For example, the following is not allowed:</p>
+<div data-lang="ts">
+<div><span translate="no">index.ts</span></div>
+<div><div><div><div data-h="15"><pre data-language="typescript">import { getText } from "./getText.ts" with { type: "macro" };
+
+export function howLong() {
+  // the value of `foo` cannot be statically known
+  const foo = Math.random() ? "foo" : "bar";
+
+  const text = getText(`https://example.com/${foo}`);
+  console.log("The page is ", text.length, " characters long");
+}</pre></div></div></div></div>
+</div>
+<p>However, if the value of <code>foo</code> is known at bundle-time (say, if it's a constant or the result of another macro), then the call is allowed:</p>
+<div data-lang="ts">
+<div><span translate="no">index.ts</span></div>
+<div><div><div><div data-h="16"><pre data-language="typescript">import { getText } from "./getText.ts" with { type: "macro" };
+import { getFoo } from "./getFoo.ts" with { type: "macro" };
+
+export function howLong() {
+  // this works because getFoo() is statically known
+  const foo = getFoo();
+  const text = getText(`https://example.com/${foo}`);
+  console.log("The page is", text.length, "characters long");
+}</pre></div></div></div></div>
+</div>
+<p>This outputs:</p>
+<div data-lang="js"><div><div><div><div data-h="17"><pre data-language="javascript">function howLong() {
+  console.log("The page is", 1322, "characters long");
+}
+export { howLong };</pre></div></div></div></div></div>
+<h2 id="examples">Examples</h2>
+<h3 id="embed-latest-git-commit-hash">Embed latest git commit hash</h3>
+<div data-lang="ts">
+<div><span translate="no">getGitCommitHash.ts</span></div>
+<div><div><div><div data-h="18"><pre data-language="typescript">export function getGitCommitHash() {
+  const { stdout } = Bun.spawnSync({
+    cmd: ["git", "rev-parse", "HEAD"],
+    stdout: "pipe",
+  });
+
+  return stdout.toString();
+}</pre></div></div></div></div>
+</div>
+<p>When you build it, Bun replaces the <code>getGitCommitHash</code> call with the result of calling the function:</p>
+<div>
+<div role="tabpanel" id=":Rv6qh:-p0" aria-labelledby=":Rv6qh:-t0">
+<p><strong>input</strong></p>
+<div data-lang="ts"><div><div><div><div data-h="19"><pre data-language="typescript">import { getGitCommitHash } from "./getGitCommitHash.ts" with { type: "macro" };
+
+console.log(`The current Git commit hash is ${getGitCommitHash()}`);</pre></div></div></div></div></div>
+</div>
+<div role="tabpanel" id=":Rv6qh:-p1" aria-labelledby=":Rv6qh:-t1">
+<p><strong>output</strong></p>
+<div data-lang="ts"><div><div><div><div data-h="20"><pre data-language="typescript">console.log(`The current Git commit hash is 3ee3259104e4507cf62c160f0ff5357ec4c7a7f8`);</pre></div></div></div></div></div>
+</div>
+</div>
+<div data-callout="info">
+<div><p>You're probably thinking "Why not use <code>process.env.GIT_COMMIT_HASH</code>?" Well, you can do that too. But can you do this with an environment variable?</p></div>
+</div>
+<h3 id="make-fetch-requests-at-bundle-time">Make fetch() requests at bundle-time</h3>
+<p>This example makes an outgoing HTTP request with <code>fetch()</code>, parses the HTML response with <code>HTMLRewriter</code>, and returns an object containing the title and meta tags, all at bundle-time.</p>
+<div data-lang="ts">
+<div><span translate="no">meta.ts</span></div>
+<div><div><div><div data-h="21"><pre data-language="typescript">export async function extractMetaTags(url: string) {
+  const response = await fetch(url);
+  const meta = {
+    title: "",
+  };
+  new HTMLRewriter()
+    .on("title", {
+      text(element) {
+        meta.title += element.text;
+      },
+    })
+    .on("meta", {
+      element(element) {
+        const name =
+          element.getAttribute("name") || element.getAttribute("property") || element.getAttribute("itemprop");
+
+        if (name) meta[name] = element.getAttribute("content");
+      },
+    })
+    .transform(response);
+
+  return meta;
+}</pre></div></div></div></div>
+</div>
+<p>Bun erases the <code>extractMetaTags</code> function at bundle-time and replaces it with the result of the function call. The fetch request happens at bundle-time, and Bun embeds the result in the bundle. Bun also eliminates the branch throwing the error since it's unreachable, provided that the minify syntax option is enabled.</p>
+<div>
+<div role="tabpanel" id=":R126qh:-p0" aria-labelledby=":R126qh:-t0">
+<p><strong>input</strong></p>
+<div data-lang="jsx"><div><div><div><div data-h="22"><pre data-language="jsx">import { extractMetaTags } from "./meta.ts" with { type: "macro" };
+
+export const Head = () =&gt; {
+  const headTags = extractMetaTags("https://example.com");
+
+  if (headTags.title !== "Example Domain") {
+    throw new Error("Expected title to be 'Example Domain'");
+  }
+
+  return (
+    &lt;head&gt;
+      &lt;title&gt;{headTags.title}&lt;/title&gt;
+      &lt;meta name="viewport" content={headTags.viewport} /&gt;
+    &lt;/head&gt;
+  );
+};</pre></div></div></div></div></div>
+</div>
+<div role="tabpanel" id=":R126qh:-p1" aria-labelledby=":R126qh:-t1">
+<p><strong>output</strong></p>
+<div data-lang="jsx"><div><div><div><div data-h="23"><pre data-language="jsx">export const Head = () =&gt; {
+  const headTags = {
+    title: "Example Domain",
+    viewport: "width=device-width, initial-scale=1",
+  };
+
+  return (
+    &lt;head&gt;
+      &lt;title&gt;{headTags.title}&lt;/title&gt;
+      &lt;meta name="viewport" content={headTags.viewport} /&gt;
+    &lt;/head&gt;
+  );
+};</pre></div></div></div></div></div>
+</div>
+</div>
+</div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; bun.com, oven-sh, Jarred Sumner<br>Licensed under the MIT License.<br>
+    <a href="https://bun.com/docs/bundler/macros" class="_attribution-link">https://bun.com/docs/bundler/macros</a>
+  </p>
+</div>

@@ -1,0 +1,198 @@
+<header><h1>Global virtual store</h1>
+<p>Install packages once. Every project links to the same copy.</p></header><div>
+<p>Every project on your machine depends on the same handful of heavy packages — <code>typescript</code>, <code>next</code>, <code>webpack</code>, <code>@babel/*</code>, <code>react-dom</code>. Without a shared store, every <code>node_modules</code> gets its own copy, and every fresh <code>bun install</code> writes them all out again.</p>
+<p>The global virtual store changes that to <strong>install once, link everywhere</strong>. Package files live in one shared cache; each project's <code>node_modules</code> is a thin tree of symlinks into it. A second checkout, a new branch worktree, a CI workspace — they all point at the copy that's already on disk.</p>
+<p>The result: warm installs are roughly <strong>7× faster</strong> (one symlink per package instead of copying every file), and <code>node_modules</code> shrinks from hundreds of megabytes per project to a few megabytes of links.</p>
+<h2 id="enabling">Enabling</h2>
+<p>The global virtual store is <strong>off by default</strong>. It only applies to the <a href="isolated-installs.html">isolated linker</a>; the hoisted linker does not use it.</p>
+<p>To enable it for a project:</p>
+<div data-lang="toml">
+<div><span translate="no">bunfig.toml</span></div>
+<div><div><div><div data-h="0"><pre>[install]
+linker = "isolated"
+globalStore = true</pre></div></div></div></div>
+</div>
+<p>Or per invocation, through the environment:</p>
+<div data-lang="bash">
+<div><span translate="no">terminal</span></div>
+<div><div><div><div data-h="1"><pre data-language="bash">BUN_INSTALL_GLOBAL_STORE=1 bun install --linker isolated</pre></div></div></div></div>
+</div>
+<p>To explicitly opt out (the default), set <code>globalStore = false</code> or <code>BUN_INSTALL_GLOBAL_STORE=0</code>.</p>
+<h2 id="why-it-s-fast">Why it's fast</h2>
+<p>Without the global store, the isolated linker calls <code>clonefileat()</code> (macOS) or <code>link()</code>/<code>copyfile()</code> (other platforms) for every package on every install, even when the package cache is warm and <code>node_modules</code> is the only thing missing. Profiling a warm install of a 1,400-package fixture on macOS showed the main thread spending <strong>95.4 % of its time inside <code>clonefileat</code></strong>:</p>
+<div data-lang="txt"><div><div><div><div data-h="2"><pre>Sort by top of stack (bun install --linker isolated, warm cache):
+    clonefileat        891 / 934 samples
+    __openat            15
+    __read_nocancel     10</pre></div></div></div></div></div>
+<p><code>clonefileat</code> on APFS holds a volume-wide kernel lock, so spreading the work across more threads barely helps. Eight threads only improved a 2,830-directory clone from 959 ms to 743 ms. The fix is to not call it at all on the warm path.</p>
+<p>With the global store, the warm path is one <code>access()</code> (does the global entry exist?) plus one <code>symlink()</code> (point the project at it) per package.</p>
+<h2 id="benchmarks">Benchmarks</h2>
+<p>Warm CI install on a 1,400-package React/webpack/Babel/jest fixture, Apple Silicon macOS, <code>hyperfine --warmup 3 --runs 10</code>. The lockfile is present, the package cache is warm, and <code>node_modules</code> is deleted between runs:</p>
+<div><table>
+<thead><tr>
+<th></th>
+<th>wall time</th>
+<th>system time</th>
+<th><code>clonefileat</code></th>
+<th>total syscalls</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>--linker hoisted</code></td>
+<td>823.9 ms</td>
+<td>477 ms</td>
+<td>1,387</td>
+<td>7,857</td>
+</tr>
+<tr>
+<td>
+<code>--linker isolated</code>, <code>globalStore=false</code>
+</td>
+<td>840.9 ms</td>
+<td>1,256 ms</td>
+<td>1,387</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong><code>--linker isolated</code>, global store</strong></td>
+<td><strong>124.8 ms</strong></td>
+<td><strong>94 ms</strong></td>
+<td><strong>0</strong></td>
+<td><strong>4,957</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>6.7× faster</strong> than the same linker without the global store, <strong>6.6× faster</strong> than hoisted.</p>
+<h3 id="disk">Disk</h3>
+<p><code>node_modules</code> sizes for the same fixture (<code>du -sh node_modules</code> on APFS; clonefile copies are copy-on-write, so the hoisted/per-project numbers are the <em>logical</em> size — on filesystems without CoW that is also the physical size):</p>
+<div><table>
+<thead><tr>
+<th></th>
+<th>
+<code>node_modules</code> per project</th>
+<th>shared on disk</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><code>--linker hoisted</code></td>
+<td>391 MB</td>
+<td>—</td>
+</tr>
+<tr>
+<td>
+<code>--linker isolated</code>, <code>globalStore=false</code>
+</td>
+<td>391 MB</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong><code>--linker isolated</code>, global store</strong></td>
+<td><strong>~5 MB of symlinks</strong></td>
+<td>391 MB once</td>
+</tr>
+</tbody>
+</table></div>
+<p>Clone the same project five times and the difference is ~2 GB of duplicated package files versus ~400 MB total. The break-even is one project; every additional checkout, branch worktree, or CI workspace after that is free.</p>
+<h3 id="real-world-cold-warm">Real-world cold→warm</h3>
+<p>Cold-to-warm timings on cloned real-world repositories (macOS arm64):</p>
+<div><table>
+<thead><tr>
+<th>project</th>
+<th>packages</th>
+<th>cold</th>
+<th>warm</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>cal.com</td>
+<td>~3,580</td>
+<td>37.4 s</td>
+<td><strong>4.7 s</strong></td>
+</tr>
+<tr>
+<td>remix</td>
+<td>~1,750</td>
+<td>23.1 s</td>
+<td><strong>2.0 s</strong></td>
+</tr>
+<tr>
+<td>excalidraw</td>
+<td>~1,332</td>
+<td>5.9 s</td>
+<td><strong>1.1 s</strong></td>
+</tr>
+<tr>
+<td>hono</td>
+<td>~790</td>
+<td>4.5 s</td>
+<td><strong>1.3 s</strong></td>
+</tr>
+<tr>
+<td>
+<code>next build</code> (create-next-app)</td>
+<td>~382</td>
+<td>1.0 s</td>
+<td><strong>0.35 s</strong></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="directory-structure">Directory structure</h2>
+<p>The on-disk layout adds one level of indirection compared to <a href="isolated-installs.html#directory-structure">isolated installs</a>:</p>
+<div data-lang="bash">
+<div><span translate="no">tree layout</span></div>
+<div><div><div><div data-h="3"><pre data-language="bash">~/.bun/install/cache/
+├── react@18.3.1@@@1/                     # Package cache (unchanged)
+│   └── ...package files...
+└── links/                                # Global virtual store
+    └── react@18.3.1-5664d3cd670b3205/    # &lt;storepath&gt;-&lt;entry hash&gt;
+        └── node_modules/
+            ├── react/                    # Package files (created once)
+            ├── loose-envify -&gt; ../../loose-envify@1.4.0-ea24…/node_modules/loose-envify
+            └── .bin/
+                └── ...
+
+project/node_modules/
+├── .bun/
+│   ├── node_modules/                     # Hidden hoisted layer (per project)
+│   │   └── react -&gt; ../react@18.3.1/node_modules/react
+│   └── react@18.3.1 -&gt; ~/.bun/install/cache/links/react@18.3.1-5664d3cd670b3205
+└── react -&gt; .bun/react@18.3.1/node_modules/react</pre></div></div></div></div>
+</div>
+<p>The 16-hex <code>entry_hash</code> suffix encodes the entry's <strong>resolved dependency closure</strong>: the package's own store path and tarball integrity, plus the hash of every dependency it links to. Two projects that resolve <code>react@18.3.1</code> to the same set of transitive versions share one global directory. A project that resolves a transitive dependency to a different version gets a separate global entry whose dep symlinks point at the right siblings. Packages that participate in a dependency cycle share one hash computed over the whole strongly-connected component. The key is therefore independent of which member a given project's dependency graph happened to reach first.</p>
+<h2 id="what-stays-project-local">What stays project-local</h2>
+<p>An entry only lives in the global store when it can be safely shared. Entries fall back to a per-project <code>node_modules/.bun/&lt;storepath&gt;/</code> directory when:</p>
+<ul>
+<li>the package has a <strong>patch</strong> applied via <code>bun patch</code> — the patched contents are project-specific;</li>
+<li>the package is listed in <strong><code>trustedDependencies</code></strong> (or trusted via <code>bun add --trust</code>) — its lifecycle script may mutate the install directory, and a script running through the project symlink would mutate the shared copy;</li>
+<li>the package, or <strong>any</strong> dependency it links to, is a <code>workspace:</code>, <code>file:</code>, or <code>link:</code> dependency — those resolve to project-local paths that other projects can't see.</li>
+</ul>
+<p>Ineligibility propagates: if <code>your-app</code> depends on <code>internal-utils</code> which is a workspace package, <code>internal-utils</code> is project-local, and so is every entry that links to it. When an entry loses eligibility between installs (newly patched, newly trusted), Bun detaches it from the global store and rebuilds it project-locally on the next install. The shared entry stays untouched.</p>
+<h2 id="peer-dependencies">Peer dependencies</h2>
+<p>Bun folds resolved peer dependencies (required and optional) into each global entry as dep symlinks. These peer dependencies contribute to the entry's hash. Bun synthesizes an implicit <code>"*"</code> optional peer for packages that list a name only in <code>peerDependenciesMeta</code> without a matching <code>peerDependencies</code> entry (matching pnpm and yarn). As a result, a package like <code>webpack</code> that declares <code>webpack-cli</code> only in <code>peerDependenciesMeta</code> still gets a <code>webpack-cli</code> symlink in its global entry when one is installed in the project.</p>
+<h2 id="tradeoffs">Tradeoffs</h2>
+<h3 id="phantom-dependency-fallback">Phantom-dependency fallback</h3>
+<p>When packages live under the project's <code>node_modules/.bun/</code>, Node's module resolution walks up through <code>node_modules/.bun/node_modules/</code> — the hidden hoisted layer — before reaching the project root. With the global store, packages realpath into <code>&lt;cache&gt;/links/</code>, so that layer is no longer on the resolution path from inside a package.</p>
+<p>In practice this only affects <strong>true phantom dependencies</strong>: a package doing <code>require('helper')</code> for something it never declared in <code>dependencies</code>, <code>peerDependencies</code>, or <code>peerDependenciesMeta</code>. If you hit this, add the helper to the consuming package's dependencies (the right fix) or set <code>globalStore = false</code>.</p>
+<p><a href="../runtime/bunfig.html#install-publichoistpattern"><code>publicHoistPattern</code></a> and <a href="../runtime/bunfig.html#install-hoistpattern"><code>hoistPattern</code></a> hoist into the project's <code>node_modules</code>, which packages inside the global store can't reach. They still work for resolving hoisted packages from your own source code.</p>
+<h3 id="node-modules-is-mostly-symlinks">
+<code>node_modules</code> is mostly symlinks</h3>
+<p>Tools that scan <code>node_modules</code> without following symlinks, or that compare file paths by string equality, may behave differently. This is the same caveat as any pnpm-style layout.</p>
+<h3 id="disk-usage">Disk usage</h3>
+<p>Each unique <code>(package, version, resolved-dependency-set)</code> triple gets one directory in <code>&lt;cache&gt;/links/</code>. Across many projects that's a large net win: one copy on disk instead of one per checkout. But the store does grow over time as new versions and new peer-dependency combinations land. Run <code>bun pm cache rm</code> to clear the cache including the global store; the next install repopulates only what that project needs.</p>
+<h3 id="concurrency">Concurrency</h3>
+<p>Multiple <code>bun install</code> processes (parallel CI jobs, concurrent workspace builds) may race to populate the same global entry. Each process builds the entire entry (package files, dependency symlinks, bin links) under a private <code>&lt;entry&gt;.tmp-&lt;random&gt;/</code> staging directory. As the final step, it renames that directory into place. The loser of the rename sees <code>EEXIST</code> and discards its identical staging tree. A writer that crashes mid-build leaves only an unreferenced staging directory that the next install ignores. A published entry is therefore always complete; there is no separate completeness sentinel.</p>
+<h2 id="related-documentation">Related documentation</h2>
+<ul>
+<li>
+<a href="isolated-installs.html">Package manager &gt; Isolated installs</a> — The linker the global store builds on</li>
+<li>
+<a href="global-cache.html">Package manager &gt; Global cache</a> — Where downloaded packages are stored</li>
+<li>
+<a href="../runtime/bunfig.html#install-globalstore">Runtime &gt; bunfig</a> — <code>bunfig.toml</code> reference</li>
+</ul>
+</div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; bun.com, oven-sh, Jarred Sumner<br>Licensed under the MIT License.<br>
+    <a href="https://bun.com/docs/pm/global-store" class="_attribution-link">https://bun.com/docs/pm/global-store</a>
+  </p>
+</div>

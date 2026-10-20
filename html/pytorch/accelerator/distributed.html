@@ -1,0 +1,111 @@
+<div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList"> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="User Guide"> <meta itemprop="position" content="1"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">  <meta itemprop="name" content="Accelerator Integration"> <meta itemprop="position" content="2"> </div> <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem"> <meta itemprop="name" content="Distributed Training Integration"> <meta itemprop="position" content="3"> </div> </div>  <article class="bd-article"> <section id="distributed-training-integration"> <h1>Distributed Training Integration</h1> <p class="date-info-last-verified" style="color: #6c6c6d; font-size: small;">Created On: May 18, 2026 | Last Updated On: May 18, 2026</p> <section id="background"> <h2>Background</h2> <p>Distributed training allows accelerators to scale workloads across multiple devices and nodes by coordinating collective communication (e.g., allreduce, broadcast, allgather) through a <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/ProcessGroup.hpp">ProcessGroup</a> backend. PyTorch ships built-in backends such as <a class="reference external" href="https://developer.nvidia.com/nccl">NCCL</a> for CUDA and <a class="reference external" href="https://github.com/facebookincubator/gloo">Gloo</a> for CPU, but the framework exposes a registration mechanism that allows out-of-tree accelerator vendors to plug in their own collective communication library without modifying upstream code.</p> <p>The integration surface can be broken down into three layers:</p> <ol class="arabic simple"> <li>
+<strong>C++ Backend implementation</strong> – A subclass of <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/Backend.hpp" title="Backend.hpp"><code>c10d::Backend</code></a> that implements the collective, point-to-point, and synchronization operations.</li> <li>
+<strong>Python bindings</strong> – Expose the C++ backend class to Python via <a class="reference external" href="https://pybind11.readthedocs.io/">pybind11</a>.</li> <li>
+<strong>Backend registration</strong> – Register the backend with <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py" title="distributed_c10d.py"><code>torch.distributed.Backend.register_backend()</code></a> so that <code>init_process_group</code> can discover and instantiate it.</li> </ol> <div class="admonition note"> <p class="admonition-title">Note</p> <p><a class="reference external" href="https://github.com/pytorch/pytorch/tree/main/test/cpp_extensions/open_registration_extension/torch_openreg">OpenReg</a> (<code>torch_openreg</code>) is PyTorch’s official reference implementation for out-of-tree accelerator integration. It ships a minimal distributed backend called <strong>OCCL</strong> (OpenReg Collective Communications Library) that demonstrates the full <code>ProcessGroup</code> integration. All code examples in this chapter reference the OCCL implementation.</p> </div> </section> <section id="before-you-start"> <h2>Before You Start</h2> <p>This guide covers <strong>ProcessGroup backend integration</strong> only – how to register a custom collective communication backend with <code>torch.distributed</code>. It does not cover full-stack integration with higher-level APIs such as DDP, FSDP, or other distributed training strategies.</p> <p>Before following this guide, make sure you have:</p> <ul class="simple"> <li>
+<strong>An importable <code>torch_xxx</code> extension package</strong> that registers your device via <code>PrivateUse1</code>. See the earlier chapters in this guide for device registration, operators, and runtime hooks.</li> <li>
+<strong>A collective communication library (CCL)</strong> that provides implementations of basic collectives such as <code>allreduce</code> and <code>broadcast</code> for your device. The CCL can be vendor-provided (e.g., NCCL for NVIDIA, HCCL for Huawei) or a custom implementation.</li> </ul> </section> <section id="design"> <h2>Design</h2> <p>This section describes the interfaces and concepts involved in backend registration.</p> <section id="registration-api"> <h3>Registration API</h3> <p>The primary entry point for OOT backend registration is <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py" title="distributed_c10d.py"><code>Backend.register_backend()</code></a>:</p> <div class="pst-scrollable-table-container">
+<table class="table"> <thead> <tr>
+<th class="head text-left"><p>Parameter</p></th> <th class="head text-left"><p>Type</p></th> <th class="head text-left"><p>Description</p></th> </tr> </thead>  <tr>
+<td class="text-left"><p><code>name</code></p></td> <td class="text-left"><p><code>str</code></p></td> <td class="text-left"><p>Backend name, e.g. <code>"occl"</code>. Must match the value passed to <code>init_process_group(backend=...)</code>.</p></td> </tr> <tr>
+<td class="text-left"><p><code>func</code></p></td> <td class="text-left"><p><code>Callable</code></p></td> <td class="text-left"><p>Factory function that creates a backend instance (see signature below).</p></td> </tr> <tr>
+<td class="text-left"><p><code>extended_api</code></p></td> <td class="text-left"><p><code>bool</code></p></td> <td class="text-left"><p>If <code>True</code>, the factory receives a <code>_DistributedBackendOptions</code> object instead of individual arguments.</p></td> </tr> <tr>
+<td class="text-left"><p><code>devices</code></p></td> <td class="text-left"><p><code>str | list[str] | None</code></p></td> <td class="text-left"><p>Device types supported by this backend, e.g. <code>["openreg"]</code>. Populates the device-to-backend mapping.</p></td> </tr>  </table> </div> <p>When <code>devices</code> is specified, the backend is automatically associated with those device types. This means <code>init_process_group()</code> can resolve the correct backend when the user passes a <code>device_id</code> argument without explicitly naming a backend.</p> </section> <section id="factory-function-signature"> <h3>Factory Function Signature</h3> <p>The factory function receives different arguments depending on <code>extended_api</code>:</p> <div class="pst-scrollable-table-container">
+<table class="table"> <thead> <tr>
+<th class="head text-left"><p>Mode</p></th> <th class="head text-left"><p>Signature</p></th> </tr> </thead>  <tr>
+<td class="text-left"><p>Standard (default)</p></td> <td class="text-left"><p><code>func(store: Store, rank: int, world_size: int, timeout: timedelta) -&gt; Backend</code></p></td> </tr> <tr>
+<td class="text-left"><p>Extended API</p></td> <td class="text-left"><p><code>func(dist_backend_opts: _DistributedBackendOptions, backend_options) -&gt; Backend</code></p></td> </tr>  </table> </div> <p>The standard mode is sufficient for most backends. The extended API provides additional context such as <code>group_id</code> and <code>global_ranks_in_group</code>.</p> </section> <section id="backend-operations"> <h3>Backend Operations</h3> <p>The <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/Backend.hpp" title="Backend.hpp"><code>c10d::Backend</code></a> base class defines virtual methods for collective, point-to-point, and synchronization operations. Each operation returns a <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/Work.hpp" title="Work.hpp"><code>c10::intrusive_ptr&lt;Work&gt;</code></a> that represents the asynchronous operation. For backends with synchronous operations, the <code>Work</code> object can be immediately completed.</p> <section id="minimal-required-operations"> <h4>Minimal Required Operations</h4> <p>To get a working backend that supports basic distributed training, implement the following operations at minimum:</p> <div class="pst-scrollable-table-container">
+<table class="table"> <thead> <tr>
+<th class="head text-left"><p>Category</p></th> <th class="head text-left"><p>Operations</p></th> </tr> </thead>  <tr>
+<td class="text-left"><p><strong>Collective</strong></p></td> <td class="text-left"><p><code>broadcast</code>, <code>allreduce</code>, <code>allgather</code>, <code>reduce_scatter</code></p></td> </tr> <tr>
+<td class="text-left"><p><strong>Synchronization</strong></p></td> <td class="text-left"><p><code>barrier</code></p></td> </tr>  </table> </div> <p>These cover the core communication patterns used by DDP and other common distributed workflows.</p> </section> <section id="extended-operations"> <h4>Extended Operations</h4> <p>For broader compatibility with advanced distributed strategies (e.g., FSDP, model parallelism, pipeline parallelism), implement the full set of operations:</p> <div class="pst-scrollable-table-container">
+<table class="table"> <thead> <tr>
+<th class="head text-left"><p>Category</p></th> <th class="head text-left"><p>Operations</p></th> </tr> </thead>  <tr>
+<td class="text-left"><p><strong>Collective</strong></p></td> <td class="text-left"><p><code>allreduce_coalesced</code>, <code>reduce</code>, <code>_allgather_base</code>, <code>allgather_coalesced</code>, <code>allgather_into_tensor_coalesced</code>, <code>gather</code>, <code>scatter</code>, <code>_reduce_scatter_base</code>, <code>reduce_scatter_tensor_coalesced</code>, <code>alltoall_base</code></p></td> </tr> <tr>
+<td class="text-left"><p><strong>Point-to-Point</strong></p></td> <td class="text-left"><p><code>send</code>, <code>recv</code>, <code>recvAnysource</code></p></td> </tr>  </table> </div> <p>See <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/Backend.hpp" title="Backend.hpp"><code>Backend.hpp</code></a> for the full list of virtual methods and their signatures.</p> </section> </section> <section id="optional-capabilities"> <h3>Optional Capabilities</h3> <p>Backends can advertise optional capabilities by overriding the following methods:</p> <div class="pst-scrollable-table-container">
+<table class="table"> <thead> <tr>
+<th class="head text-left"><p>Method</p></th> <th class="head text-left"><p>Default</p></th> <th class="head text-left"><p>Description</p></th> </tr> </thead>  <tr>
+<td class="text-left"><p><code>supportsSplitting()</code></p></td> <td class="text-left"><p><code>false</code></p></td> <td class="text-left"><p>Process group splitting support</p></td> </tr> <tr>
+<td class="text-left"><p><code>supportsCoalescing()</code></p></td> <td class="text-left"><p><code>false</code></p></td> <td class="text-left"><p>Coalesced collective operations</p></td> </tr>  </table> </div> </section> </section> <section id="implementation"> <h2>Implementation</h2> <p>This section walks through the concrete steps to implement and register a backend, using the OCCL reference implementation as an example. The implementation follows three steps:</p> <ol class="arabic simple"> <li>Implement the C++ backend</li> <li>Create Python bindings</li> <li>Register the backend in Python</li> </ol> <section id="step-1-implement-the-c-backend"> <h3>Step 1: Implement the C++ Backend</h3> <p>Create a class that inherits from <code>c10d::Backend</code> and implements the required collective operations. The backend must also define:</p> <ul class="simple"> <li>A <strong><code>Work</code> subclass</strong> that tracks asynchronous operation state</li> <li>An <strong><code>Options</code> subclass</strong> (inheriting from <code>Backend::Options</code>) for backend-specific configuration</li> </ul> <section id="work-object"> <h4>Work Object</h4> <p>The <code>Work</code> subclass manages the lifecycle of an asynchronous collective operation. For a minimal (synchronous) implementation, the work can be completed immediately in its constructor:</p> <div class="literal-block-wrapper docutils container" id="id1"> <div class="code-block-caption"><span class="caption-text">ProcessGroupOCCL::DummyWork declaration (ProcessGroupOCCL.hpp)</span></div> <pre data-language="c++"> 1  class DummyWork : public Work {
+ 2   public:
+ 3    DummyWork();
+ 4
+ 5    virtual ~DummyWork();
+ 6    bool isCompleted() override;
+ 7    bool isSuccess() const override;
+ 8    bool wait(std::chrono::milliseconds timeout) override;
+ 9    void synchronize() override;
+10    void abort() override;
+11    c10::intrusive_ptr&lt;c10::ivalue::Future&gt; getFuture() override;
+12
+13   protected:
+14    friend class ProcessGroupOCCL;
+15
+16   private:
+17    c10::intrusive_ptr&lt;c10::ivalue::Future&gt; future_;
+18  };
+</pre> </div> <p>For production backends, <code>Work</code> typically wraps an asynchronous handle from the vendor’s communication library (e.g., a stream event or request handle), and <code>wait()</code> blocks until the operation completes on the device.</p> </section> <section id="backend-class"> <h4>Backend Class</h4> <p>The backend class inherits from <code>c10d::Backend</code> and overrides the collective operations. Each method should validate that input tensors reside on the expected device type (e.g., <code>PrivateUse1</code>) and then dispatch to the vendor’s communication library. Key implementation details:</p> <ul class="simple"> <li>
+<strong><code>getBackendName()</code></strong> must return the same string used during Python registration (e.g., <code>"occl"</code>).</li> <li>
+<strong>Input validation</strong> – Each collective should verify tensor device types. The OCCL reference uses <code>CHECK_TENSOR</code> and <code>CHECK_TENSOR_LIST</code> macros for this.</li> <li>
+<strong>Return value</strong> – All collectives return a <code>c10::intrusive_ptr&lt;Work&gt;</code>.</li> </ul> <p>See <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/test/cpp_extensions/open_registration_extension/torch_openreg/csrc/distributed/c10d/ProcessGroupOCCL.hpp" title="ProcessGroupOCCL.hpp"><code>ProcessGroupOCCL.hpp</code></a> and <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/test/cpp_extensions/open_registration_extension/torch_openreg/csrc/distributed/c10d/ProcessGroupOCCL.cpp" title="ProcessGroupOCCL.cpp"><code>ProcessGroupOCCL.cpp</code></a> for the full reference implementation.</p> </section> </section> <section id="step-2-python-bindings"> <h3>Step 2: Python Bindings</h3> <p>Expose the backend class to Python using pybind11. The OCCL reference places bindings in a dedicated <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/test/cpp_extensions/open_registration_extension/torch_openreg/torch_openreg/csrc/distributed/init.cpp" title="init.cpp"><code>init.cpp</code></a> file, separate from the main extension module, and calls <code>initProcessGroupBindings()</code> from the module’s entry point:</p> <div class="literal-block-wrapper docutils container" id="id2"> <div class="code-block-caption"><span class="caption-text">Python bindings for OCCL (init.cpp)</span></div> <pre data-language="c++"> 1void initProcessGroupBindings(py::module&amp; m) {
+ 2  py::class_&lt;c10d::ProcessGroupOCCL, c10d::Backend, c10::intrusive_ptr&lt;c10d::ProcessGroupOCCL&gt;&gt;(m, "ProcessGroupOCCL")
+ 3      .def(
+ 4          py::init([](const c10::intrusive_ptr&lt;::c10d::Store&gt;&amp; /*store*/,
+ 5                      int rank,
+ 6                      int size,
+ 7                      std::chrono::milliseconds /*timeout*/) {
+ 8            return c10::make_intrusive&lt;::c10d::ProcessGroupOCCL&gt;(rank, size);
+ 9          }),
+10          py::arg("store"),
+11          py::arg("rank"),
+12          py::arg("size"),
+13          py::arg("timeout") = std::chrono::milliseconds(30 * 60 * 1000));
+14}
+</pre> </div> <p>Important considerations:</p> <ul class="simple"> <li>The <code>py::class_</code> template must list <code>c10d::Backend</code> as a base class and use <code>c10::intrusive_ptr</code> as the holder, so that PyTorch recognizes the backend in its internal registry.</li> <li>The constructor is exposed directly via <code>py::init</code> with a lambda that forwards to the C++ constructor. This avoids the need for a separate factory function.</li> <li>Guard the bindings with <code>#if USE_DISTRIBUTED</code> to handle builds where distributed is disabled.</li> </ul> </section> <section id="step-3-register-the-backend-in-python"> <h3>Step 3: Register the Backend in Python</h3> <p>In the extension package’s <code>__init__.py</code>, register the backend with <code>torch.distributed</code>:</p> <div class="literal-block-wrapper docutils container" id="id3"> <div class="code-block-caption"><span class="caption-text">Backend registration (torch_openreg/__init__.py)</span></div> <pre data-language="python"> 1if torch.distributed.is_available():
+ 2    try:
+ 3        from torch_openreg._C import ProcessGroupOCCL
+ 4
+ 5        def _create_occl_backend(store, rank, size, timeout):
+ 6            return ProcessGroupOCCL(store, rank, size, timeout)
+ 7
+ 8        torch.distributed.Backend.register_backend(
+ 9            "occl", _create_occl_backend, devices=["openreg"]
+10        )
+11    except Exception as e:
+12        raise RuntimeError("Failed to register 'occl' process group backend.") from e
+</pre> </div> <p>The Python side imports the pybind11-exposed <code>ProcessGroupOCCL</code> class and wraps it in a thin factory function that matches the signature expected by <code>register_backend()</code>. The call to <code>Backend.register_backend()</code> does the following:</p> <ol class="arabic simple"> <li>Adds <code>"occl"</code> to <code>Backend.backend_list</code>, making it a recognized backend name.</li> <li>Maps <code>"openreg"</code> device type to the <code>"occl"</code> backend in <code>Backend.default_device_backend_map</code>.</li> <li>Stores the factory function so that <code>init_process_group()</code> can call it when <code>backend="occl"</code> is specified.</li> </ol> </section> </section> <section id="usage"> <h2>Usage</h2> <p>After registration, the backend integrates seamlessly with <code>torch.distributed</code>:</p> <pre data-language="python">import torch
+import torch.distributed as dist
+
+# Import triggers autoload, which registers the "occl" backend
+import torch_openreg
+
+# Initialize process group – OCCL is auto-selected for openreg devices
+dist.init_process_group(
+    backend="occl",
+    init_method="env://",
+    world_size=2,
+    rank=0,
+)
+
+# Use standard distributed APIs
+tensor = torch.randn(4, device="openreg")
+dist.all_reduce(tensor)
+
+dist.destroy_process_group()
+</pre> <p>Alternatively, the backend name can be omitted if a <code>device_id</code> is provided – PyTorch resolves the backend from the device-to-backend mapping:</p> <pre data-language="python">dist.init_process_group(
+    device_id=torch.device("openreg:0"),
+    init_method="env://",
+    world_size=2,
+    rank=0,
+)
+</pre> <section id="multi-device-backend-strings"> <h3>Multi-device Backend Strings</h3> <p>PyTorch supports specifying different backends for different device types in a single process group using the <code>"device:backend"</code> format:</p> <pre data-language="python">dist.init_process_group(
+    backend="cpu:gloo,openreg:occl",
+    init_method="env://",
+    world_size=2,
+    rank=0,
+)
+</pre> </section> </section> <section id="testing"> <h2>Testing</h2> <p>Key testing considerations:</p> <ul class="simple"> <li>Verify that the backend appears in <code>dist.Backend.backend_list</code> after import.</li> <li>Confirm that <code>init_process_group</code> / <code>destroy_process_group</code> succeeds.</li> <li>Test that collective operations accept tensors on the registered device and return completed <code>Work</code> objects.</li> <li>Use <code>MultiProcessTestCase</code> from <code>torch.testing._internal.common_distributed</code> for multi-process test execution.</li> </ul> <p>See the <a class="reference external" href="https://github.com/pytorch/pytorch/blob/main/test/cpp_extensions/open_registration_extension/torch_openreg/tests/test_distributed.py">OCCL test suite</a> for a reference example.</p> </section> </section> </article><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2026, PyTorch Contributors<br>PyTorch has a BSD-style license, as found in the <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">LICENSE</a> file.<br>
+    <a href="https://docs.pytorch.org/docs/2.14/accelerator/distributed.html" class="_attribution-link">https://docs.pytorch.org/docs/2.14/accelerator/distributed.html</a>
+  </p>
+</div>

@@ -1,0 +1,153 @@
+<h1 id="extend-valibot">Extend Valibot</h1>
+
+<p>This guide is for developers who need to go beyond Valibot&#39;s built-in primitives — for example when validating a domain-specific format, wrapping a schema in a reusable envelope, or building a library on top of Valibot. Because every schema and action is just a plain object satisfying a shared interface, custom schemas and actions are first-class citizens — not second-class extensions.</p>
+
+<p>We cover three levels of extension: Composing existing schemas into reusable factories, building fully custom schemas from scratch, and building fully custom actions from scratch.</p>
+
+<h2 id="dynamic-schemas">Dynamic schemas</h2>
+
+<p>The lightest form of extension is composing existing schemas into a reusable generic factory — no custom interfaces or internal utilities required. We can wrap any user-provided schema by using <a href="../api/types/genericschema.html"><code>GenericSchema</code></a> as the type constraint. It is an alias for <a href="../api/types/baseschema.html"><code>BaseSchema</code></a> with all type parameters defaulting to <code>unknown</code>, designed specifically for this purpose. TypeScript propagates the concrete type so the return type is fully inferred.</p>
+
+<p>A common use case is wrapping a user-provided item schema in a reusable envelope, like a pagination wrapper:</p>
+
+<pre data-language="ts"><code>import * as v from &#39;valibot&#39;;
+
+function paginatedList&lt;TItem extends v.GenericSchema&gt;(item: TItem) {
+  return v.object({
+    items: v.array(item),
+    total: v.number(),
+    page: v.number(),
+  });
+}
+
+const UserList = paginatedList(v.object({ id: v.number(), name: v.string() }));
+
+type UserList = v.InferOutput&lt;typeof UserList&gt;;
+// {
+//   items: { id: number; name: string }[];
+//   total: number;
+//   page: number;
+// }
+</code></pre>
+
+<h2 id="custom-schemas">Custom schemas</h2>
+
+<p>A custom schema is a plain object with three parts: A typed issue interface extending <a href="../api/types/baseissue.html"><code>BaseIssue</code></a>, a typed schema interface extending <a href="../api/types/baseschema.html"><code>BaseSchema</code></a>, and a factory function that returns the object.</p>
+
+<p>Two internal utilities do the heavy lifting: <code>_standardSchema</code> attaches the Standard Schema <code>&#39;~standard&#39;</code> properties, and <code>_addIssue</code> constructs and attaches a well-formed issue to the dataset. The <code>label</code> argument passed to <code>_addIssue</code> (e.g. <code>&#39;type&#39;</code>) describes what kind of issue it is and is used to build the human-readable <code>message</code>.</p>
+
+<p>Here is a simplified version of Valibot&#39;s own <code>string</code> schema:</p>
+
+<pre data-language="ts"><code>import * as v from &#39;valibot&#39;;
+
+// 1. Define the issue interface
+interface StringIssue extends v.BaseIssue&lt;unknown&gt; {
+  kind: &#39;schema&#39;;
+  type: &#39;string&#39;;
+  expected: &#39;string&#39;;
+}
+
+// 2. Define the schema interface
+interface StringSchema&lt;TMessage extends v.ErrorMessage&lt;StringIssue&gt; | undefined&gt;
+  extends v.BaseSchema&lt;string, string, StringIssue&gt; {
+  type: &#39;string&#39;;
+  reference: typeof string;
+  expects: &#39;string&#39;;
+  message: TMessage;
+}
+
+// 3. Implement the factory function
+function string&lt;
+  TMessage extends v.ErrorMessage&lt;StringIssue&gt; | undefined = undefined,
+&gt;(message?: TMessage): StringSchema&lt;TMessage | undefined&gt; {
+  return v._standardSchema({
+    kind: &#39;schema&#39;,
+    type: &#39;string&#39;,
+    reference: string,
+    expects: &#39;string&#39;,
+    async: false,
+    message,
+    &#39;~run&#39;(dataset, config) {
+      if (typeof dataset.value === &#39;string&#39;) {
+        // @ts-expect-error
+        dataset.typed = true;
+      } else {
+        v._addIssue(this, &#39;type&#39;, dataset, config);
+      }
+      // @ts-expect-error
+      return dataset as v.OutputDataset&lt;string, StringIssue&gt;;
+    },
+  });
+}
+</code></pre>
+
+<p>The <code>// @ts-expect-error</code> comments are a deliberate trade-off in Valibot&#39;s codebase to avoid complex conditional generics and improve runtime performance by mutating the <code>dataset</code> object. They are safe here because the <code>typed</code> flag and return type are always consistent with the logic above.</p>
+
+<blockquote>
+<p><code>_addIssue</code> and <code>_standardSchema</code> are prefixed with an underscore to signal that they are internal. They are exported for advanced use cases like this, but their signatures may change between minor versions.</p>
+</blockquote>
+
+<p><code>v.ErrorMessage&lt;T&gt;</code> accepts either a plain string or a callback <code>(issue: T) =&gt; string</code>, so custom error messages can be static or dynamically derived from the issue.</p>
+
+<h2 id="custom-actions">Custom actions</h2>
+
+<p>Actions follow the same plain-object pattern. Valibot has three action kinds — <a href="../api/types/basevalidation.html"><code>BaseValidation</code></a>, <a href="../api/types/basetransformation.html"><code>BaseTransformation</code></a>, and <a href="../api/types/basemetadata.html"><code>BaseMetadata</code></a> — each with its own <code>kind</code> string. Validation actions check a typed value and may add issues. Transformation actions convert the value to a new type or value. Metadata actions carry static annotations and are never executed during pipeline runs.</p>
+
+<p>Here is a simplified version of Valibot&#39;s own <code>email</code> validation action:</p>
+
+<pre data-language="ts"><code>import * as v from &#39;valibot&#39;;
+
+const EMAIL_REGEX =
+  /^[\w+-]+(?:\.[\w+-]+)*@[\w+-]+(?:\.[\w+-]+)*\.[a-zA-Z]{2,}$/iu;
+
+// 1. Define the issue interface
+interface EmailIssue&lt;TInput extends string&gt; extends v.BaseIssue&lt;TInput&gt; {
+  kind: &#39;validation&#39;;
+  type: &#39;email&#39;;
+  expected: null;
+  received: `&quot;${string}&quot;`;
+  requirement: RegExp;
+}
+
+// 2. Define the action interface
+interface EmailAction&lt;
+  TInput extends string,
+  TMessage extends v.ErrorMessage&lt;EmailIssue&lt;TInput&gt;&gt; | undefined,
+&gt; extends v.BaseValidation&lt;TInput, TInput, EmailIssue&lt;TInput&gt;&gt; {
+  type: &#39;email&#39;;
+  reference: typeof email;
+  expects: null;
+  requirement: RegExp;
+  message: TMessage;
+}
+
+// 3. Implement the factory function
+function email&lt;
+  TInput extends string,
+  TMessage extends v.ErrorMessage&lt;EmailIssue&lt;TInput&gt;&gt; | undefined,
+&gt;(message?: TMessage): EmailAction&lt;TInput, TMessage&gt; {
+  return {
+    kind: &#39;validation&#39;,
+    type: &#39;email&#39;,
+    reference: email,
+    expects: null,
+    async: false,
+    requirement: EMAIL_REGEX,
+    message,
+    &#39;~run&#39;(dataset, config) {
+      if (dataset.typed &amp;&amp; !this.requirement.test(dataset.value)) {
+        v._addIssue(this, &#39;email&#39;, dataset, config);
+      }
+      return dataset;
+    },
+  };
+}
+</code></pre>
+
+<p>Notice that <code>&#39;~run&#39;</code> first checks <code>dataset.typed</code> before testing the value. This is the correct pattern for all validation actions — if the dataset is not yet typed (e.g. a schema earlier in the pipe failed), we skip the check entirely.</p>
+<div class="_attribution">
+  <p class="_attribution-p">
+    &copy; Fabian Hiller<br>Licensed under the MIT License.<br>
+    <a href="https://valibot.dev/guides/extend-valibot/" class="_attribution-link">https://valibot.dev/guides/extend-valibot/</a>
+  </p>
+</div>

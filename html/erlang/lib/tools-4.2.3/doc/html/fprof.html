@@ -1,0 +1,371 @@
+<h1> <span>fprof</span>  </h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L30" title="View Source" class="source" rel="help nofollow">Source</a>   <p>A Time Profiling Tool using trace to file for minimal runtime performance impact.</p>
+<p>This module is used to profile a program to find out how the execution time is used. Tracing to file is used to minimize the runtime performance degradation.</p>
+<p>The <code>fprof</code> module uses tracing to collect profiling data, hence there is no need for special compilation of any module to be profiled. When it starts tracing, <code>fprof</code> will erase all previous tracing in the node and set the necessary trace flags on the profiling target processes as well as local call trace on all functions in all loaded modules and all modules to be loaded. <code>fprof</code> disable all tracing in the node when it stops tracing.</p>
+<p><code>fprof</code> presents both <em>own time</em> that is, how much time a function has used for its own execution, and <em>accumulated time</em> that is, including called functions. All presented times are collected using trace timestamps. <code>fprof</code> tries to collect CPU time timestamps, if the host machine OS supports it. Therefore, the times can be wallclock times and OS scheduling will randomly strike all called functions in a presumably fair way.</p>
+<p>However, if the profiling time is short, and the host machine OS does not support high resolution CPU time measurements, a few OS schedulings can show up as ridiculously long execution times for functions doing practically nothing. As an example, it has been observed that a function that more or less just composing a tuple, was running 100 times slower than normal. When tracing was repeated, the execution time was normal.</p>
+<p>Profiling is essentially done in 3 steps:</p>
+<ul>
+<li><p>Tracing: to a file. The trace data contains entries for function calls, returns to function, process scheduling, other process related events (for example <code>spawn</code>), and garbage collection. All trace entries are timestamped.</p></li>
+<li><p>Profiling: the trace file is read, the execution call stack is simulated, and raw profile data is calculated from the simulated call stack and the trace timestamps. The profile data is stored in the <code>fprof</code> server state. During this step the trace data may be dumped in text format to file or console.</p></li>
+<li><p>Analysing: the raw profile data is sorted, filtered and dumped in text format either to file or console. The text format intended to be both readable for a human reader, as well as parsable with the standard erlang parsing tools.</p></li>
+</ul>
+<p>Since <code>fprof</code> sends trace data to afile, the runtime performance degradation is minimized, but still far from negligible, especially for programs that themselves use the filesystem heavily. Where the trace file is placed is also important, for example, on Unix systems <code>/tmp</code> is usually a good choice since it is essentially a RAM disk, while any network-mounted disk is a bad idea.</p>
+<p><code>fprof</code> can also skip the file step and trace to a tracer process that does the profiling in runtime.</p>
+
+<h2 id="module-analysis-format">Analysis format</h2>
+<p>This section describes the output format of the <a href="#analyse/1"><code>analyse/1</code></a> function.</p>
+<p>The format is parsable with the standard Erlang parsing tools <a href="../../../stdlib-8.1/doc/html/erl_scan.html"><code>erl_scan</code></a> and <a href="../../../stdlib-8.1/doc/html/erl_parse.html"><code>erl_parse</code></a>, <a href="../../../kernel-11.0.4/doc/html/file.html#consult/1"><code>file:consult/1</code></a>, or <a href="../../../stdlib-8.1/doc/html/io.html#read/2"><code>io:read/2</code></a>. The parse format is not described here — it should be easy enough for the interested reader to try it out. Note that some flags to <a href="#analyse/1"><code>analyse/1</code></a> will affect the format.</p>
+<p>The following example was run on Erlang/OTP R8 on Solaris 8; all OTP internals in this example are version dependent.</p>
+<p>As an example, we will use the following function, which is a slightly modified benchmark function from module <a href="../../../kernel-11.0.4/doc/html/file.html"><code>file</code></a>:</p>
+<pre data-language="erlang">-module(foo).
+-export([create_file_slow/2]).
+
+create_file_slow(Name, N) when is_integer(N), N &gt;= 0 -&gt;
+    {ok, FD} =
+        file:open(Name, [raw, write, delayed_write, binary]),
+    if N &gt; 256 -&gt;
+            ok = file:write(FD,
+                            lists:map(fun (X) -&gt; &lt;&lt;X:32/unsigned&gt;&gt; end,
+                            lists:seq(0, 255))),
+            ok = create_file_slow(FD, 256, N);
+       true -&gt;
+            ok = create_file_slow(FD, 0, N)
+    end,
+    ok = file:close(FD).
+
+create_file_slow(FD, M, M) -&gt;
+    ok;
+create_file_slow(FD, M, N) -&gt;
+    ok = file:write(FD, &lt;&lt;M:32/unsigned&gt;&gt;),
+    create_file_slow(FD, M+1, N).</pre>
+<p>Let us have a look at the printout after running:</p>
+<pre data-language="erlang">1&gt; fprof:apply(foo, create_file_slow, [junk, 1024]).
+2&gt; fprof:profile().
+3&gt; fprof:analyse().</pre>
+<p>The printout starts with:</p>
+<pre data-language="erlang">%% Analysis results:
+{  analysis_options,
+ [{callers, true},
+  {sort, acc},
+  {totals, false},
+  {details, true}]}.
+
+%                                       CNT       ACC       OWN
+[{ totals,                             9627, 1691.119, 1659.074}].  %%%</pre>
+<p>The <code>CNT</code> column shows the total number of function calls that was found in the trace. In the <code>ACC</code> column is the total time of the trace from first timestamp to last. And in the <code>OWN</code> column is the sum of the execution time in functions found in the trace, not including called functions. In this case it is very close to the <code>ACC</code> time since the emulator had practically nothing to do except executing our test program.</p>
+<p>All time values in the printout are in milliseconds.</p>
+<p>The printout continues:</p>
+<pre data-language="erlang">%                                       CNT       ACC       OWN
+[{ "&lt;0.28.0&gt;",                         9627,undefined, 1659.074}].   %%</pre>
+<p>This is the printout header of one process. The printout contains only this one process since we called <a href="#apply/3"><code>fprof:apply/3</code></a> that traces only the current process. Therefore the <code>CNT</code> and <code>OWN</code> columns perfectly matches the totals above. The <code>ACC</code> column is undefined since summing the <code>ACC</code> times of all calls in the process makes no sense — one would get something like the <code>ACC</code> value from totals above multiplied by the average depth of the call stack.</p>
+<p>All paragraphs up to the next process header only concerns function calls within this process.</p>
+<p>Now we come to something more interesting:</p>
+<pre data-language="erlang">{[{undefined,                             0, 1691.076,    0.030}],
+ { {fprof,apply_start_stop,4},            0, 1691.076,    0.030},     %
+ [{{foo,create_file_slow,2},              1, 1691.046,    0.103},
+  {suspend,                               1,    0.000,    0.000}]}.
+
+{[{{fprof,apply_start_stop,4},            1, 1691.046,    0.103}],
+ { {foo,create_file_slow,2},              1, 1691.046,    0.103},     %
+ [{{file,close,1},                        1, 1398.873,    0.019},
+  {{foo,create_file_slow,3},              1,  249.678,    0.029},
+  {{file,open,2},                         1,   20.778,    0.055},
+  {{lists,map,2},                         1,   16.590,    0.043},
+  {{lists,seq,2},                         1,    4.708,    0.017},
+  {{file,write,2},                        1,    0.316,    0.021}]}.</pre>
+<p>The printout consists of one paragraph per called function. The function <em>marked</em> with <code>%</code> is the one the paragraph concerns — <code>foo:create_file_slow/2</code>. Above the marked function are the <em>calling</em> functions — those that has called the marked, and below are those <em>called</em> by the marked function.</p>
+<p>The paragraphs are per default sorted in descending order of the <code>ACC</code> column for the marked function. The calling list and called list within one paragraph are also per default sorted in descending order of their <code>ACC</code> column.</p>
+<p>The columns are:</p>
+<ul>
+<li>
+<code>CNT</code> - the number of times the function has been called</li>
+<li>
+<code>ACC</code> - the time spent in the function including called functions</li>
+<li>
+<code>OWN</code> - the time spent in the function not including called functions</li>
+</ul>
+<p>The rows for the <em>calling</em> functions contain statistics for the <em>marked</em> function with the constraint that only the occasions when a call was made from the <em>row's</em> function to the <em>marked</em> function are accounted for.</p>
+<p>The row for the <em>marked</em> function simply contains the sum of all <em>calling</em> rows.</p>
+<p>The rows for the <em>called</em> functions contains statistics for the <em>row's</em> function with the constraint that only the occasions when a call was made from the <em>marked</em> to the <em>row's</em> function are accounted for.</p>
+<p>So, we see that <code>foo:create_file_slow/2</code> used very little time for its own execution. It spent most of its time in <a href="../../../kernel-11.0.4/doc/html/file.html#close/1"><code>file:close/1</code></a>. The function <code>foo:create_file_slow/3</code> that writes 3/4 of the file contents is the second biggest time thief.</p>
+<p>We also see that the call to <a href="../../../kernel-11.0.4/doc/html/file.html#write/2"><code>file:write/2</code></a> that writes 1/4 of the file contents takes very little time in itself. What takes time is to build the data (<a href="../../../stdlib-8.1/doc/html/lists.html#seq/2"><code>lists:seq/2</code></a> and <a href="../../../stdlib-8.1/doc/html/lists.html#map/2"><code>lists:map/2</code></a>).</p>
+<p>The function <code>undefined</code> that has called <code>fprof:apply_start_stop/4</code> is an unknown function because that call was not recorded in the trace. It was only recorded that the execution returned from <code>fprof:apply_start_stop/4</code> to some other function above in the call stack, or that the process exited from there.</p>
+<p>Let us continue down the printout to find:</p>
+<pre data-language="erlang">{[{{foo,create_file_slow,2},              1,  249.678,    0.029},
+  {{foo,create_file_slow,3},            768,    0.000,   23.294}],
+ { {foo,create_file_slow,3},            769,  249.678,   23.323},     %
+ [{{file,write,2},                      768,  220.314,   14.539},
+  {suspend,                              57,    6.041,    0.000},
+  {{foo,create_file_slow,3},            768,    0.000,   23.294}]}.</pre>
+<p>If you compare with the code you will see there also that <code>foo:create_file_slow/3</code> was called only from <code>foo:create_file_slow/2</code> and itself, and called only <a href="../../../kernel-11.0.4/doc/html/file.html#write/2"><code>file:write/2</code></a>, note the number of calls to <a href="../../../kernel-11.0.4/doc/html/file.html#write/2"><code>file:write/2</code></a>. But here we see that <code>suspend</code> was called a few times. This is a pseudo function that indicates that the process was suspended while executing in <code>foo:create_file_slow/3</code>, and since there is no <code>receive</code> or <a href="../../../../erts-17.1/doc/html/erlang.html#yield/0"><code>erlang:yield/0</code></a> in the code, it must be Erlang scheduling suspensions, or the trace file driver compensating for large file write operations (these are regarded as a schedule out followed by a schedule in to the same process).</p>
+<p>Let us find the <code>suspend</code> entry:</p>
+<pre data-language="erlang">{[{{file,write,2},                       53,    6.281,    0.000},
+  {{foo,create_file_slow,3},             57,    6.041,    0.000},
+  {{prim_file,drv_command,4},            50,    4.582,    0.000},
+  {{prim_file,drv_get_response,1},       34,    2.986,    0.000},
+  {{lists,map,2},                        10,    2.104,    0.000},
+  {{prim_file,write,2},                  17,    1.852,    0.000},
+  {{erlang,port_command,2},              15,    1.713,    0.000},
+  {{prim_file,drv_command,2},            22,    1.482,    0.000},
+  {{prim_file,translate_response,2},     11,    1.441,    0.000},
+  {{prim_file,'-drv_command/2-fun-0-',1},  15,    1.340,    0.000},
+  {{lists,seq,4},                         3,    0.880,    0.000},
+  {{foo,'-create_file_slow/2-fun-0-',1},   5,    0.523,    0.000},
+  {{erlang,bump_reductions,1},            4,    0.503,    0.000},
+  {{prim_file,open_int_setopts,3},        1,    0.165,    0.000},
+  {{prim_file,i32,4},                     1,    0.109,    0.000},
+  {{fprof,apply_start_stop,4},            1,    0.000,    0.000}],
+ { suspend,                             299,   32.002,    0.000},     %
+ [ ]}.</pre>
+<p>We find no particularly long suspend times, so no function seems to have waited in a receive statement. Actually, <code>prim_file:drv_command/4</code> contains a receive statement, but in this test program, the message lies in the process receive buffer when the receive statement is entered. We also see that the total suspend time for the test run is small.</p>
+<p>The <code>suspend</code> pseudo function has an <code>OWN</code> time of zero. This is to prevent the process total <code>OWN</code> time from including time in suspension. Whether suspend time is really <code>ACC</code> or <code>OWN</code> time is more of a philosophical question.</p>
+<p>Now we look at another interesting pseudo function, <code>garbage_collect</code>:</p>
+<pre data-language="erlang">{[{{prim_file,drv_command,4},            25,    0.873,    0.873},
+  {{prim_file,write,2},                  16,    0.692,    0.692},
+  {{lists,map,2},                         2,    0.195,    0.195}],
+ { garbage_collect,                      43,    1.760,    1.760},     %
+ [ ]}.</pre>
+<p>Here we see that no function stands out, which is very normal.</p>
+<p>The <code>garbage_collect</code> pseudo function has not an <code>OWN</code> time of zero like <code>suspend</code>, instead it is equal to the <code>ACC</code> time.</p>
+<p>Garbage collection often occurs while a process is suspended, but <code>fprof</code> hides this fact by pretending that the suspended function was first unsuspended and then garbage collected. Otherwise the printout would show <code>garbage_collect</code> being called from <code>suspend</code>, but not which function that might have caused the garbage collection.</p>
+<p>Let us now get back to the test code:</p>
+<pre data-language="erlang">{[{{foo,create_file_slow,3},            768,  220.314,   14.539},
+  {{foo,create_file_slow,2},              1,    0.316,    0.021}],
+ { {file,write,2},                      769,  220.630,   14.560},     %
+ [{{prim_file,write,2},                 769,  199.789,   22.573},
+  {suspend,                              53,    6.281,    0.000}]}.</pre>
+<p>Not unexpectedly, we see that <a href="../../../kernel-11.0.4/doc/html/file.html#write/2"><code>file:write/2</code></a> was called from <code>foo:create_file_slow/3</code> and <code>foo:create_file_slow/2</code>. The number of calls in each case as well as the used time are also confirms the previous results.</p>
+<p>We see that <a href="../../../kernel-11.0.4/doc/html/file.html#write/2"><code>file:write/2</code></a> only calls <code>prim_file:write/2</code>, but let us refrain from digging into the internals of the kernel application.</p>
+<p>If we nevertheless <em>do</em> dig down we find the call to the linked-in driver that does the file operations towards the host operating system:</p>
+<pre data-language="erlang">{[{{prim_file,drv_command,4},           772, 1458.356, 1456.643}],
+ { {erlang,port_command,2},             772, 1458.356, 1456.643},     %
+ [{suspend,                              15,    1.713,    0.000}]}.</pre>
+<p>This is 86 % of the total run time, and as we saw before it is the close operation the absolutely biggest contributor. We find a comparison ratio a little bit up in the call stack:</p>
+<pre data-language="erlang">{[{{prim_file,close,1},                   1, 1398.748,    0.024},
+  {{prim_file,write,2},                 769,  174.672,   12.810},
+  {{prim_file,open_int,4},                1,   19.755,    0.017},
+  {{prim_file,open_int_setopts,3},        1,    0.147,    0.016}],
+ { {prim_file,drv_command,2},           772, 1593.322,   12.867},     %
+ [{{prim_file,drv_command,4},           772, 1578.973,   27.265},
+  {suspend,                              22,    1.482,    0.000}]}.</pre>
+<p>The time for file operations in the linked in driver distributes itself as 1 % for open, 11 % for write, and 87 % for close. All data is probably buffered in the operating system until the close.</p>
+<p>The observant reader may notice that the ACC times for <code>prim_file:drv_command/2</code> and <code>prim_file:drv_command/4</code> is not equal between the paragraphs above, even though it is easy to believe that <code>prim_file:drv_command/2</code> is just a passthrough function.</p>
+<p>The missing time can be found in the paragraph for <code>prim_file:drv_command/4</code> where it is evident that not only <code>prim_file:drv_command/2</code> is called but also a fun:</p>
+<pre data-language="erlang">{[{{prim_file,drv_command,2},           772, 1578.973,   27.265}],
+ { {prim_file,drv_command,4},           772, 1578.973,   27.265},     %
+ [{{erlang,port_command,2},             772, 1458.356, 1456.643},
+  {{prim_file,'-drv_command/2-fun-0-',1}, 772,   87.897,   12.736},
+  {suspend,                              50,    4.582,    0.000},
+  {garbage_collect,                      25,    0.873,    0.873}]}.</pre>
+<p>And some more missing time can be explained by the fact that <code>prim_file:open_int/4</code> both calls <code>prim_file:drv_command/2</code> directly as well as through <code>prim_file:open_int_setopts/3</code>, which complicates the picture.</p>
+<pre data-language="erlang">{[{{prim_file,open,2},                    1,   20.309,    0.029},
+  {{prim_file,open_int,4},                1,    0.000,    0.057}],
+ { {prim_file,open_int,4},                2,   20.309,    0.086},     %
+ [{{prim_file,drv_command,2},             1,   19.755,    0.017},
+  {{prim_file,open_int_setopts,3},        1,    0.360,    0.032},
+  {{prim_file,drv_open,2},                1,    0.071,    0.030},
+  {{erlang,list_to_binary,1},             1,    0.020,    0.020},
+  {{prim_file,i32,1},                     1,    0.017,    0.017},
+  {{prim_file,open_int,4},                1,    0.000,    0.057}]}.
+.
+.
+.
+{[{{prim_file,open_int,4},                1,    0.360,    0.032},
+  {{prim_file,open_int_setopts,3},        1,    0.000,    0.016}],
+ { {prim_file,open_int_setopts,3},        2,    0.360,    0.048},     %
+ [{suspend,                               1,    0.165,    0.000},
+  {{prim_file,drv_command,2},             1,    0.147,    0.016},
+  {{prim_file,open_int_setopts,3},        1,    0.000,    0.016}]}.</pre>
+<h2 id="module-notes-on-accuracy-of-measurements">Notes on accuracy of measurements</h2>
+<p>The actual supervision of execution times is in itself a CPU-intensive activity. A message is written on the trace file for every function call that is made by the profiled code.</p>
+<p>The <code>ACC</code> time calculation is sometimes difficult to make correct, since it is difficult to define. This happens especially when a function occurs in several instances in the call stack, for example by calling itself perhaps through other functions and perhaps even non-tail recursively.</p>
+<p>To produce sensible results, <code>fprof</code> tries not to charge any function more than once for <code>ACC</code> time. The instance highest up (with longest duration) in the call stack is chosen.</p>
+<p>Sometimes a function can unexpectedly waste a lot (some 10 ms or more depending on host machine OS) of <code>OWN</code> (and <code>ACC</code>) time, even functions that do practically nothing at all. The problem may be that the OS has chosen to schedule out the Erlang runtime system process for a while, and if the OS does not support high resolution CPU time measurements <code>fprof</code> will use wallclock time for its calculations, and it will appear as if functions are randomly burning virtual machine time.</p>
+<h3 id="module-see-also">See Also</h3>
+<p><a href="fprof_chapter.html">fprof - The File Trace Profiler</a>, <a href="../../../runtime_tools-2.5/doc/html/dbg.html"><code>dbg</code></a>, <a href="eprof.html"><code>eprof</code></a></p>   <section id="summary" class="details-list"> <h2>Summary</h2> <h3>Types</h3>
+<dl class="summary-types summary">   <dt> <a href="#t:analyse_option/0">analyse_option()</a> </dt>   <dt> <a href="#t:apply_option/0">apply_option()</a> </dt>   <dt> <a href="#t:pid_spec/0">pid_spec()</a> </dt>   <dt> <a href="#t:profile_option/0">profile_option()</a> </dt>   <dt> <a href="#t:trace_option/0">trace_option()</a> </dt>  </dl> <h3>Functions</h3>
+<dl class="summary-functions summary">   <dt> <a href="#analyse/0">analyse()</a> </dt> <dd><p>Equivalent to <a href="#analyse/1"><code>analyse([])</code></a>.</p></dd>   <dt> <a href="#analyse/1">analyse(Arg)</a> </dt> <dd><p>Analyses raw profile data in the <code>fprof</code> server.</p></dd>   <dt> <a href="#analyse/2">analyse(OptionName, OptionValue)</a> </dt> <dd><p>Equivalent to <a href="#analyse/1"><code>analyse([{OptionName, OptionValue}])</code></a>.</p></dd>   <dt> <a href="#apply/2">apply(Func, Args)</a> </dt> <dd><p>Equivalent to <a href="#apply/3"><code>apply(Func, Args, [])</code></a>.</p></dd>   <dt> <a href="#apply/3">apply(Arg1, Arg2, Arg3)</a> </dt> <dd><p>Calls the given function surrounded by <a href="#trace/1"><code>trace([start, ...])</code></a> and <a href="#trace/1"><code>trace(stop)</code></a>.</p></dd>   <dt> <a href="#apply/4">apply(Module, Function, Args, OptionList)</a> </dt> <dd><p>Equivalent to <a href="#apply/3"><code>apply({Module, Function}, Args, OptionList)</code></a>.</p></dd>   <dt> <a href="#profile/0">profile()</a> </dt> <dd><p>Equivalent to <a href="#profile/1"><code>profile([])</code></a>.</p></dd>   <dt> <a href="#profile/1">profile(Arg)</a> </dt> <dd><p>Compiles a trace into raw profile data held by the <code>fprof</code> server.</p></dd>   <dt> <a href="#profile/2">profile(OptionName, OptionValue)</a> </dt> <dd><p>Equivalent to <a href="#profile/1"><code>profile([{OptionName, OptionValue}])</code></a>.</p></dd>   <dt> <a href="#start/0">start()</a> </dt> <dd><p>Starts the <code>fprof</code> server.</p></dd>   <dt> <a href="#stop/0">stop()</a> </dt> <dd><p>Equivalent to <a href="#stop/1"><code>stop(normal)</code></a>.</p></dd>   <dt> <a href="#stop/1">stop(Reason)</a> </dt> <dd><p>Stops the <code>fprof</code> server.</p></dd>   <dt> <a href="#trace/1">trace(Arg)</a> </dt> <dd><p>Starts or stops tracing.</p></dd>   <dt> <a href="#trace/2">trace(What, Value)</a> </dt> <dd><p>Starts or stop tracing.</p></dd>  </dl> </section> <section id="types" class="details-list"> <h2>Types</h2> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:analyse_option/0">analyse_option() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L1141" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> analyse_option() ::
+          append | callers |
+          {callers, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          {cols, Cols :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>()} |
+          dest |
+          {dest, Dest :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | (Destfile :: <a href="../../../kernel-11.0.4/doc/html/file.html#t:filename/0">file:filename</a>())} |
+          details |
+          {details, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          no_callers | no_details |
+          {sort, SortSpec :: acc | own} |
+          totals |
+          {totals, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()}.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:apply_option/0">apply_option() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L513" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> apply_option() ::
+          continue | {procs, PidList :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()]} | start | (TraceStartOption :: <a href="#t:trace_option/0">trace_option</a>()).</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:pid_spec/0">pid_spec() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L500" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> pid_spec() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>().</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:profile_option/0">profile_option() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L961" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> profile_option() ::
+          append | dump |
+          {dump, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | (Dump :: (Dumpfile :: <a href="../../../kernel-11.0.4/doc/html/file.html#t:filename/0">file:filename</a>() | []))} |
+          file |
+          {file, Filename :: <a href="../../../kernel-11.0.4/doc/html/file.html#t:filename/0">file:filename</a>()} |
+          start | stop.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_option/0">trace_option() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L501" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_option() ::
+          cpu_time |
+          {cpu_time, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()} |
+          file |
+          {file, Filename :: <a href="../../../kernel-11.0.4/doc/html/file.html#t:filename/0">file:filename</a>()} |
+          {procs, PidSpec :: <a href="#t:pid_spec/0">pid_spec</a>()} |
+          {procs, [PidSpec :: <a href="#t:pid_spec/0">pid_spec</a>()]} |
+          start | stop |
+          {tracer, Tracer :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:port/0">port</a>()} |
+          verbose |
+          {verbose, <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()}.</pre>  </section> </section> </div> </section> <section id="functions" class="details-list"> <h2>Functions</h2> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="analyse/0">analyse()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L1124" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> analyse() -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Equivalent to <a href="#analyse/1"><code>analyse([])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="analyse/1">analyse(Arg)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L1230" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> analyse(OptionName) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when OptionName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>();
+             ({OptionName, OptionValue}) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when OptionName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), OptionValue :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>();
+             (OptionList) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when
+                     OptionList :: [Option],
+                     Option :: <a href="#t:analyse_option/0">analyse_option</a>(),
+                     ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                     Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Analyses raw profile data in the <code>fprof</code> server.</p>
+<p>If <code>Arg</code> is an atom, this call is equivalent to <code>analyse([Arg])</code>.</p>
+<p>If <code>Arg</code> is a a tuple <code>{Option, _}</code>, this call is equivalent to <code>analyse([Option])</code>.</p>
+<p>Otherwise <code>Arg</code> must be a list of valid options.</p>
+<p>If called when no raw profile data is available, <code>{error, no_profile}</code> is returned.</p>
+<p><code>Destfile</code> is used to call <a href="../../../kernel-11.0.4/doc/html/file.html#open/2"><code>file:open/2</code></a>.</p>
+<p>Option description:</p>
+<ul>
+<li><p><strong><code>dest</code> | <code>{dest, Dest}</code></strong> - Specifies the destination for the analysis. If this option is not given or it is <code>dest</code>, the destination will be the caller's group leader, otherwise the destination <code>Dest</code> is either the <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a> of an I/O device or a filename. If the filename is <code>[]</code>, <code>"fprof.analysis"</code> is used instead.</p></li>
+<li><p><strong><code>append</code></strong> - Causes the analysis to be appended to the destination file. This option is only allowed with the <code>{dest, Destfile}</code> option.</p></li>
+<li><p><strong><code>{cols, Cols}</code></strong> - Specifies the number of columns in the analysis text. If this option is not given the number of columns is set to 80.</p></li>
+<li><p><strong><code>callers</code> | <code>{callers, true}</code></strong> - Prints callers and called information in the analysis. This is the default.</p></li>
+<li><p><strong><code>{callers, false}</code> | <code>no_callers</code></strong> - Suppresses the printing of callers and called information in the analysis.</p></li>
+<li><p><strong><code>{sort, SortSpec}</code></strong> - Specifies if the analysis should be sorted according to the ACC column, which is the default, or the OWN column. See <a href="fprof.html#analysis">Analysis Format</a> below.</p></li>
+<li><p><strong><code>totals</code> | <code>{totals, true}</code></strong> - Includes a section containing call statistics for all calls regardless of process, in the analysis.</p></li>
+<li><p><strong><code>{totals, false}</code></strong> - Suppresses the totals section in the analysis, which is the default.</p></li>
+<li><p><strong><code>details</code> | <code>{details, true}</code></strong> - Prints call statistics for each process in the analysis. This is the default.</p></li>
+<li><p><strong><code>{details, false}</code> | <code>no_details</code></strong> - Suppresses the call statistics for each process from the analysis.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="analyse/2">analyse(OptionName, OptionValue)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L1136" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> analyse(OptionName, OptionValue) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when OptionName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), OptionValue :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Equivalent to <a href="#analyse/1"><code>analyse([{OptionName, OptionValue}])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="apply/2">apply(Func, Args)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L491" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> apply(Func, Args) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()
+               when Func :: fun() | {Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Function :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>()}, Args :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()].</pre>  <p>Equivalent to <a href="#apply/3"><code>apply(Func, Args, [])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="apply/3">apply(Arg1, Arg2, Arg3)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L558" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> apply(Module, Function, Args) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()
+               when Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Function :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Args :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()];
+           (Func, Args, OptionList) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()
+               when
+                   Func :: fun() | {Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Function :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>()},
+                   Args :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()],
+                   OptionList :: [Option],
+                   Option :: <a href="#t:apply_option/0">apply_option</a>().</pre>  <p>Calls the given function surrounded by <a href="#trace/1"><code>trace([start, ...])</code></a> and <a href="#trace/1"><code>trace(stop)</code></a>.</p>
+<p>If the function arguments (<code>Arg1</code>, <code>Arg2</code>, and <code>Arg3</code>) are <code>Module</code> (an atom), <code>Function</code> (an atom), and <code>Args</code> (a list), the function will be called using <a href="../../../../erts-17.1/doc/html/erlang.html#apply/3"><code>erlang:apply(Module, Function, Args)</code></a>.</p>
+<p>If the function arguments are <code>Func</code> (a fun), <code>Args</code> (a list), and <code>OptionList</code> (a list of options), the fun will be called using <a href="../../../../erts-17.1/doc/html/erlang.html#apply/2"><code>erlang:apply(Func, Args)</code></a>.</p>
+<p>Some effort is made to keep the trace clean from unnecessary trace messages; tracing is started and stopped from a spawned process while <a href="../../../../erts-17.1/doc/html/erlang.html#apply/2"><code>erlang:apply/2</code></a> is called in the current process only surrounded by <code>receive</code> and <code>send</code> statements towards the trace starting process. The trace starting process exits when it is not needed any more.</p>
+<p>The <code>TraceStartOption</code> is any option allowed for <a href="#trace/1"><code>trace/1</code></a>. The options <code>[start, {procs, [self() | PidList]} | OptList]</code> are given to <a href="#trace/1"><code>trace/1</code></a>, where <code>OptList</code> is <code>OptionList</code> with the <code>continue</code>, <code>start</code> and <code>{procs, _}</code> options removed.</p>
+<p>The <code>continue</code> option inhibits the call to <a href="#trace/1"><code>trace(stop)</code></a> and leaves it up to the caller to stop tracing at a suitable time.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="apply/4">apply(Module, Function, Args, OptionList)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L577" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> apply(Module, Function, Args, OptionList) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()
+               when
+                   Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(),
+                   Function :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(),
+                   Args :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()],
+                   OptionList :: [Option],
+                   Option :: <a href="#t:apply_option/0">apply_option</a>().</pre>  <p>Equivalent to <a href="#apply/3"><code>apply({Module, Function}, Args, OptionList)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="profile/0">profile()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L958" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> profile() -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Equivalent to <a href="#profile/1"><code>profile([])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="profile/1">profile(Arg)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L1056" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> profile(OptionName) -&gt; ok | {ok, Tracer} | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when OptionName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Tracer :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>();
+             ({OptionName, OptionValue}) -&gt;
+                 ok | {ok, Tracer} | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when
+                     OptionName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(),
+                     OptionValue :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                     Tracer :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                     ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                     Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>();
+             (OptionList) -&gt; ok | {ok, Tracer} | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when
+                     OptionList :: [Option],
+                     Option :: <a href="#t:profile_option/0">profile_option</a>(),
+                     Tracer :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                     ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                     Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Compiles a trace into raw profile data held by the <code>fprof</code> server.</p>
+<p>If <code>Arg</code> is an atom, this call is equivalent to <code>profile([Arg])</code>.</p>
+<p>If <code>Arg</code> is a tuple <code>{OptionName, OptionValue}</code>, this call is equivalent to <code>profile([Arg])</code>.</p>
+<p>Otherwise, <code>Arg</code> must be a list of options.</p>
+<p><code>Dumpfile</code> is used to call <a href="../../../kernel-11.0.4/doc/html/file.html#open/2"><code>file:open/2</code></a>, and <code>Filename</code> is used to call <a href="../../../runtime_tools-2.5/doc/html/dbg.html#trace_port/2"><code>dbg:trace_port(file, Filename)</code></a>.</p>
+<p>The following options are supported:</p>
+<ul>
+<li><p><strong><code>file</code> | <code>{file, Filename}</code></strong> - Reads the file <code>Filename</code> and creates raw profile data that is stored in RAM by the <code>fprof</code> server. If the option <code>file</code> is given, or none of these options are given, the file <code>fprof.trace</code> is read. The call will return when the whole trace has been read with the return value <code>ok</code> if successful. This option is not allowed with the <code>start</code> or <code>stop</code> options.</p></li>
+<li><p><strong><code>dump</code> | <code>{dump, Dump}</code></strong> - Specifies the destination for the trace text dump. If this option is not given, no dump is generated, if it is <code>dump</code> the destination will be the caller's group leader, otherwise the destination <code>Dump</code> is either the pid of an I/O device or a filename. If the filename is <code>[]</code>, <code>"fprof.dump"</code> is used instead. This option cannot be combined with the <code>stop</code> option.</p></li>
+<li><p><strong><code>append</code></strong> - Causes the trace text dump to be appended to the destination file. This option is only allowed with the <code>{dump, Dumpfile}</code> option.</p></li>
+<li><p><strong><code>start</code></strong> - Starts a tracer process that profiles trace data in runtime. The call will return immediately with the return value <code>{ok, Tracer}</code> if successful. This option is not allowed with the <code>stop</code>, <code>file</code>, or <code>{file, Filename}</code> options.</p></li>
+<li><p><strong><code>stop</code></strong> - Stops the tracer process that profiles trace data in runtime. The return value will be value <code>ok</code> if successful. This option cannot be combined with the <code>start</code>, <code>file</code>, or <code>{file, Filename}</code> options.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="profile/2">profile(OptionName, OptionValue)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L981" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> profile(OptionName, OptionValue) -&gt;
+                 ok | {ok, Tracer} | {error, Reason} | {'EXIT', ServerPid, Reason}
+                 when
+                     OptionName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(),
+                     OptionValue :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                     Tracer :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                     ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                     Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Equivalent to <a href="#profile/1"><code>profile([{OptionName, OptionValue}])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start/0">start()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L1461" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start() -&gt; {ok, Pid} | {error, {already_started, Pid}} when Pid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>().</pre>  <p>Starts the <code>fprof</code> server.</p>
+<p>Note that there is seldom any need to call this function directly, since the server will be automatically started by any function that will need it.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="stop/0">stop()<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L1491" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> stop() -&gt; ok.</pre>  <p>Equivalent to <a href="#stop/1"><code>stop(normal)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="stop/1">stop(Reason)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L1510" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> stop(Reason) -&gt; ok when Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Stops the <code>fprof</code> server.</p>
+<p>The supplied <code>Reason</code> becomes the exit reason for the server process. By default, any <code>Reason</code> other than <code>kill</code> sends a request to the server and waits for it to clean up, reply, and exit. If <code>Reason</code> is <code>kill</code>, the server is bluntly killed.</p>
+<p>If the <code>fprof</code> server is not running, this function returns immediately.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>When the <code>fprof</code> server is stopped the collected raw profile data is lost.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="trace/1">trace(Arg)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L882" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> trace(verbose) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+               when ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>();
+           (OptionName) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+               when OptionName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>();
+           ({OptionName, OptionValue}) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+               when OptionName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), OptionValue :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>();
+           (OptionList) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+               when
+                   OptionList :: [Option],
+                   Option :: <a href="#t:trace_option/0">trace_option</a>(),
+                   ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                   Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Starts or stops tracing.</p>
+<p>If <code>Arg</code> is atom <code>verbose</code>, this call is equivalent to <code>trace([start, verbose])</code>.</p>
+<p>If <code>Arg</code> is an atom, this call is equivalent to <code>trace([Arg])</code>.</p>
+<p>If <code>Arg</code> is a tuple <code>{OptionName, OptionValue}</code>, this call is equivalent to <code>trace([Arg])</code>.</p>
+<p>Otherwise, <code>Arg</code> has to be a list of <a href="#t:trace_option/0">trace options</a>.</p>
+<p><code>PidSpec</code> and <code>Tracer</code> are used in calls to <a href="../../../../erts-17.1/doc/html/erlang.html#trace/3"><code>erlang:trace(PidSpec, true, [{tracer, Tracer} | Flags])</code></a>, and <code>Filename</code> is used to call <a href="../../../runtime_tools-2.5/doc/html/dbg.html#trace_port/2"><code>dbg:trace_port(file, Filename)</code></a>.</p>
+<p>Option description:</p>
+<ul>
+<li><p><strong><code>stop</code></strong> - Stops a running <code>fprof</code> trace and clears all tracing from the node. Either option <code>stop</code> or <code>start</code> must be specified, but not both.</p></li>
+<li><p><strong><code>start</code></strong> - Clears all tracing from the node and starts a new <code>fprof</code> trace. Either option <code>start</code> or <code>stop</code> must be specified, but not both.</p></li>
+<li><p><strong><code>verbose</code> | <code>{verbose, boolean()}</code></strong> - The <code>verbose</code> or <code>{verbose, true}</code> options add some trace flags that <code>fprof</code> does not need, but that can be interesting for general debugging purposes. These options are only allowed with the <code>start</code> option.</p></li>
+<li>
+<p><strong><code>cpu_time</code> | <code>{cpu_time, boolean()}</code></strong> - The <code>cpu_time</code> or <code>{cpu_time, true}</code> options make the timestamps in the trace be in CPU time instead of the default wallclock time. These options are only allowed with the <code>start</code> option.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>Getting correct values out of <code>cpu_time</code> can be difficult. The best way to get correct values is to run using a single scheduler and bind that scheduler to a specific CPU. For example:</p>
+<pre data-language="bash">erl +S 1 +sbt db`
+</pre>
+</div>
+</li>
+<li><p><strong><code>{procs, PidSpec}</code> | <code>{procs, [PidSpec]}</code></strong> - Specifies which processes that should be traced. If this option is not given, the calling process is traced. All processes spawned by the traced processes are also traced. This option is only allowed with the <code>start</code> option.</p></li>
+<li><p><strong><code>file</code> | <code>{file, Filename}</code></strong> - Specifies the filename of the trace. If the option <code>file</code> is given, or none of these options are given, the file <code>fprof.trace</code> is used. This option is only allowed with the <code>start</code> option, but not with the <code>{tracer, Tracer}</code> option.</p></li>
+<li><p><strong><code>{tracer, Tracer}</code></strong> - Specifies that trace to process or port shall be done instead of trace to file. This option is only allowed with the <code>start</code> option, but not with the <code>{file, Filename}</code> option.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="trace/2">trace(What, Value)<a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/tools/src/fprof.erl#L783" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> trace(start, Filename) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+               when Filename :: <a href="../../../kernel-11.0.4/doc/html/file.html#t:filename/0">file:filename</a>(), ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>();
+           (verbose, Filename) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+               when Filename :: <a href="../../../kernel-11.0.4/doc/html/file.html#t:filename/0">file:filename</a>(), ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>();
+           (OptionName, OptionValue) -&gt; ok | {error, Reason} | {'EXIT', ServerPid, Reason}
+               when OptionName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), OptionValue :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), ServerPid :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Starts or stop tracing.</p>
+<p>If <code>What</code> is atom <code>start</code>, this call is equivalent to <a href="#trace/1"><code>trace([start, {file, Value}])</code></a>.</p>
+<p>If <code>What</code> is atom <code>verbose</code>, this call is equivalent to <a href="#trace/1"><code>trace([start, verbose, {file, Value}])</code></a>.</p>
+<p>If <code>What</code> is a tuple <code>{OptionName, OptionValue}</code>, this call is equivalent to <a href="#trace/1"><code>trace([What])</code></a>.</p> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

@@ -1,0 +1,947 @@
+<h1> <span>gen_statem</span> <small>behaviour</small>  </h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L22" title="View Source" class="source" rel="help nofollow">Source</a>   <p>Generic state machine behavior.</p>
+<p><code>gen_statem</code> provides a generic state machine behaviour that since Erlang/OTP 20.0 replaces its predecessor <a href="gen_fsm.html"><code>gen_fsm</code></a>, and should be used for new code. The <code>gen_fsm</code> behaviour remains in OTP "as is" to not break old code using it.</p>
+<p>A generic state machine server process (<code>gen_statem</code>) implemented using this module has a standard set of interface functions and includes functionality for tracing and error reporting. It also fits into an OTP supervision tree. For more information, see <a href="../../../../doc/system/statem.html">gen_statem section in OTP Design Principles</a>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>If you are new to <code>gen_statem</code> and want an overview of concepts and operation the section <a href="../../../../doc/system/statem.html"><code>gen_statem</code> Behaviour</a> located in the User's Guide <span>OTP Design Principles</span> is recommended to read. This reference manual focuses on being correct and complete, which might make it hard to see the forest for all the trees.</p>
+</div>
+<h4>Features</h4>
+<p><code>gen_statem</code> has got the same features that <a href="gen_fsm.html"><code>gen_fsm</code></a> had and adds some really useful:</p>
+<ul>
+<li><a href="#state_functions">Co-located state code</a></li>
+<li><a href="#handle_event_function">Arbitrary term state</a></li>
+<li><a href="#event-postponing">Event postponing</a></li>
+<li><a href="#event-insertion">Self-generated events</a></li>
+<li><a href="#t:state_timeout/0">State time-out</a></li>
+<li><a href="#t:generic_timeout/0">Multiple generic named time-outs</a></li>
+<li><a href="#t:timeout_option/0">Absolute time-out time</a></li>
+<li><a href="#state-enter-calls">Automatic state enter calls</a></li>
+<li>
+<a href="#reply-to-a-call">Reply from other state than the request</a>, traceable with <a href="sys.html"><code>sys</code></a>
+</li>
+<li>
+<a href="#reply-to-a-call">Multiple replies</a>, traceable with <a href="sys.html"><code>sys</code></a>
+</li>
+<li><a href="#change_callback_module">Changing the callback module</a></li>
+</ul>
+<p>Two <a href="#t:callback_mode/0"><em>callback modes</em></a> are supported:</p>
+<ul>
+<li>
+<code>state_functions</code> - for finite-state machines (<a href="gen_fsm.html"><code>gen_fsm</code></a> like), which requires the state to be an atom and uses that state as the name of the current callback function, arity 3.</li>
+<li>
+<code>handle_event_function</code> - that allows the state to be any term and that uses <a href="#c:handle_event/4"><code>handle_event/4</code></a> as callback function for all states.</li>
+</ul>
+<p>The callback modes for <code>gen_statem</code> differs from the one for <code>gen_fsm</code>, but it is still fairly easy to rewrite from <code>gen_fsm</code> to <code>gen_statem</code>. See the <a href="gen_fsm.html#module-migration-to-gen_statem">rewrite guide</a> at the start of the <a href="gen_fsm.html"><code>gen_fsm</code></a> documentation.</p>
+<h4>Callback module</h4>
+<p>A <code>gen_statem</code> assumes all specific parts to be located in a callback module exporting a predefined set of functions. The relationship between the behavior functions and the callback functions is as follows:</p>
+<pre data-language="erlang">gen_statem module            Callback module
+-----------------            ---------------
+gen_statem:start
+gen_statem:start_monitor
+gen_statem:start_link -----&gt; Module:init/1
+
+Server start or code change
+                      -----&gt; Module:callback_mode/0
+                      selects callback mode
+
+gen_statem:stop
+Supervisor exit
+Callback failure      -----&gt; Module:terminate/3
+
+gen_statem:call
+gen_statem:cast
+gen_statem:send_request
+erlang:send
+erlang:'!'            -----&gt; Module:StateName/3
+                   or -----&gt; Module:handle_event/4
+                   depending on callback mode
+
+Release upgrade/downgrade
+(code change)
+                      -----&gt; Module:code_change/4</pre>
+<h4 id="state-callback">State callback</h4>
+<p>The <em>state callback</em> for a specific <a href="#t:state/0">state</a> in a <code>gen_statem</code> is the callback function that is called for all events in this state. It is selected depending on which <a href="#t:callback_mode/0"><em>callback mode</em></a> that the callback module defines with the callback function <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a>.</p>
+<p> When the <a href="#t:callback_mode/0"><em>callback mode</em></a> is <code>state_functions</code>, the state must be an atom and is used as the <em>state callback</em> name; see <a href="#c:StateName/3"><code>Module:StateName/3</code></a>. This co-locates all code for a specific state in one function as the <code>gen_statem</code> engine branches depending on state name. Note the fact that the callback function <a href="#c:terminate/3"><code>Module:terminate/3</code></a> makes the state name <code>terminate</code> unusable in this mode.</p>
+<p> When the <a href="#t:callback_mode/0"><em>callback mode</em></a> is <code>handle_event_function</code>, the state can be any term and the <em>state callback</em> name is <a href="#c:handle_event/4"><code>Module:handle_event/4</code></a>. This makes it easy to branch depending on state or event as you desire. Be careful about which events you handle in which states so that you do not accidentally postpone an event forever creating an infinite busy loop.</p>
+<h4>Event types</h4>
+<p>Events are of different <a href="#t:event_type/0">types</a>, therefore the callback functions can know the origin of an event when handling it. <a href="#t:external_event_type/0">External events</a> are <code>call</code>, <code>cast</code>, and <code>info</code>. Internal events are <a href="#t:timeout_event_type/0"><code>timeout</code></a> and <code>internal</code>.</p>
+<h4>Event handling</h4>
+<p>When <code>gen_statem</code> receives a process message it is transformed into an event and the <a href="#state-callback"><em>state callback</em></a> is called with the event as two arguments: type and content. When the <a href="#state-callback"><em>state callback</em></a> has processed the event it returns to <code>gen_statem</code> which does a <em>state transition</em>. If this <em>state transition</em> is to a different state, that is: <code>NextState =/= State</code>, it is a <em>state change</em>.</p>
+<h4>Transition actions</h4>
+<p>The <a href="#state-callback"><em>state callback</em></a> may return <a href="#t:action/0"><em>transition actions</em></a> for <code>gen_statem</code> to execute during the <em>state transition</em>, for example to set a time-out or reply to a call.</p>
+<h4 id="reply-to-a-call">Reply to a call</h4>
+<p>See <a href="#call-reply"><code>gen_statem:call/2,3</code></a> about how to reply to a call. A reply can be sent from any <em>state callback</em>, not just the one that got the request event.</p>
+<h4 id="event-postponing">Event postponing</h4>
+<p>One of the possible <em>transition actions</em> is to postpone the current event. Then it will not be handled in the current state. The <code>gen_statem</code> engine keeps a queue of events divided into postponed events and events still to process (not presented yet). After a <em>state change</em> the queue restarts with the postponed events.</p>
+<p>The <code>gen_statem</code> event queue model is sufficient to emulate the normal process message queue with selective receive. Postponing an event corresponds to not matching it in a receive statement, and changing states corresponds to entering a new receive statement.</p>
+<h4 id="event-insertion">Event insertion</h4>
+<p>The <a href="#state-callback"><em>state callback</em></a> can insert events using the <a href="#t:action/0"><em>transition action</em></a> <code>next_event</code>, and such an event is inserted in the event queue as the next to call the <a href="#state-callback"><em>state callback</em></a> with. That is, as if it is the oldest incoming event. A dedicated <a href="#t:event_type/0"><code>event_type/0</code></a> <code>internal</code> can be used for such events making it possible to safely distinguish them from external events.</p>
+<p>Inserting an event replaces the trick of calling your own state handling functions that you often would have to resort to in, for example, <a href="gen_fsm.html"><code>gen_fsm</code></a> to force processing an inserted event before others.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>If you postpone an event and (against good practice) directly call a different <em>state callback</em>, the postponed event is not retried, since there was no <em>state change</em>.</p>
+<p>Instead of directly calling a <em>state callback</em>, do a <em>state change</em>. This makes the <code>gen_statem</code> engine retry postponed events.</p>
+<p>Inserting an event in a <em>state change</em> also triggers the new <em>state callback</em> to be called with that event before receiving any external events.</p>
+</div>
+<h4 id="state-enter-calls">State enter calls</h4>
+<p>The <code>gen_statem</code> engine can automatically make a special call to the <a href="#state-callback"><em>state callback</em></a> whenever a new state is entered; see <a href="#t:state_enter/0"><code>state_enter/0</code></a>. This is for writing code common to all state entries. Another way to do it is to explicitly insert an event at the <em>state transition</em>, and/or to use a dedicated <em>state transition</em> function, but that is something you will have to remember at every <em>state transition</em> to the state(s) that need it.</p>
+<p>For the details of a <em>state transition</em>, see type <a href="#t:transition_option/0"><code>transition_option/0</code></a>.</p>
+<h4>Hibernation</h4>
+<p>The <code>gen_statem</code> process can go into hibernation; see <a href="proc_lib.html#hibernate/3"><code>proc_lib:hibernate/3</code></a>. It is done when a <a href="#state-callback"><em>state callback</em></a> or <a href="#c:init/1"><code>Module:init/1</code></a> specifies <code>hibernate</code> in the returned <a href="#t:enter_action/0"><code>Actions</code></a> list. This feature can be useful to reclaim process heap memory while the server is expected to be idle for a long time. However, use it with care, as hibernation can be too costly to use after every event; see <a href="../../../../erts-17.1/doc/html/erlang.html#hibernate/3"><code>erlang:hibernate/3</code></a>.</p>
+<p>There is also a server start option <a href="#t:enter_loop_opt/0"><code>{hibernate_after, Timeout}</code></a> for <a href="#start/3"><code>start/3,4</code></a>, <a href="#start_link/3"><code>start_link/3,4</code></a>, <a href="#start_monitor/3"><code>start_monitor/3,4</code></a>, or <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a>, that may be used to automatically hibernate the server.</p>
+<h4>Callback failure</h4>
+<p>If a callback function fails or returns a bad value, the <code>gen_statem</code> terminates. However, an exception of class <a href="../../../../erts-17.1/doc/html/erlang.html#throw/1"><code>throw</code></a> is not regarded as an error but as a valid return, from all callback functions.</p>
+<h4>System messages and the <a href="sys.html"><code>sys</code></a> module</h4>
+<p>A <code>gen_statem</code> handles system messages as described in <a href="sys.html"><code>sys</code></a>. The <a href="sys.html"><code>sys</code></a> module can be used for debugging a <code>gen_statem</code>. Replies sent through <a href="#t:action/0"><em>transition actions</em></a> gets logged, but not replies sent through <a href="#reply/2"><code>reply/1,2</code></a>.</p>
+<h4>Trapping exit</h4>
+<p>A <code>gen_statem</code> process, like all <code>gen_</code>* behaviours, does not trap exit signals automatically; this must be explicitly initiated in the callback module (by calling <a href="../../../../erts-17.1/doc/html/erlang.html#process_flag/2"><code>process_flag(trap_exit, true)</code></a> preferably from <a href="#c:init/1"><code>init/1</code></a>.</p>
+<h4>Server termination</h4>
+<p>If the <code>gen_statem</code> process terminates, e.g. as a result of a callback function returning <code>{stop, Reason}</code>, an exit signal with this <code>Reason</code> is sent to linked processes and ports. See <a href="../../../../doc/system/ref_man_processes.html#errors">Processes</a> in the Reference Manual for details regarding error handling using exit signals.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>For some important information about distributed signals, see the <a href="../../../../doc/system/ref_man_processes.html#blocking-signaling-over-distribution"><em>Blocking Signaling Over Distribution</em> </a> section in the <em>Processes</em> chapter of the <em>Erlang Reference Manual</em>. Blocking signaling can, for example, cause call time-outs in <code>gen_statem</code> to be significantly delayed.</p>
+</div>
+<h4>Bad argument</h4>
+<p>Unless otherwise stated, all functions in this module fail if the specified <code>gen_statem</code> does not exist or if bad arguments are specified.</p>
+<h2 id="module-example">Example</h2>
+<p>The following example shows a simple pushbutton model for a toggling pushbutton implemented with <a href="#t:callback_mode/0"><em>callback mode</em></a> <code>state_functions</code>. You can push the button and it replies if it went on or off, and you can ask for a count of how many times it has been pushed to switch on.</p>
+<h3 id="module-pushbutton-state-diagram">Pushbutton State Diagram</h3>
+<pre>---
+title: Pushbutton State Diagram
+---
+stateDiagram-v2
+    [*]  --&gt; off
+    off  --&gt; on  : push\n* Increment count\n* Reply 'on'
+    on   --&gt; off : push\n* Reply 'off'</pre>
+<p>Not shown in the state diagram:</p>
+<ul>
+<li>The API function <code>push()</code> generates an event <code>push</code> of type <code>call</code>.</li>
+<li>The API function <code>get_count()</code> generates an event <code>get_count</code> of type <code>call</code> that is handled in all states by replying with the current count value.</li>
+<li>Unknown events are ignored and discarded.</li>
+<li>There is boilerplate code for start, stop, terminate, code change, init, to set the callback mode to <code>state_functions</code>, etc...</li>
+</ul>
+<h3 id="module-pushbutton-code">Pushbutton Code</h3>
+<p>The following is the complete callback module file <code>pushbutton.erl</code>:</p>
+<pre data-language="erlang">-module(pushbutton).
+-behaviour(gen_statem).
+
+-export([start/0,push/0,get_count/0,stop/0]).
+-export([terminate/3,code_change/4,init/1,callback_mode/0]).
+-export([on/3,off/3]).
+
+name() -&gt; pushbutton_statem. % The registered server name
+
+%% API.  This example uses a registered name name()
+%% and does not link to the caller.
+start() -&gt;
+    gen_statem:start({local,name()}, ?MODULE, [], []).
+push() -&gt;
+    gen_statem:call(name(), push).
+get_count() -&gt;
+    gen_statem:call(name(), get_count).
+stop() -&gt;
+    gen_statem:stop(name()).
+
+%% Mandatory callback functions
+terminate(_Reason, _State, _Data) -&gt;
+    void.
+code_change(_Vsn, State, Data, _Extra) -&gt;
+    {ok,State,Data}.
+init([]) -&gt;
+    %% Set the initial state + data.  Data is used only as a counter.
+    State = off, Data = 0,
+    {ok,State,Data}.
+callback_mode() -&gt; state_functions.
+
+%%% state callback(s)
+
+off({call,From}, push, Data) -&gt;
+    %% Go to 'on', increment count and reply
+    %% that the resulting status is 'on'
+    {next_state,on,Data+1,[{reply,From,on}]};
+off(EventType, EventContent, Data) -&gt;
+    handle_event(EventType, EventContent, Data).
+
+on({call,From}, push, Data) -&gt;
+    %% Go to 'off' and reply that the resulting status is 'off'
+    {next_state,off,Data,[{reply,From,off}]};
+on(EventType, EventContent, Data) -&gt;
+    handle_event(EventType, EventContent, Data).
+
+%% Handle events common to all states
+handle_event({call,From}, get_count, Data) -&gt;
+    %% Reply with the current count
+    {keep_state,Data,[{reply,From,Data}]};
+handle_event(_, _, Data) -&gt;
+    %% Ignore all other events
+    {keep_state,Data}.</pre>
+<p>The following is a shell session when running it:</p>
+<pre data-language="erlang">1&gt; pushbutton:start().
+{ok,&lt;0.36.0&gt;}
+2&gt; pushbutton:get_count().
+0
+3&gt; pushbutton:push().
+on
+4&gt; pushbutton:get_count().
+1
+5&gt; pushbutton:push().
+off
+6&gt; pushbutton:get_count().
+1
+7&gt; pushbutton:stop().
+ok
+8&gt; pushbutton:push().
+** exception exit: {noproc,{gen_statem,call,[pushbutton_statem,push,infinity]}}
+     in function  gen:do_for_proc/2 (gen.erl, line 261)
+     in call from gen_statem:call/3 (gen_statem.erl, line 386)</pre>
+<p>To compare styles, here follows the same example using <a href="#t:callback_mode/0"><em>callback mode</em></a> <code>handle_event_function</code>, or rather, the code to replace after function <a href="#c:init/1"><code>init/1</code></a> of the <code>pushbutton.erl</code> example file above:</p>
+<pre data-language="erlang">callback_mode() -&gt; handle_event_function.
+
+%%% state callback(s)
+
+handle_event({call,From}, push, off, Data) -&gt;
+    %% Go to 'on', increment count and reply
+    %% that the resulting status is 'on'
+    {next_state,on,Data+1,[{reply,From,on}]};
+handle_event({call,From}, push, on, Data) -&gt;
+    %% Go to 'off' and reply that the resulting status is 'off'
+    {next_state,off,Data,[{reply,From,off}]};
+%%
+%% Event handling common to all states
+handle_event({call,From}, get_count, State, Data) -&gt;
+    %% Reply with the current count
+    {next_state,State,Data,[{reply,From,Data}]};
+handle_event(_, _, State, Data) -&gt;
+    %% Ignore all other events
+    {next_state,State,Data}.</pre>
+<div class="note">
+<p class="label">Note</p>
+<h2 id="module-api-changes">API changes</h2>
+<ul>
+<li>This behavior appeared in Erlang/OTP 19.0 as experimental.</li>
+<li>In OTP 19.1 a backwards incompatible change of the return tuple from <a href="#c:init/1"><code>Module:init/1</code></a> was made, the mandatory callback function <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a> was introduced, and <a href="#enter_loop/4"><code>enter_loop/4</code></a> was added.</li>
+<li>In OTP 19.2 <a href="#t:state_enter/0"><em>state enter calls</em></a> were added.</li>
+<li>In OTP 19.3 <a href="#t:state_timeout/0">state time-outs</a> were added.</li>
+<li>In OTP 20.0 <a href="#t:generic_timeout/0">generic time-outs</a> were added and <code>gen_statem</code> was stated to be no longer experimental and preferred over <code>gen_fsm</code>.</li>
+<li>In OTP 22.1 time-out content <a href="#t:timeout_update_action/0"><code>update</code></a> and explicit time-out <a href="#t:timeout_cancel_action/0"><code>cancel</code></a> were added.</li>
+<li>In OTP 22.3 the possibility to change the callback module with actions <a href="#change_callback_module"><code>change_callback_module</code></a>, <a href="#push_callback_module"><code>push_callback_module</code></a> and <a href="#pop_callback_module"><code>pop_callback_module</code></a>, was added.</li>
+<li>In OTP 23.0 <a href="#start_monitor/3"><code>start_monitor/3,4</code></a> were added, as well as functions for asynchronous calls: <a href="#send_request/2"><code>send_request/2</code></a>, <a href="#wait_response/2"><code>wait_response/1,2</code></a>, and <a href="#check_response/2"><code>check_response/2</code></a>.</li>
+<li>In OTP 24.0 <a href="#receive_response/2"><code>receive_response/1,2</code></a> were added.</li>
+<li>In OTP 25.0 <a href="#c:format_status/1"><code>Module:format_status/1</code></a> was added to replace <a href="#c:format_status/2"><code>Module:format_status/2</code></a>, as well as functions for collections of asynchronous calls: <a href="#send_request/4"><code>send_request/4</code></a>, <a href="#wait_response/3"><code>wait_response/3</code></a>, <a href="#receive_response/3"><code>receive_response/3</code></a>, <a href="#check_response/3"><code>check_response/3</code></a>, <a href="#reqids_new/0"><code>reqids_new/0</code></a>, <a href="#reqids_size/1"><code>reqids_size/1</code></a>, <a href="#reqids_add/3"><code>reqids_add/3</code></a>, <a href="#reqids_to_list/1"><code>reqids_to_list/1</code></a>.</li>
+<li>In OTP 26.0 the possibility to return <code>{error, Reason}</code> from <a href="#c:init/1"><code>Module:init/1</code></a> was added.</li>
+<li>In OTP 27.0 <a href="#c:format_status/2"><code>Module:format_status/2</code></a> was deprecated.</li>
+</ul>
+</div>
+<h3 id="module-see-also">See Also</h3>
+<p><a href="gen_event.html"><code>gen_event</code></a>, <a href="gen_fsm.html"><code>gen_fsm</code></a>, <a href="gen_server.html"><code>gen_server</code></a>, <a href="proc_lib.html"><code>proc_lib</code></a>, <a href="supervisor.html"><code>supervisor</code></a>, <a href="sys.html"><code>sys</code></a>.</p>   <section id="summary" class="details-list"> <h2>Summary</h2> <h3>Types</h3>
+<dl class="summary-types summary">   <dt> <a href="#t:action/0">action()</a> </dt> <dd><p>Actions for a <em>state transition</em>, or when starting the server.</p></dd>   <dt> <a href="#t:callback_mode/0">callback_mode()</a> </dt> <dd><p>One function per state or one common event handler.</p></dd>   <dt> <a href="#t:callback_mode_result/0">callback_mode_result()</a> </dt> <dd><p>Return value from <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a>.</p></dd>   <dt> <a href="#t:data/0">data()</a> </dt> <dd><p>Generic state data for the server.</p></dd>   <dt> <a href="#t:enter_action/0">enter_action()</a> </dt> <dd><p>Actions for any callback: hibernate, time-outs or replies.</p></dd>   <dt> <a href="#t:enter_loop_opt/0">enter_loop_opt()</a> </dt> <dd><p>Server <a href="#start-options">start options</a> for the <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a>, <a href="#start/3"><code>start/3,4</code></a>, <a href="#start_link/3"><code>start_link/3,4</code></a>, and <a href="#start_monitor/3"><code>start_monitor/3,4</code></a>, functions.</p></dd>   <dt> <a href="#t:event_content/0">event_content()</a> </dt> <dd><p>Event payload from the event's origin, delivered to the <a href="#state-callback"><em>state callback</em></a>.</p></dd>   <dt> <a href="#t:event_handler_result/1">event_handler_result(StateType)</a> </dt>   <dt> <a href="#t:event_handler_result/2">event_handler_result(StateType, DataType)</a> </dt> <dd><p>Return value from a <a href="#state-callback"><em>state callback</em></a> after handling an event.</p></dd>   <dt> <a href="#t:event_timeout/0">event_timeout()</a> </dt> <dd><p>How long to wait for an event.</p></dd>   <dt> <a href="#t:event_type/0">event_type()</a> </dt> <dd><p>All event types: <a href="#t:external_event_type/0">external</a>, <a href="#t:timeout_event_type/0">time-out</a>, or <code>internal</code>.</p></dd>   <dt> <a href="#t:external_event_type/0">external_event_type()</a> </dt> <dd><p>Event from a <a href="#call/3">call</a>, <a href="#cast/2">cast</a>, or regular process message; "info".</p></dd>   <dt> <a href="#t:format_status/0">format_status()</a> </dt> <dd><p>A map that describes the server's status.</p></dd>   <dt> <a href="#t:from/0">from()</a> </dt> <dd><p>A <a href="#t:external_event_type/0"><code>call</code></a> event's reply destination.</p></dd>   <dt> <a href="#t:generic_timeout/0">generic_timeout()</a> </dt> <dd><p>How long to wait for a named time-out event.</p></dd>   <dt> <a href="#t:hibernate/0">hibernate()</a> </dt> <dd><p>Hibernate the server process.</p></dd>   <dt> <a href="#t:init_result/1">init_result(StateType)</a> </dt>   <dt> <a href="#t:init_result/2">init_result(StateType, DataType)</a> </dt> <dd><p>The return value from <a href="#c:init/1"><code>Module:init/1</code></a>.</p></dd>   <dt> <a href="#t:postpone/0">postpone()</a> </dt> <dd><p>Postpone an event to handle it later.</p></dd>   <dt> <a href="#t:reply_action/0">reply_action()</a> </dt> <dd><p>Reply to a <a href="#call/3"><code>call/2,3</code></a>.</p></dd>   <dt> <a href="#t:reply_tag/0">reply_tag()</a> </dt> <dd><p>A handle that associates a reply to the corresponding request.</p></dd>   <dt> <a href="#t:request_id/0">request_id()</a> </dt> <dd><p>An opaque request identifier. See <a href="#send_request/2"><code>send_request/2</code></a> for details.</p></dd>   <dt> <a href="#t:request_id_collection/0">request_id_collection()</a> </dt> <dd><p>An opaque collection of request identifiers (<a href="#t:request_id/0"><code>request_id/0</code></a>).</p></dd>   <dt> <a href="#t:response_timeout/0">response_timeout()</a> </dt> <dd><p>Response time-out for an asynchronous call.</p></dd>   <dt> <a href="#t:server_name/0">server_name()</a> </dt> <dd><p>Server name specification: <code>local</code>, <code>global</code>, or <code>via</code> registered.</p></dd>   <dt> <a href="#t:server_ref/0">server_ref()</a> </dt> <dd><p>Server specification: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a> or registered <a href="#t:server_name/0"><code>server_name/0</code></a>.</p></dd>   <dt> <a href="#t:start_mon_ret/0">start_mon_ret()</a> </dt> <dd><p>Return value from the <a href="#start_monitor/3"><code>start_monitor/3,4</code></a> functions.</p></dd>   <dt> <a href="#t:start_opt/0">start_opt()</a> </dt> <dd><p>Server <a href="#start-options">start options</a> for the <a href="#start/3"><code>start/3,4</code></a>, <a href="#start_link/3"><code>start_link/3,4</code></a>, and <a href="#start_monitor/3"><code>start_monitor/3,4</code></a> functions.</p></dd>   <dt> <a href="#t:start_ret/0">start_ret()</a> </dt> <dd><p><a href="#start-return-values">Return value</a> from the <a href="#start/3"><code>start/3,4</code></a> and <a href="#start_link/3"><code>start_link/3,4</code></a> functions.</p></dd>   <dt> <a href="#t:state/0">state()</a> </dt> <dd><p>State name or state term.</p></dd>   <dt> <a href="#t:state_callback_result/2">state_callback_result(ActionType, DataType)</a> </dt> <dd><p>Return value from any <a href="#state-callback"><em>state callback</em></a>.</p></dd>   <dt> <a href="#t:state_enter/0">state_enter()</a> </dt> <dd><p><a href="#t:callback_mode/0"><em>Callback mode</em></a> modifier for <em>state enter calls</em>: the atom <code>state_enter</code>.</p></dd>   <dt> <a href="#t:state_enter_result/1">state_enter_result(State)</a> </dt>   <dt> <a href="#t:state_enter_result/2">state_enter_result(State, DataType)</a> </dt> <dd><p>Return value from a <a href="#state-callback"><em>state callback</em></a> after a <em>state enter call</em>.</p></dd>   <dt> <a href="#t:state_name/0">state_name()</a> </dt> <dd><p>State name in <a href="#t:callback_mode/0"><em>callback mode</em></a> <code>state_functions</code>.</p></dd>   <dt> <a href="#t:state_timeout/0">state_timeout()</a> </dt> <dd><p>How long to wait in the current state.</p></dd>   <dt> <a href="#t:timeout_action/0">timeout_action()</a> </dt> <dd><p>Event time-out, generic time-outs or state time-out.</p></dd>   <dt> <a href="#t:timeout_cancel_action/0">timeout_cancel_action()</a> </dt> <dd><p>Clearer way to cancel a time-out than the original setting it to 'infinity'.</p></dd>   <dt> <a href="#t:timeout_event_type/0">timeout_event_type()</a> </dt> <dd><p><a href="#t:event_timeout/0">Event time-out</a>, <a href="#t:generic_timeout/0">generic time-out</a>, or <a href="#t:state_timeout/0">state time-out</a>.</p></dd>   <dt> <a href="#t:timeout_option/0">timeout_option()</a> </dt> <dd><p>Time-out timer start option, to select absolute time of expiry.</p></dd>   <dt> <a href="#t:timeout_update_action/0">timeout_update_action()</a> </dt> <dd><p>Update the <code>EventContent</code> without affecting the time of expiry.</p></dd>   <dt> <a href="#t:transition_option/0">transition_option()</a> </dt> <dd><p><em>State transition</em> options set by <a href="#t:action/0">actions</a>.</p></dd>  </dl> <h3>Callbacks</h3>
+<dl class="summary-callbacks summary">   <dt> <a href="#c:callback_mode/0">callback_mode()</a> </dt> <dd><p>Select the <em>callback mode</em> and possibly <a href="#t:state_enter/0"><em>state enter calls</em></a>.</p></dd>   <dt> <a href="#c:code_change/4">code_change(OldVsn, OldState, OldData, Extra)</a> </dt> <dd><p>Update the <a href="#t:state/0">state</a> and <a href="#t:data/0">data</a> after code change.</p></dd>   <dt> <a href="#c:format_status/1">format_status(Status)</a> </dt> <dd><p>Format/limit the status value.</p></dd>   <dt> <a href="#c:format_status/2">format_status/2</a> <span class="deprecated" title="the callback gen_statem:format_status(_,_) is deprecated; use format_status/1 instead">deprecated</span> </dt> <dd><p>Format/limit the status value.</p></dd>   <dt> <a href="#c:handle_event/4">handle_event/4</a> </dt> <dd><p><a href="#state-callback"><em>State callback</em></a> in <a href="#t:callback_mode/0"><em>callback mode</em></a> <code>handle_event_function</code>.</p></dd>   <dt> <a href="#c:init/1">init(Args)</a> </dt> <dd><p>Initialize the state machine.</p></dd>   <dt> <a href="#c:StateName/3">'StateName'/3</a> </dt> <dd><p><a href="#state-callback"><em>State callback</em></a> in <a href="#t:callback_mode/0"><em>callback mode</em></a> <code>state_functions</code>.</p></dd>   <dt> <a href="#c:terminate/3">terminate/3</a> </dt> <dd><p>Handle state machine termination.</p></dd>  </dl> <h3>Functions</h3>
+<dl class="summary-functions summary">   <dt> <a href="#call/2">call(ServerRef, Request)</a> </dt> <dd><p>Equivalent to <a href="#call/3"><code>call(ServerRef, Request, infinity)</code></a>.</p></dd>   <dt> <a href="#call/3">call(ServerRef, Request, Timeout)</a> </dt> <dd><p>Call a server: send request and wait for response.</p></dd>   <dt> <a href="#cast/2">cast(ServerRef, Msg)</a> </dt> <dd><p>Cast an event to a server.</p></dd>   <dt> <a href="#check_response/2">check_response(Msg, ReqId)</a> </dt> <dd><p>Check if a received message is a request response.</p></dd>   <dt> <a href="#check_response/3">check_response(Msg, ReqIdCollection, Delete)</a> </dt> <dd><p>Check if a received message is a request response in a collection.</p></dd>   <dt> <a href="#enter_loop/4">enter_loop(Module, Opts, State, Data)</a> </dt> <dd><p>Equivalent to <a href="#enter_loop/6"><code>enter_loop(Module, Opts, State, Data, self(), [])</code></a>.</p></dd>   <dt> <a href="#enter_loop/5">enter_loop(Module, Opts, State, Data, Server_or_Actions)</a> </dt> <dd><p>Make the calling process become a <code>gen_statem</code> server.</p></dd>   <dt> <a href="#enter_loop/6">enter_loop(Module, Opts, State, Data, Server, Actions)</a> </dt> <dd><p>Make the calling process become a <code>gen_statem</code> server.</p></dd>   <dt> <a href="#receive_response/1">receive_response(ReqId)</a> </dt> <dd><p>Equivalent to <a href="#receive_response/2"><code>receive_response(ReqId, infinity)</code></a>.</p></dd>   <dt> <a href="#receive_response/2">receive_response(ReqId, Timeout)</a> </dt> <dd><p>Receive a request response.</p></dd>   <dt> <a href="#receive_response/3">receive_response(ReqIdCollection, Timeout, Delete)</a> </dt> <dd><p>Receive a request response in a collection.</p></dd>   <dt> <a href="#reply/1">reply(Replies)</a> </dt> <dd><p>Send one or multiple <code>call</code> replies.</p></dd>   <dt> <a href="#reply/2">reply(From, Reply)</a> </dt> <dd><p>Send a <code>call</code> <code>Reply</code> to <code>From</code>.</p></dd>   <dt> <a href="#reqids_add/3">reqids_add(ReqId, Label, ReqIdCollection)</a> </dt> <dd><p>Store a request identifier in a colletion.</p></dd>   <dt> <a href="#reqids_new/0">reqids_new()</a> </dt> <dd><p>Create an empty request identifier collection.</p></dd>   <dt> <a href="#reqids_size/1">reqids_size(ReqIdCollection)</a> </dt> <dd><p>Return the number of request identifiers in <code>ReqIdCollection</code>.</p></dd>   <dt> <a href="#reqids_to_list/1">reqids_to_list(ReqIdCollection)</a> </dt> <dd><p>Convert a request identifier collection to a list.</p></dd>   <dt> <a href="#send_request/2">send_request(ServerRef, Request)</a> </dt> <dd><p>Send an asynchronous <code>call</code> request.</p></dd>   <dt> <a href="#send_request/4">send_request(ServerRef, Request, Label, ReqIdCollection)</a> </dt> <dd><p>Send an asynchronous <code>call</code> request and add it to a request identifier collection.</p></dd>   <dt> <a href="#start/3">start(Module, Args, Opts)</a> </dt> <dd><p>Start a server, neither linked nor registered.</p></dd>   <dt> <a href="#start/4">start(ServerName, Module, Args, Opts)</a> </dt> <dd><p>Start a server, registered but not linked.</p></dd>   <dt> <a href="#start_link/3">start_link(Module, Args, Opts)</a> </dt> <dd><p>Start a server, linked but not registered.</p></dd>   <dt> <a href="#start_link/4">start_link(ServerName, Module, Args, Opts)</a> </dt> <dd><p>Start a server, linked and registered.</p></dd>   <dt> <a href="#start_monitor/3">start_monitor(Module, Args, Opts)</a> </dt> <dd><p>Start a server, monitored but neither linked nor registered.</p></dd>   <dt> <a href="#start_monitor/4">start_monitor(ServerName, Module, Args, Opts)</a> </dt> <dd><p>Start a server, monitored and registered, but not linked.</p></dd>   <dt> <a href="#stop/1">stop(ServerRef)</a> </dt> <dd><p>Equivalent to <a href="#stop/3"><code>stop(ServerRef, normal, infinity)</code></a>.</p></dd>   <dt> <a href="#stop/3">stop(ServerRef, Reason, Timeout)</a> </dt> <dd><p>Stop a server.</p></dd>   <dt> <a href="#wait_response/1">wait_response(ReqId)</a> </dt> <dd><p>Equivalent to <a href="#wait_response/2"><code>wait_response(ReqId, infinity)</code></a>.</p></dd>   <dt> <a href="#wait_response/2">wait_response(ReqId, WaitTime)</a> </dt> <dd><p>Wait for a request response.</p></dd>   <dt> <a href="#wait_response/3">wait_response(ReqIdCollection, WaitTime, Delete)</a> </dt> <dd><p>Wait for any request response in a collection.</p></dd>  </dl> </section> <section id="types" class="details-list"> <h2>Types</h2> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:action/0">action() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1087" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> action() ::
+          postpone |
+          {postpone, Postpone :: <a href="#t:postpone/0">postpone</a>()} |
+          {next_event, EventType :: <a href="#t:event_type/0">event_type</a>(), EventContent :: <a href="#t:event_content/0">event_content</a>()} |
+          {change_callback_module, NewModule :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>()} |
+          {push_callback_module, NewModule :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>()} |
+          pop_callback_module |
+          <a href="#t:enter_action/0">enter_action</a>().</pre>  <p>Actions for a <em>state transition</em>, or when starting the server.</p>
+<p>These <em>transition actions</em> can be invoked by returning them from the <a href="#state-callback"><em>state callback</em></a> when it is called with an <a href="#t:event_type/0">event</a>, from <a href="#c:init/1"><code>Module:init/1</code></a> or by passing them to <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a>. They are <strong>not allowed</strong> from <em>state enter calls</em>.</p>
+<p>Actions are executed in the containing list order.</p>
+<p>Actions that set <a href="#t:transition_option/0">transition options</a> override any previous of the same type, so the last in the containing list wins. For example, the last <a href="#t:postpone/0"><code>postpone/0</code></a> overrides any previous <a href="#t:postpone/0"><code>postpone/0</code></a> in the list.</p>
+<ul>
+<li>
+<p><strong><code>{postpone, Value}</code></strong> - Sets the <a href="#t:transition_option/0"><code>transition_option()</code> </a><a href="#t:postpone/0"><code>postpone/0</code></a> for this <em>state transition</em>. This action is ignored when returned from <a href="#c:init/1"><code>Module:init/1</code></a> or passed to <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a>, as there is no event to postpone in those cases.</p>
+<p><code>postpone</code> is equivalent to <code>{postpone, true}</code>.</p>
+</li>
+<li>
+<p><strong><code>{next_event, EventType, EventContent}</code></strong> - This action does not set any <a href="#t:transition_option/0"><code>transition_option()</code></a> but instead stores the specified <code>EventType</code> and <code>EventContent</code> for insertion after all actions have been executed.</p>
+<p>The stored events are inserted in the queue as the next to process before any already queued events. The order of these stored events is preserved, so the first <code>next_event</code> in the containing list becomes the first to process.</p>
+<p>An event of type <a href="#t:event_type/0"><code>internal</code></a> should be used when you want to reliably distinguish an event inserted this way from any external event.</p>
+</li>
+<li>
+<p><strong id="change_callback_module"><code>{change_callback_module, NewModule}</code></strong> - Changes the callback module to <code>NewModule</code> which will be used when calling all subsequent <a href="#state-callback">state callbacks</a>.<br><strong>Since OTP 22.3.</strong></p>
+<p>The <code>gen_statem</code> engine will find out the <a href="#t:callback_mode/0"><em>callback mode</em></a> of <code>NewModule</code> by calling <a href="#c:callback_mode/0"><code>NewModule:callback_mode/0</code></a> before the next <a href="#state-callback">state callback</a>.</p>
+<p>Changing the callback module does not affect the <em>state transition</em> in any way, it only changes which module that handles the events. Be aware that all relevant callback functions in <code>NewModule</code> such as the <a href="#state-callback">state callback</a>, <a href="#c:code_change/4"><code>NewModule:code_change/4</code></a>, <a href="#c:format_status/1"><code>NewModule:format_status/1</code></a> and <a href="#c:terminate/3"><code>NewModule:terminate/3</code></a> must be able to handle the state and data from the old module.</p>
+</li>
+<li><p><strong id="push_callback_module"><code>{push_callback_module, NewModule}</code></strong> - Pushes the current callback module to the top of an internal stack of callback modules, and changes the callback module to <code>NewModule</code>. Otherwise like <code>{change_callback_module, NewModule}</code> above.<br><strong>Since OTP 22.3.</strong></p></li>
+<li><p><strong id="pop_callback_module"><code>pop_callback_module</code></strong> - Pops the top module from the internal stack of callback modules and changes the callback module to be the popped module. If the stack is empty the server fails. Otherwise like <code>{change_callback_module, NewModule}</code> above.<br><strong>Since OTP 22.3.</strong></p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:callback_mode/0">callback_mode() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L723" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> callback_mode() :: state_functions | handle_event_function.</pre>  <p>One function per state or one common event handler.</p>
+<p>The <em>callback mode</em> is selected with the return value from <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a>:</p>
+<ul>
+<li><p><strong><code>state_functions</code></strong> - The state must be of type <a href="#t:state_name/0"><code>state_name/0</code></a> and one callback function per state, that is, <a href="#c:StateName/3"><code>Module:StateName/3</code></a>, is used.</p></li>
+<li><p><strong><code>handle_event_function</code></strong> - The state can be any term and the callback function <a href="#c:handle_event/4"><code>Module:handle_event/4</code></a> is used for all states.</p></li>
+</ul>
+<p>The function <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a> is called when starting the <code>gen_statem</code>, after code change and after changing the callback module with any of the actions <a href="#change_callback_module"><code>change_callback_module</code></a>, <a href="#push_callback_module"><code>push_callback_module</code></a>, or <a href="#pop_callback_module"><code>pop_callback_module</code></a>. The result is cached for subsequent calls to <a href="#state-callback"><em>state callbacks</em></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:callback_mode_result/0">callback_mode_result() <span class="since">(since OTP 19.2)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L695" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> callback_mode_result() :: <a href="#t:callback_mode/0">callback_mode</a>() | [<a href="#t:callback_mode/0">callback_mode</a>() | <a href="#t:state_enter/0">state_enter</a>()].</pre>  <p>Return value from <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a>.</p>
+<p>This is the return type from <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a> which selects <a href="#t:callback_mode/0"><em>callback mode</em></a> and whether to do <a href="#t:state_enter/0"><em>state enter calls</em></a>, or not.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:data/0">data() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L621" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> data() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Generic state data for the server.</p>
+<p>A term in which the state machine implementation is to store any server data it needs. The difference between this and the <a href="#t:state/0"><code>state/0</code></a> itself is that a change in this data does not cause postponed events to be retried. Hence, if a change in this data would change the set of events that are handled, then that data item should be part of the <a href="#t:state/0"><code>state/0</code></a> instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:enter_action/0">enter_action() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1139" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> enter_action() ::
+          hibernate | {hibernate, Hibernate :: <a href="#t:hibernate/0">hibernate</a>()} | <a href="#t:timeout_action/0">timeout_action</a>() | <a href="#t:reply_action/0">reply_action</a>().</pre>  <p>Actions for any callback: hibernate, time-outs or replies.</p>
+<p>These <em>transition actions</em> are allowed when a <a href="#t:action/0"><code>action/0</code></a> is allowed, and also from a <em>state enter call</em>, and can be invoked by returning them from the <a href="#state-callback"><em>state callback</em></a>, from <a href="#c:init/1"><code>Module:init/1</code></a> or by passing them to <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a>.</p>
+<p>Actions are executed in the containing list order.</p>
+<p>Actions that set <a href="#t:transition_option/0">transition options</a> override any previous of the same type, so the last in the containing list wins. For example, the last <a href="#t:event_timeout/0"><code>event_timeout/0</code></a> overrides any previous <a href="#t:event_timeout/0"><code>event_timeout/0</code></a> in the list.</p>
+<ul><li>
+<p><strong><code>{hibernate, Value}</code></strong> - Sets the <a href="#t:transition_option/0"><code>transition_option/0</code></a> <a href="#t:hibernate/0"><code>hibernate/0</code></a> for this <em>state transition</em>.</p>
+<p><code>hibernate</code> is equivalent to <code>{hibernate, true}</code>.</p>
+</li></ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:enter_loop_opt/0">enter_loop_opt() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2186" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> enter_loop_opt() ::
+          {hibernate_after, HibernateAfterTimeout :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>()} | {debug, Dbgs :: [<a href="sys.html#t:debug_option/0">sys:debug_option</a>()]}.</pre>  <p>Server <a href="#start-options">start options</a> for the <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a>, <a href="#start/3"><code>start/3,4</code></a>, <a href="#start_link/3"><code>start_link/3,4</code></a>, and <a href="#start_monitor/3"><code>start_monitor/3,4</code></a>, functions.</p>
+<p>See <a href="#start-options"><code>start_link/4</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:event_content/0">event_content() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L682" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> event_content() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Event payload from the event's origin, delivered to the <a href="#state-callback"><em>state callback</em></a>.</p>
+<p>See <a href="#t:event_type/0"><code>event_type</code></a> that describes the origins of the different event types, which is also where the event's content comes from.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:event_handler_result/1">event_handler_result(StateType) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1328" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> event_handler_result(StateType) :: <a href="#t:event_handler_result/2">event_handler_result</a>(StateType, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()).</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:event_handler_result/2">event_handler_result(StateType, DataType) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1348" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> event_handler_result(StateType, DataType) ::
+          {next_state, NextState :: StateType, NewData :: DataType} |
+          {next_state, NextState :: StateType, NewData :: DataType, Actions :: [<a href="#t:action/0">action</a>()] | <a href="#t:action/0">action</a>()} |
+          <a href="#t:state_callback_result/2">state_callback_result</a>(<a href="#t:action/0">action</a>(), DataType).</pre>  <p>Return value from a <a href="#state-callback"><em>state callback</em></a> after handling an event.</p>
+<p><code>StateType</code> is <a href="#t:state_name/0"><code>state_name/0</code></a> if <a href="#t:callback_mode/0"><em>callback mode</em></a> is <code>state_functions</code>, or <a href="#t:state/0"><code>state/0</code></a> if <a href="#t:callback_mode/0"><em>callback mode</em></a> is <code>handle_event_function</code>.</p>
+<ul><li>
+<strong><code>{next_state, NextState, NewData [, Actions]}</code></strong> - The <code>gen_statem</code> does a <em>state transition</em> to <code>NextState</code> (which may be the same as the current state), sets <code>NewData</code> as the current server <a href="#t:data/0"><code>data/0</code></a>, and executes all <code>Actions</code>. If <code>NextState =/= CurrentState</code> the <em>state transition</em> is a <em>state change</em>.</li></ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:event_timeout/0">event_timeout() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L915" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> event_timeout() :: Time :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0">integer</a>().</pre>  <p>How long to wait for an event.</p>
+<p>Starts a timer set by <a href="#t:timeout_action/0"><code>timeout_action/0</code></a> <code>Time</code>, or <code>{timeout, Time, EventContent [, Options]}</code>.</p>
+<p>When the timer expires an event of <a href="#t:event_type/0"><code>event_type/0</code></a> <code>timeout</code> will be generated. See <a href="../../../../erts-17.1/doc/html/erlang.html#start_timer/4"><code>erlang:start_timer/4</code></a> for how <code>Time</code> and <a href="#t:timeout_option/0"><code>Options</code></a> are interpreted. Future <a href="../../../../erts-17.1/doc/html/erlang.html#start_timer/4"><code>erlang:start_timer/4</code></a> <code>Options</code> will not necessarily be supported.</p>
+<p>Any event that arrives cancels this time-out. Note that a retried or inserted event counts as arrived. So does a state time-out zero event, if it was generated before this time-out is requested.</p>
+<p>If <code>Time</code> is <code>infinity</code>, no timer is started, as it never would expire anyway.</p>
+<p>If <code>Time</code> is relative and <code>0</code> no timer is actually started, instead the the time-out event is enqueued to ensure that it gets processed before any not yet received external event, but after already queued events.</p>
+<p>Note that it is not possible nor needed to cancel this time-out, as it is cancelled automatically by any other event, meaning that whenever a callback is invoked that may want to cancel this time-out, the timer is already cancelled or expired.</p>
+<p>The timer <code>EventContent</code> can be updated with the <a href="#t:timeout_update_action/0"><code>{timeout, update, NewEventContent}</code></a> action without affecting the time of expiry.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:event_type/0">event_type() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L631" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> event_type() :: <a href="#t:external_event_type/0">external_event_type</a>() | <a href="#t:timeout_event_type/0">timeout_event_type</a>() | internal.</pre>  <p>All event types: <a href="#t:external_event_type/0">external</a>, <a href="#t:timeout_event_type/0">time-out</a>, or <code>internal</code>.</p>
+<p><code>internal</code> events can only be generated by the state machine itself through the <em>transition action</em> <a href="#t:action/0"><code>next_event</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:external_event_type/0">external_event_type() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L649" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> external_event_type() :: {call, From :: <a href="#t:from/0">from</a>()} | cast | info.</pre>  <p>Event from a <a href="#call/3">call</a>, <a href="#cast/2">cast</a>, or regular process message; "info".</p>
+<p>Type <code>{call, From}</code> originates from the API functions <a href="#call/3"><code>call/2,3</code></a> or <a href="#send_request/2"><code>send_request/2</code></a>. The event contains <a href="#t:from/0"><code>From</code></a>, which is whom to reply to by a <a href="#t:reply_action/0"><code>reply_action/0</code></a> or <a href="#reply/2"><code>reply/2,3</code></a> call.</p>
+<p>Type <code>cast</code> originates from the API function <a href="#cast/2"><code>cast/2</code></a>.</p>
+<p>Type <code>info</code> originates from regular process messages sent to the <code>gen_statem</code> process.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:format_status/0">format_status() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1895" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> format_status() ::
+          #{state =&gt; <a href="#t:state/0">state</a>(),
+            data =&gt; <a href="#t:data/0">data</a>(),
+            reason =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+            queue =&gt; [{<a href="#t:event_type/0">event_type</a>(), <a href="#t:event_content/0">event_content</a>()}],
+            postponed =&gt; [{<a href="#t:event_type/0">event_type</a>(), <a href="#t:event_content/0">event_content</a>()}],
+            timeouts =&gt; [{<a href="#t:timeout_event_type/0">timeout_event_type</a>(), <a href="#t:event_content/0">event_content</a>()}],
+            log =&gt; [<a href="sys.html#t:system_event/0">sys:system_event</a>()]}.</pre>  <p>A map that describes the server's status.</p>
+<p>The keys are:</p>
+<ul>
+<li>
+<strong><code>state</code></strong> - The current state.</li>
+<li>
+<strong><code>data</code></strong> - The state data.</li>
+<li>
+<strong><code>reason</code></strong> - The reason that caused the process to terminate.</li>
+<li>
+<strong><code>queue</code></strong> - The event queue.</li>
+<li>
+<strong><code>postponed</code></strong> - The queue of <a href="#t:postpone/0">postponed</a> events.</li>
+<li>
+<strong><code>timeouts</code></strong> - The active <a href="#t:timeout_action/0">time-outs</a>.</li>
+<li>
+<strong><code>log</code></strong> - The <a href="sys.html#log/2">sys log</a> of the server.</li>
+</ul>
+<p>New associations may be added to the status map without prior notice.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:from/0">from() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L558" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> from() :: {To :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Tag :: <a href="#t:reply_tag/0">reply_tag</a>()}.</pre>  <p>A <a href="#t:external_event_type/0"><code>call</code></a> event's reply destination.</p>
+<p>Destination to use when replying through, for example, the action <a href="#t:reply_action/0"><code>{reply, From, Reply}</code></a> to a process that has called the <code>gen_statem</code> server using <a href="#call/3"><code>call/2,3</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:generic_timeout/0">generic_timeout() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L950" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> generic_timeout() :: Time :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0">integer</a>().</pre>  <p>How long to wait for a named time-out event.</p>
+<p>Starts a timer set by <a href="#t:timeout_action/0"><code>timeout_action/0</code></a> <code>{{timeout, Name}, Time, EventContent [, Options]}</code>.</p>
+<p>When the timer expires an event of <a href="#t:event_type/0"><code>event_type/0</code></a> <code>{timeout, Name}</code> will be generated. See <a href="../../../../erts-17.1/doc/html/erlang.html#start_timer/4"><code>erlang:start_timer/4</code></a> for how <code>Time</code> and <a href="#t:timeout_option/0"><code>Options</code></a> are interpreted. Future <a href="../../../../erts-17.1/doc/html/erlang.html#start_timer/4"><code>erlang:start_timer/4</code></a> <code>Options</code> will not necessarily be supported.</p>
+<p>If <code>Time</code> is <code>infinity</code>, no timer is started, as it never would expire anyway.</p>
+<p>If <code>Time</code> is relative and <code>0</code> no timer is actually started, instead the time-out event is enqueued to ensure that it gets processed before any not yet received external event.</p>
+<p>Setting a timer with the same <code>Name</code> while it is running will restart it with the new time-out value. Therefore it is possible to cancel a specific time-out by setting it to <code>infinity</code>. It can also be cancelled more explicitly with the <a href="#t:timeout_cancel_action/0"><code>{{timeout, Name}, cancel}</code></a> action.</p>
+<p>The timer <code>EventContent</code> can be updated with the <a href="#t:timeout_update_action/0"><code>{{timeout, Name}, update, NewEventContent}</code></a> action without affecting the time of expiry.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:hibernate/0">hibernate() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L878" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> hibernate() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>().</pre>  <p>Hibernate the server process.</p>
+<p>If <code>true</code>, hibernates the <code>gen_statem</code> by calling <a href="proc_lib.html#hibernate/3"><code>proc_lib:hibernate/3</code></a> before going into <code>receive</code> to wait for a new external event.</p>
+<p>There is also a server start option <a href="#t:enter_loop_opt/0"><code>{hibernate_after, Timeout}</code></a> for automatic hibernation.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>If there are enqueued events to process when hibernation is requested, this is optimized by not hibernating but instead calling <a href="../../../../erts-17.1/doc/html/erlang.html#garbage_collect/0"><code>erlang:garbage_collect/0</code></a> to simulate, in a more efficient way, that the <code>gen_statem</code> entered hibernation and immediately got awakened by an enqueued event.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:init_result/1">init_result(StateType) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1264" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> init_result(StateType) :: <a href="#t:init_result/2">init_result</a>(StateType, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()).</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:init_result/2">init_result(StateType, DataType) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1287" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> init_result(StateType, DataType) ::
+          {ok, State :: StateType, Data :: DataType} |
+          {ok, State :: StateType, Data :: DataType, Actions :: [<a href="#t:action/0">action</a>()] | <a href="#t:action/0">action</a>()} |
+          ignore |
+          {stop, Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} |
+          {error, Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>The return value from <a href="#c:init/1"><code>Module:init/1</code></a>.</p>
+<p>For a succesful initialization, <code>State</code> is the initial <a href="#t:state/0"><code>state/0</code></a>, and <code>Data</code> the initial server <a href="#t:data/0"><code>data/0</code></a> of the <code>gen_statem</code>.</p>
+<p>The <a href="#t:action/0"><code>Actions</code></a> are executed when entering the first <a href="#t:state/0">state</a> just as for a <a href="#state-callback"><em>state callback</em></a>, except that the action <code>postpone</code> is forced to <code>false</code> since there is no event to postpone.</p>
+<p>For an unsuccesful initialization, <code>{stop, Reason}</code>, <code>{error, Reason}</code>, or <code>ignore</code> should be used; see <a href="#start_link/3"><code>start_link/3,4</code></a>.</p>
+<p><code>{error, Reason}</code> has been allowed <strong>since OTP 26.0</strong>.</p>
+<p>The <code>{ok, ...}</code> tuples have existed <strong>since OTP 19.1</strong>, before that they were not <code>ok</code> tagged. This was before <code>gen_statem</code> replaced <code>gen_fsm</code> in OTP 20.0.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:postpone/0">postpone() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L854" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> postpone() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>().</pre>  <p>Postpone an event to handle it later.</p>
+<p>If <code>true</code>, postpones the current event. After a <em>state change</em> (<code>NextState =/= State</code>), it is retried.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:reply_action/0">reply_action() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1260" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> reply_action() :: {reply, From :: <a href="#t:from/0">from</a>(), Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>Reply to a <a href="#call/3"><code>call/2,3</code></a>.</p>
+<p>This <em>transition action</em> can be invoked by returning it from the <a href="#state-callback"><em>state callback</em></a>, from <a href="#c:init/1"><code>Module:init/1</code></a> or by passing it to <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a>.</p>
+<p>It does not set any <a href="#t:transition_option/0"><code>transition_option()</code></a> but instead replies to a caller waiting for a reply in <a href="#call/3"><code>call/3</code></a>. <code>From</code> must be the term from argument <a href="#t:event_type/0"><code>{call, From}</code></a> in a call to a <a href="#state-callback"><em>state callback</em></a>.</p>
+<p>Note that using this action from <a href="#c:init/1"><code>Module:init/1</code></a> or <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a> would be weird on the border of witchcraft since there has been no earlier call to a <a href="#state-callback"><em>state callback</em></a> in this server.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:reply_tag/0">reply_tag() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L563" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-opaque</span> reply_tag()</pre>  <p>A handle that associates a reply to the corresponding request.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:request_id/0">request_id() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1432" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-opaque</span> request_id()</pre>  <p>An opaque request identifier. See <a href="#send_request/2"><code>send_request/2</code></a> for details.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:request_id_collection/0">request_id_collection() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1441" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-opaque</span> request_id_collection()</pre>  <p>An opaque collection of request identifiers (<a href="#t:request_id/0"><code>request_id/0</code></a>).</p>
+<p>Each request identifier can be associated with a label chosen by the user. For more information see <a href="#reqids_new/0"><code>reqids_new/0</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:response_timeout/0">response_timeout() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1470" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> response_timeout() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>() | {abs, <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0">integer</a>()}.</pre>  <p>Response time-out for an asynchronous call.</p>
+<p>Used to set a time limit on how long to wait for a response using either <a href="#receive_response/2"><code>receive_response/2</code></a>, <a href="#receive_response/3"><code>receive_response/3</code></a>, <a href="#wait_response/2"><code>wait_response/2</code></a>, or <a href="#wait_response/3"><code>wait_response/3</code></a>. The time unit used is <code>millisecond</code>.</p>
+<p> Currently valid values:</p>
+<ul>
+<li><p><strong><code>0..4294967295</code></strong> - Time-out relative to current time in milliseconds.</p></li>
+<li><p><strong><code>infinity</code></strong> - Infinite time-out. That is, the operation will never time out.</p></li>
+<li><p><strong><code>{abs, Timeout}</code></strong> - An absolute <a href="../../../../erts-17.1/doc/html/erlang.html#monotonic_time/1">Erlang monotonic time</a> time-out in milliseconds. That is, the operation will time out when <a href="../../../../erts-17.1/doc/html/erlang.html#monotonic_time/1"><code>erlang:monotonic_time(millisecond)</code></a> returns a value larger than or equal to <code>Timeout</code>. <code>Timeout</code> is not allowed to identify a time further into the future than <code>4294967295</code> milliseconds. Specifying the time-out using an absolute value is especially handy when you have a deadline for responses corresponding to a complete collection of requests (<a href="#t:request_id_collection/0"><code>request_id_collection/0</code></a>), since you do not have to recalculate the relative time until the deadline over and over again.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:server_name/0">server_name() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2129" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> server_name() ::
+          {local, <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>()} | {global, GlobalName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {via, RegMod :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>Server name specification: <code>local</code>, <code>global</code>, or <code>via</code> registered.</p>
+<p>Name specification to use when starting a <code>gen_statem</code> server. See <a href="#start_link/3"><code>start_link/3</code></a> and <a href="#t:server_ref/0"><code>server_ref/0</code></a> below.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:server_ref/0">server_ref() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2157" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> server_ref() ::
+          <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() |
+          (LocalName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>()) |
+          {Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Node :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>()} |
+          {global, GlobalName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} |
+          {via, RegMod :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), ViaName :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>Server specification: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a> or registered <a href="#t:server_name/0"><code>server_name/0</code></a>.</p>
+<p>To be used in <a href="#call/3"><code>call/2,3</code></a> to specify the server.</p>
+<p>It can be:</p>
+<ul>
+<li><p><strong><code>pid() | LocalName</code></strong> - The <code>gen_statem</code> is locally registered.</p></li>
+<li><p><strong><code>{Name, Node}</code></strong> - The <code>gen_statem</code> is locally registered on another node.</p></li>
+<li><p><strong><code>{global, GlobalName}</code></strong> - The <code>gen_statem</code> is globally registered in <a href="../../../kernel-11.0.4/doc/html/global.html"><code>global</code></a>.</p></li>
+<li><p><strong><code>{via, RegMod, ViaName}</code></strong> - The <code>gen_statem</code> is registered in an alternative process registry. The registry callback module <code>RegMod</code> is to export functions <code>register_name/2</code>, <code>unregister_name/1</code>, <code>whereis_name/1</code>, and <code>send/2</code>, which are to behave like the corresponding functions in <a href="../../../kernel-11.0.4/doc/html/global.html"><code>global</code></a>. Thus, <code>{via, global, GlobalName}</code> is the same as <code>{global, GlobalName}</code>.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:start_mon_ret/0">start_mon_ret() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2211" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> start_mon_ret() :: {ok, {<a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:reference/0">reference</a>()}} | ignore | {error, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>Return value from the <a href="#start_monitor/3"><code>start_monitor/3,4</code></a> functions.</p>
+<p>As for <a href="#start-return-values"><code>start_link/4</code></a> but a succesful return wraps the process ID and the <a href="../../../../erts-17.1/doc/html/erlang.html#monitor/2">monitor reference</a> in a <code>{ok, {</code><a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid()</code></a><code>,</code><a href="../../../../erts-17.1/doc/html/erlang.html#t:reference/0"><code>reference()</code></a><code>}}</code> tuple.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:start_opt/0">start_opt() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2172" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> start_opt() ::
+          {timeout, Time :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>()} | {spawn_opt, [<a href="proc_lib.html#t:start_spawn_option/0">proc_lib:start_spawn_option</a>()]} | <a href="#t:enter_loop_opt/0">enter_loop_opt</a>().</pre>  <p>Server <a href="#start-options">start options</a> for the <a href="#start/3"><code>start/3,4</code></a>, <a href="#start_link/3"><code>start_link/3,4</code></a>, and <a href="#start_monitor/3"><code>start_monitor/3,4</code></a> functions.</p>
+<p>See <a href="#start-options"><code>start_link/4</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:start_ret/0">start_ret() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2197" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> start_ret() :: {ok, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()} | ignore | {error, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p><a href="#start-return-values">Return value</a> from the <a href="#start/3"><code>start/3,4</code></a> and <a href="#start_link/3"><code>start_link/3,4</code></a> functions.</p>
+<p>See <a href="#start-return-values"><code>start_link/4</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:state/0">state() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L594" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> state() :: <a href="#t:state_name/0">state_name</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>State name or state term.</p>
+<p>If the <a href="#t:callback_mode/0"><em>callback mode</em></a> is <code>handle_event_function</code>, the state can be any term. After a <em>state change</em> (<code>NextState =/= State</code>), all postponed events are retried.</p>
+<p>Comparing two states for strict equality is assumed to be a fast operation, since for every <em>state transition</em> the <code>gen_statem</code> engine has to deduce if it is a <em>state change</em>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>The smaller the state term, in general, the faster the comparison.</p>
+<p>Note that if the "same" state term is returned for a state transition (or a return action without a <code>NextState</code> field is used), the comparison for equality is always fast because that can be seen from the term handle.</p>
+<p>But if a newly constructed state term is returned, both the old and the new state terms will have to be traversed until an inequality is found, or until both terms have been fully traversed.</p>
+<p>So it is possible to use large state terms that are fast to compare, but very easy to accidentally mess up. Using small state terms is the safe choice.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:state_callback_result/2">state_callback_result(ActionType, DataType) <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1396" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> state_callback_result(ActionType, DataType) ::
+          {keep_state, NewData :: DataType} |
+          {keep_state, NewData :: DataType, Actions :: [ActionType] | ActionType} |
+          keep_state_and_data |
+          {keep_state_and_data, Actions :: [ActionType] | ActionType} |
+          {repeat_state, NewData :: DataType} |
+          {repeat_state, NewData :: DataType, Actions :: [ActionType] | ActionType} |
+          repeat_state_and_data |
+          {repeat_state_and_data, Actions :: [ActionType] | ActionType} |
+          stop |
+          {stop, Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} |
+          {stop, Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), NewData :: DataType} |
+          {stop_and_reply, Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Replies :: [<a href="#t:reply_action/0">reply_action</a>()] | <a href="#t:reply_action/0">reply_action</a>()} |
+          {stop_and_reply,
+           Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+           Replies :: [<a href="#t:reply_action/0">reply_action</a>()] | <a href="#t:reply_action/0">reply_action</a>(),
+           NewData :: DataType}.</pre>  <p>Return value from any <a href="#state-callback"><em>state callback</em></a>.</p>
+<p><code>ActionType</code> is <a href="#t:enter_action/0"><code>enter_action/0</code></a> if the state callback was called with a <a href="#t:state_enter/0"><em>state enter call</em></a>, and <a href="#t:action/0"><code>action/0</code></a> if the state callback was called with an event.</p>
+<ul>
+<li><p><strong><code>{keep_state, NewData [, Actions]}</code></strong> - The same as <code>{next_state, CurrentState, NewData [, Actions]}</code>.</p></li>
+<li><p><strong><code>keep_state_and_data | {keep_state_and_data, Actions}</code></strong> - The same as <code>{keep_state, CurrentData [, Actions]}</code>.</p></li>
+<li><p><strong><code>{repeat_state, NewData [, Actions]}</code></strong> - If the <code>gen_statem</code> runs with <a href="#t:state_enter/0"><em>state enter calls</em></a>, the <em>state enter call</em> is repeated, see type <a href="#t:transition_option/0"><code>transition_option/0</code></a>. Other than that <code>{repeat_state, NewData [, Actions]}</code> is the same as <code>{keep_state, NewData [, Actions]}</code>.</p></li>
+<li><p><strong><code>repeat_state_and_data | {repeat_state_and_data, Actions}</code></strong> - The same as <code>{repeat_state, CurrentData [, Actions]}</code>.</p></li>
+<li><p><strong><code>{stop, Reason [, NewData]}</code></strong> - Terminates the <code>gen_statem</code> by calling <a href="#c:terminate/3"><code>Module:terminate/3</code></a> with <code>Reason</code> and <code>NewData</code>, if specified. An exit signal with this reason is sent to linked processes and ports.</p></li>
+<li><p><strong><code>stop</code></strong> - The same as <code>{stop, normal}</code>.</p></li>
+<li><p><strong><code>{stop_and_reply, Reason, Replies [, NewData]}</code></strong> - Sends all <code>Replies</code>, then terminates the <code>gen_statem</code> like with <code>{stop, Reason [, NewData]}</code>.</p></li>
+</ul>
+<p>All these terms are tuples or atoms and will be so in all future versions of <code>gen_statem</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:state_enter/0">state_enter() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L767" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> state_enter() :: state_enter.</pre>  <p><a href="#t:callback_mode/0"><em>Callback mode</em></a> modifier for <em>state enter calls</em>: the atom <code>state_enter</code>.</p>
+<p>Both <em>callback modes</em> can use <em>state enter calls</em>, and this is selected by adding this <code>state_enter</code> flag to the <a href="#t:callback_mode/0"><em>callback mode</em></a> return value from <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a>.</p>
+<p>If <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a> returns a list containing <code>state_enter</code>, the <code>gen_statem</code> engine will, at every <em>state change</em>, that is; <code>NextState =/= CurrentState</code>, call the <a href="#state-callback"><em>state callback</em></a> with arguments <code>(enter, OldState, Data)</code> or <code>(enter, OldState, State, Data)</code>, depending on the <a href="#t:callback_mode/0"><em>callback mode</em></a>.</p>
+<p>This may look like an event but is really a call performed after the previous <a href="#state-callback"><em>state callback</em></a> returned, and before any event is delivered to the new <a href="#state-callback"><em>state callback</em></a>. See <a href="#c:StateName/3"><code>Module:StateName/3</code></a> and <a href="#c:handle_event/4"><code>Module:handle_event/4</code></a>. A <em>state enter call</em> may be repeated without doing a <em>state change</em> by returning a <a href="#t:state_callback_result/2"><code>repeat_state</code></a> or <a href="#t:state_callback_result/2"><code>repeat_state_and_data</code></a> action from the <em>state callback</em>.</p>
+<p>If <a href="#c:callback_mode/0"><code>Module:callback_mode/0</code></a> does not return a list containing <code>state_enter</code>, no <em>state enter calls</em> are done.</p>
+<p>If <a href="#c:code_change/4"><code>Module:code_change/4</code></a> should transform the state, it is regarded as a state rename and not a <em>state change</em>, which will not cause a <em>state enter call</em>.</p>
+<p>Note that a <em>state enter call</em> <strong>will</strong> be done right before entering the initial state, which may be seen as a state change from no state to the initial state. In this case <code>OldState =:= State</code>, which cannot happen for a subsequent state change, but will happen when repeating the <em>state enter call</em>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:state_enter_result/1">state_enter_result(State) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1303" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> state_enter_result(State) :: <a href="#t:state_enter_result/2">state_enter_result</a>(State, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()).</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:state_enter_result/2">state_enter_result(State, DataType) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1318" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> state_enter_result(State, DataType) ::
+          {next_state, State, NewData :: DataType} |
+          {next_state, State, NewData :: DataType, Actions :: [<a href="#t:enter_action/0">enter_action</a>()] | <a href="#t:enter_action/0">enter_action</a>()} |
+          <a href="#t:state_callback_result/2">state_callback_result</a>(<a href="#t:enter_action/0">enter_action</a>(), DataType).</pre>  <p>Return value from a <a href="#state-callback"><em>state callback</em></a> after a <em>state enter call</em>.</p>
+<p><code>State</code> is the current state and it cannot be changed since the state callback was called with a <a href="#t:state_enter/0"><em>state enter call</em></a>.</p>
+<ul><li>
+<strong><code>{next_state, State, NewData [, Actions]}</code></strong> - The <code>gen_statem</code> does a state transition to <code>State</code>, which has to be equal to the current state, sets <code>NewData</code>, and executes all <code>Actions</code>.</li></ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:state_name/0">state_name() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L608" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> state_name() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>().</pre>  <p>State name in <a href="#t:callback_mode/0"><em>callback mode</em></a> <code>state_functions</code>.</p>
+<p>If the <a href="#t:callback_mode/0"><em>callback mode</em></a> is <code>state_functions</code>, the state must be an atom. After a <em>state change</em> (<code>NextState =/= State</code>), all postponed events are retried. Note that the state <code>terminate</code> is not possible to use since it would collide with the optional callback function <a href="#c:terminate/3"><code>Module:terminate/3</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:state_timeout/0">state_timeout() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1000" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> state_timeout() :: Time :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:integer/0">integer</a>().</pre>  <p>How long to wait in the current state.</p>
+<p>Starts a timer set by <a href="#t:timeout_action/0"><code>timeout_action/0</code></a>, or <code>{state_timeout, Time, EventContent [, Options]}</code>.</p>
+<p>When the timer expires an event of <a href="#t:event_type/0"><code>event_type/0</code></a> <code>state_timeout</code> will be generated. See <a href="../../../../erts-17.1/doc/html/erlang.html#start_timer/4"><code>erlang:start_timer/4</code></a> for how <code>Time</code> and <a href="#t:timeout_option/0"><code>Options</code></a> are interpreted. Future <a href="../../../../erts-17.1/doc/html/erlang.html#start_timer/4"><code>erlang:start_timer/4</code></a> <code>Options</code> will not necessarily be supported.</p>
+<p>A <em>state change</em> cancels this timer, if it is running. That is, if the <a href="#t:timeout_action/0"><code>timeout_action/0</code></a> that starts this timer is part of a list of <a href="#t:action/0"><code>action/0</code></a>s for a <em>state change</em>, <code>NextState =/= CurrentState</code>, the timer runs in the <strong><code>NextState</code></strong>.</p>
+<p>If the state machine stays in that new state, now the current state, the timer will run until it expires, which creates the time-out event. If the state machine changes states from the now current state, the timer is cancelled. During the <em>state change</em> from the now current state, a new <em>state time-out</em> may be started for the next <strong><code>NextState</code></strong>.</p>
+<p>If the <a href="#t:timeout_action/0"><code>timeout_action/0</code></a> that starts this timer is part of a list of <a href="#t:action/0"><code>action/0</code></a>s for a <em>state transition</em> that is not a <em>state change</em>, the timer runs in the current state.</p>
+<p>If <code>Time</code> is <code>infinity</code>, no timer is started, as it never would expire anyway.</p>
+<p>If <code>Time</code> is relative and <code>0</code> no timer is actually started, instead the the time-out event is enqueued to ensure that it gets processed before any not yet received external event.</p>
+<p>Setting this timer while it is running will restart it with the new time-out value. Therefore it is possible to cancel this time-out by setting it to <code>infinity</code>. It can also be cancelled more explicitly with <a href="#t:timeout_cancel_action/0"><code>{state_timeout, cancel}</code></a>.</p>
+<p>The timer <code>EventContent</code> can be updated with the <a href="#t:timeout_update_action/0"><code>{state_timeout, update, NewEventContent}</code></a> action without affecting the time of expiry.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:timeout_action/0">timeout_action() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1179" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> timeout_action() ::
+          (Time :: <a href="#t:event_timeout/0">event_timeout</a>()) |
+          {timeout, Time :: <a href="#t:event_timeout/0">event_timeout</a>(), EventContent :: <a href="#t:event_content/0">event_content</a>()} |
+          {timeout,
+           Time :: <a href="#t:event_timeout/0">event_timeout</a>(),
+           EventContent :: <a href="#t:event_content/0">event_content</a>(),
+           Options :: <a href="#t:timeout_option/0">timeout_option</a>() | [<a href="#t:timeout_option/0">timeout_option</a>()]} |
+          {{timeout, Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}, Time :: <a href="#t:generic_timeout/0">generic_timeout</a>(), EventContent :: <a href="#t:event_content/0">event_content</a>()} |
+          {{timeout, Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()},
+           Time :: <a href="#t:generic_timeout/0">generic_timeout</a>(),
+           EventContent :: <a href="#t:event_content/0">event_content</a>(),
+           Options :: <a href="#t:timeout_option/0">timeout_option</a>() | [<a href="#t:timeout_option/0">timeout_option</a>()]} |
+          {state_timeout, Time :: <a href="#t:state_timeout/0">state_timeout</a>(), EventContent :: <a href="#t:event_content/0">event_content</a>()} |
+          {state_timeout,
+           Time :: <a href="#t:state_timeout/0">state_timeout</a>(),
+           EventContent :: <a href="#t:event_content/0">event_content</a>(),
+           Options :: <a href="#t:timeout_option/0">timeout_option</a>() | [<a href="#t:timeout_option/0">timeout_option</a>()]} |
+          <a href="#t:timeout_cancel_action/0">timeout_cancel_action</a>() |
+          <a href="#t:timeout_update_action/0">timeout_update_action</a>().</pre>  <p>Event time-out, generic time-outs or state time-out.</p>
+<p>These <em>transition actions</em> can be invoked by returning them from the <a href="#state-callback"><em>state callback</em></a>, from <a href="#c:init/1"><code>Module:init/1</code></a> or by passing them to <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a>.</p>
+<p>These time-out actions sets time-out <a href="#t:transition_option/0">transition options</a>.</p>
+<ul>
+<li><p><strong><code>Time</code></strong> - Short for <code>{timeout, Time, Time}</code>, that is, the time-out message is the time-out time. This form exists to allow the <a href="#state-callback"><em>state callback</em></a> return value <code>{next_state, NextState, NewData, Time}</code> like in <code>gen_fsm</code>.</p></li>
+<li><p><strong><code>{timeout, Time, EventContent [, Options]}</code></strong> - Sets the <a href="#t:transition_option/0"><code>transition_option/0</code></a> <a href="#t:event_timeout/0"><code>event_timeout/0</code></a> to <code>Time</code> with <code>EventContent</code>, and time-out options <a href="#t:timeout_option/0"><code>Options</code></a>.</p></li>
+<li><p><strong><code>{{timeout,Name}, Time, EventContent [, Options]}</code></strong> - Sets the <a href="#t:transition_option/0"><code>transition_option/0</code></a> <a href="#t:generic_timeout/0"><code>generic_timeout/0</code></a> to <code>Time</code> for time-out <code>Name</code> with <code>EventContent</code>, and time-out options <a href="#t:timeout_option/0"><code>Options</code></a>.<br><strong>Since OTP 20.0</strong>.</p></li>
+<li><p><strong><code>{state_timeout, Time, EventContent [, Options]}</code></strong> - Sets the <a href="#t:transition_option/0"><code>transition_option/0</code></a> <a href="#t:state_timeout/0"><code>state_timeout/0</code></a> to <code>Time</code> with <code>EventContent</code>, and time-out options <a href="#t:timeout_option/0"><code>Options</code></a>.<br><strong>Since OTP 19.3</strong>.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:timeout_cancel_action/0">timeout_cancel_action() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1216" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> timeout_cancel_action() ::
+          {timeout, cancel} | {{timeout, Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}, cancel} | {state_timeout, cancel}.</pre>  <p>Clearer way to cancel a time-out than the original setting it to 'infinity'.</p>
+<p>It has always been possible to cancel a time-out using <a href="#t:timeout_action/0"><code>timeout_action/0</code></a> with <code>Time = infinity</code>, since setting a new time-out time overrides a running timer, and since setting the time to <code>infinity</code> is optimized to not setting a timer (that never will expire). Using this action shows the intention more clearly.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:timeout_event_type/0">timeout_event_type() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L670" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> timeout_event_type() :: timeout | {timeout, Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | state_timeout.</pre>  <p><a href="#t:event_timeout/0">Event time-out</a>, <a href="#t:generic_timeout/0">generic time-out</a>, or <a href="#t:state_timeout/0">state time-out</a>.</p>
+<p>The time-out event types that the state machine can generate for itself with the corresponding <a href="#t:timeout_action/0"><code>timeout_action/0</code></a>s:</p>
+<table>
+<thead><tr>
+<th style="text-align: left;">Time-out type</th>
+<th style="text-align: left;">Action</th>
+<th style="text-align: left;">Event type</th>
+</tr></thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Event time-out</td>
+<td style="text-align: left;"><code>{timeout, Time, ...}</code></td>
+<td style="text-align: left;"><code>timeout</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Generic time-out</td>
+<td style="text-align: left;"><code>{{timeout, Name}, Time, ...}</code></td>
+<td style="text-align: left;"><code>{timeout, Name}</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">State time-out</td>
+<td style="text-align: left;"><code>{state_timeout, Time, ...}</code></td>
+<td style="text-align: left;"><code>state_timeout</code></td>
+</tr>
+</tbody>
+</table>
+<p>In short; the action to set a time-out with <a href="#t:timeout_event_type/0"><code>EventType</code></a> is <code>{EventType, Time, ...}</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:timeout_option/0">timeout_option() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1013" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> timeout_option() :: {abs, Abs :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>()}.</pre>  <p>Time-out timer start option, to select absolute time of expiry.</p>
+<p>If <code>Abs</code> is <code>true</code> an absolute timer is started, and if it is <code>false</code> a relative, which is the default. See <a href="../../../../erts-17.1/doc/html/erlang.html#start_timer/4"><code>erlang:start_timer/4</code></a> for details.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:timeout_update_action/0">timeout_update_action() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1235" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> timeout_update_action() ::
+          {timeout, update, EventContent :: <a href="#t:event_content/0">event_content</a>()} |
+          {{timeout, Name :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}, update, EventContent :: <a href="#t:event_content/0">event_content</a>()} |
+          {state_timeout, update, EventContent :: <a href="#t:event_content/0">event_content</a>()}.</pre>  <p>Update the <code>EventContent</code> without affecting the time of expiry.</p>
+<p>Sets a new <code>EventContent</code> for a running time-out timer. See <a href="#t:timeout_action/0">timeout_action()</a> for how to start a time-out.</p>
+<p>If no time-out of this type is active, instead inserts the time-out event just like when starting a time-out with relative <code>Time = 0</code>. This is a time-out autostart with immediate expiry, so there will be noise for example if a generic time-out name was misspelled.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:transition_option/0">transition_option() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L843" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> transition_option() ::
+          <a href="#t:postpone/0">postpone</a>() | <a href="#t:hibernate/0">hibernate</a>() | <a href="#t:event_timeout/0">event_timeout</a>() | <a href="#t:generic_timeout/0">generic_timeout</a>() | <a href="#t:state_timeout/0">state_timeout</a>().</pre>  <p><em>State transition</em> options set by <a href="#t:action/0">actions</a>.</p>
+<p>These determine what happens during the <em>state transition</em>. The <em>state transition</em> takes place when the <a href="#state-callback"><em>state callback</em></a> has processed an event and returns. Here are the sequence of steps for a <em>state transition</em>:</p>
+<ol>
+<li><p>All returned <a href="#t:action/0">actions</a> are processed in order of appearance. In this step all replies generated by any <a href="#t:reply_action/0"><code>reply_action/0</code></a> are sent. Other actions set <a href="#t:transition_option/0"><code>transition_option/0</code></a>s that come into play in subsequent steps.</p></li>
+<li>
+<p>If <a href="#t:state_enter/0"><em>state enter calls</em></a> are used, it is either the initial state or one of the callback results <a href="#t:state_callback_result/2"><code>repeat_state</code></a> or <a href="#t:state_callback_result/2"><code>repeat_state_and_data</code></a> is used the <code>gen_statem</code> engine calls the current <em>state callback</em> with arguments <a href="#t:state_enter/0"><code>(enter, State, Data)</code></a> or <a href="#t:state_enter/0"><code>(enter, State, State, Data)</code></a> (depending on <a href="#t:callback_mode/0"><em>callback mode</em></a>) and when it returns starts again from the top of this sequence.</p>
+<p>If <a href="#t:state_enter/0"><em>state enter calls</em></a> are used, and the state changes, the <code>gen_statem</code> engine calls the new <em>state callback</em> with arguments <a href="#t:state_enter/0"><code>(enter, OldState, Data)</code></a> or <a href="#t:state_enter/0"><code>(enter, OldState, State, Data)</code></a> (depending on <a href="#t:callback_mode/0"><em>callback mode</em></a>) and when it returns starts again from the top of this sequence.</p>
+</li>
+<li><p>If <a href="#t:postpone/0"><code>postpone/0</code></a> is <code>true</code>, the current event is postponed.</p></li>
+<li><p>If this is a <em>state change</em>, the queue of incoming events is reset to start with the oldest postponed.</p></li>
+<li><p>All events stored with <a href="#t:action/0"><code>action/0</code></a> <code>next_event</code> are inserted to be processed before previously queued events.</p></li>
+<li>
+<p>Time-out timers <a href="#t:event_timeout/0"><code>event_timeout/0</code></a>, <a href="#t:generic_timeout/0"><code>generic_timeout/0</code></a> and <a href="#t:state_timeout/0"><code>state_timeout/0</code></a> are handled. Time-outs with zero time are guaranteed to be delivered to the state machine before any external not yet received event so if there is such a time-out requested, the corresponding time-out zero event is enqueued as the newest received event; that is after already queued events such as inserted and postponed events.</p>
+<p>Any event cancels an <a href="#t:event_timeout/0"><code>event_timeout/0</code></a> so a zero time event time-out is only generated if the event queue is empty.</p>
+<p>A <em>state change</em> cancels a <a href="#t:state_timeout/0"><code>state_timeout/0</code></a> and any new transition option of this type belongs to the new state, that is; a <a href="#t:state_timeout/0"><code>state_timeout/0</code></a> applies to the state the state machine enters.</p>
+</li>
+<li><p>If there are enqueued events the <a href="#state-callback"><em>state callback</em></a> for the possibly new state is called with the oldest enqueued event, and we start again from the top of this sequence.</p></li>
+<li><p>Otherwise the <code>gen_statem</code> goes into <code>receive</code> or hibernation (if <a href="#t:hibernate/0"><code>hibernate/0</code></a> is <code>true</code>) to wait for the next message. In hibernation the next non-system event awakens the <code>gen_statem</code>, or rather the next incoming message awakens the <code>gen_statem</code>, but if it is a system event it goes right back into hibernation. When a new message arrives the <a href="#state-callback"><em>state callback</em></a> is called with the corresponding event, and we start again from the top of this sequence.</p></li>
+</ol>
+<div class="note">
+<p class="label">Note</p>
+<p>The behaviour of a time-out zero (a time-out with time <code>0</code>) differs subtly from Erlang's <code>receive ... after 0 ... end</code>.</p>
+<p>The latter receives one message if there is one, while using the <a href="#t:timeout_action/0"><code>timeout_action/0</code></a> <code>{timeout, 0}</code> does not receive any external event.</p>
+<p><a href="gen_server.html"><code>gen_server</code></a>'s time-out works like Erlang's <code>receive ... after 0 ... end</code>, in contrast to <code>gen_statem</code>.</p>
+</div> </section> </section> </div> </section> <section id="callbacks" class="details-list"> <h2>Callbacks</h2> <div class="callbacks-list"> <section class="detail"> <h3 class="detail-header" id="c:callback_mode/0">callback_mode() <span class="since">(since OTP 19.1)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1542" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> callback_mode() -&gt; <a href="#t:callback_mode_result/0">callback_mode_result</a>().</pre>  <p>Select the <em>callback mode</em> and possibly <a href="#t:state_enter/0"><em>state enter calls</em></a>.</p>
+<p>This function is called by a <code>gen_statem</code> when it needs to find out the <a href="#t:callback_mode/0"><em>callback mode</em></a> of the callback module.</p>
+<p>The value is cached by <code>gen_statem</code> for efficiency reasons, so this function is only called once after server start, after code change, and after changing the callback module, but before the first <a href="#state-callback"><em>state callback</em></a> in the current callback module's code is called. More occasions may be added in future versions of <code>gen_statem</code>.</p>
+<p>Server start happens either when <a href="#c:init/1"><code>Module:init/1</code></a> returns or when <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a> is called. Code change happens when <a href="#c:code_change/4"><code>Module:code_change/4</code></a> returns. A change of the callback module happens when a <a href="#state-callback"><em>state callback</em></a> returns any of the actions <a href="#push_callback_module"><code>change_callback_module</code></a>, <a href="#push_callback_module"><code>push_callback_module</code></a> or <a href="#pop_callback_module"><code>pop_callback_module</code></a>.</p>
+<p>The <code>CallbackMode</code> is either just <a href="#t:callback_mode/0"><code>callback_mode/0</code></a> or a list containing <a href="#t:callback_mode/0"><code>callback_mode/0</code></a> and possibly the atom <a href="#t:state_enter/0"><code>state_enter</code></a>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>If this function's body does not return an inline constant value the callback module is doing something strange.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:code_change/4">code_change(OldVsn, OldState, OldData, Extra) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1800" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> code_change(OldVsn :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>() | {down, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()},
+                      OldState :: <a href="#t:state/0">state</a>(),
+                      OldData :: <a href="#t:data/0">data</a>(),
+                      Extra :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt;
+                         {ok, NewState :: <a href="#t:state/0">state</a>(), NewData :: <a href="#t:data/0">data</a>()} | (Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()).</pre>  <p>Update the <a href="#t:state/0">state</a> and <a href="#t:data/0">data</a> after code change.</p>
+<p>This function is called by a <code>gen_statem</code> when it is to update its internal state during a release upgrade/downgrade, that is, when the instruction <code>{update, Module, Change, ...}</code>, where <code>Change = {advanced, Extra}</code>, is specified in the <a href="../../../sasl-4.4/doc/html/appup.html"><code>appup</code></a> file. For more information, see <a href="../../../../doc/system/release_handling.html#instr">Release Handling Instructions in OTP Design Principles</a>.</p>
+<p>For an upgrade, <code>OldVsn</code> is <code>Vsn</code>, and for a downgrade, <code>OldVsn</code> is <code>{down, Vsn}</code>. <code>Vsn</code> is defined by the <code>vsn</code> attribute(s) of the old version of the callback module <code>Module</code>. If no such attribute is defined, the version is the checksum of the Beam file.</p>
+<p><code>OldState</code> and <code>OldData</code> is the internal state of the <code>gen_statem</code>.</p>
+<p><code>Extra</code> is passed "as is" from the <code>{advanced, Extra}</code> part of the update instruction.</p>
+<p>If successful, the function must return the updated internal state in an <code>{ok, NewState, NewData}</code> tuple.</p>
+<p>If the function returns a failure <code>Reason</code>, the ongoing upgrade fails and rolls back to the old release. Note that <code>Reason</code> cannot be an <code>{ok, _, _}</code> tuple since that will be regarded as a <code>{ok, NewState, NewData}</code> tuple, and that a tuple matching <code>{ok, _}</code> is an also invalid failure <code>Reason</code>. It is recommended to use an atom as <code>Reason</code> since it will be wrapped in an <code>{error, Reason}</code> tuple.</p>
+<p>Also note when upgrading a <code>gen_statem</code>, this function and hence the <code>Change = {advanced, Extra}</code> parameter in the <a href="../../../sasl-4.4/doc/html/appup.html"><code>appup</code></a> file is not only needed to update the internal state or to act on the <code>Extra</code> argument. It is also needed if an upgrade or downgrade should change <a href="#t:callback_mode/0"><em>callback mode</em></a>, or else the <em>callback mode</em> after the code change will not be honoured, most probably causing a server crash.</p>
+<p>If the server changes callback module using any of the actions <a href="#change_callback_module"><code>change_callback_module</code></a>, <a href="#push_callback_module"><code>push_callback_module</code></a>, or <a href="#pop_callback_module"><code>pop_callback_module</code></a>, be aware that it is always the current callback module that will get this callback call. That the current callback module handles the current state and data update should be no surprise, but it must be able to handle even parts of the state and data that it is not familiar with, somehow.</p>
+<p>In the supervisor <a href="../../../../doc/system/sup_princ.html#child-specification">child specification</a> there is a list of modules which is recommended to contain only the callback module. For a <code>gen_statem</code> with multiple callback modules there is no real need to list all of them, it may not even be possible since the list could change after code upgrade. If this list would contain only the start callback module, as recommended, what is important is to upgrade <em>that</em> module whenever a <em>synchronized code replacement</em> is done. Then the release handler concludes that an upgrade that upgrades <em>that</em> module needs to suspend, code change, and resume any server whose child specification declares that it is using <em>that</em> module. And again; the <em>current</em> callback module will get the <a href="#c:code_change/4"><code>Module:code_change/4</code></a> call.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>If a release upgrade/downgrade with <code>Change = {advanced, Extra}</code> specified in the <code>.appup</code> file is made when <a href="#c:code_change/4"><code>Module:code_change/4</code></a> is not implemented the process will crash with exit reason <code>undef</code>.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:format_status/1">format_status(Status) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1960" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> format_status(Status) -&gt; NewStatus when Status :: <a href="#t:format_status/0">format_status</a>(), NewStatus :: <a href="#t:format_status/0">format_status</a>().</pre>  <p>Format/limit the status value.</p>
+<p>This function is called by a <code>gen_statem</code> process in order to format/limit the server status for debugging and logging purposes.</p>
+<p>It is called in the following situations:</p>
+<ul>
+<li>
+<a href="sys.html#get_status/1"><code>sys:get_status/1,2</code></a> is invoked to get the <code>gen_statem</code> status.</li>
+<li>The <code>gen_statem</code> process terminates abnormally and logs an error.</li>
+</ul>
+<p>This function is useful for changing the form and appearance of the <code>gen_statem</code> status for these cases. A callback module wishing to change the <a href="sys.html#get_status/1"><code>sys:get_status/1,2</code></a> return value and how its status appears in termination error logs, exports an instance of <a href="#c:format_status/1"><code>Module:format_status/1</code></a>, which will get a map <code>Status</code> that describes the current state of the <code>gen_statem</code>, and shall return a map <code>NewStatus</code> containing the same keys as the input map, but it may transform some values.</p>
+<p>One use case for this function is to return compact alternative state representations to avoid having large state terms printed in log files. Another is to hide sensitive data from being written to the error log.</p>
+<p>Example:</p>
+<pre data-language="erlang">format_status(Status) -&gt;
+  maps:map(
+    fun(state,State) -&gt;
+            maps:remove(private_key, State);
+       (message,{password, _Pass}) -&gt;
+            {password, removed};
+       (_,Value) -&gt;
+            Value
+    end, Status).</pre>
+<div class="note">
+<p class="label">Note</p>
+<p>This callback is optional, so a callback module does not need to export it. The <code>gen_statem</code> module provides a default implementation of this function that returns <code>{State, Data}</code>.</p>
+<p>If this callback is exported but fails, to hide possibly sensitive data, the default function will instead return <code>{State, Info}</code>, where <code>Info</code> says nothing but the fact that <a href="#c:format_status/2"><code>Module:format_status/2</code></a> has crashed.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:format_status/2">format_status/2 <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1872" class="source">Source</a>
+</h3> <div class="deprecated"> This callback is deprecated. the callback gen_statem:format_status(_,_) is deprecated; use format_status/1 instead. </div> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> format_status(StatusOption, [[{Key :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Value :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}] | <a href="#t:state/0">state</a>() | <a href="#t:data/0">data</a>()]) -&gt;
+                           Status :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()
+                           when StatusOption :: normal | terminate.</pre>  <p>Format/limit the status value.</p>
+<p>This function is called by a <code>gen_statem</code> process in in order to format/limit the server state for debugging and logging purposes.</p>
+<p>It is called in the following situations:</p>
+<ul>
+<li><p>One of <a href="sys.html#get_status/1"><code>sys:get_status/1,2</code></a> is invoked to get the <code>gen_statem</code> status. <code>Opt</code> is set to the atom <code>normal</code> for this case.</p></li>
+<li><p>The <code>gen_statem</code> terminates abnormally and logs an error. <code>Opt</code> is set to the atom <code>terminate</code> for this case.</p></li>
+</ul>
+<p>This function is useful for changing the form and appearance of the <code>gen_statem</code> status for these cases. A callback module wishing to change the <a href="sys.html#get_status/1"><code>sys:get_status/1,2</code></a> return value and how its status appears in termination error logs, should export an instance of <a href="#c:format_status/2"><code>Module:format_status/2</code></a>, that returns a term describing the current status of the <code>gen_statem</code>.</p>
+<p><code>PDict</code> is the current value of the process dictionary of the <code>gen_statem</code>.</p>
+<p><a href="#t:state/0"><code>State</code></a> is the internal state of the <code>gen_statem</code>.</p>
+<p><a href="#t:data/0"><code>Data</code></a> is the internal server data of the <code>gen_statem</code>.</p>
+<p>The function is to return <code>Status</code>, a term that contains the appropriate details of the current state and status of the <code>gen_statem</code>. There are no restrictions of the form <code>Status</code> can take, but for the <a href="sys.html#get_status/1"><code>sys:get_status/1,2</code></a> case (when <code>Opt</code> is <code>normal</code>), the recommended form for the <code>Status</code> value is <code>[{data, [{"State", Term}]}]</code>, where <code>Term</code> provides relevant details of the <code>gen_statem</code> state. Following this recommendation is not required, but it makes the callback module status consistent with the rest of the <a href="sys.html#get_status/1"><code>sys:get_status/1,2</code></a> return value.</p>
+<p>One use for this function is to return compact alternative state representations to avoid having large state terms printed in log files. Another use is to hide sensitive data from being written to the error log.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>This callback is optional, so a callback module does not need to export it. The <code>gen_statem</code> module provides a default implementation of this function that returns <code>{State, Data}</code>.</p>
+<p>If this callback is exported but fails, to hide possibly sensitive data, the default function will instead return <code>{State, Info}</code>, where <code>Info</code> says nothing but the fact that <a href="#c:format_status/2"><code>Module:format_status/2</code></a> has crashed.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:handle_event/4">handle_event/4 <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1641" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> handle_event(enter, OldState, CurrentState, Data) -&gt; <a href="#t:state_enter_result/1">state_enter_result</a>(CurrentState)
+                          when OldState :: <a href="#t:state/0">state</a>(), CurrentState :: <a href="#t:state/0">state</a>(), Data :: <a href="#t:data/0">data</a>();
+                      (EventType, EventContent, CurrentState, Data) -&gt; <a href="#t:event_handler_result/1">event_handler_result</a>(<a href="#t:state/0">state</a>())
+                          when
+                              EventType :: <a href="#t:event_type/0">event_type</a>(),
+                              EventContent :: <a href="#t:event_content/0">event_content</a>(),
+                              CurrentState :: <a href="#t:state/0">state</a>(),
+                              Data :: <a href="#t:data/0">data</a>().</pre>  <p><a href="#state-callback"><em>State callback</em></a> in <a href="#t:callback_mode/0"><em>callback mode</em></a> <code>handle_event_function</code>.</p>
+<p>Whenever a <code>gen_statem</code> receives an event from <a href="#call/3"><code>call/2,3</code></a>, <a href="#cast/2"><code>cast/2</code></a>, or as a normal process message, this function is called.</p>
+<p>If <code>EventType</code> is <a href="#t:event_type/0"><code>{call, From}</code></a>, the caller waits for a reply. The reply can be sent from this or from any other <a href="#state-callback"><em>state callback</em></a> by returning with <code>{reply, From, Reply}</code> in <a href="#t:action/0"><code>Actions</code></a>, in <a href="#t:reply_action/0"><code>Replies</code></a>, or by calling <a href="#reply/2"><code>reply(From, Reply)</code></a>.</p>
+<p>If this function returns with a next state that does not match equal (<code>=/=</code>) to the current state, all postponed events are retried in the next state.</p>
+<p>For options that can be set and actions that can be done by <code>gen_statem</code> after returning from this function, see <a href="#t:action/0"><code>action/0</code></a>.</p>
+<p>When the <code>gen_statem</code> runs with <a href="#t:state_enter/0"><em>state enter calls</em></a>, this function is also called with arguments <code>(enter, OldState, ...)</code> during every <em>state change</em>. In this case there are some restrictions on the <a href="#t:action/0">actions</a> that may be returned:</p>
+<ul>
+<li><p><a href="#t:postpone/0"><code>postpone/0</code></a> is not allowed since a <em>state enter call</em> is not an event so there is no event to postpone.</p></li>
+<li><p><a href="#t:action/0"><code>{next_event, _, _}</code></a> is not allowed since using <em>state enter calls</em> should not affect how events are consumed and produced.</p></li>
+<li>
+<p>It is not allowed to change states from this call. Should you return <code>{next_state, NextState, ...}</code> with <code>NextState =/= State</code> the <code>gen_statem</code> crashes.</p>
+<p>Note that it is actually allowed to use <code>{repeat_state, NewData, ...}</code> although it makes little sense since you immediately will be called again with a new <em>state enter call</em> making this just a weird way of looping, and there are better ways to loop in Erlang.</p>
+<p>If you do not update <code>NewData</code> and have some loop termination condition, or if you use <code>{repeat_state_and_data, _}</code> or <code>repeat_state_and_data</code> you have an infinite loop!</p>
+<p>You are advised to use <code>{keep_state, ...}</code>, <code>{keep_state_and_data, _}</code> or <code>keep_state_and_data</code> since changing states from a <em>state enter call</em> is not possible anyway.</p>
+</li>
+</ul>
+<p>Note the fact that you can use <a href="../../../../erts-17.1/doc/html/erlang.html#throw/1"><code>throw</code></a> to return the result, which can be useful. For example to bail out with <a href="../../../../erts-17.1/doc/html/erlang.html#throw/1"><code>throw(keep_state_and_data)</code></a> from deep within complex code that cannot return <code>{next_state, State, Data}</code> because <code>State</code> or <code>Data</code> is no longer in scope.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:init/1">init(Args) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1502" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> init(Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt; <a href="#t:init_result/1">init_result</a>(<a href="#t:state/0">state</a>()).</pre>  <p>Initialize the state machine.</p>
+<p>Whenever a <code>gen_statem</code> is started using <a href="#start_link/3"><code>start_link/3,4</code></a>, <a href="#start_monitor/3"><code>start_monitor/3,4</code></a>, or <a href="#start/3"><code>start/3,4</code></a>, this function is called by the new process to initialize the implementation state and server data.</p>
+<p><code>Args</code> is the <code>Args</code> argument provided to that start function.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>Note that if the <code>gen_statem</code> is started through <a href="proc_lib.html"><code>proc_lib</code></a> and <a href="#enter_loop/6"><code>enter_loop/4,5,6</code></a>, this callback will never be called. Since this callback is not optional it can in that case be implemented as:</p>
+<pre data-language="erlang">-spec init(_) -&gt; no_return().
+init(Args) -&gt; erlang:error(not_implemented, [Args]).</pre>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:StateName/3">'StateName'/3 <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1573" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> 'StateName'(enter, OldStateName :: <a href="#t:state_name/0">state_name</a>(), <a href="#t:data/0">data</a>()) -&gt; <a href="#t:state_enter_result/1">state_enter_result</a>(state_name);
+                     (EventType :: <a href="#t:event_type/0">event_type</a>(), EventContent :: <a href="#t:event_content/0">event_content</a>(), Data :: <a href="#t:data/0">data</a>()) -&gt;
+                         <a href="#t:event_handler_result/1">event_handler_result</a>(<a href="#t:state_name/0">state_name</a>()).</pre>  <p><a href="#state-callback"><em>State callback</em></a> in <a href="#t:callback_mode/0"><em>callback mode</em></a> <code>state_functions</code>.</p>
+<p>State callback that handles all events in state <code>StateName</code>, where <a href="#t:state_name/0"><code>StateName :: state_name()</code></a> has to be an <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0"><code>atom/0</code></a>.</p>
+<p><code>StateName</code> cannot be <code>terminate</code> since that would collide with the callback function <a href="#c:terminate/3"><code>Module:terminate/3</code></a>.</p>
+<p>Besides that when doing a <a href="#state-callback"><em>state change</em></a> the next state always has to be an <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0"><code>atom/0</code></a>, this function is equivalent to <a href="#c:handle_event/4"><code>Module:handle_event(​EventType, EventContent, ?FUNCTION_NAME, Data)</code></a>, which is the <a href="#state-callback"><em>state callback</em></a> in <a href="#t:callback_mode/0"><em>callback mode</em></a> <code>handle_event_function</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:terminate/3">terminate/3 <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L1713" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> terminate(Reason :: normal | shutdown | {shutdown, <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                    CurrentState :: <a href="#t:state/0">state</a>(),
+                    <a href="#t:data/0">data</a>()) -&gt;
+                       <a href="../../../../erts-17.1/doc/html/erlang.html#t:any/0">any</a>().</pre>  <p>Handle state machine termination.</p>
+<p>This function is called by a <code>gen_statem</code> when it is about to terminate. It is to be the opposite of <a href="#c:init/1"><code>Module:init/1</code></a> and do any necessary cleaning up. When it returns, the <code>gen_statem</code> terminates with <code>Reason</code>. The return value is ignored.</p>
+<p><code>Reason</code> is a term denoting the stop reason and <a href="#t:state/0"><code>State</code></a> is the internal state of the <code>gen_statem</code>.</p>
+<p><code>Reason</code> depends on why the <code>gen_statem</code> is terminating. If it is because another callback function has returned, a stop tuple <code>{stop, Reason}</code> in <a href="#t:action/0"><code>Actions</code></a>, <code>Reason</code> has the value specified in that tuple. If it is because of a failure, <code>Reason</code> is the error reason.</p>
+<p>If the <code>gen_statem</code> is part of a supervision tree and is ordered by its supervisor to terminate, this function is called with <code>Reason = shutdown</code> if both the following conditions apply:</p>
+<ul>
+<li>The <code>gen_statem</code> process has been set to trap exit signals.</li>
+<li>The shutdown strategy as defined in the supervisor's child specification is an integer time-out value, not <code>brutal_kill</code>.</li>
+</ul>
+<p>Even if the <code>gen_statem</code> is <em>not</em> part of a supervision tree, this function is called if it receives an <code>'EXIT'</code> message from its parent. <code>Reason</code> is the same as in the <code>'EXIT'</code> message.</p>
+<p>If the <code>gen_statem</code> process is not set up to trap exit signals it is immediately terminated, just like any process, and this function is not called.</p>
+<p>Notice that for any other reason than <code>normal</code>, <code>shutdown</code>, or <code>{shutdown, Term}</code>, the <code>gen_statem</code> is assumed to terminate because of an error and an error report is issued using <a href="../../../kernel-11.0.4/doc/html/logger.html"><code>logger</code></a>.</p>
+<p>When the <code>gen_statem</code> process exits, an exit signal with the same reason is sent to linked processes and ports, just as for any process.</p> </section> </section> </div> </section> <section id="functions" class="details-list"> <h2>Functions</h2> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="call/2">call(ServerRef, Request) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2530" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> call(ServerRef :: <a href="#t:server_ref/0">server_ref</a>(), Request :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt; Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Equivalent to <a href="#call/3"><code>call(ServerRef, Request, infinity)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="call/3">call(ServerRef, Request, Timeout) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2582" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> call(ServerRef :: <a href="#t:server_ref/0">server_ref</a>(),
+           Request :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+           Timeout :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>() | {clean_timeout, T :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>()} | {dirty_timeout, T :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>()}) -&gt;
+              Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Call a server: send request and wait for response.</p>
+<p>Makes a synchronous call to the <code>gen_statem</code> <a href="#t:server_ref/0"><code>ServerRef</code></a> by sending a request and waiting until the response arrives.</p>
+<p> The <code>gen_statem</code> calls the <a href="#state-callback"><em>state callback</em></a> with <a href="#t:event_type/0"><code>event_type/0</code></a> <code>{call, From}</code> and event content <code>Request</code>.</p>
+<p>The server's reply is sent from a <a href="#state-callback"><em>state callback</em></a>, by returning a <a href="#t:action/0"><em>transition action</em></a> <code>{reply, From, Reply}</code>, calling <a href="#reply/1"><code>reply(Replies)</code></a> with such a reply action in the <code>Replies</code> list, or calling <a href="#reply/2"><code>reply(From, Reply)</code></a>.</p>
+<p><code>Timeout</code> is an integer &gt; 0, which specifies how many milliseconds to wait for a reply, or the atom <code>infinity</code> to wait indefinitely, which is the default. If no reply is received within the specified time, the function call fails.</p>
+<p>Previous issue with late replies that could occur when having network issues or using <code>dirty_timeout</code> is now prevented by use of <a href="../../../../doc/system/ref_man_processes.html#process-aliases"><em>process aliases</em></a>. <code>{clean_timeout, T}</code> and <code>{dirty_timeout, T}</code> therefore no longer serves any purpose and will work the same as <code>Timeout</code> while all of them also being equally efficient.</p>
+<p>The call can also fail, for example, if the <code>gen_statem</code> dies before or during this function call.</p>
+<p>When this call fails it <a href="../../../../erts-17.1/doc/html/erlang.html#exit/1">exits</a> the calling process. The exit term is on the form <code>{Reason, Location}</code> where <code>Location = {gen_statem, call, ArgList}</code>. See <a href="gen_server.html#call/3"><code>gen_server:call/3</code></a> that has a description of relevant values for the <code>Reason</code> in the exit term.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="cast/2">cast(ServerRef, Msg) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2505" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> cast(ServerRef :: <a href="#t:server_ref/0">server_ref</a>(), Msg :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt; ok.</pre>  <p>Cast an event to a server.</p>
+<p>Sends an asynchronous <code>cast</code> event to the <code>gen_statem</code> <a href="#t:server_ref/0"><code>ServerRef</code></a> and returns <code>ok</code> immediately, ignoring if the destination node or <code>gen_statem</code> does not exist.</p>
+<p>The <code>gen_statem</code> calls the <a href="#state-callback"><em>state callback</em></a> with <a href="#t:event_type/0"><code>event_type/0</code></a> <code>cast</code> and event content <code>Msg</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="check_response/2">check_response(Msg, ReqId) <span class="since">(since OTP 23.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2962" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> check_response(Msg, ReqId) -&gt; Result
+                        when
+                            Msg :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                            ReqId :: <a href="#t:request_id/0">request_id</a>(),
+                            Response ::
+                                {reply, Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {error, {Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), <a href="#t:server_ref/0">server_ref</a>()}},
+                            Result :: Response | no_reply.</pre>  <p>Check if a received message is a request response.</p>
+<p>Checks if <code>Msg</code> is a response corresponding to the request identifier <code>ReqId</code>. The request must have been made by <a href="#send_request/2"><code>send_request/2</code></a> and by the same process calling this function.</p>
+<p>If <code>Msg</code> is a reply to the handle <code>ReqId</code> the result of the request is returned in <code>Reply</code>. Otherwise this function returns <code>no_reply</code> and no cleanup is done, and thus the function shall be invoked repeatedly until the response is returned.</p>
+<p>See <a href="#call-reply"><code>call/3</code></a> about how the request is handled and the <code>Reply</code> is sent by the <code>gen_statem</code> server.</p>
+<p>If the <code>gen_statem</code> server process has died when this function is called, that is; <code>Msg</code> reports the server's death, this function returns an <code>error</code> return with the exit <code>Reason</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="check_response/3">check_response(Msg, ReqIdCollection, Delete) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3028" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> check_response(Msg, ReqIdCollection, Delete) -&gt; Result
+                        when
+                            Msg :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                            ReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>(),
+                            Delete :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>(),
+                            Response ::
+                                {reply, Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {error, {Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), <a href="#t:server_ref/0">server_ref</a>()}},
+                            Result ::
+                                {Response,
+                                 Label :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                                 NewReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>()} |
+                                no_request | no_reply.</pre>  <p>Check if a received message is a request response in a collection.</p>
+<p>Check if <code>Msg</code> is a response corresponding to a request identifier stored in <code>ReqIdCollection</code>. All request identifiers of <code>ReqIdCollection</code> must correspond to requests that have been made using <a href="#send_request/2"><code>send_request/2</code></a> or <a href="#send_request/4"><code>send_request/4</code></a>, by the process calling this function.</p>
+<p>The <code>Label</code> in the response equals the <code>Label</code> associated with the request identifier that the response corresponds to. The <code>Label</code> of a request identifier is associated when <a href="#reqids_add/3">storing the request id</a> in a collection, or when sending the request using <a href="#send_request/4"><code>send_request/4</code></a>.</p>
+<p>Compared to <a href="#check_response/2"><code>check_response/2</code></a>, the returned result or exception associated with a specific request identifier will be wrapped in a 3-tuple <code>{Response, Label, NewReqIdCollection}</code>. <code>Response</code> is the value that would have been produced by <a href="#check_response/2"><code>check_response/2</code></a>, <code>Label</code> is the value associated with the specific <a href="#t:request_id/0">request identifier</a> and <code>NewReqIdCollection</code> is a possibly modified request identifier collection.</p>
+<p>If <code>ReqIdCollection</code> is empty, <code>no_request</code> is returned.</p>
+<p>If <code>Msg</code> does not correspond to any of the request identifiers in <code>ReqIdCollection</code>, <code>no_reply</code> is returned.</p>
+<p>If <code>Delete</code> equals <code>true</code>, the association with <code>Label</code> has been deleted from <code>ReqIdCollection</code> in the resulting <code>NewReqIdCollection</code>. If <code>Delete</code> is <code>false</code>, <code>NewReqIdCollection</code> will equal <code>ReqIdCollection</code>. Note that deleting an association is not for free and that a collection containing already handled requests can still be used by subsequent calls to <a href="#wait_response/3"><code>wait_response/3</code></a>, <a href="#check_response/3"><code>check_response/3</code></a>, and <a href="#receive_response/3"><code>receive_response/3</code></a>.</p>
+<p>However, without deleting handled associations, the above calls will not be able to detect when there are no more outstanding requests to handle, so you will have to keep track of this some other way than relying on a <code>no_request</code> return. Note that if you pass a collection only containing associations of already handled or abandoned requests to this function, it will always return <code>no_reply</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="enter_loop/4">enter_loop(Module, Opts, State, Data) <span class="since">(since OTP 19.1)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3163" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> enter_loop(Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Opts :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), State :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Data :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:no_return/0">no_return</a>().</pre>  <p>Equivalent to <a href="#enter_loop/6"><code>enter_loop(Module, Opts, State, Data, self(), [])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="enter_loop/5">enter_loop(Module, Opts, State, Data, Server_or_Actions) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3187" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> enter_loop(Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Opts :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), State :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Data :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Actions) -&gt;
+                    <a href="../../../../erts-17.1/doc/html/erlang.html#t:no_return/0">no_return</a>()
+                    when Actions :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:list/0">list</a>();
+                (Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Opts :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), State :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Data :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Server) -&gt;
+                    <a href="../../../../erts-17.1/doc/html/erlang.html#t:no_return/0">no_return</a>()
+                    when Server :: <a href="#t:server_name/0">server_name</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>().</pre>  <p>Make the calling process become a <code>gen_statem</code> server.</p>
+<p>With argument <code>Actions</code>, equivalent to <a href="#enter_loop/6"><code>enter_loop(Module, Opts, State, Data, self(), Actions)</code></a>.</p>
+<p>Otherwise equivalent to <a href="#enter_loop/6"><code>enter_loop(Module, Opts, State, Data, Server, [])</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="enter_loop/6">enter_loop(Module, Opts, State, Data, Server, Actions) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3235" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> enter_loop(Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(),
+                 Opts :: [<a href="#t:enter_loop_opt/0">enter_loop_opt</a>()],
+                 State :: <a href="#t:state/0">state</a>(),
+                 Data :: <a href="#t:data/0">data</a>(),
+                 Server :: <a href="#t:server_name/0">server_name</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(),
+                 Actions :: [<a href="#t:action/0">action</a>()] | <a href="#t:action/0">action</a>()) -&gt;
+                    <a href="../../../../erts-17.1/doc/html/erlang.html#t:no_return/0">no_return</a>().</pre>  <p>Make the calling process become a <code>gen_statem</code> server.</p>
+<p>Does not return, instead the calling process enters the <code>gen_statem</code> receive loop and becomes a <code>gen_statem</code> server. The process <em>must</em> have been started using one of the start functions in <a href="proc_lib.html"><code>proc_lib</code></a>. The user is responsible for any initialization of the process, including registering a name for it.</p>
+<p>This function is useful when a more complex initialization procedure is needed than the <code>gen_statem</code> <a href="#c:init/1"><code>Module:init/1</code></a> callback offers.</p>
+<p><code>Module</code> and <code>Opts</code> have the same meanings as when calling <a href="#start_link/3"><code>start[link | monitor]/3,4</code></a>.</p>
+<p>If <code>Server</code> is <a href="../../../../erts-17.1/doc/html/erlang.html#self/0"><code>self/0</code></a> an anonymous server is created just as when using <a href="#start_link/3"><code>start[link |_monitor]/3</code></a>. If <code>Server</code> is a <a href="#t:server_name/0"><code>server_name/0</code></a> a named server is created just as when using <a href="#start_link/4"><code>start[link |_monitor]/4</code></a>. However, the <a href="#t:server_name/0"><code>server_name/0</code></a> name must have been registered accordingly <em>before</em> this function is called.</p>
+<p><code>State</code>, <code>Data</code>, and <code>Actions</code> have the same meanings as in the return value of <a href="#c:init/1"><code>Module:init/1</code></a>. Also, the callback module does not need to export a <a href="#c:init/1"><code>Module:init/1</code></a> function.</p>
+<p>The function fails if the calling process was not started by a <a href="proc_lib.html"><code>proc_lib</code></a> start function, or if it is not registered according to <a href="#t:server_name/0"><code>server_name/0</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="receive_response/1">receive_response(ReqId) <span class="since">(since OTP 24.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2809" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> receive_response(ReqId) -&gt; Result
+                          when
+                              ReqId :: <a href="#t:request_id/0">request_id</a>(),
+                              Response ::
+                                  {reply, Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {error, {Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), <a href="#t:server_ref/0">server_ref</a>()}},
+                              Result :: Response | timeout.</pre>  <p>Equivalent to <a href="#receive_response/2"><code>receive_response(ReqId, infinity)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="receive_response/2">receive_response(ReqId, Timeout) <span class="since">(since OTP 24.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2849" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> receive_response(ReqId, Timeout) -&gt; Result
+                          when
+                              ReqId :: <a href="#t:request_id/0">request_id</a>(),
+                              Timeout :: <a href="#t:response_timeout/0">response_timeout</a>(),
+                              Response ::
+                                  {reply, Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {error, {Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), <a href="#t:server_ref/0">server_ref</a>()}},
+                              Result :: Response | timeout.</pre>  <p>Receive a request response.</p>
+<p>Receive a response corresponding to the request identifier <code>ReqId</code>. The request must have been made by <a href="#send_request/2"><code>send_request/2</code></a> to the <code>gen_statem</code> process. This function must be called from the same process from which <a href="#send_request/2"><code>send_request/2</code></a> was made.</p>
+<p><code>Timeout</code> specifies how long to wait for a response. If no response is received within the specified time, this function returns <code>timeout</code>. Assuming that the server executes on a node supporting aliases (introduced in OTP 24) the request will also be abandoned. That is, no response will be received after a time-out. Otherwise, a stray response might be received at a later time.</p>
+<p>See <a href="#call-reply"><code>call/3</code></a> about how the request is handled and the <code>Reply</code> is sent by the <code>gen_statem</code> server.</p>
+<p>If the <code>gen_statem</code> server process is dead or dies while this function waits for the reply, it returns an <code>error</code> return with the exit <code>Reason</code>.</p>
+<p>The difference between <a href="#wait_response/2"><code>wait_response/2</code></a> and <a href="#receive_response/2"><code>receive_response/2</code></a> is that <a href="#receive_response/2"><code>receive_response/2</code></a> abandons the request at time-out so that a potential future response is ignored, while <a href="#wait_response/2"><code>wait_response/2</code></a> does not.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="receive_response/3">receive_response(ReqIdCollection, Timeout, Delete) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2926" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> receive_response(ReqIdCollection, Timeout, Delete) -&gt; Result
+                          when
+                              ReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>(),
+                              Timeout :: <a href="#t:response_timeout/0">response_timeout</a>(),
+                              Delete :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>(),
+                              Response ::
+                                  {reply, Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {error, {Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), <a href="#t:server_ref/0">server_ref</a>()}},
+                              Result ::
+                                  {Response,
+                                   Label :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                                   NewReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>()} |
+                                  no_request | timeout.</pre>  <p>Receive a request response in a collection.</p>
+<p>Receive a response in <code>ReqIdCollection</code>. All request identifiers of <code>ReqIdCollection</code> must correspond to requests that have been made using <a href="#send_request/2"><code>send_request/2</code></a> or <a href="#send_request/4"><code>send_request/4</code></a>, and all requests must have been made by the process calling this function.</p>
+<p>The <code>Label</code> in the response is the <code>Label</code> associated with the request identifier that the response corresponds to. The <code>Label</code> of a request identifier is associated when <a href="#reqids_add/3">adding the request id</a> to a collection, or when sending the request using <a href="#send_request/4"><code>send_request/4</code></a>.</p>
+<p>Compared to <a href="#receive_response/2"><code>receive_response/2</code></a>, the returned result or exception associated with a specific request identifier will be wrapped in a 3-tuple <code>{Response, Label, NewReqIdCollection}</code>. <code>Response</code> is the value that would have been produced by <a href="#receive_response/2"><code>receive_response/2</code></a>, <code>Label</code> is the value associated with the specific <a href="#t:request_id/0">request identifier</a> and <code>NewReqIdCollection</code> is a possibly modified request identifier collection.</p>
+<p>If <code>ReqIdCollection</code> is empty, <code>no_request</code> will be returned.</p>
+<p><code>Timeout</code> specifies how long to wait for a response. If no response is received within the specified time, the function returns <code>timeout</code>. Assuming that the server executes on a node supporting aliases (introduced in OTP 24) all requests identified by <code>ReqIdCollection</code> will also be abandoned. That is, no responses will be received after a time-out. Otherwise, stray responses might be received at a later time.</p>
+<p>The difference between <a href="#receive_response/3"><code>receive_response/3</code></a> and <a href="#wait_response/3"><code>wait_response/3</code></a> is that <a href="#receive_response/3"><code>receive_response/3</code></a> abandons requests at time-out so that potential future responses are ignored, while <a href="#wait_response/3"><code>wait_response/3</code></a> does not.</p>
+<p>If <code>Delete</code> is <code>true</code>, the association with <code>Label</code> is deleted from <code>ReqIdCollection</code> in the resulting <code>NewReqIdCollection</code>. If <code>Delete</code> is <code>false</code>, <code>NewReqIdCollection</code> will equal<code>ReqIdCollection</code>. Note that deleting an association is not for free and that a collection containing already handled requests can still be used by subsequent calls to <a href="#wait_response/3"><code>wait_response/3</code></a>, <a href="#check_response/3"><code>check_response/3</code></a>, and <a href="#receive_response/3"><code>receive_response/3</code></a>.</p>
+<p>However, without deleting handled associations, the above calls will not be able to detect when there are no more outstanding requests to handle, so you will have to keep track of this some other way than relying on a <code>no_request</code> return. Note that if you pass a collection only containing associations of already handled or abandoned requests to this function, it will always block until <code>Timeout</code> expires and then return <code>timeout</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="reply/1">reply(Replies) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3129" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> reply(Replies :: [<a href="#t:reply_action/0">reply_action</a>()] | <a href="#t:reply_action/0">reply_action</a>()) -&gt; ok.</pre>  <p>Send one or multiple <code>call</code> replies.</p>
+<p>This funcion can be used by a <code>gen_statem</code> callback to explicitly send one or multiple replies to processes waiting for <code>call</code> requests' replies, when it is impractical or impossible to return <a href="#t:reply_action/0"><code>reply_action/0</code></a>s from a <a href="#state-callback"><em>state callback</em></a>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>A reply sent with this function is not visible in <a href="sys.html"><code>sys</code></a> debug output.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="reply/2">reply(From, Reply) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3150" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> reply(From :: <a href="#t:from/0">from</a>(), Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt; ok.</pre>  <p>Send a <code>call</code> <code>Reply</code> to <code>From</code>.</p>
+<p>This funcion can be used by a <code>gen_statem</code> callback to explicitly send a reply to a process waiting for a <code>call</code> requests' reply, when it is impractical or impossible to return a <a href="#t:reply_action/0"><code>reply_action/0</code></a> from a <a href="#state-callback"><em>state callback</em></a>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>A reply sent with this function is not visible in <a href="sys.html"><code>sys</code></a> debug output.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="reqids_add/3">reqids_add(ReqId, Label, ReqIdCollection) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3087" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> reqids_add(ReqId :: <a href="#t:request_id/0">request_id</a>(), Label :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), ReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>()) -&gt;
+                    NewReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>().</pre>  <p>Store a request identifier in a colletion.</p>
+<p>Stores <code>ReqId</code> and associates a <code>Label</code> with the request identifier by adding this information to <code>ReqIdCollection</code> and returning the resulting request identifier collection.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="reqids_new/0">reqids_new() <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3058" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> reqids_new() -&gt; NewReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>().</pre>  <p>Create an empty request identifier collection.</p>
+<p>Returns a new empty request identifier collection. A request identifier collection can be used to handle multiple outstanding requests.</p>
+<p>Request identifiers of requests made by <a href="#send_request/2"><code>send_request/2</code></a> can be stored in a collection using <a href="#reqids_add/3"><code>reqids_add/3</code></a>. Such a collection of request identifiers can later be used in order to get one response corresponding to a request in the collection by passing the collection as argument to <a href="#receive_response/3"><code>receive_response/3</code></a>, <a href="#wait_response/3"><code>wait_response/3</code></a>, or, <a href="#check_response/3"><code>check_response/3</code></a>.</p>
+<p><a href="#reqids_size/1"><code>reqids_size/1</code></a> can be used to determine the number of request identifiers in a collection.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="reqids_size/1">reqids_size(ReqIdCollection) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3067" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> reqids_size(ReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>()) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:non_neg_integer/0">non_neg_integer</a>().</pre>  <p>Return the number of request identifiers in <code>ReqIdCollection</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="reqids_to_list/1">reqids_to_list(ReqIdCollection) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L3106" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> reqids_to_list(ReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>()) -&gt;
+                        [{ReqId :: <a href="#t:request_id/0">request_id</a>(), Label :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}].</pre>  <p>Convert a request identifier collection to a list.</p>
+<p>Returns a list of <code>{ReqId, Label}</code> tuples which corresponds to all request identifiers with their associated labels in <a href="#t:request_id_collection/0"><code>ReqIdCollection</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="send_request/2">send_request(ServerRef, Request) <span class="since">(since OTP 23.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2629" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> send_request(ServerRef :: <a href="#t:server_ref/0">server_ref</a>(), Request :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt; ReqId :: <a href="#t:request_id/0">request_id</a>().</pre>  <p>Send an asynchronous <code>call</code> request.</p>
+<p>Sends <code>Request</code> to the <code>gen_statem</code> process identified by <code>ServerRef</code> and returns a request identifier <code>ReqId</code>.</p>
+<p>The return value <code>ReqId</code> shall later be used with <a href="#receive_response/2"><code>receive_response/2</code></a>, <a href="#wait_response/2"><code>wait_response/2</code></a>, or <a href="#check_response/2"><code>check_response/2</code></a> to fetch the actual result of the request. Besides passing the request identifier directly to these functions, it can also be stored in a request identifier collection using <a href="#reqids_add/3"><code>reqids_add/3</code></a>. Such a collection of request identifiers can later be used in order to get one response corresponding to a request in the collection by passing the collection as argument to <a href="#receive_response/3"><code>receive_response/3</code></a>, <a href="#wait_response/3"><code>wait_response/3</code></a>, or <a href="#check_response/3"><code>check_response/3</code></a>. If you are about to store the request identifier in a collection, you may want to consider using <a href="#send_request/4"><code>send_request/4</code></a> instead.</p>
+<p>The call <code>gen_statem:wait_response(gen_statem:send_request(ServerRef, Request), Timeout)</code> can be seen as equivalent to <a href="#call/3"><code>gen_statem:call(Server, Request, Timeout)</code></a>, ignoring the error handling.</p>
+<p>See <a href="#call-reply"><code>call/3</code></a> about how the request is handled and the <code>Reply</code> is sent by the <code>gen_statem</code> server.</p>
+<p>The server's <code>Reply</code> is returned by one of the <a href="#receive_response/2"><code>receive_response/1,2</code></a>, <a href="#wait_response/2"><code>wait_response/1,2</code></a>, or <a href="#check_response/2"><code>check_response/2</code></a> functions.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="send_request/4">send_request(ServerRef, Request, Label, ReqIdCollection) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2662" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> send_request(ServerRef :: <a href="#t:server_ref/0">server_ref</a>(),
+                   Request :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                   Label :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                   ReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>()) -&gt;
+                      NewReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>().</pre>  <p>Send an asynchronous <code>call</code> request and add it to a request identifier collection.</p>
+<p>Sends <code>Request</code> to the <code>gen_statem</code> process identified by <code>ServerRef</code>. The <code>Label</code> will be associated with the request identifier of the operation and added to the returned request identifier collection <code>NewReqIdCollection</code>. The collection can later be used in order to get one response corresponding to a request in the collection by passing the collection as argument to <a href="#receive_response/3"><code>receive_response/3</code></a>, <a href="#wait_response/3"><code>wait_response/3</code></a>, or <a href="#check_response/3"><code>check_response/3</code></a>.</p>
+<p>The same as calling <a href="#reqids_add/3"><code>reqids_add(​</code></a><a href="#send_request/2"><code>send_request(ServerRef, Request),</code></a><a href="#reqids_add/3"><code>Label, ReqIdCollection)</code></a>, but slightly more efficient.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start/3">start(Module, Args, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2231" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start(Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Opts :: [<a href="#t:start_opt/0">start_opt</a>()]) -&gt; <a href="#t:start_ret/0">start_ret</a>().</pre>  <p>Start a server, neither linked nor registered.</p>
+<p>Equivalent to <a href="#start/4"><code>start/4</code></a> except that the <code>gen_statem</code> process is not registered with any <a href="#t:server_name/0">name service</a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start/4">start(ServerName, Module, Args, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2254" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start(ServerName :: <a href="#t:server_name/0">server_name</a>(), Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Opts :: [<a href="#t:start_opt/0">start_opt</a>()]) -&gt;
+               <a href="#t:start_ret/0">start_ret</a>().</pre>  <p>Start a server, registered but not linked.</p>
+<p>Creates a standalone <code>gen_statem</code> process according to OTP design principles (using <a href="proc_lib.html"><code>proc_lib</code></a> primitives). As it does not get linked to the calling process, this start function cannot be used by a supervisor to start a child.</p>
+<p>For a description of arguments and return values, see <a href="#start_link/4"><code>start_link/4</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_link/3">start_link(Module, Args, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2272" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_link(Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Opts :: [<a href="#t:start_opt/0">start_opt</a>()]) -&gt; <a href="#t:start_ret/0">start_ret</a>().</pre>  <p>Start a server, linked but not registered.</p>
+<p>Equivalent to <a href="#start_link/4"><code>start_link/4</code></a> except that the <code>gen_statem</code> process is not registered with any <a href="#t:server_name/0">name service</a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_link/4">start_link(ServerName, Module, Args, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2395" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_link(ServerName :: <a href="#t:server_name/0">server_name</a>(), Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Opts :: [<a href="#t:start_opt/0">start_opt</a>()]) -&gt;
+                    <a href="#t:start_ret/0">start_ret</a>().</pre>  <p>Start a server, linked and registered.</p>
+<p>Creates a <code>gen_statem</code> process according to OTP design principles (using <a href="proc_lib.html"><code>proc_lib</code></a> primitives) that is spawned linked to the calling process. This is essential when the <code>gen_statem</code> must be part of a supervision tree so it gets linked to its supervisor.</p>
+<p>The spawned <code>gen_statem</code> process calls <a href="#c:init/1"><code>Module:init/1</code></a> to initialize the server. To ensure a synchronized startup procedure, <code>start_link/3,4</code> does not return until <a href="#c:init/1"><code>Module:init/1</code></a> has returned or failed.</p>
+<p><code>ServerName</code> specifies the <a href="#t:server_name/0"><code>server_name/0</code></a> to register for the <code>gen_statem</code> process. If the <code>gen_statem</code> process is started with <a href="#start_link/3"><code>start_link/3</code></a>, no <code>ServerName</code> is provided and the <code>gen_statem</code> process is not registered.</p>
+<p><code>Module</code> is the name of the callback module.</p>
+<p><code>Args</code> is an arbitrary term that is passed as the argument to <a href="#c:init/1"><code>Module:init/1</code></a>.</p>
+<h4 id="start-options">Start options in <code>Opts</code>
+</h4>
+<ul>
+<li><p><strong><a href="#t:start_opt/0"><code>{timeout, Time}</code></a></strong> - The <code>gen_statem</code> process is allowed to spend <code>Time</code> milliseconds before returning from <a href="#c:init/1"><code>Module:init/1</code></a>, or it is terminated and this start function returns <a href="#t:start_ret/0"><code>{error, timeout}</code></a>.</p></li>
+<li>
+<p><strong><a href="#t:start_opt/0"><code>{spawn_opt, SpawnOpts}</code></a></strong> - <code>SpawnOpts</code> is passed as option list to <a href="../../../../erts-17.1/doc/html/erlang.html#spawn_opt/2"><code>erlang:spawn_opt/2</code></a>, which is used to spawn the <code>gen_statem</code> process. See <a href="proc_lib.html#t:start_spawn_option/0"><code>proc_lib:start_spawn_option/0</code></a>.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>Using spawn option <code>monitor</code> is not allowed, it causes a <code>badarg</code> failure.</p>
+</div>
+</li>
+<li>
+<p><strong><a href="#t:enter_loop_opt/0"><code>{hibernate_after, HibernateAfterTimeout}</code></a></strong> - When the <code>gen_statem</code> process waits for a message, if no message is received within <code>HibernateAfterTimeout</code> milliseconds, the process goes into hibernation automatically (by calling <a href="proc_lib.html#hibernate/3"><code>proc_lib:hibernate/3</code></a>). This option is also allowed for the <a href="#enter_loop/6"><code>enter_loop</code></a> functions.</p>
+<p>Note that there is also a <a href="#t:transition_option/0"><code>transition_option/0</code></a> to explicitly hibernate the server from a <a href="#state-callback"><em>state callback</em></a>.</p>
+</li>
+<li><p><strong><a href="#t:enter_loop_opt/0"><code>{debug, Dbgs}</code></a></strong> - Activates debugging through <a href="sys.html"><code>sys</code></a>. For every entry in <code>Dbgs</code>, the corresponding function in <a href="sys.html"><code>sys</code></a> is called. This option is also allowed for the <a href="#enter_loop/6"><code>enter_loop</code></a> functions.</p></li>
+</ul>
+<h4 id="start-return-values">Return values</h4>
+<ul>
+<li><p><strong><a href="#t:start_ret/0"><code>{ok, Pid}</code></a></strong> - The <code>gen_statem</code> server process was successfully created and initialized. <code>Pid</code> is the <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a> of the process.</p></li>
+<li><p><strong><a href="#t:start_ret/0"><code>ignore</code></a></strong> - <a href="#c:init/1"><code>Module:init/1</code></a> returned <a href="#t:init_result/1"><code>ignore</code></a>. The <code>gen_statem</code> process has exited with reason <code>normal</code>.</p></li>
+<li><p><strong><a href="#t:start_ret/0"><code>{error, {already_started, OtherPid}}</code></a></strong> - A process with the specified <a href="#t:server_name/0"><code>ServerName</code></a> already exists. <code>OtherPid</code> is the <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0"><code>pid/0</code></a> of that process. The <code>gen_statem</code> process exited with reason <code>normal</code> before calling <a href="#c:init/1"><code>Module:init/1</code></a>.</p></li>
+<li><p><strong><a href="#t:start_ret/0"><code>{error, timeout}</code></a></strong> - <a href="#c:init/1"><code>Module:init/1</code></a> did not return within the <a href="#t:start_opt/0">start time-out</a>. The <code>gen_statem</code> process has been killed with <a href="../../../../erts-17.1/doc/html/erlang.html#exit_signal/2"><code>exit_signal(_, kill)</code></a>.</p></li>
+<li>
+<p><strong><a href="#t:start_ret/0"><code>{error, Reason}</code></a></strong></p>
+<ul>
+<li>Either <a href="#c:init/1"><code>Module:init/1</code></a> returned <a href="#t:init_result/1"><code>{stop, Reason}</code></a> or failed with reason <code>Reason</code>, The <code>gen_statem</code> process exited with reason <code>Reason</code>.</li>
+<li>Or <a href="#c:init/1"><code>Module:init/1</code></a> returned <a href="#t:init_result/1"><code>{error, Reason}</code></a>. The <code>gen_statem</code> process did a graceful exit with reason <code>normal</code>.</li>
+</ul>
+</li>
+</ul>
+<p>If the return value is <code>ignore</code> or <code>{error, _}</code>, the started <code>gen_statem</code> process has terminated. If an <code>'EXIT'</code> message was delivered to the calling process (due to the process link), that message has been consumed.</p>
+<div class="warning">
+<p class="label">Warning</p>
+<p>Before OTP 26.0, if the started <code>gen_statem</code> process returned e.g. <code>{stop, Reason}</code> from <a href="#c:init/1"><code>Module:init/1</code></a>, this function could return <code>{error, Reason}</code> <em>before</em> the started <code>gen_statem</code> process had terminated, so starting again might fail because VM resources such as the registered name was not yet unregistered, and an <code>'EXIT'</code> message could arrive later to the process calling this function.</p>
+<p>But if the started <code>gen_statem</code> process instead failed during <a href="#c:init/1"><code>Module:init/1</code></a>, a process link <code>{'EXIT', Pid, Reason}</code> message caused this function to return <code>{error, Reason}</code>, so the <code>'EXIT'</code> message had been consumed and the started <code>gen_statem</code> process had terminated.</p>
+<p>Since it was impossible to tell the difference between these two cases from <code>start_link/3,4</code>'s return value, this inconsistency was cleaned up in OTP 26.0.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_monitor/3">start_monitor(Module, Args, Opts) <span class="since">(since OTP 23.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2413" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_monitor(Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Opts :: [<a href="#t:start_opt/0">start_opt</a>()]) -&gt; <a href="#t:start_mon_ret/0">start_mon_ret</a>().</pre>  <p>Start a server, monitored but neither linked nor registered.</p>
+<p>Equivalent to <a href="#start_monitor/4"><code>start_monitor/4</code></a> except that the <code>gen_statem</code> process is not registered with any <a href="#t:server_name/0">name service</a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_monitor/4">start_monitor(ServerName, Module, Args, Opts) <span class="since">(since OTP 23.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2444" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_monitor(ServerName :: <a href="#t:server_name/0">server_name</a>(),
+                    Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(),
+                    Args :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                    Opts :: [<a href="#t:start_opt/0">start_opt</a>()]) -&gt;
+                       <a href="#t:start_mon_ret/0">start_mon_ret</a>().</pre>  <p>Start a server, monitored and registered, but not linked.</p>
+<p>Creates a standalone <code>gen_statem</code> process according to OTP design principles (using <a href="proc_lib.html"><code>proc_lib</code></a> primitives), and atomically sets up a monitor to the newly created process.</p>
+<p>As the started process does not get linked to the calling process, this start function cannot be used by a supervisor to start a child.</p>
+<p>For a description of arguments and return values, see <a href="#start_link/4"><code>start_link/4</code></a>, but note that for a succesful start the return value differs since this function returns <code>{ok, {Pid, Mon}}</code>, where <code>Pid</code> is the process identifier of the process, and <code>Mon</code> is the monitor reference for the process. If the start is not successful, the caller will be blocked until the <code>DOWN</code> message has been received and removed from the caller's message queue.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="stop/1">stop(ServerRef) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2455" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> stop(ServerRef :: <a href="#t:server_ref/0">server_ref</a>()) -&gt; ok.</pre>  <p>Equivalent to <a href="#stop/3"><code>stop(ServerRef, normal, infinity)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="stop/3">stop(ServerRef, Reason, Timeout) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2487" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> stop(ServerRef :: <a href="#t:server_ref/0">server_ref</a>(), Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), Timeout :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>()) -&gt; ok.</pre>  <p>Stop a server.</p>
+<p>Orders the <code>gen_statem</code> <a href="#t:server_ref/0"><code>ServerRef</code></a> to exit with the specified <code>Reason</code> and waits for it to terminate. The <code>gen_statem</code> calls <a href="#c:terminate/3"><code>Module:terminate/3</code></a> before exiting.</p>
+<p>This function returns <code>ok</code> if the server terminates with the expected reason. Any other reason than <code>normal</code>, <code>shutdown</code>, or <code>{shutdown, Term}</code> causes an error report to be issued through <a href="../../../kernel-11.0.4/doc/html/logger.html"><code>logger</code></a>. An exit signal with the same reason is sent to linked processes and ports. The default <code>Reason</code> is <code>normal</code>.</p>
+<p><code>Timeout</code> is an integer &gt; 0, which specifies how many milliseconds to wait for the server to terminate, or the atom <code>infinity</code> to wait indefinitely. Defaults to <code>infinity</code>. If the server does not terminate within the specified time, the call exits the calling process with reason <code>timeout</code>.</p>
+<p>If the process does not exist, the call exits the calling process with reason <code>noproc</code>, or with reason <code>{nodedown, Node}</code> if the connection fails to the remote <code>Node</code> where the server runs.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="wait_response/1">wait_response(ReqId) <span class="since">(since OTP 23.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2680" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> wait_response(ReqId) -&gt; Result
+                       when
+                           ReqId :: <a href="#t:request_id/0">request_id</a>(),
+                           Response ::
+                               {reply, Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {error, {Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), <a href="#t:server_ref/0">server_ref</a>()}},
+                           Result :: Response | timeout.</pre>  <p>Equivalent to <a href="#wait_response/2"><code>wait_response(ReqId, infinity)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="wait_response/2">wait_response(ReqId, WaitTime) <span class="since">(since OTP 23.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2717" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> wait_response(ReqId, WaitTime) -&gt; Result
+                       when
+                           ReqId :: <a href="#t:request_id/0">request_id</a>(),
+                           WaitTime :: <a href="#t:response_timeout/0">response_timeout</a>(),
+                           Response ::
+                               {reply, Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {error, {Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), <a href="#t:server_ref/0">server_ref</a>()}},
+                           Result :: Response | timeout.</pre>  <p>Wait for a request response.</p>
+<p>Waits for the response to the request identifier <code>ReqId</code>. The request must have been made by <a href="#send_request/2"><code>send_request/2</code></a> to the <code>gen_statem</code> process. This function must be called from the same process from which <a href="#send_request/2"><code>send_request/2</code></a> was called.</p>
+<p><code>WaitTime</code> specifies how long to wait for a reply. If no reply is received within the specified time, the function returns <code>timeout</code> and no cleanup is done, Thus the function can be invoked repeatedly until a reply is returned.</p>
+<p>See <a href="#call-reply"><code>call/3</code></a> about how the request is handled and the <code>Reply</code> is sent by the <code>gen_statem</code> server.</p>
+<p>If the <code>gen_statem</code> server process is dead or dies while this function waits for the reply, it returns an <code>error</code> return with the exit <code>Reason</code>.</p>
+<p>The difference between <a href="#receive_response/2"><code>receive_response/2</code></a> and <a href="#wait_response/2"><code>wait_response/2</code></a> is that <a href="#receive_response/2"><code>receive_response/2</code></a> abandons the request at time-out so that a potential future response is ignored, while <a href="#wait_response/2"><code>wait_response/2</code></a> does not.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="wait_response/3">wait_response(ReqIdCollection, WaitTime, Delete) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/gen_statem.erl#L2792" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> wait_response(ReqIdCollection, WaitTime, Delete) -&gt; Result
+                       when
+                           ReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>(),
+                           WaitTime :: <a href="#t:response_timeout/0">response_timeout</a>(),
+                           Delete :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>(),
+                           Response ::
+                               {reply, Reply :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | {error, {Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(), <a href="#t:server_ref/0">server_ref</a>()}},
+                           Result ::
+                               {Response,
+                                Label :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>(),
+                                NewReqIdCollection :: <a href="#t:request_id_collection/0">request_id_collection</a>()} |
+                               no_request | timeout.</pre>  <p>Wait for any request response in a collection.</p>
+<p>Waits for a response in <code>ReqIdCollection</code>. All request identifiers of <code>ReqIdCollection</code> must correspond to requests that have been made using <a href="#send_request/2"><code>send_request/2</code></a> or <a href="#send_request/4"><code>send_request/4</code></a>, and all requests must have been made by the process calling this function.</p>
+<p>The <code>Label</code> in the response is the <code>Label</code> associated with the request identifier that the response corresponds to. The <code>Label</code> of a request identifier is associated when <a href="#reqids_add/3">adding the request id</a> to a collection, or when sending the request using <a href="#send_request/4"><code>send_request/4</code></a>.</p>
+<p>Compared to <a href="#wait_response/2"><code>wait_response/2</code></a>, the returned result or exception associated with a specific request identifier will be wrapped in a 3-tuple <code>{Response, Label, NewReqIdCollection}</code>. <code>Response</code> is the value that would have been produced by <a href="#wait_response/2"><code>wait_response/2</code></a>, <code>Label</code> is the value associated with the specific <a href="#t:request_id/0">request identifier</a> and <code>NewReqIdCollection</code> is a possibly modified request identifier collection.</p>
+<p>If <code>ReqIdCollection</code> is empty, <code>no_request</code> is returned.</p>
+<p>If no response is received before <code>WaitTime</code> has expired, <code>timeout</code> is returned. It is valid to continue waiting for a response as many times as needed up until a response has been received and completed by <code>check_response()</code>, <code>receive_response()</code>, or <code>wait_response()</code>.</p>
+<p>The difference between <a href="#receive_response/3"><code>receive_response/3</code></a> and <a href="#wait_response/3"><code>wait_response/3</code></a> is that <a href="#receive_response/3"><code>receive_response/3</code></a> abandons requests at time-out so that potential future responses are ignored, while <a href="#wait_response/3"><code>wait_response/3</code></a> does not.</p>
+<p>If <code>Delete</code> is <code>true</code>, the association with <code>Label</code> has been deleted from <code>ReqIdCollection</code> in the resulting <code>NewReqIdCollection</code>. If <code>Delete</code> is <code>false</code>, <code>NewReqIdCollection</code> will equal<code>ReqIdCollection</code>. Note that deleting an association is not for free and that a collection containing already handled requests can still be used by subsequent calls to <a href="#wait_response/3"><code>wait_response/3</code></a>, <a href="#check_response/3"><code>check_response/3</code></a>, and <a href="#receive_response/3"><code>receive_response/3</code></a>.</p>
+<p>However, without deleting handled associations, the above calls will not be able to detect when there are no more outstanding requests to handle, so you will have to keep track of this some other way than relying on a <code>no_request</code> return. Note that if you pass a collection only containing associations of already handled or abandoned requests to this function, it will always block until <code>WaitTime</code> expires and then return <code>timeout</code>.</p> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

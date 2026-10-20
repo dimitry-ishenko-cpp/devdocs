@@ -1,0 +1,238 @@
+<h1> <span>peer</span>  </h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L48" title="View Source" class="source" rel="help nofollow">Source</a>   <p>Start and control linked Erlang nodes.</p>
+<p>This module provides functions for starting linked Erlang nodes. The node spawning new nodes is called <em>origin</em>, and newly started nodes are <em>peer</em> nodes, or peers. A peer node automatically terminates when it loses the <em>control connection</em> to the origin. This connection could be an Erlang distribution connection, or an alternative - TCP or standard I/O. The alternative connection provides a way to execute remote procedure calls even when Erlang Distribution is not available, allowing to test the distribution itself.</p>
+<p>Peer node terminal input/output is relayed through the origin. If a standard I/O alternative connection is requested, console output also goes via the origin, allowing debugging of node startup and boot script execution (see <a href="../../../../erts-17.1/doc/html/erl_cmd.html#init_debug"><code>-init_debug</code></a>). File I/O is not redirected, contrary to <a href="slave.html"><code>slave</code></a> behaviour.</p>
+<p>The peer node can start on the same or a different host (via <code>ssh</code>) or in a separate container (for example Docker). When the peer starts on the same host as the origin, it inherits the current directory and environment variables from the origin.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>This module is designed to facilitate multi-node testing with Common Test. Use the <code>?CT_PEER()</code> macro to start a linked peer node according to Common Test conventions: crash dumps written to specific location, node name prefixed with module name, calling function, and origin OS process ID). Use <a href="#random_name/1"><code>random_name/1</code></a> to create sufficiently unique node names if you need more control.</p>
+<p>A peer node started without alternative connection behaves similarly to <a href="slave.html"><code>slave</code></a>. When an alternative connection is requested, the behaviour is similar to <code>test_server:start_node(Name, peer, Args).</code></p>
+</div>
+<h2 id="module-example">Example</h2>
+<p>The following example implements a test suite starting extra Erlang nodes. It employs a number of techniques to speed up testing and reliably shut down peer nodes:</p>
+<ul>
+<li>peers start linked to test runner process. If the test case fails, the peer node is stopped automatically, leaving no rogue nodes running in the background</li>
+<li>arguments used to start the peer are saved in the control process state for manual analysis. If the test case fails, the CRASH REPORT contains these arguments</li>
+<li>multiple test cases can run concurrently speeding up overall testing process, peer node names are unique even when there are multiple instances of the same test suite running in parallel</li>
+</ul>
+<pre data-language="erlang">-module(my_SUITE).
+-behaviour(ct_suite).
+-export([all/0, groups/0]).
+-export([basic/1, args/1, named/1, restart_node/1, multi_node/1]).
+
+-include_lib("common_test/include/ct.hrl").
+
+groups() -&gt;
+    [{quick, [parallel],
+        [basic, args, named, restart_node, multi_node]}].
+
+all() -&gt;
+    [{group, quick}].
+
+basic(Config) when is_list(Config) -&gt;
+    {ok, Peer, _Node} = ?CT_PEER(),
+    peer:stop(Peer).
+
+args(Config) when is_list(Config) -&gt;
+    %% specify additional arguments to the new node
+    {ok, Peer, _Node} = ?CT_PEER(["-emu_flavor", "smp"]),
+    peer:stop(Peer).
+
+named(Config) when is_list(Config) -&gt;
+    %% pass test case name down to function starting nodes
+    Peer = start_node_impl(named_test),
+    peer:stop(Peer).
+
+start_node_impl(ActualTestCase) -&gt;
+    {ok, Peer, Node} = ?CT_PEER(#{name =&gt; ?CT_PEER_NAME(ActualTestCase)}),
+    %% extra setup needed for multiple test cases
+    ok = rpc:call(Node, application, set_env, [kernel, key, value]),
+    Peer.
+
+restart_node(Config) when is_list(Config) -&gt;
+    Name = ?CT_PEER_NAME(),
+    {ok, Peer, Node} = ?CT_PEER(#{name =&gt; Name}),
+    peer:stop(Peer),
+    %% restart the node with the same name as before
+    {ok, Peer2, Node} = ?CT_PEER(#{name =&gt; Name, args =&gt; ["+fnl"]}),
+    peer:stop(Peer2).</pre>
+<p>The next example demonstrates how to start multiple nodes concurrently:</p>
+<pre data-language="erlang">multi_node(Config) when is_list(Config) -&gt;
+    Peers = [?CT_PEER(#{wait_boot =&gt; {self(), tag}})
+        || _ &lt;- lists:seq(1, 4)],
+    %% wait for all nodes to complete boot process, get their names:
+    _Nodes = [receive {tag, {started, Node, Peer}} -&gt; Node end
+        || {ok, Peer} &lt;- Peers],
+    [peer:stop(Peer) || {ok, Peer} &lt;- Peers].</pre>
+<p>Start a peer on a different host. Requires <code>ssh</code> key-based authentication set up, allowing "another_host" connection without password prompt.</p>
+<pre data-language="erlang">Ssh = os:find_executable("ssh"),
+peer:start_link(#{exec =&gt; {Ssh, ["another_host", "erl"]},
+    connection =&gt; standard_io}),</pre>
+<p>The following Common Test case demonstrates Docker integration, starting two containers with hostnames "one" and "two". In this example Erlang nodes running inside containers form an Erlang cluster.</p>
+<pre data-language="erlang">docker(Config) when is_list(Config) -&gt;
+    Docker = os:find_executable("docker"),
+    PrivDir = proplists:get_value(priv_dir, Config),
+    build_release(PrivDir),
+    build_image(PrivDir),
+
+    %% start two Docker containers
+    {ok, Peer, Node} = peer:start_link(#{name =&gt; lambda,
+        connection =&gt; standard_io,
+        exec =&gt; {Docker, ["run", "-h", "one", "-i", "lambda"]}}),
+    {ok, Peer2, Node2} = peer:start_link(#{name =&gt; lambda,
+        connection =&gt; standard_io,
+        exec =&gt; {Docker, ["run", "-h", "two", "-i", "lambda"]}}),
+
+    %% find IP address of the second node using alternative connection RPC
+    {ok, Ips} = peer:call(Peer2, inet, getifaddrs, []),
+    {"eth0", Eth0} = lists:keyfind("eth0", 1, Ips),
+    {addr, Ip} = lists:keyfind(addr, 1, Eth0),
+
+    %% make first node to discover second one
+    ok = peer:call(Peer, inet_db, set_lookup, [[file]]),
+    ok = peer:call(Peer, inet_db, add_host, [Ip, ["two"]]),
+
+    %% join a cluster
+    true = peer:call(Peer, net_kernel, connect_node, [Node2]),
+    %% verify that second peer node has only the first node visible
+    [Node] = peer:call(Peer2, erlang, nodes, []),
+
+    %% stop peers, causing containers to also stop
+    peer:stop(Peer2),
+    peer:stop(Peer).
+
+build_release(Dir) -&gt;
+    %% load sasl.app file, otherwise application:get_key will fail
+    application:load(sasl),
+    %% create *.rel - release file
+    RelFile = filename:join(Dir, "lambda.rel"),
+    Release = {release, {"lambda", "1.0.0"},
+        {erts, erlang:system_info(version)},
+        [{App, begin {ok, Vsn} = application:get_key(App, vsn), Vsn end}
+            || App &lt;- [kernel, stdlib, sasl]]},
+    ok = file:write_file(RelFile, list_to_binary(lists:flatten(
+        io_lib:format("~tp.", [Release])))),
+    RelFileNoExt = filename:join(Dir, "lambda"),
+
+    %% create boot script
+    {ok, systools_make, []} = systools:make_script(RelFileNoExt,
+        [silent, {outdir, Dir}]),
+    %% package release into *.tar.gz
+    ok = systools:make_tar(RelFileNoExt, [{erts, code:root_dir()}]).
+
+build_image(Dir) -&gt;
+    %% Create Dockerfile example, working only for Ubuntu 20.04
+    %% Expose port 4445, and make Erlang distribution to listen
+    %%  on this port, and connect to it without EPMD
+    %% Set cookie on both nodes to be the same.
+    BuildScript = filename:join(Dir, "Dockerfile"),
+    Dockerfile =
+      "FROM ubuntu:20.04 as runner\n"
+      "EXPOSE 4445\n"
+      "WORKDIR /opt/lambda\n"
+      "COPY lambda.tar.gz /tmp\n"
+      "RUN tar -zxvf /tmp/lambda.tar.gz -C /opt/lambda\n"
+      "ENTRYPOINT [\"/opt/lambda/erts-" ++ erlang:system_info(version) ++
+      "/bin/erl\", \"-boot\", \"/opt/lambda/releases/1.0.0/start\","
+      " \"-kernel\", \"inet_dist_listen_min\", \"4445\","
+      " \"-erl_epmd_port\", \"4445\","
+      " \"-setcookie\", \"secret\"]\n",
+    ok = file:write_file(BuildScript, Dockerfile),
+    os:cmd("docker build -t lambda " ++ Dir).</pre>   <section id="summary" class="details-list"> <h2>Summary</h2> <h3>Types</h3>
+<dl class="summary-types summary">   <dt> <a href="#t:connection/0">connection()</a> </dt> <dd><p>Alternative connection between the origin and the peer. When the connection closes, the peer node terminates automatically.</p></dd>   <dt> <a href="#t:disconnect_timeout/0">disconnect_timeout()</a> </dt> <dd><p>Disconnect timeout. See <a href="#stop/1"><code>stop()</code></a>.</p></dd>   <dt> <a href="#t:exec/0">exec()</a> </dt> <dd><p>Overrides executable to start peer nodes with.</p></dd>   <dt> <a href="#t:peer_state/0">peer_state()</a> </dt> <dd><p>Peer node state.</p></dd>   <dt> <a href="#t:server_ref/0">server_ref()</a> </dt> <dd><p>Identifies the controlling process of a peer node.</p></dd>   <dt> <a href="#t:start_options/0">start_options()</a> </dt> <dd><p>Options that can be used when starting a <code>peer</code> node through <a href="#start/1"><code>start/1</code></a> and <a href="#start_link/0"><code>start_link/0,1</code></a>.</p></dd>   <dt> <a href="#t:wait_boot/0">wait_boot()</a> </dt> <dd><p>Specifies start/start_link timeout in milliseconds. Can be set to <code>false</code>, allowing the peer to start asynchronously. If <code>{Pid, Tag}</code> is specified instead of a timeout, the peer will send <code>Tag</code> to the requested process.</p></dd>  </dl> <h3>Functions</h3>
+<dl class="summary-functions summary">   <dt> <a href="#call/4">call(Dest, Module, Function, Args)</a> </dt> <dd><p>Equivalent to <a href="#call/5"><code>call(Dest, Module, Function, Args, 5000)</code></a>.</p></dd>   <dt> <a href="#call/5">call(Dest, Module, Function, Args, Timeout)</a> </dt> <dd><p>Uses the alternative connection to evaluate <a href="../../../../erts-17.1/doc/html/erlang.html#apply/3"><code>apply(Module, Function, Args)</code></a> on the peer node and returns the corresponding value <code>Result</code>.</p></dd>   <dt> <a href="#cast/4">cast(Dest, Module, Function, Args)</a> </dt> <dd><p>Uses the alternative connection to evaluate <a href="../../../../erts-17.1/doc/html/erlang.html#apply/3"><code>apply(Module, Function, Args)</code></a> on the peer node. No response is delivered to the calling process.</p></dd>   <dt> <a href="#get_state/1">get_state(Dest)</a> </dt> <dd><p>Returns the peer node state.</p></dd>   <dt> <a href="#random_name/0">random_name()</a> </dt> <dd><p>Equivalent to <a href="#random_name/1"><code>random_name(peer)</code></a>.</p></dd>   <dt> <a href="#random_name/1">random_name(Prefix)</a> </dt> <dd><p>Creates a sufficiently unique node name for the current host, combining a prefix, a unique number, and the current OS process ID.</p></dd>   <dt> <a href="#send/3">send(Dest, To, Message)</a> </dt> <dd><p>Uses the alternative connection to send Message to a process on the the peer node.</p></dd>   <dt> <a href="#start/1">start(Options)</a> </dt> <dd><p>Starts a peer node with the specified <a href="#t:start_options/0"><code>start_options/0</code></a>. Returns the controlling process and the full peer node name, unless <code>wait_boot</code> is not requested and the host name is not known in advance.</p></dd>   <dt> <a href="#start_link/0">start_link()</a> </dt> <dd><p>The same as <a href="#start_link/1"><code>start_link(#{name =&gt; random_name()})</code></a>.</p></dd>   <dt> <a href="#start_link/1">start_link(Options)</a> </dt> <dd><p>Starts a peer node in the same way as <a href="#start/1"><code>start/1</code></a>, except that the peer node is linked to the currently executing process. If that process terminates, the peer node also terminates.</p></dd>   <dt> <a href="#stop/1">stop(Dest)</a> </dt> <dd><p>Stops a peer node. How the node is stopped depends on the <a href="#t:start_options/0"><code>shutdown</code></a> option passed when starting the peer node. Currently the following <code>shutdown</code> options are supported</p></dd>  </dl> </section> <section id="types" class="details-list"> <h2>Types</h2> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:connection/0">connection() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L144" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> connection() :: Port :: 0..65535 | {<a href="../../../kernel-11.0.4/doc/html/inet.html#t:ip_address/0">inet:ip_address</a>(), 0..65535} | standard_io.</pre>  <p>Alternative connection between the origin and the peer. When the connection closes, the peer node terminates automatically.</p>
+<p>If the <code>peer_down</code> startup flag is set to <code>crash</code>, the controlling process on the origin node exits with corresponding reason, effectively providing a two-way link.</p>
+<p>When <code>connection</code> is set to a port number, the origin starts listening on the requested TCP port, and the peer node connects to the port. When it is set to an <code>{IP, Port}</code> tuple, the origin listens only on the specified IP. The port number can be set to 0 for automatic selection.</p>
+<p>Using the <code>standard_io</code> alternative connection starts the peer attached to the origin (other connections use <code>-detached</code> flag to erl). In this mode peer and origin communicate via stdin/stdout.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:disconnect_timeout/0">disconnect_timeout() <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L313" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> disconnect_timeout() :: 1000..4294967295 | infinity.</pre>  <p>Disconnect timeout. See <a href="#stop/1"><code>stop()</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:exec/0">exec() <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L180" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> exec() :: <a href="../../../kernel-11.0.4/doc/html/file.html#t:name/0">file:name</a>() | {<a href="../../../kernel-11.0.4/doc/html/file.html#t:name/0">file:name</a>(), [<a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>()]}.</pre>  <p>Overrides executable to start peer nodes with.</p>
+<p>By default it is the path to "erl", taken from <code>init:get_argument(progname)</code>. If <code>progname</code> is not known, <code>peer</code> makes best guess given the current ERTS version.</p>
+<p>When a tuple is passed, the first element is the path to executable, and the second element is prepended to the final command line. This can be used to start peers on a remote host or in a Docker container. See the examples above.</p>
+<p>This option is useful for testing backwards compatibility with previous releases, installed at specific paths, or when the Erlang installation location is missing from the <code>PATH</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:peer_state/0">peer_state() <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L274" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> peer_state() :: booting | running | {down, Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>Peer node state.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:server_ref/0">server_ref() <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L90" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> server_ref() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>().</pre>  <p>Identifies the controlling process of a peer node.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:start_options/0">start_options() <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L244" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> start_options() ::
+          #{name =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>(),
+            longnames =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>(),
+            host =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>(),
+            peer_down =&gt; stop | continue | crash,
+            connection =&gt; <a href="#t:connection/0">connection</a>(),
+            exec =&gt; <a href="#t:exec/0">exec</a>(),
+            detached =&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:boolean/0">boolean</a>(),
+            args =&gt; [<a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>()],
+            post_process_args =&gt; fun(([<a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>()]) -&gt; [<a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>()]),
+            env =&gt; [{<a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>()}],
+            wait_boot =&gt; <a href="#t:wait_boot/0">wait_boot</a>(),
+            shutdown =&gt; close | halt | {halt, <a href="#t:disconnect_timeout/0">disconnect_timeout</a>()} | <a href="#t:disconnect_timeout/0">disconnect_timeout</a>()}.</pre>  <p>Options that can be used when starting a <code>peer</code> node through <a href="#start/1"><code>start/1</code></a> and <a href="#start_link/0"><code>start_link/0,1</code></a>.</p>
+<ul>
+<li><p><strong><code>name</code></strong> - Node name (the part before "@"). When <code>name</code> is not specified, but <code>host</code> is, <code>peer</code> follows compatibility behaviour and uses the origin node name.</p></li>
+<li><p><strong><code>longnames</code></strong> - Use long names to start a node. Default is taken from the origin using <code>net_kernel:longnames()</code>. If the origin is not distributed, short names is the default.</p></li>
+<li><p><strong><code>host</code></strong> - Enforces a specific host name. Can be used to override the default behaviour and start "node@localhost" instead of "node@realhostname".</p></li>
+<li><p><strong><code>peer_down</code></strong> - Defines the peer control process behaviour when the control connection is closed from the peer node side (for example when the peer crashes or dumps core). When set to <code>stop</code> (default), a lost control connection causes the control process to exit normally. Setting <code>peer_down</code> to <code>continue</code> keeps the control process running, and <code>crash</code> will cause the controlling process to exit abnormally.</p></li>
+<li><p><strong><code>connection</code></strong> - Alternative connection specification. See the <a href="#t:connection/0"><code>connection</code> datatype</a>.</p></li>
+<li><p><strong><code>exec</code></strong> - Alternative mechanism to start peer nodes with, for example, ssh instead of the default bash.</p></li>
+<li><p><strong><code>detached</code></strong> - Defines whether to pass the <code>-detached</code> flag to the started peer. This option cannot be set to <code>false</code> using the <code>standard_io</code> alternative connection type. Default is <code>true</code>.</p></li>
+<li><p><strong><code>args</code></strong> - Extra command line arguments to append to the "erl" command. Arguments are passed as is, no escaping or quoting is needed or accepted.</p></li>
+<li>
+<p><strong><code>post_process_args</code></strong> - Allows the user to change the arguments passed to <code>exec</code> before the peer is started. This can for example be useful when the <code>exec</code> program wants the arguments to "erl" as a single argument. Example:</p>
+<pre data-language="erlang">peer:start(#{ name =&gt; peer:random_name(),
+  exec =&gt; {os:find_executable("bash"),["-c","erl"]},
+  post_process_args =&gt;
+     fun(["-c"|Args]) -&gt; ["-c", lists:flatten(lists:join($\s, Args))] end
+  }).</pre>
+</li>
+<li><p><strong><code>env</code></strong> - List of environment variables with their values. This list is applied to a locally started executable. If you need to change the environment of the remote peer, adjust <code>args</code> to contain <code>-env ENV_KEY ENV_VALUE</code>.</p></li>
+<li><p><strong><code>wait_boot</code></strong> - Specifies the start/start_link timeout. See <a href="#t:wait_boot/0"><code>wait_boot</code> datatype</a>.</p></li>
+<li><p><strong><code>shutdown</code></strong> - Specifies the peer node stopping behaviour. See <a href="#stop/1"><code>stop()</code></a>.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:wait_boot/0">wait_boot() <span class="since">(not exported)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L159" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> wait_boot() :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>() | {<a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), Tag :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()} | false.</pre>  <p>Specifies start/start_link timeout in milliseconds. Can be set to <code>false</code>, allowing the peer to start asynchronously. If <code>{Pid, Tag}</code> is specified instead of a timeout, the peer will send <code>Tag</code> to the requested process.</p>
+<p>The default is <code>15_000</code> ms.</p> </section> </section> </div> </section> <section id="functions" class="details-list"> <h2>Functions</h2> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="call/4">call(Dest, Module, Function, Args) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L475" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> call(Dest :: <a href="#t:server_ref/0">server_ref</a>(), Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Function :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Args :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()]) -&gt;
+              Result :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Equivalent to <a href="#call/5"><code>call(Dest, Module, Function, Args, 5000)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="call/5">call(Dest, Module, Function, Args, Timeout) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L496" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> call(Dest :: <a href="#t:server_ref/0">server_ref</a>(),
+           Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(),
+           Function :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(),
+           Args :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()],
+           Timeout :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:timeout/0">timeout</a>()) -&gt;
+              Result :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Uses the alternative connection to evaluate <a href="../../../../erts-17.1/doc/html/erlang.html#apply/3"><code>apply(Module, Function, Args)</code></a> on the peer node and returns the corresponding value <code>Result</code>.</p>
+<p><code>Timeout</code> is an integer representing the timeout in milliseconds or the atom <code>infinity</code> which prevents the operation from ever timing out.</p>
+<p>When an alternative connection is not requested, this function will raise <code>exit</code> signal with the <code>noconnection</code> reason. Use <a href="../../../kernel-11.0.4/doc/html/erpc.html"><code>erpc</code></a> module to communicate over Erlang distribution.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="cast/4">cast(Dest, Module, Function, Args) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L519" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> cast(Dest :: <a href="#t:server_ref/0">server_ref</a>(), Module :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:module/0">module</a>(), Function :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Args :: [<a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()]) -&gt; ok.</pre>  <p>Uses the alternative connection to evaluate <a href="../../../../erts-17.1/doc/html/erlang.html#apply/3"><code>apply(Module, Function, Args)</code></a> on the peer node. No response is delivered to the calling process.</p>
+<p><a href="#cast/4"><code>peer:cast/4</code></a> fails silently when the alternative connection is not configured. Use <a href="../../../kernel-11.0.4/doc/html/erpc.html"><code>erpc</code></a> module to communicate over Erlang distribution.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="get_state/1">get_state(Dest) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L465" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> get_state(Dest :: <a href="#t:server_ref/0">server_ref</a>()) -&gt; <a href="#t:peer_state/0">peer_state</a>().</pre>  <p>Returns the peer node state.</p>
+<p>The initial state is <code>booting</code>; the node stays in that state until then boot script is complete, and then the node progresses to <code>running</code>. If the node stops (gracefully or not), the state changes to <code>down</code>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="random_name/0">random_name() <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L324" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> random_name() -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>().</pre>  <p>Equivalent to <a href="#random_name/1"><code>random_name(peer)</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="random_name/1">random_name(Prefix) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L346" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> random_name(Prefix :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>()) -&gt; <a href="../../../../erts-17.1/doc/html/erlang.html#t:string/0">string</a>().</pre>  <p>Creates a sufficiently unique node name for the current host, combining a prefix, a unique number, and the current OS process ID.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>Use the <code>?CT_PEER(["erl_arg1"])</code> macro provided by Common Test <code>-include_lib("common_test/include/ct.hrl")</code> for convenience. It starts a new peer using Erlang distribution as the control channel, supplies thes calling module's code path to the peer, and uses the calling function name for the name prefix.</p>
+</div> </section> </section> <section class="detail"> <h3 class="detail-header" id="send/3">send(Dest, To, Message) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L534" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> send(Dest :: <a href="#t:server_ref/0">server_ref</a>(), To :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>() | <a href="../../../../erts-17.1/doc/html/erlang.html#t:atom/0">atom</a>(), Message :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()) -&gt; ok.</pre>  <p>Uses the alternative connection to send Message to a process on the the peer node.</p>
+<p>Silently fails if no alternative connection is configured. The process can be referenced by process ID or registered name.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start/1">start(Options) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L397" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start(<a href="#t:start_options/0">start_options</a>()) -&gt; {ok, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()} | {ok, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:node/0">node</a>()} | {error, Reason}
+               when Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Starts a peer node with the specified <a href="#t:start_options/0"><code>start_options/0</code></a>. Returns the controlling process and the full peer node name, unless <code>wait_boot</code> is not requested and the host name is not known in advance.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_link/0">start_link() <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L359" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_link() -&gt; {ok, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:node/0">node</a>()} | {error, Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>()}.</pre>  <p>The same as <a href="#start_link/1"><code>start_link(#{name =&gt; random_name()})</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="start_link/1">start_link(Options) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L383" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> start_link(<a href="#t:start_options/0">start_options</a>()) -&gt; {ok, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>()} | {ok, <a href="../../../../erts-17.1/doc/html/erlang.html#t:pid/0">pid</a>(), <a href="../../../../erts-17.1/doc/html/erlang.html#t:node/0">node</a>()} | {error, Reason}
+                    when Reason :: <a href="../../../../erts-17.1/doc/html/erlang.html#t:term/0">term</a>().</pre>  <p>Starts a peer node in the same way as <a href="#start/1"><code>start/1</code></a>, except that the peer node is linked to the currently executing process. If that process terminates, the peer node also terminates.</p>
+<p>Accepts <a href="#t:start_options/0"><code>start_options/0</code></a>. Returns the controlling process and the full peer node name, unless <code>wait_boot</code> is not requested and host name is not known in advance.</p>
+<p>When the <code>standard_io</code> alternative connection is requested, and <code>wait_boot</code> is not set to <code>false</code>, a failed peer boot sequence causes the caller to exit with the <code>{boot_failed, {exit_status, ExitCode}}</code> reason.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="stop/1">stop(Dest) <span class="since">(since OTP 25.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/stdlib/src/peer.erl#L450" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-spec</span> stop(Dest :: <a href="#t:server_ref/0">server_ref</a>()) -&gt; ok.</pre>  <p>Stops a peer node. How the node is stopped depends on the <a href="#t:start_options/0"><code>shutdown</code></a> option passed when starting the peer node. Currently the following <code>shutdown</code> options are supported:</p>
+<ul>
+<li><p><strong><code>halt</code></strong> - This is the default shutdown behavior. It behaves as <code>shutdown</code> option <code>{halt, DefaultTimeout}</code> where <code>DefaultTimeout</code> currently equals <code>5000</code>.</p></li>
+<li><p><strong><code>{halt, Timeout :: disconnect_timeout()}</code></strong> - Triggers a call to <a href="../../../../erts-17.1/doc/html/erlang.html#halt/0"><code>erlang:halt()</code></a> on the peer node and then waits for the Erlang distribution connection to the peer node to be taken down. If this connection has not been taken down after <code>Timeout</code> milliseconds, it will forcefully be taken down by <a href="#stop/1"><code>peer:stop/1</code></a>. See the <a href="peer.html#dist_connection_close">warning</a> below for more info about this.</p></li>
+<li><p><strong><code>Timeout :: disconnect_timeout()</code></strong> - Triggers a call to <a href="../../../../erts-17.1/doc/html/init.html#stop/0"><code>init:stop()</code></a> on the peer node and then waits for the Erlang distribution connection to the peer node to be taken down. If this connection has not been taken down after <code>Timeout</code> milliseconds, it will forcefully be taken down by <a href="#stop/1"><code>peer:stop/1</code></a>. See the <a href="peer.html#dist_connection_close">warning</a> below for more info about this.</p></li>
+<li>
+<p><strong><code>close</code></strong> - Close the <em>control connection</em> to the peer node and return. This is the fastest way for the caller of <a href="#stop/1"><code>peer:stop/1</code></a> to stop a peer node.</p>
+<p>Note that if the Erlang distribution connection is not used as control connection it might not have been taken down when <a href="#stop/1"><code>peer:stop/1</code></a> returns. Also note that the <a href="peer.html#dist_connection_close">warning</a> below applies when the Erlang distribution connection is used as control connection.</p>
+</li>
+</ul>
+
+<div class="warning">
+<p class="label">Warning</p>
+<p>In the cases where the Erlang distribution connection is taken down by <a href="#stop/1"><code>peer:stop/1</code></a>, other code independent of the peer code might react to the connection loss before the peer node is stopped which might cause undesirable effects. For example, <a href="../../../kernel-11.0.4/doc/html/global.html#prevent_overlapping_partitions"><code>global</code></a> might trigger even more Erlang distribution connections to other nodes to be taken down. The potential undesirable effects are, however, not limited to this. It is hard to say what the effects will be since these effects can be caused by any code with links or monitors to something on the origin node, or code monitoring the connection to the origin node.</p>
+</div> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

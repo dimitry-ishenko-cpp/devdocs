@@ -1,0 +1,338 @@
+<h1> <span>erl_tracer</span> <small>behaviour</small>  </h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L23" title="View Source" class="source" rel="help nofollow">Source</a>   <p>Erlang tracer behavior.</p>
+<p>This behavior module implements the back end of the Erlang tracing system. The functions in this module are called whenever a trace probe is triggered. Both the <code>enabled</code> and <code>trace</code> functions are called in the context of the entity that triggered the trace probe. This means that the overhead by having the tracing enabled is greatly effected by how much time is spent in these functions. So, do as little work as possible in these functions.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>All functions in this behavior must be implemented as NIFs. This limitation can be removed in a future releases. An <a href="erl_tracer.html#example">example tracer module NIF</a> implementation is provided below.</p>
+</div>
+<div class="warning">
+<p class="label">Warning</p>
+<p>Do not send messages or issue port commands to the <code>Tracee</code> in any of the callbacks. This is not allowed and can cause all sorts of strange behavior, including, but not limited to, infinite recursions.</p>
+</div>
+
+<h2 id="module-erl-tracer-module-example">Erl Tracer Module Example</h2>
+<p>In this example, a tracer module with a NIF back end sends a message for each <code>send</code> trace tag containing only the sender and receiver. Using this tracer module, a much more lightweight message tracer is used, which only records who sent messages to who.</p>
+<p>The following is an example session using it on Linux:</p>
+<pre data-language="erlang">$ gcc -I erts-8.0/include/ -fPIC -shared -o erl_msg_tracer.so erl_msg_tracer.c
+$ erl
+Erlang/OTP 19 [DEVELOPMENT] [erts-8.0] [source-ed2b56b] [64-bit] [smp:8:8] [async-threads:10] [hipe] [kernel-poll:false]
+
+Eshell V8.0  (abort with ^G)
+1&gt; c(erl_msg_tracer), erl_msg_tracer:load().
+ok
+2&gt; Tracer = spawn(fun F() -&gt; receive M -&gt; io:format("~p~n",[M]), F() end end).
+&lt;0.37.0&gt;
+3&gt; erlang:trace(new, true, [send,{tracer, erl_msg_tracer, Tracer}]).
+0
+{trace,&lt;0.39.0&gt;,&lt;0.27.0&gt;}
+4&gt; {ok, D} = file:open("/tmp/tmp.data",[write]).
+{trace,#Port&lt;0.486&gt;,&lt;0.40.0&gt;}
+{trace,&lt;0.40.0&gt;,&lt;0.21.0&gt;}
+{trace,#Port&lt;0.487&gt;,&lt;0.4.0&gt;}
+{trace,#Port&lt;0.488&gt;,&lt;0.4.0&gt;}
+{trace,#Port&lt;0.489&gt;,&lt;0.4.0&gt;}
+{trace,#Port&lt;0.490&gt;,&lt;0.4.0&gt;}
+{ok,&lt;0.40.0&gt;}
+{trace,&lt;0.41.0&gt;,&lt;0.27.0&gt;}
+5&gt;</pre>
+<p><code>erl_msg_tracer.erl</code>:</p>
+<pre data-language="erlang">-module(erl_msg_tracer).
+
+-export([enabled/3, trace/5, load/0]).
+
+load() -&gt;
+    erlang:load_nif("erl_msg_tracer", []).
+
+enabled(_, _, _) -&gt;
+    error.
+
+trace(_, _, _, _, _) -&gt;
+    error.</pre>
+<p><code>erl_msg_tracer.c</code>:</p>
+<pre data-language="c">#include &lt;erl_nif.h&gt;
+
+/* NIF interface declarations */
+static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info);
+static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, ERL_NIF_TERM load_info);
+static void unload(ErlNifEnv* env, void* priv_data);
+
+/* The NIFs: */
+static ERL_NIF_TERM enabled(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM trace(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+static ErlNifFunc nif_funcs[] = {
+    {"enabled", 3, enabled},
+    {"trace", 5, trace}
+};
+
+ERL_NIF_INIT(erl_msg_tracer, nif_funcs, load, NULL, upgrade, unload)
+
+static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
+{
+    *priv_data = NULL;
+    return 0;
+}
+
+static void unload(ErlNifEnv* env, void* priv_data)
+{
+
+}
+
+static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data,
+		   ERL_NIF_TERM load_info)
+{
+    if (*old_priv_data != NULL || *priv_data != NULL) {
+	return -1; /* Don't know how to do that */
+    }
+    if (load(env, priv_data, load_info)) {
+	return -1;
+    }
+    return 0;
+}
+
+/*
+ * argv[0]: TraceTag
+ * argv[1]: TracerState
+ * argv[2]: Tracee
+ */
+static ERL_NIF_TERM enabled(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    ErlNifPid to_pid;
+    if (enif_get_local_pid(env, argv[1], &amp;to_pid))
+        if (!enif_is_process_alive(env, &amp;to_pid))
+            if (enif_is_identical(enif_make_atom(env, "trace_status"), argv[0]))
+                /* tracer is dead so we should remove this tracepoint */
+                return enif_make_atom(env, "remove");
+            else
+                return enif_make_atom(env, "discard");
+
+    /* Only generate trace for when tracer != tracee */
+    if (enif_is_identical(argv[1], argv[2]))
+        return enif_make_atom(env, "discard");
+
+    /* Only trigger trace messages on 'send' */
+    if (enif_is_identical(enif_make_atom(env, "send"), argv[0]))
+        return enif_make_atom(env, "trace");
+
+    /* Have to answer trace_status */
+    if (enif_is_identical(enif_make_atom(env, "trace_status"), argv[0]))
+        return enif_make_atom(env, "trace");
+
+    return enif_make_atom(env, "discard");
+}
+
+/*
+ * argv[0]: TraceTag, should only be 'send'
+ * argv[1]: TracerState, process to send {Tracee, Recipient} to
+ * argv[2]: Tracee
+ * argv[3]: Message
+ * argv[4]: Options, map containing Recipient
+ */
+static ERL_NIF_TERM trace(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    ErlNifPid to_pid;
+    ERL_NIF_TERM recipient, msg;
+
+    if (enif_get_local_pid(env, argv[1], &amp;to_pid)) {
+      if (enif_get_map_value(env, argv[4], enif_make_atom(env, "extra"), &amp;recipient)) {
+        msg = enif_make_tuple3(env, enif_make_atom(env, "trace"), argv[2], recipient);
+        enif_send(env, &amp;to_pid, NULL, msg);
+      }
+    }
+
+    return enif_make_atom(env, "ok");
+}</pre>   <section id="summary" class="details-list"> <h2>Summary</h2> <h3>Types</h3>
+<dl class="summary-types summary">   <dt> <a href="#t:trace_opts/0">trace_opts()</a> </dt> <dd><p>The options for the tracee</p></dd>   <dt> <a href="#t:trace_tag/0">trace_tag()</a> </dt> <dd><p>The different trace tags that the tracer is called with.</p></dd>   <dt> <a href="#t:trace_tag_call/0">trace_tag_call()</a> </dt>   <dt> <a href="#t:trace_tag_gc/0">trace_tag_gc()</a> </dt>   <dt> <a href="#t:trace_tag_ports/0">trace_tag_ports()</a> </dt>   <dt> <a href="#t:trace_tag_procs/0">trace_tag_procs()</a> </dt>   <dt> <a href="#t:trace_tag_receive/0">trace_tag_receive()</a> </dt>   <dt> <a href="#t:trace_tag_running_ports/0">trace_tag_running_ports()</a> </dt>   <dt> <a href="#t:trace_tag_running_procs/0">trace_tag_running_procs()</a> </dt>   <dt> <a href="#t:trace_tag_send/0">trace_tag_send()</a> </dt>   <dt> <a href="#t:tracee/0">tracee()</a> </dt> <dd><p>The process or port that the trace belongs to.</p></dd>  </dl> <h3>Functions</h3>
+<dl class="summary-functions summary">   <dt> <a href="#c:enabled/3">enabled(TraceTag, TracerState, Tracee)</a> </dt> <dd><p>This callback is called whenever a tracepoint is triggered.</p></dd>   <dt> <a href="#c:enabled_call/3">enabled_call(TraceTag, TracerState, Tracee)</a> </dt> <dd><p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>call | return_to</code></a> is triggered.</p></dd>   <dt> <a href="#c:enabled_garbage_collection/3">enabled_garbage_collection(TraceTag, TracerState, Tracee)</a> </dt> <dd><p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>garbage_collection</code></a> is triggered.</p></dd>   <dt> <a href="#c:enabled_ports/3">enabled_ports(TraceTag, TracerState, Tracee)</a> </dt> <dd><p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>ports</code></a> is triggered.</p></dd>   <dt> <a href="#c:enabled_procs/3">enabled_procs(TraceTag, TracerState, Tracee)</a> </dt> <dd><p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>procs</code></a> is triggered.</p></dd>   <dt> <a href="#c:enabled_receive/3">enabled_receive(TraceTag, TracerState, Tracee)</a> </dt> <dd><p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>'receive'</code></a> is triggered.</p></dd>   <dt> <a href="#c:enabled_running_ports/3">enabled_running_ports(TraceTag, TracerState, Tracee)</a> </dt> <dd><p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>running_ports</code></a> is triggered.</p></dd>   <dt> <a href="#c:enabled_running_procs/3">enabled_running_procs(TraceTag, TracerState, Tracee)</a> </dt> <dd><p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>running_procs | running</code></a> is triggered.</p></dd>   <dt> <a href="#c:enabled_send/3">enabled_send(TraceTag, TracerState, Tracee)</a> </dt> <dd><p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>send</code></a> is triggered.</p></dd>   <dt> <a href="#c:trace/5">trace(Tag, TracerState, Tracee, Msg, Opts)</a> </dt> <dd><p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled/3"><code>Module:enabled/3</code></a> callback returned <code>trace</code>.</p></dd>   <dt> <a href="#c:trace_call/5">trace_call(TraceTag, TracerState, Tracee, TraceTerm, Opts)</a> </dt> <dd><p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_call/3"><code>Module:enabled_call/3</code></a> callback returned <code>trace</code>.</p></dd>   <dt> <a href="#c:trace_garbage_collection/5">trace_garbage_collection(TraceTag, TracerState, Tracee, TraceTerm, Opts)</a> </dt> <dd><p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_garbage_collection/3"><code>Module:enabled_garbage_collection/3</code></a> callback returned <code>trace</code>.</p></dd>   <dt> <a href="#c:trace_ports/5">trace_ports(TraceTag, TracerState, Tracee, TraceTerm, Opts)</a> </dt> <dd><p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_ports/3"><code>Module:enabled_ports/3</code></a> callback returned <code>trace</code>.</p></dd>   <dt> <a href="#c:trace_procs/5">trace_procs(TraceTag, TracerState, Tracee, TraceTerm, Opts)</a> </dt> <dd><p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_procs/3"><code>Module:enabled_procs/3</code></a> callback returned <code>trace</code>.</p></dd>   <dt> <a href="#c:trace_receive/5">trace_receive(TraceTag, TracerState, Tracee, TraceTerm, Opts)</a> </dt> <dd><p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_receive/3"><code>Module:enabled_receive/3</code></a> callback returned <code>trace</code>.</p></dd>   <dt> <a href="#c:trace_running_ports/5">trace_running_ports(TraceTag, TracerState, Tracee, TraceTerm, Opts)</a> </dt> <dd><p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_running_ports/3"><code>Module:enabled_running_ports/3</code></a> callback returned <code>trace</code>.</p></dd>   <dt> <a href="#c:trace_running_procs/5">trace_running_procs(TraceTag, TracerState, Tracee, TraceTerm, Opts)</a> </dt> <dd><p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_running_procs/3"><code>Module:enabled_running_procs/3</code></a> callback returned <code>trace</code>.</p></dd>   <dt> <a href="#c:trace_send/5">trace_send(TraceTag, TracerState, Tracee, TraceTerm, Opts)</a> </dt> <dd><p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_send/3"><code>Module:enabled_send/3</code></a> callback returned <code>trace</code>.</p></dd>  </dl> </section> <section id="types" class="details-list"> <h2>Types</h2> <div class="types-list"> <section class="detail"> <h3 class="detail-header" id="t:trace_opts/0">trace_opts() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L250" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_opts() ::
+          #{extra =&gt; <a href="erlang.html#t:term/0">term</a>(),
+            match_spec_result =&gt; <a href="erlang.html#t:term/0">term</a>(),
+            scheduler_id =&gt; <a href="erlang.html#t:non_neg_integer/0">non_neg_integer</a>(),
+            timestamp =&gt; timestamp | cpu_timestamp | monotonic | strict_monotonic}.</pre>  <p>The options for the tracee:</p>
+<ul>
+<li><p><strong><code>timestamp</code></strong> - If set the tracer has been requested to include a time stamp.</p></li>
+<li><p><strong><code>extra</code></strong> - If set the tracepoint has included additional data about the trace event. What the additional data is depends on which <code>TraceTag</code> has been triggered. The <code>extra</code> trace data corresponds to the fifth element in the trace tuples described in <a href="../../../lib/kernel-11.0.4/doc/html/trace.html#process_trace_messages">trace:process/4</a>.</p></li>
+<li><p><strong><code>match_spec_result</code></strong> - If set the tracer has been requested to include the output of a match specification that was run.</p></li>
+<li><p><strong><code>scheduler_id</code></strong> - If set the scheduler id is to be included by the tracer.</p></li>
+</ul> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_tag/0">trace_tag() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L225" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_tag() ::
+          <a href="#t:trace_tag_send/0">trace_tag_send</a>() |
+          <a href="#t:trace_tag_receive/0">trace_tag_receive</a>() |
+          <a href="#t:trace_tag_call/0">trace_tag_call</a>() |
+          <a href="#t:trace_tag_procs/0">trace_tag_procs</a>() |
+          <a href="#t:trace_tag_ports/0">trace_tag_ports</a>() |
+          <a href="#t:trace_tag_running_procs/0">trace_tag_running_procs</a>() |
+          <a href="#t:trace_tag_running_ports/0">trace_tag_running_ports</a>() |
+          <a href="#t:trace_tag_gc/0">trace_tag_gc</a>().</pre>  <p>The different trace tags that the tracer is called with.</p>
+<p>Each trace tag is described in detail in <a href="#c:trace/5"><code>Module:trace/5</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_tag_call/0">trace_tag_call() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L211" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_tag_call() :: call | return_to | return_from | exception_from.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_tag_gc/0">trace_tag_gc() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L217" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_tag_gc() :: gc_minor_start | gc_minor_end | gc_major_start | gc_major_end.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_tag_ports/0">trace_tag_ports() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L215" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_tag_ports() :: open | closed | link | unlink | getting_linked | getting_unlinked.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_tag_procs/0">trace_tag_procs() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L212" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_tag_procs() ::
+          spawn | spawned | exit | link | unlink | getting_linked | getting_unlinked | register |
+          unregister.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_tag_receive/0">trace_tag_receive() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L210" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_tag_receive() :: 'receive'.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_tag_running_ports/0">trace_tag_running_ports() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L207" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_tag_running_ports() :: in | out | in_exiting | out_exiting | out_exited.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_tag_running_procs/0">trace_tag_running_procs() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L208" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_tag_running_procs() :: in | out | in_exiting | out_exiting | out_exited.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:trace_tag_send/0">trace_tag_send() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L209" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> trace_tag_send() :: send | send_to_non_existing_process.</pre>  </section> </section> <section class="detail"> <h3 class="detail-header" id="t:tracee/0">tracee() <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L205" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-type</span> tracee() :: <a href="erlang.html#t:port/0">port</a>() | <a href="erlang.html#t:pid/0">pid</a>() | undefined.</pre>  <p>The process or port that the trace belongs to.</p> </section> </section> </div> </section> <section id="functions" class="details-list"> <h2>Functions</h2> <div class="functions-list"> <section class="detail"> <h3 class="detail-header" id="c:enabled/3">enabled(TraceTag, TracerState, Tracee) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L281" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> enabled(TraceTag, TracerState, Tracee) -&gt; Result
+                     when
+                         TraceTag :: <a href="#t:trace_tag/0">trace_tag</a>() | trace_status,
+                         TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                         Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                         Result :: trace | discard | remove.</pre>  <p>This callback is called whenever a tracepoint is triggered.</p>
+<p>It allows the tracer to decide whether a trace is to be generated or not. This check is made as early as possible to limit the amount of overhead associated with tracing. If <code>trace</code> is returned, the necessary trace data is created and the trace callback of the tracer is called. If <code>discard</code> is returned, this trace call is discarded and no call to trace is done.</p>
+<p><code>trace_status</code> is a special type of <code>TraceTag</code>, which is used to check if the tracer is still to be active. It is called in multiple scenarios, but most significantly it is used when tracing is started using this tracer. If <code>remove</code> is returned when the <code>trace_status</code> is checked, the tracer is removed from the tracee.</p>
+<p>This function can be called multiple times per tracepoint, so it is important that it is both fast and without side effects.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:enabled_call/3">enabled_call(TraceTag, TracerState, Tracee) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L294" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> enabled_call(TraceTag, TracerState, Tracee) -&gt; Result
+                          when
+                              TraceTag :: <a href="#t:trace_tag_call/0">trace_tag_call</a>(),
+                              TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                              Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                              Result :: trace | discard | remove.</pre>  <p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>call | return_to</code></a> is triggered.</p>
+<p>If <a href="#c:enabled_call/3"><code>enabled_call/3</code></a> is undefined, <a href="#c:enabled/3"><code>Module:enabled/3</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:enabled_garbage_collection/3">enabled_garbage_collection(TraceTag, TracerState, Tracee) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L307" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> enabled_garbage_collection(TraceTag, TracerState, Tracee) -&gt; Result
+                                        when
+                                            TraceTag :: <a href="#t:trace_tag_gc/0">trace_tag_gc</a>(),
+                                            TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                                            Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                                            Result :: trace | discard | remove.</pre>  <p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>garbage_collection</code></a> is triggered.</p>
+<p>If <a href="#c:enabled_garbage_collection/3"><code>enabled_garbage_collection/3</code></a> is undefined, <a href="#c:enabled/3"><code>Module:enabled/3</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:enabled_ports/3">enabled_ports(TraceTag, TracerState, Tracee) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L320" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> enabled_ports(TraceTag, TracerState, Tracee) -&gt; Result
+                           when
+                               TraceTag :: <a href="#t:trace_tag_ports/0">trace_tag_ports</a>(),
+                               TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                               Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                               Result :: trace | discard | remove.</pre>  <p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>ports</code></a> is triggered.</p>
+<p>If <a href="#c:enabled_ports/3"><code>enabled_ports/3</code></a> is undefined, <a href="#c:enabled/3"><code>Module:enabled/3</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:enabled_procs/3">enabled_procs(TraceTag, TracerState, Tracee) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L333" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> enabled_procs(TraceTag, TracerState, Tracee) -&gt; Result
+                           when
+                               TraceTag :: <a href="#t:trace_tag_procs/0">trace_tag_procs</a>(),
+                               TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                               Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                               Result :: trace | discard | remove.</pre>  <p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>procs</code></a> is triggered.</p>
+<p>If <a href="#c:enabled_procs/3"><code>enabled_procs/3</code></a> is undefined, <a href="#c:enabled/3"><code>Module:enabled/3</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:enabled_receive/3">enabled_receive(TraceTag, TracerState, Tracee) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L346" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> enabled_receive(TraceTag, TracerState, Tracee) -&gt; Result
+                             when
+                                 TraceTag :: <a href="#t:trace_tag_receive/0">trace_tag_receive</a>(),
+                                 TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                                 Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                                 Result :: trace | discard | remove.</pre>  <p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>'receive'</code></a> is triggered.</p>
+<p>If <a href="#c:enabled_receive/3"><code>enabled_receive/3</code></a> is undefined, <a href="#c:enabled/3"><code>Module:enabled/3</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:enabled_running_ports/3">enabled_running_ports(TraceTag, TracerState, Tracee) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L359" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> enabled_running_ports(TraceTag, TracerState, Tracee) -&gt; Result
+                                   when
+                                       TraceTag :: <a href="#t:trace_tag_running_ports/0">trace_tag_running_ports</a>(),
+                                       TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                                       Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                                       Result :: trace | discard | remove.</pre>  <p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>running_ports</code></a> is triggered.</p>
+<p>If <a href="#c:enabled_running_ports/3"><code>enabled_running_ports/3</code></a> is undefined, <a href="#c:enabled/3"><code>Module:enabled/3</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:enabled_running_procs/3">enabled_running_procs(TraceTag, TracerState, Tracee) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L372" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> enabled_running_procs(TraceTag, TracerState, Tracee) -&gt; Result
+                                   when
+                                       TraceTag :: <a href="#t:trace_tag_running_procs/0">trace_tag_running_procs</a>(),
+                                       TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                                       Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                                       Result :: trace | discard | remove.</pre>  <p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>running_procs | running</code></a> is triggered.</p>
+<p>If <a href="#c:enabled_running_procs/3"><code>enabled_running_procs/3</code></a> is undefined, <a href="#c:enabled/3"><code>Module:enabled/3</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:enabled_send/3">enabled_send(TraceTag, TracerState, Tracee) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L385" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> enabled_send(TraceTag, TracerState, Tracee) -&gt; Result
+                          when
+                              TraceTag :: <a href="#t:trace_tag_send/0">trace_tag_send</a>(),
+                              TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                              Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                              Result :: trace | discard | remove.</pre>  <p>This callback is called whenever a tracepoint with trace flag <a href="erlang.html#trace/3"><code>send</code></a> is triggered.</p>
+<p>If <a href="#c:enabled_send/3"><code>enabled_send/3</code></a> is undefined, <a href="#c:enabled/3"><code>Module:enabled/3</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:trace/5">trace(Tag, TracerState, Tracee, Msg, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L411" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> trace(seq_trace, TracerState, Label, SeqTraceInfo, Opts) -&gt; Result
+                   when
+                       TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                       Label :: <a href="erlang.html#t:term/0">term</a>(),
+                       SeqTraceInfo :: <a href="erlang.html#t:term/0">term</a>(),
+                       Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                       Result :: ok;
+               (TraceTag, TracerState, Tracee, TraceTerm, Opts) -&gt; Result
+                   when
+                       TraceTag :: <a href="#t:trace_tag/0">trace_tag</a>(),
+                       TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                       Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                       TraceTerm :: <a href="erlang.html#t:term/0">term</a>(),
+                       Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                       Result :: ok.</pre>  <p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled/3"><code>Module:enabled/3</code></a> callback returned <code>trace</code>.</p>
+<p>In it any side effects needed by the tracer are to be done. The tracepoint payload is located in the <code>TraceTerm</code>. The content of the <code>TraceTerm</code> depends on which <code>TraceTag</code> is triggered. <code>TraceTerm</code> corresponds to the fourth element in the trace tuples described in <a href="../../../lib/kernel-11.0.4/doc/html/trace.html#process_trace_messages"><code>trace:process/4</code></a>.</p>
+<p>If the trace tuple has five elements, the fifth element will be sent as the <code>extra</code> value in the <code>Opts</code> maps.</p>
+<p>The <code>TraceTag</code> <code>seq_trace</code> is handled slightly differently. There is no <code>Tracee</code> for <code>seq_trace</code>, instead the <code>Label</code> associated with the <code>seq_trace</code> event is specified.</p>
+<p>For more information on what <code>Label</code> and <code>SeqTraceInfo</code> can be, see <a href="../../../lib/kernel-11.0.4/doc/html/seq_trace.html"><code>seq_trace</code></a>.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:trace_call/5">trace_call(TraceTag, TracerState, Tracee, TraceTerm, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L432" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> trace_call(TraceTag, TracerState, Tracee, TraceTerm, Opts) -&gt; Result
+                        when
+                            TraceTag :: <a href="#t:trace_tag_call/0">trace_tag_call</a>(),
+                            TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                            Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                            TraceTerm :: <a href="erlang.html#t:term/0">term</a>(),
+                            Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                            Result :: ok.</pre>  <p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_call/3"><code>Module:enabled_call/3</code></a> callback returned <code>trace</code>.</p>
+<p>If <a href="#c:trace_call/5"><code>trace_call/5</code></a> is undefined, <a href="#c:trace/5"><code>Module:trace/5</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:trace_garbage_collection/5">trace_garbage_collection(TraceTag, TracerState, Tracee, TraceTerm, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L448" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> trace_garbage_collection(TraceTag, TracerState, Tracee, TraceTerm, Opts) -&gt; Result
+                                      when
+                                          TraceTag :: <a href="#t:trace_tag_gc/0">trace_tag_gc</a>(),
+                                          TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                                          Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                                          TraceTerm :: <a href="erlang.html#t:term/0">term</a>(),
+                                          Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                                          Result :: ok.</pre>  <p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_garbage_collection/3"><code>Module:enabled_garbage_collection/3</code></a> callback returned <code>trace</code>.</p>
+<p>If <a href="#c:trace_garbage_collection/5"><code>trace_garbage_collection/5</code></a> is undefined, <a href="#c:trace/5"><code>Module:trace/5</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:trace_ports/5">trace_ports(TraceTag, TracerState, Tracee, TraceTerm, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L463" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> trace_ports(TraceTag, TracerState, Tracee, TraceTerm, Opts) -&gt; Result
+                         when
+                             TraceTag :: <a href="#t:trace_tag/0">trace_tag</a>(),
+                             TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                             Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                             TraceTerm :: <a href="erlang.html#t:term/0">term</a>(),
+                             Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                             Result :: ok.</pre>  <p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_ports/3"><code>Module:enabled_ports/3</code></a> callback returned <code>trace</code>.</p>
+<p>If <a href="#c:trace_ports/5"><code>trace_ports/5</code></a> is undefined, <a href="#c:trace/5"><code>Module:trace/5</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:trace_procs/5">trace_procs(TraceTag, TracerState, Tracee, TraceTerm, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L478" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> trace_procs(TraceTag, TracerState, Tracee, TraceTerm, Opts) -&gt; Result
+                         when
+                             TraceTag :: <a href="#t:trace_tag/0">trace_tag</a>(),
+                             TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                             Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                             TraceTerm :: <a href="erlang.html#t:term/0">term</a>(),
+                             Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                             Result :: ok.</pre>  <p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_procs/3"><code>Module:enabled_procs/3</code></a> callback returned <code>trace</code>.</p>
+<p>If <a href="#c:trace_procs/5"><code>trace_procs/5</code></a> is undefined, <a href="#c:trace/5"><code>Module:trace/5</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:trace_receive/5">trace_receive(TraceTag, TracerState, Tracee, TraceTerm, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L493" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> trace_receive(TraceTag, TracerState, Tracee, TraceTerm, Opts) -&gt; Result
+                           when
+                               TraceTag :: <a href="#t:trace_tag_receive/0">trace_tag_receive</a>(),
+                               TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                               Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                               TraceTerm :: <a href="erlang.html#t:term/0">term</a>(),
+                               Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                               Result :: ok.</pre>  <p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_receive/3"><code>Module:enabled_receive/3</code></a> callback returned <code>trace</code>.</p>
+<p>If <a href="#c:trace_receive/5"><code>trace_receive/5</code></a> is undefined, <a href="#c:trace/5"><code>Module:trace/5</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:trace_running_ports/5">trace_running_ports(TraceTag, TracerState, Tracee, TraceTerm, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L509" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> trace_running_ports(TraceTag, TracerState, Tracee, TraceTerm, Opts) -&gt; Result
+                                 when
+                                     TraceTag :: <a href="#t:trace_tag_running_ports/0">trace_tag_running_ports</a>(),
+                                     TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                                     Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                                     TraceTerm :: <a href="erlang.html#t:term/0">term</a>(),
+                                     Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                                     Result :: ok.</pre>  <p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_running_ports/3"><code>Module:enabled_running_ports/3</code></a> callback returned <code>trace</code>.</p>
+<p>If <a href="#c:trace_running_ports/5"><code>trace_running_ports/5</code></a> is undefined, <a href="#c:trace/5"><code>Module:trace/5</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:trace_running_procs/5">trace_running_procs(TraceTag, TracerState, Tracee, TraceTerm, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L525" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> trace_running_procs(TraceTag, TracerState, Tracee, TraceTerm, Opts) -&gt; Result
+                                 when
+                                     TraceTag :: <a href="#t:trace_tag_running_procs/0">trace_tag_running_procs</a>(),
+                                     TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                                     Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                                     TraceTerm :: <a href="erlang.html#t:term/0">term</a>(),
+                                     Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                                     Result :: ok.</pre>  <p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_running_procs/3"><code>Module:enabled_running_procs/3</code></a> callback returned <code>trace</code>.</p>
+<p>If <a href="#c:trace_running_procs/5"><code>trace_running_procs/5</code></a> is undefined, <a href="#c:trace/5"><code>Module:trace/5</code></a> is called instead.</p> </section> </section> <section class="detail"> <h3 class="detail-header" id="c:trace_send/5">trace_send(TraceTag, TracerState, Tracee, TraceTerm, Opts) <span class="since">(since OTP 19.0)</span><a href="https://github.com/erlang/otp/blob/OTP-29.1.1/erts/preloaded/src/erl_tracer.erl#L540" class="source">Source</a>
+</h3> <section class="docstring">  <pre data-language="erlang"><span class="attribute">-callback</span> trace_send(TraceTag, TracerState, Tracee, TraceTerm, Opts) -&gt; Result
+                        when
+                            TraceTag :: <a href="#t:trace_tag_send/0">trace_tag_send</a>(),
+                            TracerState :: <a href="erlang.html#t:term/0">term</a>(),
+                            Tracee :: <a href="#t:tracee/0">tracee</a>(),
+                            TraceTerm :: <a href="erlang.html#t:term/0">term</a>(),
+                            Opts :: <a href="#t:trace_opts/0">trace_opts</a>(),
+                            Result :: ok.</pre>  <p>This callback is called when a tracepoint is triggered and the <a href="#c:enabled_send/3"><code>Module:enabled_send/3</code></a> callback returned <code>trace</code>.</p>
+<p>If <a href="#c:trace_send/5"><code>trace_send/5</code></a> is undefined, <a href="#c:trace/5"><code>Module:trace/5</code></a> is called instead.</p> </section> </section> </div> </section><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

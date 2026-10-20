@@ -1,0 +1,344 @@
+<h1>Prefetching &amp; Router Integration</h1>
+<p>When you know or suspect that a certain piece of data will be needed, you can use prefetching to populate the cache with that data ahead of time, leading to a faster experience.</p>
+<p>There are a few different prefetching patterns:</p>
+<ol>
+<li>In event handlers</li>
+<li>In components</li>
+<li>Via router integration</li>
+<li>During Server Rendering (another form of router integration)</li>
+</ol>
+<p>In this guide, we'll take a look at the first three, while the fourth will be covered in depth in the <a href="ssr.html">Server Rendering &amp; Hydration guide</a> and the <a href="advanced-ssr.html">Advanced Server Rendering guide</a>.</p>
+<p>One specific use of prefetching is to avoid Request Waterfalls, for an in-depth background and explanation of those, see the <a href="request-waterfalls.html">Performance &amp; Request Waterfalls guide</a>.</p>
+<h2 id="using-query-to-prefetch">Using <code>query</code> to prefetch</h2>
+<div class="_note">
+<strong>Note</strong><p>These tips replace the use of the now deprecated <code>prefetchQuery</code> and <code>ensureQueryData</code> methods. If you used an earlier version of this guide, note that those methods will be removed in the next major version of TanStack Query</p>
+</div>
+<p>Prefetching a query uses the <code>query</code> method. This method by default will</p>
+<ul>
+<li>Run the query function</li>
+<li>Cache the result</li>
+<li>Return the result of that query</li>
+<li>Throw if it hits any errors</li>
+</ul>
+<p>For prefetching you often want to modify these defaults:</p>
+<ul>
+<li>Out of the box, <code>query</code> uses the default <code>staleTime</code> configured for the <code>queryClient</code> to determine whether existing data in the cache is fresh or needs to be fetched again</li>
+<li>You can also pass a specific <code>staleTime</code> like this: <code>query({ queryKey: ['todos'], queryFn: fn, staleTime: 5000 })</code><ul>
+<li>This <code>staleTime</code> is only used for that query fetch, you still need to set it for any <code>useQuery</code> call as well</li>
+<li>If you want to always return data if it's available in the cache regardless of the default <code>staleTime</code>, you can pass <code>"static"</code> in for <code>staleTime</code>.</li>
+<li>Tip: If you are prefetching on the server, set a default <code>staleTime</code> higher than <code>0</code> for that <code>queryClient</code> to avoid having to pass in a specific <code>staleTime</code> to each prefetch call</li>
+</ul>
+</li>
+<li>If no instances of <code>useQuery</code> appear for a prefetched query, it will be deleted and garbage collected after the time specified in <code>gcTime</code>
+</li>
+<li>If your prefetch is for non-critical data, you can discard the promise with <code>void</code> and use <code>.catch(noop)</code> to swallow errors. The query will usually try to fetch again in a <code>useQuery</code>, which is a nice graceful fallback.</li>
+</ul>
+<p>This is how you use <code>query</code> to prefetch:</p>
+<pre data-language="jsx">import { noop } from '@tanstack/react-query'
+
+const prefetchTodos = async () =&gt; {
+  await queryClient
+    .query({
+      queryKey: ['todos'],
+      queryFn: fetchTodos,
+      // Swallow errors here, because usually they will fetch again in `useQuery`
+    })
+    .catch(noop)
+}</pre>
+<p>Infinite Queries can be prefetched like regular Queries. By default, only the first page of the Query will be prefetched and will be stored under the given QueryKey. If you want to prefetch more than one page, you can use the <code>pages</code> option, in which case you also have to provide a <code>getNextPageParam</code> function:</p>
+<pre data-language="jsx">import { noop } from '@tanstack/react-query'
+
+const prefetchProjects = () =&gt; {
+  await queryClient
+    .infiniteQuery({
+      queryKey: ['projects'],
+      queryFn: fetchProjects,
+      initialPageParam: 0,
+      getNextPageParam: (lastPage, pages) =&gt; lastPage.nextCursor,
+      pages: 3, // prefetch the first 3 pages
+    })
+    .catch(noop)
+}</pre>
+<p>Next, let's look at how you can use these and other ways to prefetch in different situations.</p>
+<h2 id="prefetch-in-event-handlers">Prefetch in event handlers</h2>
+<p>A straightforward form of prefetching is doing it when the user interacts with something. In this example we'll use <code>queryClient.query</code> to start a prefetch on <code>onMouseEnter</code> or <code>onFocus</code>.</p>
+<pre data-language="jsx">function ShowDetailsButton() {
+  const queryClient = useQueryClient()
+
+  const prefetch = () =&gt; {
+    void queryClient.query({
+      queryKey: ['details'],
+      queryFn: getDetailsData,
+      // Prefetch only fires when data is older than the staleTime,
+      // so in a case like this you definitely want to set one
+      staleTime: 60000,
+    }).catch(noop)
+  }
+
+  return (
+    &lt;button onMouseEnter={prefetch} onFocus={prefetch} onClick={...}&gt;
+      Show Details
+    &lt;/button&gt;
+  )
+}</pre>
+<h2 id="prefetch-in-components">Prefetch in components</h2>
+<p>Prefetching during the component lifecycle is useful when we know some child or descendant will need a particular piece of data, but we can't render that until some other query has finished loading. Let's borrow an example from the Request Waterfall guide to explain:</p>
+<pre data-language="jsx">function Article({ id }) {
+  const { data: articleData, isPending } = useQuery({
+    queryKey: ['article', id],
+    queryFn: getArticleById,
+  })
+
+  if (isPending) {
+    return 'Loading article...'
+  }
+
+  return (
+    &lt;&gt;
+      &lt;ArticleHeader articleData={articleData} /&gt;
+      &lt;ArticleBody articleData={articleData} /&gt;
+      &lt;Comments id={id} /&gt;
+    &lt;/&gt;
+  )
+}
+
+function Comments({ id }) {
+  const { data, isPending } = useQuery({
+    queryKey: ['article-comments', id],
+    queryFn: getArticleCommentsById,
+  })
+
+  ...
+}</pre>
+<p>This results in a request waterfall looking like this:</p>
+<pre data-language="plaintext">1. |&gt; getArticleById()
+2.   |&gt; getArticleCommentsById()</pre>
+<p>As mentioned in that guide, one way to flatten this waterfall and improve performance is to hoist the <code>getArticleCommentsById</code> query to the parent and pass down the result as a prop, but what if this is not feasible or desirable, for example when the components are unrelated and have multiple levels between them?</p>
+<p>In that case, we can instead prefetch the query in the parent. The simplest way to do this is to use a query but ignore the result:</p>
+<pre data-language="jsx">function Article({ id }) {
+  const { data: articleData, isPending } = useQuery({
+    queryKey: ['article', id],
+    queryFn: getArticleById,
+  })
+
+  // Prefetch
+  useQuery({
+    queryKey: ['article-comments', id],
+    queryFn: getArticleCommentsById,
+    // Optional optimization to avoid rerenders when this query changes:
+    notifyOnChangeProps: [],
+  })
+
+  if (isPending) {
+    return 'Loading article...'
+  }
+
+  return (
+    &lt;&gt;
+      &lt;ArticleHeader articleData={articleData} /&gt;
+      &lt;ArticleBody articleData={articleData} /&gt;
+      &lt;Comments id={id} /&gt;
+    &lt;/&gt;
+  )
+}
+
+function Comments({ id }) {
+  const { data, isPending } = useQuery({
+    queryKey: ['article-comments', id],
+    queryFn: getArticleCommentsById,
+  })
+
+  ...
+}</pre>
+<p>This starts fetching <code>'article-comments'</code> immediately and flattens the waterfall:</p>
+<pre data-language="plaintext">1. |&gt; getArticleById()
+1. |&gt; getArticleCommentsById()</pre>
+<p>If you want to prefetch together with Suspense, you will have to do things a bit differently. You can't use <code>useSuspenseQueries</code> to prefetch, since the prefetch would block the component from rendering. You also can not use <code>useQuery</code> for the prefetch, because that wouldn't start the prefetch until after suspenseful query had resolved. For this scenario, you can use the <a href="../reference/functions/useprefetchquery.html"><code>usePrefetchQuery</code></a> or the <a href="../reference/functions/useprefetchinfinitequery.html"><code>usePrefetchInfiniteQuery</code></a> hooks available in the library.</p>
+<p>You can now use <code>useSuspenseQuery</code> in the component that actually needs the data. You <em>might</em> want to wrap this later component in its own <code>&lt;Suspense&gt;</code> boundary so the "secondary" query we are prefetching does not block rendering of the "primary" data.</p>
+<pre data-language="jsx">function ArticleLayout({ id }) {
+  usePrefetchQuery({
+    queryKey: ['article-comments', id],
+    queryFn: getArticleCommentsById,
+  })
+
+  return (
+    &lt;Suspense fallback="Loading article"&gt;
+      &lt;Article id={id} /&gt;
+    &lt;/Suspense&gt;
+  )
+}
+
+function Article({ id }) {
+  const { data: articleData, isPending } = useSuspenseQuery({
+    queryKey: ['article', id],
+    queryFn: getArticleById,
+  })
+
+  ...
+}</pre>
+<p>Another way is to prefetch inside the query function. This makes sense if you know that every time an article is fetched it's very likely comments will also be needed. For this, we'll use <code>queryClient.query</code>:</p>
+<pre data-language="jsx">const queryClient = useQueryClient()
+const { data: articleData, isPending } = useQuery({
+  queryKey: ['article', id],
+  queryFn: (...args) =&gt; {
+    void queryClient
+      .query({
+        queryKey: ['article-comments', id],
+        queryFn: getArticleCommentsById,
+      })
+      .catch(noop)
+
+    return getArticleById(...args)
+  },
+})</pre>
+<p>Prefetching in an effect also works, but note that if you are using <code>useSuspenseQuery</code> in the same component, this effect won't run until <em>after</em> the query finishes which might not be what you want.</p>
+<pre data-language="jsx">const queryClient = useQueryClient()
+
+useEffect(() =&gt; {
+  void queryClient
+    .query({
+      queryKey: ['article-comments', id],
+      queryFn: getArticleCommentsById,
+    })
+    .catch(noop)
+}, [queryClient, id])</pre>
+<p>To recap, if you want to prefetch a query during the component lifecycle, there are a few different ways to do it, pick the one that suits your situation best:</p>
+<ul>
+<li>Prefetch before a suspense boundary using <code>usePrefetchQuery</code> or <code>usePrefetchInfiniteQuery</code> hooks</li>
+<li>Use <code>useQuery</code> or <code>useSuspenseQueries</code> and ignore the result</li>
+<li>Prefetch inside the query function</li>
+<li>Prefetch in an effect</li>
+</ul>
+<p>Let's look at a slightly more advanced case next.</p>
+<h3 id="dependent-queries-code-splitting">Dependent Queries &amp; Code Splitting</h3>
+<p>Sometimes we want to prefetch conditionally, based on the result of another fetch. Consider this example borrowed from the <a href="request-waterfalls.html">Performance &amp; Request Waterfalls guide</a>:</p>
+<pre data-language="jsx">// This lazy loads the GraphFeedItem component, meaning
+// it won't start loading until something renders it
+const GraphFeedItem = React.lazy(() =&gt; import('./GraphFeedItem'))
+
+function Feed() {
+  const { data, isPending } = useQuery({
+    queryKey: ['feed'],
+    queryFn: getFeed,
+  })
+
+  if (isPending) {
+    return 'Loading feed...'
+  }
+
+  return (
+    &lt;&gt;
+      {data.map((feedItem) =&gt; {
+        if (feedItem.type === 'GRAPH') {
+          return &lt;GraphFeedItem key={feedItem.id} feedItem={feedItem} /&gt;
+        }
+
+        return &lt;StandardFeedItem key={feedItem.id} feedItem={feedItem} /&gt;
+      })}
+    &lt;/&gt;
+  )
+}
+
+// GraphFeedItem.tsx
+function GraphFeedItem({ feedItem }) {
+  const { data, isPending } = useQuery({
+    queryKey: ['graph', feedItem.id],
+    queryFn: getGraphDataById,
+  })
+
+  ...
+}</pre>
+<p>As noted over in that guide, this example leads to the following double request waterfall:</p>
+<pre data-language="plaintext">1. |&gt; getFeed()
+2.   |&gt; JS for &lt;GraphFeedItem&gt;
+3.     |&gt; getGraphDataById()</pre>
+<p>If we can not restructure our API so <code>getFeed()</code> also returns the <code>getGraphDataById()</code> data when necessary, there is no way to get rid of the <code>getFeed-&gt;getGraphDataById</code> waterfall, but by leveraging conditional prefetching, we can at least load the code and data in parallel. Just like described above, there are multiple ways to do this, but for this example, we'll do it in the query function:</p>
+<pre data-language="jsx">function Feed() {
+  const queryClient = useQueryClient()
+  const { data, isPending } = useQuery({
+    queryKey: ['feed'],
+    queryFn: async (...args) =&gt; {
+      const feed = await getFeed(...args)
+
+      for (const feedItem of feed) {
+        if (feedItem.type === 'GRAPH') {
+          void queryClient.query({
+            queryKey: ['graph', feedItem.id],
+            queryFn: getGraphDataById,
+          }).catch(noop)
+        }
+      }
+
+      return feed
+    }
+  })
+
+  ...
+}</pre>
+<p>This would load the code and data in parallel:</p>
+<pre data-language="plaintext">1. |&gt; getFeed()
+2.   |&gt; JS for &lt;GraphFeedItem&gt;
+2.   |&gt; getGraphDataById()</pre>
+<p>There is a tradeoff however, in that the code for <code>getGraphDataById</code> is now included in the parent bundle instead of in <code>JS for &lt;GraphFeedItem&gt;</code> so you'll need to determine what's the best performance tradeoff on a case by case basis. If <code>GraphFeedItem</code> are likely, it's probably worth to include the code in the parent. If they are exceedingly rare, it's probably not.</p>
+<h2 id="router-integration">Router Integration</h2>
+<p>Because data fetching in the component tree itself can easily lead to request waterfalls and the different fixes for that can be cumbersome as they accumulate throughout the application, an attractive way to do prefetching is integrating it at the router level.</p>
+<p>In this approach, you explicitly declare for each <em>route</em> what data is going to be needed for that component tree, ahead of time. Because Server Rendering has traditionally needed all data to be loaded before rendering starts, this has been the dominating approach for SSR'd apps for a long time. This is still a common approach and you can read more about it in the <a href="ssr.html">Server Rendering &amp; Hydration guide</a>.</p>
+<p>For now, let's focus on the client side case and look at an example of how you can make this work with <a href="https://tanstack.com/router">TanStack Router</a>. These examples leave out a lot of setup and boilerplate to stay concise, you can check out a <a href="https://tanstack.com/router/latest/docs/framework/react/examples/basic-react-query-file-based">full React Query example</a> over in the <a href="https://tanstack.com/router/latest/docs">TanStack Router docs</a>.</p>
+<p>When integrating at the router level, you can choose to either <em>block</em> rendering of that route until all data is present, or you can start a prefetch but not await the result. That way, you can start rendering the route as soon as possible. You can also mix these two approaches and await some critical data, but start rendering before all the secondary data has finished loading. In this example, we'll configure an <code>/article</code> route to not render until the article data has finished loading, as well as start prefetching comments as soon as possible, but not block rendering the route if comments haven't finished loading yet.</p>
+<p>Note that many route loaders use error boundaries to trigger error fallbacks. Whereas up to now we have been using <code>.catch(noop)</code> to ignore errors for data that will be retried by <code>useQuery</code>, for critical data that the route will not work without, you should <code>await</code> the promise without <code>noop</code> and handle the error in a <code>try</code> block or the router's error handling (such as TanStack Router's <code>errorComponent</code>).</p>
+<pre data-language="jsx">const queryClient = new QueryClient()
+const routerContext = new RouterContext()
+const rootRoute = routerContext.createRootRoute({
+  component: () =&gt; { ... }
+})
+
+const articleRoute = new Route({
+  getParentRoute: () =&gt; rootRoute,
+  path: 'article',
+  beforeLoad: () =&gt; {
+    return {
+      articleQueryOptions: { queryKey: ['article'], queryFn: fetchArticle },
+      commentsQueryOptions: { queryKey: ['comments'], queryFn: fetchComments },
+    }
+  },
+  loader: async ({
+    context: { queryClient },
+    routeContext: { articleQueryOptions, commentsQueryOptions },
+  }) =&gt; {
+    // Fetch comments asap, but don't block or throw errors
+    void queryClient.query(commentsQueryOptions).catch(noop)
+
+    // Don't render the route at all until article has been fetched
+    // As this is critical data we want the error component to trigger
+    // as soon as possible if something goes wrong
+    await queryClient.query({
+      ...articleQueryOptions,
+      // If we have the article loaded already, we don't want to block on
+      // an extra prefetch; fallback on the default useQuery behavior to
+      // keep the data fresh
+      staleTime: 'static'
+    })
+  },
+  component: ({ useRouteContext }) =&gt; {
+    const { articleQueryOptions, commentsQueryOptions } = useRouteContext()
+    const articleQuery = useQuery(articleQueryOptions)
+    const commentsQuery = useQuery(commentsQueryOptions)
+
+    return (
+      ...
+    )
+  },
+  errorComponent: () =&gt; 'Oh crap!',
+})</pre>
+<p>Integration with other routers is also possible, see the <a href="https://tanstack.com/query/latest/docs/framework/react/examples/react-router">react-router</a> for another demonstration.</p>
+<h2 id="manually-priming-a-query">Manually Priming a Query</h2>
+<p>If you already have the data for your query synchronously available, you don't need to prefetch it. You can just use the <a href="../reference/classes/queryclient.html#setquerydata">Query Client's <code>setQueryData</code> method</a> to directly add or update a query's cached result by key.</p>
+<pre data-language="jsx">queryClient.setQueryData(['todos'], todos)</pre>
+<h2 id="further-reading">Further reading</h2>
+<p>For a deep-dive on how to get data into your Query Cache before you fetch, see the <a href="https://tkdodo.eu/blog/seeding-the-query-cache" target="_blank" rel="noopener">article Seeding the Query Cache by TkDodo</a>.</p>
+<p>Integrating with Server Side routers and frameworks is very similar to what we just saw, with the addition that the data has to be passed from the server to the client to be hydrated into the cache there. To learn how, continue on to the <a href="ssr.html">Server Rendering &amp; Hydration guide</a>.</p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2021-present Tanner Linsley<br>Licensed under the MIT License.<br>
+    <a href="https://tanstack.com/query/latest/docs/framework/react/guides/prefetching" class="_attribution-link">https://tanstack.com/query/latest/docs/framework/react/guides/prefetching</a>
+  </p>
+</div>

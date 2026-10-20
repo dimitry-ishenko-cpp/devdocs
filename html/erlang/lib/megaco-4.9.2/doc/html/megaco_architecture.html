@@ -1,0 +1,175 @@
+<h1>Architecture</h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/lib/megaco/doc/guides/megaco_architecture.md#L1" title="View Source" class="source" rel="help nofollow">Source</a>  <h2 id="network-view">Network view</h2>
+<p>Megaco is a (master/slave) protocol for control of gateway functions at the edge of the packet network. Examples of this is IP-PSTN trunking gateways and analog line gateways. The main function of Megaco is to allow gateway decomposition into a call agent (call control) part (known as Media Gateway Controller, MGC) - master, and an gateway interface part (known as Media Gateway, MG) - slave. The MG has no call control knowledge and only handle making the connections and simple configurations.</p>
+<p>SIP and H.323 are peer-to-peer protocols for call control (valid only for some of the protocols within H.323), or more generally multi-media session protocols. They both operate at a different level (call control) from Megaco in a decomposed network, and are therefor not aware of whether or not Megaco is being used underneath.</p>
+<pre>---
+title: Network architecture
+---
+
+flowchart TB
+  %% Pad text (first/longest line) in node, with non-breaking spaces.
+  %% This is done to force the node circle to be big enough, to fit it's text inside the circle.
+  telco_network(("&amp;nbsp;&amp;nbsp;&amp;nbsp;PSTN&amp;nbsp;&amp;nbsp;&amp;nbsp;&lt;br /&gt;ATM&lt;br /&gt;etc.")) &lt;--SS7 etc.--&gt; signal_gw[Signaling Gateway]
+
+  %% Alt: box with rounded left &amp; right corners, the narrow text makes the node eliptic,
+  %% slightly taller than wide
+  %% telco_network(["PSTN&lt;br /&gt;ATM&lt;br /&gt;etc."]) &lt;--SS7 etc.--&gt; signal_gw[Signaling Gateway]
+
+
+  signal_gw &lt;--Sigtran--&gt; mgc[Call Agent&lt;br /&gt;&lt;br /&gt;&lt;br /&gt;Media Gateway Controller]
+  telco_network &lt;--Trunks--&gt; trunk_gw[Trunking&lt;br /&gt;Media Gateway]
+  mgc --Megaco/H.248--&gt; trunk_gw
+  mgc --Megaco/H.248--&gt; lines_gw[Lines&lt;br /&gt;Media Gateway]
+  lines_gw --&gt; phone1[📞 phone 1]
+  lines_gw --&gt; phone2[📞 phone 2]
+  lines_gw --&gt; phone3[📞 ...]
+  mgc --Megaco/H.248--&gt; ip_phone_gw[IP Phone Media Gateway]
+
+  %% Note: edges are numbered by the order they are introduced
+  %% SS7
+  linkStyle 0 stroke-width:5px;
+  %% Sigtran
+  linkStyle 1 stroke-width:3px;
+  %% Trunks
+  linkStyle 2 stroke-width:5px;
+  %% Megaco
+  linkStyle 3 stroke-width:3px;
+  linkStyle 4 stroke-width:3px;
+  %% phone
+  linkStyle 5 stroke-width:1px;
+  linkStyle 6 stroke-width:1px;
+  linkStyle 7 stroke-width:1px;
+  %% Megaco
+  linkStyle 8 stroke-width:3px;</pre>
+<p>Megaco and peer protocols are complementary in nature and entirely compatible within the same system. At a system level, Megaco allows for</p>
+<ul>
+<li>overall network cost and performance optimization</li>
+<li>protection of investment by isolation of changes at the call control layer</li>
+<li>freedom to geographically distribute both call function and gateway function</li>
+<li>adaption of legacy equipment</li>
+</ul>
+<h2 id="general">General</h2>
+<p>This Erlang/OTP application supplies a framework for building applications that needs to utilize the Megaco/H.248 protocol.</p>
+<p>We have introduced the term "user" as a generic term for either an MG or an MGC, since most of the functionality we support, is common for both MG's and MGC's. A (local) user may be configured in various ways and it may establish any number of connections to its counterpart, the remote user. Once a connection has been established, the connection is supervised and it may be used for the purpose of sending messages. N.B. according to the standard an MG is connected to at most one MGC, while an MGC may be connected to any number of MG's.</p>
+<p>For the purpose of managing "virtual MG's", one Erlang node may host any number of MG's. In fact it may host a mix of MG's and MGC's. You may say that an Erlang node may host any number of "users".</p>
+<p>The protocol engine uses callback modules to handle various things:</p>
+<ul>
+<li>encoding callback modules - handles the encoding and decoding of messages. Several modules for handling different encodings are included, such as ASN.1 BER, pretty well indented text, compact text and some others. Others may be written by you.</li>
+<li>transport callback modules - handles sending and receiving of messages. Transport modules for TCP/IP and UDP/IP are included and others may be written by you.</li>
+<li>user callback modules - the actual implementation of an MG or MGC. Most of the functions are intended for handling of a decoded transaction (request, reply, acknowledgement), but there are others that handles connect, disconnect and errors cases.</li>
+</ul>
+<p>Each connection may have its own configuration of callback modules, re-send timers, transaction id ranges etc. and they may be re-configured on-the-fly.</p>
+<p>In the API of Megaco, a user may explicitly send action requests, but generation of transaction identifiers, the encoding and actual transport of the message to the remote user is handled automatically by the protocol engine according to the actual connection configuration. Megaco messages are not exposed in the API.</p>
+<p>On the receiving side the transport module receives the message and forwards it to the protocol engine, which decodes it and invokes user callback functions for each transaction. When a user has handled its action requests, it simply returns a list of action replies (or a message error) and the protocol engine uses the encoding module and transport module to compose and forward the message to the originating user.</p>
+<p>The protocol stack does also handle things like automatic sending of acknowledgements, pending transactions, re-send of messages, supervision of connections etc.</p>
+<p>In order to provide a solution for scalable implementations of MG's and MGC's, a user may be distributed over several Erlang nodes. One of the Erlang nodes is connected to the physical network interface, but messages may be sent from other nodes and the replies are automatically forwarded back to the originating node.</p>
+<h2 id="single-node-config">Single node config</h2>
+<p>Here a system configuration with an MG and MGC residing in one Erlang node each is outlined:</p>
+<pre>---
+title: Single node config
+---
+
+flowchart LR
+  subgraph MG
+    mg_user[MG User]
+    enc_dec1[enc/dec] &lt;--&gt; proto_engine1[Protocol Engine]
+    transport1[Transport Layer]
+  end
+  subgraph MGC
+    mgc_user[MGC User]
+    proto_engine2[Protocol Engine]
+    enc_dec2[enc/dec] &lt;--&gt; proto_engine2
+    transport2[Transport Layer]
+  end
+  mg_user &lt;-.-&gt; mgc_user
+  transport1 &lt;--&gt; transport2
+  transport1 &lt;-.-&gt; transport2</pre>
+<h2 id="distributed-config">Distributed config</h2>
+<p>In a larger system with a user (in this case an MGC) distributed over several Erlang nodes, it looks a little bit different. Here the encoding is performed on the originating Erlang node (1) and the binary is forwarded to the node (2) with the physical network interface. When the potential message reply is received on the interface on node (2), it is decoded there and then different actions will be taken for each transaction in the message. The transaction reply will be forwarded in its decoded form to the originating node (1) while the other types of transactions will be handled locally on node (2).</p>
+<p>Timers and re-send of messages will be handled on locally on one node, that is node(1), in order to avoid unnecessary transfer of data between the Erlang nodes.</p>
+<pre>---
+title: Distributed config
+---
+
+flowchart
+  subgraph MG
+    mg_user[MG User]
+    enc_dec[enc/dec] &lt;--&gt; proto_engine3[Protocol Engine]
+    transport3[Transport Layer]
+  end
+  subgraph Conceptual MGC
+    subgraph node 1
+      mgc_user[MGC User]
+      proto_engine1[Protocol Engine]
+      enc &lt;--&gt; proto_engine1
+    end
+    subgraph node 2
+      proto_engine2[Protocol Engine]
+      dec &lt;--&gt; proto_engine2
+      transport2[Transport Layer]
+    end
+    proto_engine1 &lt;--&gt; proto_engine2
+  end
+  mg_user &lt;-.-&gt; mgc_user
+  transport3 &lt;--&gt; transport2
+  transport3 &lt;-.-&gt; transport2</pre>
+<h2 id="message-round-trip-call-flow">Message round-trip call flow</h2>
+<p>The typical round-trip of a message can be viewed as follows. Firstly we view the call flow on the originating side:</p>
+<pre>---
+title: Message Call Flow (originating side)
+---
+
+sequenceDiagram
+    participant user
+    participant main
+    participant encoder
+    participant transport
+    participant network as transport layer
+
+    user -&gt;&gt; main: megaco:cast/3
+    main -&gt;&gt; encoder: EncMod:encode_message/2
+    encoder -&gt;&gt; main: 
+    main -&gt;&gt; transport: SendMod:send_message/2
+    transport -&gt;&gt; network: send bytes(1)
+    network -&gt;&gt; transport: receive bytes(2)
+    transport -&gt;&gt; main: megaco:receive_message/4
+    main -&gt;&gt; encoder: EncMod:decode_message/4
+    encoder -&gt;&gt; main: 
+    note over main, encoder: (ack requested)
+    main -&gt;&gt; encoder: EncMod:encode_message
+    encoder -&gt;&gt; main: 
+    main -&gt;&gt; transport: SendMod:send_message/2
+    transport -&gt;&gt; network: send bytes(3)
+    encoder -&gt;&gt; user: UserMod:handle_trans_reply/4</pre>
+<p>Then we continue with the call flow on the destination side:</p>
+<pre>---
+title: Message Call Flow (destination side)
+---
+
+sequenceDiagram
+    participant network as transport layer
+    participant transport
+    participant main
+    participant encoder
+    participant user
+
+    network -&gt;&gt; transport: receive bytes(1)
+    transport -&gt;&gt; main: megaco:receive_message/2
+    main -&gt;&gt; encoder: EncMod:decode_message/2
+    encoder -&gt;&gt; main: 
+    main -&gt;&gt; user: UserMod:handle_trans_request/3
+    user -&gt;&gt; main: 
+    main -&gt;&gt; encoder: EncMod:encode_message/2
+    encoder -&gt;&gt; main: 
+    main -&gt;&gt; transport: SendMod:send_message/2
+    transport -&gt;&gt; network: send bytes(2)
+    network -&gt;&gt; transport: receive bytes(3)
+    transport -&gt;&gt; main: megaco:receive_message/4
+    main -&gt;&gt; encoder: EncMod:decode_message/2
+    encoder -&gt;&gt; main: 
+    main -&gt;&gt; user: UserMod:handle_trans_ack/4
+    user -&gt;&gt; main: </pre><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

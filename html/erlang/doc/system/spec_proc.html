@@ -1,0 +1,391 @@
+<h1>sys and proc_lib</h1>  <a href="https://github.com/erlang/otp/blob/OTP-29.1.1/system/doc/design_principles/spec_proc.md#L1" title="View Source" class="source" rel="help nofollow">Source</a>  
+<p>The <a href="../../lib/stdlib-8.1/doc/html/sys.html"><code>sys</code></a> module has functions for simple debugging of processes implemented using behaviours. It also has functions that, together with functions in the <code>proc_lib</code> module, can be used to implement a <em>special process</em> that complies to the OTP design principles without using a standard behaviour. These functions can also be used to implement user-defined (non-standard) behaviours.</p>
+<p>Both <a href="../../lib/stdlib-8.1/doc/html/sys.html"><code>sys</code></a> and <a href="../../lib/stdlib-8.1/doc/html/proc_lib.html"><code>proc_lib</code></a> belong to the STDLIB application.</p>
+<h2 id="simple-debugging">Simple Debugging</h2>
+<p>The <a href="../../lib/stdlib-8.1/doc/html/sys.html"><code>sys</code></a> module has functions for simple debugging of processes implemented using behaviours. The <code>code_lock</code> example from <a href="statem.html#example">gen_statem Behaviour</a> is used to illustrate this:</p>
+<pre data-language="erlang">Erlang/OTP 27 [erts-15.0] [64-bit] [smp:8:8] [ds:8:8:10] [async-threads:1] [jit]
+
+Eshell V15.0 (press Ctrl+G to abort, type help(). for help)
+1&gt; code_lock:start_link([1,2,3,4]).
+Lock
+{ok,&lt;0.90.0&gt;}
+2&gt; sys:statistics(code_lock, true).
+ok
+3&gt; sys:trace(code_lock, true).
+ok
+4&gt; code_lock:button(1).
+*DBG* code_lock receive cast {button,1} in state locked
+ok
+*DBG* code_lock consume cast {button,1} in state locked
+5&gt; code_lock:button(2).
+*DBG* code_lock receive cast {button,2} in state locked
+ok
+*DBG* code_lock consume cast {button,2} in state locked
+6&gt; code_lock:button(3).
+*DBG* code_lock receive cast {button,3} in state locked
+ok
+*DBG* code_lock consume cast {button,3} in state locked
+7&gt; code_lock:button(4).
+*DBG* code_lock receive cast {button,4} in state locked
+ok
+Unlock
+*DBG* code_lock consume cast {button,4} in state locked =&gt; open
+*DBG* code_lock start_timer {state_timeout,10000,lock,[]} in state open
+*DBG* code_lock receive state_timeout lock in state open
+Lock
+*DBG* code_lock consume state_timeout lock in state open =&gt; locked
+8&gt; sys:statistics(code_lock, get).
+{ok,[{start_time,{{2024,5,3},{8,11,1}}},
+     {current_time,{{2024,5,3},{8,11,48}}},
+     {reductions,4098},
+     {messages_in,5},
+     {messages_out,0}]}
+9&gt; sys:statistics(code_lock, false).
+ok
+10&gt; sys:trace(code_lock, false).
+ok
+11&gt; sys:get_status(code_lock).
+{status,&lt;0.90.0&gt;,
+        {module,gen_statem},
+        [[{'$initial_call',{code_lock,init,1}},
+          {'$ancestors',[&lt;0.88.0&gt;,&lt;0.87.0&gt;,&lt;0.70.0&gt;,&lt;0.65.0&gt;,&lt;0.69.0&gt;,
+                         &lt;0.64.0&gt;,kernel_sup,&lt;0.47.0&gt;]}],
+         running,&lt;0.88.0&gt;,[],
+         [{header,"Status for state machine code_lock"},
+          {data,[{"Status",running},
+                 {"Parent",&lt;0.88.0&gt;},
+                 {"Modules",[code_lock]},
+                 {"Time-outs",{0,[]}},
+                 {"Logged Events",[]},
+                 {"Postponed",[]}]},
+          {data,[{"State",
+                  {locked,#{code =&gt; [1,2,3,4],
+                            length =&gt; 4,buttons =&gt; []}}}]}]]}</pre>
+<h2 id="special-processes">Special Processes</h2>
+<p>This section describes how to write a process that complies to the OTP design principles, without using a standard behaviour. Such a process is to:</p>
+<ul>
+<li>Be started in a way that makes the process fit into a supervision tree</li>
+<li>Support the <code>sys</code> <a href="spec_proc.html#debug">debug facilities</a>
+</li>
+<li>Take care of <a href="spec_proc.html#msg">system messages</a>.</li>
+</ul>
+<p>System messages are messages with a special meaning, used in the supervision tree. Typical system messages are requests for trace output, and requests to suspend or resume process execution (used during release handling). Processes implemented using standard behaviours automatically understand these messages.</p>
+<h3 id="example">Example</h3>
+<p>Here follows the simple server from <a href="design_principles.html#ch1">Overview</a>, implemented using <code>sys</code> and <code>proc_lib</code> to fit into a supervision tree:</p>
+<pre data-language="erlang">-module(ch4).
+-export([start_link/0]).
+-export([alloc/0, free/1]).
+-export([init/1]).
+-export([system_continue/3, system_terminate/4,
+         write_debug/3,
+         system_get_state/1, system_replace_state/2]).
+
+start_link() -&gt;
+    proc_lib:start_link(ch4, init, [self()]).
+
+alloc() -&gt;
+    ch4 ! {self(), alloc},
+    receive
+        {ch4, Res} -&gt;
+            Res
+    end.
+
+free(Ch) -&gt;
+    ch4 ! {free, Ch},
+    ok.
+
+init(Parent) -&gt;
+    register(ch4, self()),
+    Chs = channels(),
+    Deb = sys:debug_options([]),
+    proc_lib:init_ack(Parent, {ok, self()}),
+    loop(Chs, Parent, Deb).
+
+loop(Chs, Parent, Deb) -&gt;
+    receive
+        {From, alloc} -&gt;
+            Deb2 = sys:handle_debug(Deb, fun ch4:write_debug/3,
+                                    ch4, {in, alloc, From}),
+            {Ch, Chs2} = alloc(Chs),
+            From ! {ch4, Ch},
+            Deb3 = sys:handle_debug(Deb2, fun ch4:write_debug/3,
+                                    ch4, {out, {ch4, Ch}, From}),
+            loop(Chs2, Parent, Deb3);
+        {free, Ch} -&gt;
+            Deb2 = sys:handle_debug(Deb, fun ch4:write_debug/3,
+                                    ch4, {in, {free, Ch}}),
+            Chs2 = free(Ch, Chs),
+            loop(Chs2, Parent, Deb2);
+
+        {system, From, Request} -&gt;
+            sys:handle_system_msg(Request, From, Parent,
+                                  ch4, Deb, Chs)
+    end.
+
+system_continue(Parent, Deb, Chs) -&gt;
+    loop(Chs, Parent, Deb).
+
+system_terminate(Reason, _Parent, _Deb, _Chs) -&gt;
+    exit(Reason).
+
+system_get_state(Chs) -&gt;
+    {ok, Chs}.
+
+system_replace_state(StateFun, Chs) -&gt;
+    NChs = StateFun(Chs),
+    {ok, NChs, NChs}.
+
+write_debug(Dev, Event, Name) -&gt;
+    io:format(Dev, "~p event = ~p~n", [Name, Event]).</pre>
+<p id="ex">As it is not relevant to the example, the channel handling functions have been omitted. To compile this example, the <a href="design_principles.html#channels-implementation">implementation of channel handling</a> needs to be added to the module.</p>
+<p>Here is an example showing how the debugging functions in the <code>sys</code> module can be used for <code>ch4</code>:</p>
+<pre data-language="erlang">% erl
+Erlang/OTP 27 [erts-15.0] [64-bit] [smp:8:8] [ds:8:8:10] [async-threads:1] [jit]
+
+Eshell V15.0 (press Ctrl+G to abort, type help(). for help)
+1&gt; ch4:start_link().
+{ok,&lt;0.90.0&gt;}
+2&gt; sys:statistics(ch4, true).
+ok
+3&gt; sys:trace(ch4, true).
+ok
+4&gt; ch4:alloc().
+ch4 event = {in,alloc,&lt;0.88.0&gt;}
+ch4 event = {out,{ch4,1},&lt;0.88.0&gt;}
+1
+5&gt; ch4:free(ch1).
+ch4 event = {in,{free,ch1}}
+ok
+6&gt; sys:statistics(ch4, get).
+{ok,[{start_time,{{2024,5,3},{8,26,13}}},
+     {current_time,{{2024,5,3},{8,26,49}}},
+     {reductions,202},
+     {messages_in,2},
+     {messages_out,1}]}
+7&gt; sys:statistics(ch4, false).
+ok
+8&gt; sys:trace(ch4, false).
+ok
+9&gt; sys:get_status(ch4).
+{status,&lt;0.90.0&gt;,
+        {module,ch4},
+        [[{'$initial_call',{ch4,init,1}},
+          {'$ancestors',[&lt;0.88.0&gt;,&lt;0.87.0&gt;,&lt;0.70.0&gt;,&lt;0.65.0&gt;,&lt;0.69.0&gt;,
+                         &lt;0.64.0&gt;,kernel_sup,&lt;0.47.0&gt;]}],
+         running,&lt;0.88.0&gt;,[],
+         {[1],[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19|...]}]}</pre>
+<h3 id="starting-the-process">Starting the Process</h3>
+<p>A function in the <a href="../../lib/stdlib-8.1/doc/html/proc_lib.html"><code>proc_lib</code></a> module is to be used to start the process. Several functions are available, for example, <a href="../../lib/stdlib-8.1/doc/html/proc_lib.html#spawn_link/4"><code>proc_lib:spawn_link/3,4</code></a> for asynchronous start and <a href="../../lib/stdlib-8.1/doc/html/proc_lib.html#start_link/5"><code>proc_lib:start_link/3,4,5</code></a> for synchronous start.</p>
+<p>Information necessary for a process within a supervision tree, such as details on ancestors and the initial call, is stored when a process is started through one of these functions.</p>
+<p>If the process terminates with a reason other than <code>normal</code> or <code>shutdown</code>, a crash report is generated. For more information about the crash report, see <a href="../../lib/kernel-11.0.4/doc/html/logger_chapter.html">Logging</a> in Kernel User's Guide.</p>
+<p>In the example, synchronous start is used. The process starts by calling <code>ch4:start_link()</code>:</p>
+<pre data-language="erlang">start_link() -&gt;
+    proc_lib:start_link(ch4, init, [self()]).</pre>
+<p><code>ch4:start_link/0</code> calls <a href="../../lib/stdlib-8.1/doc/html/proc_lib.html#start_link/3"><code>proc_lib:start_link/3</code></a>, which takes a module name, a function name, and an argument list as arguments. It then spawns a new process and establishes a link. The new process starts by executing the given function, here <code>ch4:init(Pid)</code>, where <code>Pid</code> is the pid of the parent process (obtained by the call to <a href="../../erts-17.1/doc/html/erlang.html#self/0"><code>self()</code></a> in the call to <a href="../../lib/stdlib-8.1/doc/html/proc_lib.html#start_link/3"><code>proc_lib:start_link/3</code></a>).</p>
+<p>All initialization, including name registration, is done in <code>init/1</code>. The new process has to acknowledge that it has been started to the parent:</p>
+<pre data-language="erlang">init(Parent) -&gt;
+    ...
+    proc_lib:init_ack(Parent, {ok, self()}),
+    loop(...).</pre>
+<p><a href="../../lib/stdlib-8.1/doc/html/proc_lib.html#start_link/3"><code>proc_lib:start_link/3</code></a> is synchronous and does not return until <a href="../../lib/stdlib-8.1/doc/html/proc_lib.html#init_ack/2"><code>proc_lib:init_ack/1,2</code></a> or <a href="../../lib/stdlib-8.1/doc/html/proc_lib.html#init_fail/3"><code>proc_lib:init_fail/2,3</code></a> has been called, or the process has exited.</p>
+
+<h3 id="debugging">Debugging</h3>
+<p>To support the debug facilities in <code>sys</code>, a <em>debug structure</em> is needed. The <code>Deb</code> term is initialized using <a href="../../lib/stdlib-8.1/doc/html/sys.html#debug_options/1"><code>sys:debug_options/1</code></a>:</p>
+<pre data-language="erlang">init(Parent) -&gt;
+    ...
+    Deb = sys:debug_options([]),
+    ...
+    loop(Chs, Parent, Deb).</pre>
+<p><a href="../../lib/stdlib-8.1/doc/html/sys.html#debug_options/1"><code>sys:debug_options/1</code></a> takes a list of options. Given an empty list as in this example means that debugging is initially disabled. For information about the possible options, see <a href="../../lib/stdlib-8.1/doc/html/sys.html"><code>sys</code></a> in STDLIB.</p>
+<p>For each <em>system event</em> to be logged or traced, the following function is to be called:</p>
+<pre data-language="erlang">sys:handle_debug(Deb, Func, Info, Event) =&gt; Deb1</pre>
+<p>The arguments have the following meaning:</p>
+<ul>
+<li>
+<code>Deb</code> is the debug structure as returned from <a href="../../lib/stdlib-8.1/doc/html/sys.html#debug_options/1"><code>sys:debug_options/1</code></a>.</li>
+<li>
+<code>Func</code> is a fun specifying a (user-defined) function used to format trace output. For each system event, the format function is called as <code>Func(Dev, Event, Info)</code>, where:<ul>
+<li>
+<code>Dev</code> is the I/O device to which the output is to be printed. See <a href="../../lib/stdlib-8.1/doc/html/io.html"><code>io</code></a> in STDLIB.</li>
+<li>
+<code>Event</code> and <code>Info</code> are passed as-is from the call to <a href="../../lib/stdlib-8.1/doc/html/sys.html#handle_debug/4"><code>sys:handle_debug/4</code></a>.</li>
+</ul>
+</li>
+<li>
+<code>Info</code> is used to pass more information to <code>Func</code>. It can be any term, and it is passed as-is.</li>
+<li>
+<code>Event</code> is the system event. It is up to the user to define what a system event is and how it is to be represented. Typically, at least incoming and outgoing messages are considered system events and represented by the tuples <code>{in,Msg[,From]}</code> and <code>{out,Msg,To[,State]}</code>, respectively.</li>
+</ul>
+<p><a href="../../lib/stdlib-8.1/doc/html/sys.html#handle_debug/4"><code>sys:handle_debug/4</code></a> returns an updated debug structure <code>Deb1</code>.</p>
+<p>In the example, <a href="../../lib/stdlib-8.1/doc/html/sys.html#handle_debug/4"><code>sys:handle_debug/4</code></a> is called for each incoming and outgoing message. The format function <code>Func</code> is the function <code>ch4:write_debug/3</code>, which prints the message using <a href="../../lib/stdlib-8.1/doc/html/io.html#format/3"><code>io:format/3</code></a>.</p>
+<pre data-language="erlang">loop(Chs, Parent, Deb) -&gt;
+    receive
+        {From, alloc} -&gt;
+            Deb2 = sys:handle_debug(Deb, fun ch4:write_debug/3,
+                                    ch4, {in, alloc, From}),
+            {Ch, Chs2} = alloc(Chs),
+            From ! {ch4, Ch},
+            Deb3 = sys:handle_debug(Deb2, fun ch4:write_debug/3,
+                                    ch4, {out, {ch4, Ch}, From}),
+            loop(Chs2, Parent, Deb3);
+        {free, Ch} -&gt;
+            Deb2 = sys:handle_debug(Deb, fun ch4:write_debug/3,
+                                    ch4, {in, {free, Ch}}),
+            Chs2 = free(Ch, Chs),
+            loop(Chs2, Parent, Deb2);
+        ...
+    end.
+
+write_debug(Dev, Event, Name) -&gt;
+    io:format(Dev, "~p event = ~p~n", [Name, Event]).</pre>
+
+<h3 id="handling-system-messages">Handling System Messages</h3>
+<p><em>System messages</em> are received as:</p>
+<pre>{system, From, Request}</pre>
+<p>The content and meaning of these messages are not to be interpreted by the process. Instead the following function is to be called:</p>
+<pre data-language="erlang">sys:handle_system_msg(Request, From, Parent, Module, Deb, State)</pre>
+<p>The arguments have the following meaning:</p>
+<ul>
+<li>
+<code>Request</code> and <code>From</code> from the received system message are to be passed as-is to the call to <a href="../../lib/stdlib-8.1/doc/html/sys.html#handle_system_msg/6"><code>sys:handle_system_msg/6</code></a>.</li>
+<li>
+<code>Parent</code> is the pid of the parent process.</li>
+<li>
+<code>Module</code> is the name of the module implementing the special process.</li>
+<li>
+<code>Deb</code> is the debug structure.</li>
+<li>
+<code>State</code> is a term describing the internal state and is passed on to <code>Module:system_continue/3</code>, <code>Module:system_terminate/4</code>, <code>Module:system_get_state/1</code>, and <code>Module:system_replace_state/2</code>.</li>
+</ul>
+<p><a href="../../lib/stdlib-8.1/doc/html/sys.html#handle_system_msg/6"><code>sys:handle_system_msg/6</code></a> does not return. It handles the system message and <em>eventually</em> calls either of the following functions:</p>
+<ul>
+<li><p><code>Module:system_continue(Parent, Deb, State)</code> - if process execution is to continue.</p></li>
+<li><p><code>Module:system_terminate(Reason, Parent, Deb, State)</code> - if the process is to terminate.</p></li>
+</ul>
+<p>While handling the system message, <a href="../../lib/stdlib-8.1/doc/html/sys.html#handle_system_msg/6"><code>sys:handle_system_msg/6</code></a> can call one of the following functions:</p>
+<ul>
+<li><p><code>Module:system_get_state(State)</code> - if the process is to return its state.</p></li>
+<li><p><code>Module:system_replace_state(StateFun, State)</code> - if the process is to replace its state using the fun <code>StateFun</code>. See <a href="../../lib/stdlib-8.1/doc/html/sys.html#replace_state/3"><code>sys:replace_state/3</code></a> for more information.</p></li>
+<li><p><code>system_code_change(Misc, Module, OldVsn, Extra)</code> - if the process is to perform a code change.</p></li>
+</ul>
+<p>A process in a supervision tree is expected to terminate with the same reason as its parent.</p>
+<p>In the example, system messages are handled by the following code:</p>
+<pre data-language="erlang">loop(Chs, Parent, Deb) -&gt;
+    receive
+        ...
+
+        {system, From, Request} -&gt;
+            sys:handle_system_msg(Request, From, Parent,
+                                  ch4, Deb, Chs)
+    end.
+
+system_continue(Parent, Deb, Chs) -&gt;
+    loop(Chs, Parent, Deb).
+
+system_terminate(Reason, Parent, Deb, Chs) -&gt;
+    exit(Reason).
+
+system_get_state(Chs) -&gt;
+    {ok, Chs}.
+
+system_replace_state(StateFun, Chs) -&gt;
+    NChs = StateFun(Chs),
+    {ok, NChs, NChs}.</pre>
+<p>If a special process is configured to trap exits, it must take notice of 'EXIT' messages from its parent process and terminate using the same exit reason once the parent process has terminated.</p>
+<p>Here is an example:</p>
+<pre data-language="erlang">init(Parent) -&gt;
+    ...,
+    process_flag(trap_exit, true),
+    ...,
+    loop(Parent).
+
+loop(Parent) -&gt;
+    receive
+        ...
+        {'EXIT', Parent, Reason} -&gt;
+            %% Clean up here, if needed.
+            exit(Reason);
+        ...
+    end.</pre>
+<h2 id="user-defined-behaviours">User-Defined Behaviours</h2>
+<p> To implement a user-defined behaviour, write code similar to code for a special process, but call functions in a callback module for handling specific tasks.</p>
+<p>If the compiler is to warn for missing callback functions, as it does for the OTP behaviours, add <code>-callback</code> attributes in the behaviour module to describe the expected callbacks:</p>
+<pre>-callback Name1(Arg1_1, Arg1_2, ..., Arg1_N1) -&gt; Res1.
+-callback Name2(Arg2_1, Arg2_2, ..., Arg2_N2) -&gt; Res2.
+...
+-callback NameM(ArgM_1, ArgM_2, ..., ArgM_NM) -&gt; ResM.</pre>
+<p><code>NameX</code> are the names of the expected callbacks. <code>ArgX_Y</code> and <code>ResX</code> are types as they are described in <a href="typespec.html">Types and Function Specifications</a>. The whole syntax of the <code>-spec</code> attribute is supported by the <code>-callback</code> attribute.</p>
+<p>Callback functions that are optional for the user of the behaviour to implement are specified by use of the <code>-optional_callbacks</code> attribute:</p>
+<pre>-optional_callbacks([OptName1/OptArity1, ..., OptNameK/OptArityK]).</pre>
+<p>where each <code>OptName/OptArity</code> specifies the name and arity of a callback function. Note that the <code>-optional_callbacks</code> attribute is to be used together with the <code>-callback</code> attribute; it cannot be combined with the <code>behaviour_info()</code> function described below.</p>
+<p>Tools that need to know about optional callback functions can call <code>Behaviour:behaviour_info(optional_callbacks)</code> to get a list of all optional callback functions.</p>
+<div class="note">
+<p class="label">Note</p>
+<p>We recommend using the <code>-callback</code> attribute rather than the <code>behaviour_info()</code> function. The reason is that the extra type information can be used by tools to produce documentation or find discrepancies.</p>
+</div>
+<p>As an alternative to the <code>-callback</code> and <code>-optional_callbacks</code> attributes you may directly implement and export <code>behaviour_info()</code>:</p>
+<pre data-language="erlang">behaviour_info(callbacks) -&gt;
+    [{Name1, Arity1},...,{NameN, ArityN}].</pre>
+<p>where each <code>{Name, Arity}</code> specifies the name and arity of a callback function. This function is otherwise automatically generated by the compiler using the <code>-callback</code> attributes.</p>
+<p>When the compiler encounters the module attribute <code>-behaviour(Behaviour).</code> in a module <code>Mod</code>, it calls <code>Behaviour:behaviour_info(callbacks)</code> and compares the result with the set of functions actually exported from <code>Mod</code>, and issues a warning if any callback function is missing.</p>
+<p><em>Example:</em></p>
+<pre data-language="erlang">%% User-defined behaviour module
+-module(simple_server).
+-export([start_link/2, init/3, ...]).
+
+-callback init(State :: term()) -&gt; 'ok'.
+-callback handle_req(Req :: term(), State :: term()) -&gt; {'ok', Reply :: term()}.
+-callback terminate() -&gt; 'ok'.
+-callback format_state(State :: term()) -&gt; term().
+
+-optional_callbacks([format_state/1]).
+
+%% Alternatively you may define:
+%%
+%% -export([behaviour_info/1]).
+%% behaviour_info(callbacks) -&gt;
+%%     [{init,1},
+%%      {handle_req,2},
+%%      {terminate,0}].
+
+start_link(Name, Module) -&gt;
+    proc_lib:start_link(?MODULE, init, [self(), Name, Module]).
+
+init(Parent, Name, Module) -&gt;
+    register(Name, self()),
+    ...,
+    Dbg = sys:debug_options([]),
+    proc_lib:init_ack(Parent, {ok, self()}),
+    loop(Parent, Module, Dbg, ...).
+
+...</pre>
+<p>In a callback module:</p>
+<pre data-language="erlang">-module(db).
+-behaviour(simple_server).
+
+-export([init/1, handle_req/2, terminate/0]).
+
+...</pre>
+<p>The contracts specified with <code>-callback</code> attributes in behaviour modules can be further refined by adding <code>-spec</code> attributes in callback modules. This can be useful as <code>-callback</code> contracts are usually generic. The same callback module with contracts for the callbacks:</p>
+<pre data-language="erlang">-module(db).
+-behaviour(simple_server).
+
+-export([init/1, handle_req/2, terminate/0]).
+
+-record(state, {field1 :: [atom()], field2 :: integer()}).
+
+-type state()   :: #state{}.
+-type request() :: {'store', term(), term()};
+                   {'lookup', term()}.
+
+...
+
+-spec handle_req(request(), state()) -&gt; {'ok', term()}.
+
+...</pre>
+<p>Each <code>-spec</code> contract is to be a subtype of the respective <code>-callback</code> contract.</p><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; 2010&ndash;2026 Ericsson AB<br>Licensed under the Apache License, Version 2.0.<br>
+    
+  </p>
+</div>

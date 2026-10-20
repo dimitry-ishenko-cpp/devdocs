@@ -1,0 +1,274 @@
+<header><h1>XML</h1>
+<p>Use Bun's built-in support for XML through both runtime APIs and bundler integration</p></header><div>
+<div data-callout="note">
+<div>New in Bun v1.4</div>
+</div>
+<p>In Bun, XML is a first-class citizen alongside JSON, TOML, YAML, and JSON5. You can:</p>
+<ul>
+<li>Parse and stringify XML with <code>Bun.XML.parse</code> and <code>Bun.XML.stringify</code>
+</li>
+<li>
+<code>import</code> &amp; <code>require</code> XML files as modules at runtime (including hot reloading &amp; watch mode support)</li>
+<li>
+<code>import</code> &amp; <code>require</code> XML files in frontend apps with Bun's bundler</li>
+</ul>
+<hr>
+<h2 id="runtime-api">Runtime API</h2>
+<h3 id="bun-xml-parse"><code>Bun.XML.parse()</code></h3>
+<p>Parse an XML document into a plain JavaScript object.</p>
+<div data-lang="ts"><div><div><div><div data-h="0"><pre data-language="typescript">import { XML } from "bun";
+
+const data = XML.parse(`
+  &lt;order id="A1" currency="USD"&gt;
+    &lt;customer&gt;Ada&lt;/customer&gt;
+    &lt;item sku="tea" qty="2"&gt;Green tea&lt;/item&gt;
+    &lt;item sku="mug" qty="1"&gt;Mug&lt;/item&gt;
+    &lt;paid/&gt;
+  &lt;/order&gt;
+`);
+
+console.log(data);
+// {
+//   order: {
+//     "@id": "A1",
+//     "@currency": "USD",
+//     customer: "Ada",
+//     item: [
+//       { "@sku": "tea", "@qty": "2", "#text": "Green tea" },
+//       { "@sku": "mug", "@qty": "1", "#text": "Mug" },
+//     ],
+//     paid: "",
+//   },
+// }</pre></div></div></div></div></div>
+<p>By default the result is a compact object keyed by element name — the <code>@attr</code> / <code>#text</code> convention most XML-to-object libraries use. It works like this:</p>
+<ul>
+<li>The result has one key, the root element's name.</li>
+<li>An element with no attributes and no child elements becomes its character data: a string, <code>""</code> when empty. <code>&lt;paid/&gt;</code> and <code>&lt;paid&gt;&lt;/paid&gt;</code> are the same thing in XML.</li>
+<li>Any other element becomes an object. It has a <code>"@name"</code> key per attribute, then one key per distinct child element name and a <code>"#text"</code> key for the element's own text, in the order each first appears.</li>
+<li>When a child element name occurs more than once in the element, its key holds an array in document order. Otherwise it holds the single value. See <a href="#one-or-many">One or many</a>.</li>
+<li>
+<code>compact</code> chooses a structure; it does not change values. Bun returns text as written: leading, trailing and internal whitespace included, CDATA sections and entity references expanded, line ends normalized to <code>\n</code> — the same text the tree shape gives for that element. Because an element has one <code>"#text"</code>, Bun concatenates its text runs and leaves out whitespace-only runs that sit between child elements (the document's layout). If your documents are hand-formatted (<code>&lt;name&gt;\n  value\n&lt;/name&gt;</code>), trim where you read.</li>
+<li>All values are strings. Nothing is coerced to numbers, booleans, or <code>null</code>.</li>
+<li>Names are kept as written, namespace prefix included (<code>"soap:Body"</code>); <code>xmlns</code> declarations are ordinary attributes.</li>
+<li>Comments, processing instructions, the <code>&lt;?xml …?&gt;</code> declaration and the <code>&lt;!DOCTYPE …&gt;</code> are not represented.</li>
+</ul>
+<p><code>@</code> and <code>#</code> cannot start an XML name, so attribute and text keys do not collide with child element keys.</p>
+<p>The compact shape is for <em>data</em>. It does not keep the relative order of differently named siblings, or where text sat relative to child elements:</p>
+<div data-lang="ts"><div><div><div><div data-h="1"><pre data-language="typescript">XML.parse(`&lt;p&gt;Hello &lt;b&gt;world&lt;/b&gt;!&lt;/p&gt;`);
+// { p: { "#text": "Hello !", b: "world" } }</pre></div></div></div></div></div>
+<p>When that matters — documents rather than data — pass <code>{ compact: false }</code> to get the root element as a tree that keeps the element's content in document order:</p>
+<div data-lang="ts"><div><div><div><div data-h="2"><pre data-language="typescript">const p = XML.parse(`&lt;p class="lead"&gt;Hello &lt;b&gt;world&lt;/b&gt;!&lt;!-- draft --&gt;&lt;/p&gt;`, { compact: false });
+
+console.log(p);
+// {
+//   name: "p",
+//   attributes: { class: "lead" },
+//   children: [
+//     "Hello ",
+//     { name: "b", attributes: {}, children: ["world"] },
+//     "!",
+//     { comment: " draft " },
+//   ],
+// }</pre></div></div></div></div></div>
+<p>Every element is <code>{ name, attributes, children }</code>; both keys are present even when empty. <code>children</code> holds the element's content in order: text as strings (as written, whitespace-only runs included, adjacent text merged), child elements, comments as <code>{ comment }</code>, and processing instructions as <code>{ target, data }</code>. Tell object children apart by which key they have. As in the compact shape, the tree does not represent the declaration, the DOCTYPE, or anything before or after the root element.</p>
+<h4 id="one-or-many">One or many</h4>
+<p>In the compact shape a list of one and a list of two have different types (<code>entry: {…}</code> vs <code>entry: [{…}, {…}]</code>). An element that is usually a string also becomes an object when it carries an attribute (<code>&lt;title&gt;</code> vs <code>&lt;title type="html"&gt;</code>). Read values that you iterate, or that may carry attributes, defensively:</p>
+<div data-lang="ts"><div><div><div><div data-h="3"><pre data-language="typescript">const entries = [feed.entry ?? []].flat(); // an array either way
+const title = typeof e.title === "string" ? e.title : (e.title["#text"] ?? "");</pre></div></div></div></div></div>
+<p>The tree shape has neither ambiguity: <code>children</code> is an array and each element is an object.</p>
+<h4 id="input-types-and-encodings">Input types and encodings</h4>
+<p><code>XML.parse</code> accepts a string, or bytes as a <code>Buffer</code>, <code>TypedArray</code>, <code>DataView</code>, <code>ArrayBuffer</code>, or <code>Blob</code>.</p>
+<p>A string is already-decoded text, so its <code>encoding</code> declaration is checked for syntax but otherwise ignored. Bytes are decoded per the XML rules: a byte-order mark or the <code>encoding</code> in <code>&lt;?xml version="1.0" encoding="..."?&gt;</code> selects UTF-8 (the default), UTF-16 (either byte order), or ISO-8859-1. Other encodings throw.</p>
+<div data-lang="ts"><div><div><div><div data-h="4"><pre data-language="typescript">XML.parse(await Bun.file("feed.xml").bytes());</pre></div></div></div></div></div>
+<h4 id="error-handling">Error handling</h4>
+<p><code>Bun.XML.parse()</code> throws a <code>SyntaxError</code> when the document is not well-formed (there is no lenient mode), and a <code>RangeError</code> for pathologically deep nesting:</p>
+<div data-lang="ts"><div><div><div><div data-h="5"><pre data-language="typescript">try {
+  XML.parse("&lt;a&gt;&lt;b&gt;&lt;/a&gt;");
+} catch (error) {
+  console.error(error.message); // "XML Parse error: Expected closing tag &lt;/b&gt; but found &lt;/a&gt;"
+}</pre></div></div></div></div></div>
+<h3 id="bun-xml-stringify"><code>Bun.XML.stringify()</code></h3>
+<p>Serialize one element, in either shape, to XML.</p>
+<div data-lang="ts"><div><div><div><div data-h="6"><pre data-language="typescript">import { XML } from "bun";
+
+XML.stringify({
+  order: {
+    "@id": "A1",
+    customer: "Ada",
+    item: [{ "@sku": "tea", "#text": "Green tea" }, { "@sku": "mug" }],
+    paid: null,
+  },
+});
+// '&lt;order id="A1"&gt;&lt;customer&gt;Ada&lt;/customer&gt;&lt;item sku="tea"&gt;Green tea&lt;/item&gt;&lt;item sku="mug"/&gt;&lt;paid/&gt;&lt;/order&gt;'
+
+XML.stringify({
+  name: "p",
+  attributes: { class: "lead" },
+  children: ["Hello ", { name: "b", children: ["world"] }, "!", { comment: " draft " }],
+});
+// '&lt;p class="lead"&gt;Hello &lt;b&gt;world&lt;/b&gt;!&lt;!-- draft --&gt;&lt;/p&gt;'</pre></div></div></div></div></div>
+<p>Bun writes a value as a tree node when it has a string <code>name</code> and a <code>children</code> or <code>attributes</code> property. Inside <code>children</code>, an object with <code>name</code> is an element, one with <code>comment</code> is a comment, and one with <code>target</code> is a processing instruction. Anything else is a compact object with one key naming the root element. Bun writes keys in order, <code>@</code>-keys as attributes. Strings, numbers, booleans and bigints become text via <code>String()</code>, and a <code>Date</code> becomes its ISO string. <code>null</code> becomes an empty element. Bun skips <code>undefined</code>, functions and symbols, as <code>JSON.stringify</code> does. An array is one element per item.</p>
+<p>The output is well-formed XML, or <code>stringify</code> throws. Bun escapes <code>&amp;</code>, <code>&lt;</code> and <code>&gt;</code>. It writes <code>"</code>, tabs and newlines in attribute values, and carriage returns anywhere, as character references so they parse back unchanged. Values XML cannot hold produce an error rather than a broken document: element and attribute names that are not XML names (<code>"first name"</code>, <code>"0"</code>), characters outside XML's repertoire (U+0000 and other control characters, unpaired surrogates — XML 1.0 has no escape for these), <code>--</code> inside a comment, <code>?&gt;</code> inside a processing instruction, an array at the root or inside another array, and circular structures.</p>
+<p>The result is the element only, with no <code>&lt;?xml …?&gt;</code> declaration and no DOCTYPE, so you can concatenate results inside an enclosing element. To write a file, prepend the prolog yourself:</p>
+<div data-lang="ts"><div><div><div><div data-h="7"><pre data-language="typescript">await Bun.write(
+  "Info.plist",
+  `&lt;?xml version="1.0" encoding="UTF-8"?&gt;\n` +
+    `&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;\n` +
+    XML.stringify(plist, null, "\t"),
+);</pre></div></div></div></div></div>
+<h4 id="pretty-printing">Pretty printing</h4>
+<p>Pass a <code>space</code> argument (a number of spaces or an indent string, as with <code>JSON.stringify</code>) to indent element-only content. Bun writes an element that contains text on one line, so indentation does not change character data:</p>
+<div data-lang="ts"><div><div><div><div data-h="8"><pre data-language="typescript">console.log(XML.stringify(data, null, 2));
+// &lt;order id="A1" currency="USD"&gt;
+//   &lt;customer&gt;Ada&lt;/customer&gt;
+//   &lt;item sku="tea" qty="2"&gt;Green tea&lt;/item&gt;
+//   &lt;item sku="mug" qty="1"&gt;Mug&lt;/item&gt;
+//   &lt;paid/&gt;
+// &lt;/order&gt;</pre></div></div></div></div></div>
+<p>The second parameter is reserved; pass <code>null</code> or <code>undefined</code>.</p>
+<p>For a value that <code>XML.parse</code> produced, in either shape, <code>XML.parse(XML.stringify(value))</code> gives back an equal value.</p>
+<hr>
+<h2 id="module-import">Module Import</h2>
+<h3 id="es-modules">ES Modules</h3>
+<p>You can import XML files directly. Bun decodes the file like bytes passed to <code>XML.parse</code> (UTF-8, UTF-16, or ISO-8859-1 per the byte-order mark or declaration). The module's value is the compact object described above:</p>
+<div data-lang="xml">
+<div><span translate="no">config.xml</span></div>
+<div><div><div><div data-h="9"><pre>&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;config env="production"&gt;
+  &lt;database host="localhost" port="5432" name="myapp"/&gt;
+  &lt;feature name="auth"/&gt;
+  &lt;feature name="rateLimit"/&gt;
+&lt;/config&gt;</pre></div></div></div></div>
+</div>
+<h4 id="default-import">Default Import</h4>
+<div data-lang="ts">
+<div><span translate="no">app.ts</span></div>
+<div><div><div><div data-h="10"><pre data-language="typescript">import doc from "./config.xml";
+
+console.log(doc.config["@env"]); // "production"
+console.log(doc.config.database["@host"]); // "localhost"
+console.log(doc.config.feature.map(f =&gt; f["@name"])); // ["auth", "rateLimit"]</pre></div></div></div></div>
+</div>
+<h4 id="named-import">Named Import</h4>
+<p>The root element is also available as a named import:</p>
+<div data-lang="ts">
+<div><span translate="no">app.ts</span></div>
+<div><div><div><div data-h="11"><pre data-language="typescript">import { config } from "./config.xml";
+
+console.log(config.database["@port"]); // "5432"</pre></div></div></div></div>
+</div>
+<h3 id="commonjs">CommonJS</h3>
+<div data-lang="ts">
+<div><span translate="no">app.ts</span></div>
+<div><div><div><div data-h="12"><pre data-language="typescript">const { config } = require("./config.xml");
+console.log(config.database["@name"]); // "myapp"</pre></div></div></div></div>
+</div>
+<h3 id="import-attributes">Import Attributes</h3>
+<p>Use <code>with { type: "xml" }</code> to parse a file with another extension as XML:</p>
+<div data-lang="ts"><div><div><div><div data-h="13"><pre data-language="typescript">import feed from "./export.rss" with { type: "xml" };</pre></div></div></div></div></div>
+<hr>
+<h2 id="hot-reloading-with-xml">Hot Reloading with XML</h2>
+<p>When you run your application with <code>bun --hot</code>, Bun reloads XML files when they change:</p>
+<div data-lang="ts">
+<div><span translate="no">server.ts</span></div>
+<div><div><div><div data-h="14"><pre data-language="typescript">import { config } from "./config.xml";
+
+Bun.serve({
+  port: 3000,
+  fetch(req) {
+    return new Response(`Running in ${config["@env"]} against ${config.database["@host"]}`);
+  },
+});</pre></div></div></div></div>
+</div>
+<div data-lang="bash">
+<div><span translate="no">terminal</span></div>
+<div><div><div><div data-h="15"><pre data-language="bash">bun --hot server.ts</pre></div></div></div></div>
+</div>
+<hr>
+<h2 id="bundler-integration">Bundler Integration</h2>
+<p>When you bundle with Bun, the bundler parses imported XML files at build time and inlines them as JavaScript objects:</p>
+<div data-lang="bash">
+<div><span translate="no">terminal</span></div>
+<div><div><div><div data-h="16"><pre data-language="bash">bun build app.ts --outdir=dist</pre></div></div></div></div>
+</div>
+<p>Parsing at build time means:</p>
+<ul>
+<li>Zero runtime XML parsing overhead in production</li>
+<li>Smaller bundle sizes</li>
+<li>Tree shaking of unused properties</li>
+</ul>
+<h3 id="dynamic-imports">Dynamic Imports</h3>
+<p>You can import XML files dynamically:</p>
+<div data-lang="ts"><div><div><div><div data-h="17"><pre data-language="typescript">const { default: doc } = await import("./config.xml");</pre></div></div></div></div></div>
+<hr>
+<h2 id="conformance">Conformance</h2>
+<p>Bun's XML parser is written in Rust and implements <a href="https://www.w3.org/TR/2008/REC-xml-20081126/" target="_blank" rel="noopener noreferrer">XML 1.0 (Fifth Edition)</a> as a non-validating processor that does not read external entities:</p>
+<ul>
+<li>The whole document, including the internal DTD subset, must be well-formed — anything else throws a <code>SyntaxError</code>.</li>
+<li>The parser expands internal entities declared in the document, with expansion limits so "billion laughs" payloads fail instead of exhausting memory. It normalizes attribute values and applies attribute defaults declared in the internal subset.</li>
+<li>The parser does not fetch or read external DTDs or external entities, so there is no XXE surface. In a document with no DTD, a reference to an undeclared entity is an error. When the DOCTYPE points at an external subset (or uses parameter entities) that could have declared the entity, the parser keeps the reference as written (<code>&amp;nbsp;</code> stays <code>&amp;nbsp;</code>), unless the document says <code>standalone="yes"</code>.</li>
+<li>The parser validates nothing against the DTD. It does not resolve namespaces and keeps prefixed names verbatim.</li>
+</ul>
+<p>The parser is run against the <a href="https://www.w3.org/XML/Test/" target="_blank" rel="noopener noreferrer">W3C XML Conformance Test Suite</a>. All 1,679 cases that have a required outcome for this class of processor pass: the parser rejects not-well-formed documents and accepts well-formed ones. Where the suite gives a canonical output, the element tree of a well-formed document (processing instructions included) matches it byte for byte. The <a href="https://github.com/oven-sh/bun/blob/main/test/js/bun/xml/xml-test-suite.test.ts" target="_blank" rel="noopener noreferrer">translated test suite</a> lists every case, including the ones whose outcome legitimately depends on not reading external entities.</p>
+<hr>
+<h2 id="performance">Performance</h2>
+<p>The parser works in two stages, like Bun's JSON parser. A SIMD pass (runtime-dispatched AVX2/AVX-512/NEON/SVE kernels) finds the bytes that can change the parse, so the parser never scans character data, attribute values, comments and CDATA sections a byte at a time. Element and attribute names reuse JavaScriptCore's atom-string cache the same way <code>JSON.parse</code> does.</p>
+<p><a href="https://github.com/oven-sh/bun/blob/main/bench/xml/xml.mjs" target="_blank" rel="noopener noreferrer"><code>bench/xml/xml.mjs</code></a> compares <code>Bun.XML.parse</code> with popular npm parsers on the same documents (lower is better; Linux x64, one core):</p>
+<div><table>
+<thead><tr>
+<th>Document</th>
+<th><code>Bun.XML.parse</code></th>
+<th>txml</th>
+<th>fast-xml-parser</th>
+<th>@xmldom/xmldom</th>
+<th>xml2js</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>S3 <code>ListObjectsV2</code> response, 231 KB</td>
+<td><strong>1.1 ms</strong></td>
+<td>4.0 ms</td>
+<td>23 ms</td>
+<td>31 ms</td>
+<td>19 ms</td>
+</tr>
+<tr>
+<td>Atom feed, 193 KB</td>
+<td><strong>1.1 ms</strong></td>
+<td>3.7 ms</td>
+<td>19 ms</td>
+<td>23 ms</td>
+<td>16 ms</td>
+</tr>
+<tr>
+<td>libphonenumber metadata, 960 KB</td>
+<td><strong>5.3 ms</strong></td>
+<td>9.6 ms</td>
+<td>56 ms</td>
+<td>53 ms</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Chromium <code>enums.xml</code>, 1.4 MB</td>
+<td><strong>16 ms</strong></td>
+<td>41 ms</td>
+<td>150 ms</td>
+<td>103 ms</td>
+<td>—</td>
+</tr>
+<tr>
+<td>freedesktop MIME database, 2.2 MB</td>
+<td><strong>27 ms</strong></td>
+<td>56 ms</td>
+<td>299 ms</td>
+<td>280 ms</td>
+<td>—</td>
+</tr>
+</tbody>
+</table></div>
+</div><div class="_attribution">
+  <p class="_attribution-p">
+    &copy; bun.com, oven-sh, Jarred Sumner<br>Licensed under the MIT License.<br>
+    <a href="https://bun.com/docs/runtime/xml" class="_attribution-link">https://bun.com/docs/runtime/xml</a>
+  </p>
+</div>
